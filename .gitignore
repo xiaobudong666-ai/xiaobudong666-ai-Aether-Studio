@@ -1,0 +1,31 @@
+# Node dependencies
+node_modules/
+.pnpm-store/
+pnpm-lock.yaml
+
+# Python cache & virtualenv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Build outputs
+dist/
+build/
+*.log
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# IDEs & System
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,14 @@
+{
+  "name": "aether-studio-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aether Studio - AI anime short video editor foundation",
+  "scripts": {
+    "build": "pnpm --filter \"./packages/*\" --filter \"./apps/*\" build",
+    "test": "pnpm --filter \"./packages/*\" --filter \"./apps/*\" test",
+    "lint": "pnpm --filter \"./packages/*\" --filter \"./apps/*\" lint"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}

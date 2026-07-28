@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - sqlite-db:/app
+    environment:
+      - DATABASE_URL=sqlite:////app/aether.db
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/worker.Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - BACKEND_URL=http://api:8000
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+      - worker
+    restart: unless-stopped
+
+volumes:
+  sqlite-db:
