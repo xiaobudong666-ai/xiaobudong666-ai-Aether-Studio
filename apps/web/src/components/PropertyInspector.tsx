@@ -5,6 +5,7 @@ interface PropertyInspectorProps {
   selectedClip: ClipDTO | null;
   projectId: string | null;
   onTriggerRender: () => Promise<void>;
+  apiBase: string;
 }
 
 export interface RenderTask {
@@ -19,13 +20,15 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   selectedClip,
   projectId,
   onTriggerRender,
+  apiBase,
 }) => {
   const [tasks, setTasks] = useState<RenderTask[]>([]);
   const [sseConnected, setSseConnected] = useState(false);
 
   useEffect(() => {
-    // Establish connection with the FastAPI SSE endpoint
-    const eventSource = new EventSource("http://127.0.0.1:8000/events");
+    // Dynamically build URL from apiBase prop
+    const sseUrl = `${apiBase}/events`;
+    const eventSource = new EventSource(sseUrl);
 
     eventSource.onopen = () => {
       setSseConnected(true);
@@ -58,7 +61,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
     return () => {
       eventSource.close();
     };
-  }, []);
+  }, [apiBase]);
 
   const handleRender = async () => {
     if (!projectId) return;

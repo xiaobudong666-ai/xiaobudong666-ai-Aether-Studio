@@ -1,7 +1,6 @@
 # Node dependencies
 node_modules/
 .pnpm-store/
-pnpm-lock.yaml
 
 # Python cache & virtualenv
 __pycache__/

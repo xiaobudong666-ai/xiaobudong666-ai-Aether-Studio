@@ -10,6 +10,9 @@ export class RationalTime {
     if (timescale <= 0) {
       throw new Error("timescale must be greater than 0");
     }
+    if (!Number.isSafeInteger(value) || !Number.isSafeInteger(timescale)) {
+      throw new Error("RationalTime values must be safe integers");
+    }
   }
 
   static fromSeconds(seconds: number, timescale = 24000): RationalTime {

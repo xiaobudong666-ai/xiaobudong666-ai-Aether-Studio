@@ -13,7 +13,8 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState<RationalTime>(new RationalTime(0, 24000));
   const [apiError, setApiError] = useState<string | null>(null);
 
-  const API_BASE = "http://127.0.0.1:8000";
+  // Dynamic API Base mapping via Vite environment variables
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
   // 1. Fetch projects on load
   const fetchProjects = async () => {
@@ -70,6 +71,7 @@ export default function App() {
 
   useEffect(() => {
     fetchProjects();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchProjectDetail = async (id: string) => {
@@ -171,7 +173,7 @@ export default function App() {
 
     // Find if track of material type exists, otherwise create it
     const trackType = material.type === "video" ? "video" : material.type === "audio" ? "audio" : "subtitle";
-    let tracks = [...currentProject.timeline.tracks];
+    const tracks = [...currentProject.timeline.tracks];
     let targetTrack = tracks.find((t) => t.type === trackType);
 
     if (!targetTrack) {
@@ -291,6 +293,7 @@ export default function App() {
           selectedClip={selectedClip}
           projectId={currentProject?.id || null}
           onTriggerRender={handleTriggerRender}
+          apiBase={API_BASE}
         />
       </main>
 

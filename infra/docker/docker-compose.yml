@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   api:
     build:
@@ -8,9 +6,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - sqlite-db:/app
+      - sqlite-db:/data
     environment:
-      - DATABASE_URL=sqlite:////app/aether.db
+      - DATABASE_URL=sqlite:////data/aether.db
     restart: unless-stopped
 
   worker:
@@ -32,6 +30,8 @@ services:
     depends_on:
       - api
       - worker
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
     restart: unless-stopped
 
 volumes:

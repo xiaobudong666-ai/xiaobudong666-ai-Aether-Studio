@@ -1,10 +1,12 @@
 import asyncio
 import uuid
 import datetime
+import logging
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from typing import List, Dict
 
 from .database import Base, engine, get_db
@@ -12,19 +14,23 @@ from .models import DBProject
 from .schemas import (
     CreateProjectRequest,
     UpdateProjectRequest,
-    ProjectResponse,
-    TimelineSchema
+    ProjectResponse
 )
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("api.main")
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Aether Studio API", version="1.0.0")
 
+# SECURITY: Set allow_credentials=False when using wildcards, OR provide proper environment configured origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,12 +40,21 @@ app.add_middleware(
 active_tasks: Dict[str, dict] = {}
 
 @app.get("/health")
-def health_check():
+def health_check(db: Session = Depends(get_db)):
+    journal_mode = "unknown"
+    try:
+        # Execute query to get actual SQLite journal mode
+        res = db.execute(text("PRAGMA journal_mode;")).fetchone()
+        if res:
+            journal_mode = res[0].upper()
+    except Exception as e:
+        logger.error(f"Failed to fetch SQLite journal_mode: {e}")
+
     return {
         "status": "healthy",
         "service": "api",
         "database": "sqlite",
-        "journal_mode": "WAL",
+        "journal_mode": journal_mode,
         "timestamp": datetime.datetime.utcnow().isoformat()
     }
 
@@ -140,7 +155,6 @@ def update_project(project_id: str, req: UpdateProjectRequest, db: Session = Dep
     if req.name is not None:
         p.name = req.name
     if req.timeline is not None:
-        # Pydantic dict serialization
         p.timeline = req.timeline.model_dump()
     if req.materials is not None:
         p.materials = [m.model_dump() for m in req.materials]
@@ -173,32 +187,37 @@ async def start_render_task(project_id: str, db: Session = Depends(get_db)):
         "projectId": project_id,
         "progress": 0,
         "status": "pending",
-        "message": "Initializing background render task"
+        "message": "Initializing background render task [MOCK]"
     }
 
     # Simulate work asynchronously
     async def simulate_task():
         try:
-            await asyncio.sleep(2)
-            active_tasks[task_id]["status"] = "processing"
-            active_tasks[task_id]["progress"] = 20
-            active_tasks[task_id]["message"] = "Processing timeline frames..."
+            await asyncio.sleep(1)
+            if task_id in active_tasks:
+                active_tasks[task_id]["status"] = "processing"
+                active_tasks[task_id]["progress"] = 20
+                active_tasks[task_id]["message"] = "Processing timeline frames... [MOCK]"
 
-            await asyncio.sleep(2)
-            active_tasks[task_id]["progress"] = 50
-            active_tasks[task_id]["message"] = "Generating 480p proxy with FFmpeg..."
+            await asyncio.sleep(1)
+            if task_id in active_tasks:
+                active_tasks[task_id]["progress"] = 50
+                active_tasks[task_id]["message"] = "Generating 480p proxy with FFmpeg... [MOCK]"
 
-            await asyncio.sleep(2)
-            active_tasks[task_id]["progress"] = 80
-            active_tasks[task_id]["message"] = "Merging audio layers..."
+            await asyncio.sleep(1)
+            if task_id in active_tasks:
+                active_tasks[task_id]["progress"] = 80
+                active_tasks[task_id]["message"] = "Merging audio layers... [MOCK]"
 
-            await asyncio.sleep(2)
-            active_tasks[task_id]["progress"] = 100
-            active_tasks[task_id]["status"] = "completed"
-            active_tasks[task_id]["message"] = "Render successfully completed"
+            await asyncio.sleep(1)
+            if task_id in active_tasks:
+                active_tasks[task_id]["progress"] = 100
+                active_tasks[task_id]["status"] = "completed"
+                active_tasks[task_id]["message"] = "Render successfully completed [MOCK]"
         except Exception as e:
-            active_tasks[task_id]["status"] = "failed"
-            active_tasks[task_id]["message"] = f"Task failed: {str(e)}"
+            if task_id in active_tasks:
+                active_tasks[task_id]["status"] = "failed"
+                active_tasks[task_id]["message"] = f"Task failed: {str(e)} [MOCK]"
 
     asyncio.create_task(simulate_task())
 
@@ -225,6 +244,6 @@ async def sse_events():
                 if task["status"] in ["completed", "failed"]:
                     active_tasks.pop(task_id, None)
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

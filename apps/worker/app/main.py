@@ -1,3 +1,4 @@
+import os
 import time
 import json
 import logging
@@ -46,10 +47,12 @@ START_TIME = time.time()
 def run_worker():
     logger.info("Initializing Aether Studio Background Worker...")
 
-    # 1. Initialize Adapters and Interfaces
+    # 1. Initialize Adapters and Interfaces with env variables
+    backend_url = os.environ.get("BACKEND_URL", "http://localhost:8000")
+
     ffmpeg = FFmpegAdapter()
     ai = AIProviderInterface()
-    recovery = TaskRecoveryManager(backend_url="http://localhost:8000")
+    recovery = TaskRecoveryManager(backend_url=backend_url)
 
     # 2. Run Task Recovery scan
     recovery.scan_and_recover_tasks()

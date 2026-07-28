@@ -2,9 +2,12 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ "main", "feat/m0-0-foundation" ]
+    branches:
+      - "main"
+      - "feat/**"
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - "main"
 
 jobs:
   build-and-test:
@@ -14,21 +17,26 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # Node Setup & Checks
-    - name: Setup Node.js
+    # Node Setup (Node 24 LTS)
+    - name: Setup Node.js (24 LTS)
       uses: actions/setup-node@v4
       with:
-        node-version: 22
+        node-version: 24
 
     - name: Install pnpm
       uses: pnpm/action-setup@v3
       with:
         version: 10.30.3
 
+    # Install using --frozen-lockfile for deterministic deployments
     - name: Install Node Dependencies
-      run: pnpm install --no-frozen-lockfile
+      run: pnpm install --frozen-lockfile
 
-    - name: TypeScript Compile & Check
+    # Sequence: Install -> Lint -> Type Check -> Test -> Build
+    - name: Run ESLint Checks
+      run: pnpm lint
+
+    - name: Compile and Type Check
       run: pnpm build
 
     - name: Run Web and Package Tests
