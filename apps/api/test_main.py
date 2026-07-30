@@ -1,83 +1,136 @@
-import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
-
-# Force isolated test SQLite database URL before imports are evaluated
-os.environ["DATABASE_URL"] = "sqlite:///aether_test.db"
-
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from app.main import app, get_db, sse_events
-from app.database import Base, engine, SessionLocal
+from sqlalchemy.orm import sessionmaker
 
-@pytest.fixture(scope="module", autouse=True)
-def setup_test_db():
-    # Setup test schema
-    Base.metadata.create_all(bind=engine)
-    yield
-    # Clean up test database file after tests complete
-    Base.metadata.drop_all(bind=engine)
-    if os.path.exists("aether_test.db"):
+from app.database import Base, build_engine
+from app.main import apply_project_update, create_app
+from app.schemas import UpdateProjectRequest
+
+
+@pytest.fixture()
+def api_context(tmp_path):
+    database_path = tmp_path / "aether-api-test.db"
+    test_engine = build_engine(f"sqlite:///{database_path}")
+    test_session = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=test_engine,
+    )
+
+    def get_test_db():
+        db = test_session()
         try:
-            os.remove("aether_test.db")
-        except OSError:
-            pass
+            yield db
+        finally:
+            db.close()
 
-@pytest.fixture(scope="module")
-def client():
-    with TestClient(app) as c:
-        yield c
+    test_app = create_app(
+        app_engine=test_engine,
+        db_dependency=get_test_db,
+        render_step_delay=0.01,
+    )
+    with TestClient(test_app) as client:
+        yield client, test_session
 
-def test_health_check_dynamic_wal(client):
+    Base.metadata.drop_all(bind=test_engine)
+    test_engine.dispose()
+
+
+def create_project(client: TestClient, name: str = "Aether Epic Anime"):
+    response = client.post("/projects", json={"name": name})
+    assert response.status_code == 201
+    return response.json()
+
+
+def test_health_check_uses_isolated_wal_database(api_context):
+    client, _ = api_context
     response = client.get("/health")
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "healthy"
-    assert data["service"] == "api"
-    # Ensure it's querying actual journal mode
-    assert "journal_mode" in data
-    assert data["journal_mode"] in ["WAL", "MEMORY", "DELETE", "TRUNCATE"]
+    assert response.json()["journal_mode"] == "WAL"
 
-def test_project_crud_lifecycle_with_concurrency_locks(client):
-    # 1. Create project
-    response = client.post("/projects", json={"name": "Aether Epic Anime"})
-    assert response.status_code == 201
-    project = response.json()
-    assert project["name"] == "Aether Epic Anime"
+
+def test_project_list_create_query_update_and_not_found(api_context):
+    client, _ = api_context
+    assert client.get("/projects").json() == []
+
+    project = create_project(client)
+    project_id = project["id"]
     assert project["revision"] == 1
-    assert project["timeline"]["version"] == "1.1"
+    assert client.get("/projects").json()[0]["id"] == project_id
+    assert client.get(f"/projects/{project_id}").json()["name"] == project["name"]
 
+    update_response = client.put(
+        f"/projects/{project_id}",
+        json={"name": "Aether Stylized V2", "expectedRevision": 1},
+    )
+    assert update_response.status_code == 200
+    assert update_response.json()["revision"] == 2
+    assert update_response.json()["name"] == "Aether Stylized V2"
+
+    stale_response = client.put(
+        f"/projects/{project_id}",
+        json={"name": "Stale Update", "expectedRevision": 1},
+    )
+    assert stale_response.status_code == 409
+    assert stale_response.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
+
+    missing_id = "00000000-0000-0000-0000-000000000000"
+    assert client.get(f"/projects/{missing_id}").status_code == 404
+    assert client.put(
+        f"/projects/{missing_id}",
+        json={"name": "Missing", "expectedRevision": 1},
+    ).status_code == 404
+    assert client.post(f"/projects/{missing_id}/render").status_code == 404
+
+
+def test_atomic_optimistic_lock_allows_exactly_one_competing_update(api_context):
+    client, test_session = api_context
+    project = create_project(client, "Concurrency Test")
     project_id = project["id"]
 
-    # 2. Get project details
-    response = client.get(f"/projects/{project_id}")
-    assert response.status_code == 200
-    assert response.json()["name"] == "Aether Epic Anime"
+    def competing_update(name: str):
+        db = test_session()
+        try:
+            updated = apply_project_update(
+                db,
+                project_id,
+                UpdateProjectRequest(name=name, expectedRevision=1),
+            )
+            return ("updated", updated.name)
+        except HTTPException as exc:
+            return ("conflict", exc.status_code)
+        finally:
+            db.close()
 
-    # 3. Update project (Valid expectedRevision)
-    update_payload = {
-        "name": "Aether Stylized V2",
-        "expectedRevision": 1
-    }
-    response = client.put(f"/projects/{project_id}", json=update_payload)
-    assert response.status_code == 200
-    updated = response.json()
-    assert updated["name"] == "Aether Stylized V2"
-    assert updated["revision"] == 2
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(competing_update, ["Writer A", "Writer B"]))
 
-    # 4. Trigger concurrency conflict (Expected is 1, but current is 2)
-    conflict_payload = {
-        "name": "Stale Update Blocked",
-        "expectedRevision": 1
-    }
-    response = client.put(f"/projects/{project_id}", json=conflict_payload)
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
+    assert [outcome[0] for outcome in outcomes].count("updated") == 1
+    assert [outcome[0] for outcome in outcomes].count("conflict") == 1
+    persisted = client.get(f"/projects/{project_id}").json()
+    assert persisted["revision"] == 2
+    assert persisted["name"] in {"Writer A", "Writer B"}
 
-@pytest.mark.anyio
-async def test_sse_generator():
-    # Test the SSE generator directly to avoid blocking test execution client streams
-    response = await sse_events()
-    generator = response.body_iterator
 
-    # Read first event produced by generator
-    first_event = await generator.__anext__()
-    assert "heartbeat" in first_event or "timestamp" in first_event
+def test_render_and_sse_emit_real_task_progress_event(api_context):
+    client, _ = api_context
+    project = create_project(client, "Render Test")
+
+    render_response = client.post(f"/projects/{project['id']}/render")
+    assert render_response.status_code == 200
+    task_id = render_response.json()["taskId"]
+    assert render_response.json()["mock"] is True
+
+    first_snapshot = client.get("/events?once=true")
+    assert first_snapshot.status_code == 200
+    assert "event: task_progress" in first_snapshot.text
+    assert task_id in first_snapshot.text
+
+    time.sleep(0.08)
+    completed_snapshot = client.get("/events?once=true")
+    assert f'"taskId":"{task_id}"' in completed_snapshot.text
+    assert '"status":"completed"' in completed_snapshot.text

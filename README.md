@@ -1,183 +1,182 @@
 # Aether Studio — M0-0 Engineering Baseline
 
-Aether Studio is an AI-powered anime/cartoon short video editor. This repository houses the completed **M0-0 Engineering Baseline**, establishing a robust, modular, testable, and containerized workspace foundation for subsequent M1/M2/M3 phase developments.
+Aether Studio is an AI anime and short-video editing project. This repository
+contains the M0-0 engineering foundation: a runnable web workbench, API,
+isolated worker, shared contracts, container topology, tests, and CI gates.
 
-This project is completely independent. It does **not** read, reference, or modify `Ai-Eos` as per engineering constraints.
+The repository is independent and does not read, import, or modify `Ai-Eos`.
 
----
+## Architecture
 
-## 1. Architectural Blueprint & Design Decision Record (DDR)
+| Area | Purpose |
+| --- | --- |
+| `apps/web` | React, TypeScript, and Vite three-panel editing workbench |
+| `apps/api` | FastAPI project CRUD, SQLite WAL, optimistic locking, render mock, and SSE |
+| `apps/worker` | Isolated Python Worker with explicitly mocked FFmpeg, AI, and recovery adapters |
+| `packages/contracts` | Canonical Timeline v1.1 DTOs, validation, error codes, and RationalTime |
+| `packages/editor` | Editor-agnostic material, canvas, and timeline adapter interfaces |
+| `infra/docker` | API, Worker, and same-origin Nginx Web deployment |
+| `e2e` | Playwright workbench and render-progress flow |
 
-### Monorepo Strategy (pnpm Workspace)
-- **Monorepo Root**: Managed via `pnpm` workspaces for maximum dependency deduplication, speed, and clean code boundaries.
-- **`packages/contracts`**: Standardizes domain models, shared Data Transfer Objects (DTOs), Zod validators, standard SSE event schemas, and the **Canonical Timeline v1.1**.
-- **`packages/editor`**: Contains visual-editor-agnostic abstract adapters (`IMaterialLoader`, `ICanvasAdapter`, `ITimelineController`). This strictly prevents tight coupling of core business capabilities with any single third-party timeline or rendering engine.
-- **`apps/web`**: Responsive three-column React + TypeScript + Vite workbench.
-- **`apps/api`**: FastAPI-based Web API facilitating project metadata, SQLite WAL storage, and Server-Sent Events (SSE) streaming.
-- **`apps/worker`**: Independent Python daemon handling processing tasks (FFmpeg proxies, AI-driven stylization, crash recoveries).
+### Canonical time
 
-### Accurate Frame Timing (`RationalTime`)
-Unlike floating-point decimals or flat millisecond integers, frame-accurate systems cannot afford cumulative precision drift. We enforce `RationalTime` math representing time as a rational fraction:
-$$\text{Time} = \frac{\text{value}}{\text{timescale}}$$
-For instance, a standard anime timeline uses a timescale of `24000` (allowing perfect fraction increments for 24fps film rates, i.e., 1000 value ticks per frame). All duration and offset computations are resolved using exact common denominators, completely eliminating precision drifting over long sequences.
+`RationalTime` stores `value / timescale` as safe integers. Exact operations use
+BigInt cross-products plus gcd/lcm reduction; comparisons do not convert to
+floating-point seconds. `toSeconds()` and `toMilliseconds()` are display
+conveniences, not exact comparison primitives. An operation fails explicitly
+if its reduced result cannot fit JavaScript's safe-integer range.
 
-### High-Performance DB (`SQLite WAL`)
-- **WAL (Write-Ahead Logging)**: Configured via SQL pragmas (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`). This enables simultaneous high-speed reads and writes, protecting database consistency during continuous auto-saving without blocking visual rendering tasks.
+The tests cover 24 fps, 24000/1001, 30000/1001, 60000/1001, long timelines,
+safe-integer boundaries, exact comparisons, and arithmetic overflow.
 
-### Auto-Save & Optimistic Concurrency Control
-- **Automatic Revision Logs**: Every visual change (adding clips, updating materials) increments the project's `revision` count.
-- **Optimistic Locking**: When updating a project (`PUT /projects/{id}`), the front-end includes an `expectedRevision`. If the DB revision has progressed beyond `expectedRevision` (due to multiple tabs or parallel processing), a `409 Concurrency Conflict` is returned. The UI gracefully alerts the user, refetches, and merges states, preventing silent visual data loss.
+### SQLite WAL and optimistic locking
 
----
+Each SQLite connection applies:
 
-## 2. Directory Structure & File Inventory
-
-```
-aether-studio-monorepo/
-├── .github/
-│   └── workflows/
-│       └── ci.yml             # Github Actions: setup, compile checks, linting, tests
-├── apps/
-│   ├── api/                   # Python FastAPI backend
-│   │   ├── app/
-│   │   │   ├── main.py        # Routes, optimistic locks, SSE events streaming
-│   │   │   ├── database.py    # DB WAL & connection configurations
-│   │   │   ├── models.py      # SQLAlchemy DB project layout
-│   │   │   └── schemas.py     # Pydantic schemas mapping contracts
-│   │   ├── requirements.txt
-│   │   └── test_main.py       # Pytest API integration tests
-│   ├── web/                   # React + TS + Vite Workbench
-│   │   ├── src/
-│   │   │   ├── components/    # AssetLibrary, CanvasPreview, PropertyInspector, Timeline
-│   │   │   ├── test/          # Test setups
-│   │   │   ├── App.tsx        # Workbench connector
-│   │   │   ├── main.tsx
-│   │   │   └── index.css      # Dark-themed dashboard stylesheets
-│   │   ├── package.json
-│   │   └── vite.config.ts
-│   └── worker/                # Python processing daemon
-│       ├── app/
-│       │   ├── main.py        # Event loop & health server
-│       │   ├── ffmpeg_adapter.py # Video transcoding skeleton (480p proxy)
-│       │   ├── ai_provider.py # AI cartoon stylizer & STT subtitle skeleton
-│       │   └── recovery.py    # Interrupted task recovery adapter
-│       ├── requirements.txt
-│       └── test_worker.py     # Pytest unit tests
-├── infra/
-│   └── docker/
-│       ├── docker-compose.yml # Dev orchestration (API + Worker + Web)
-│       ├── api.Dockerfile
-│       ├── worker.Dockerfile
-│       └── web.Dockerfile     # Multi-stage built React static app in Nginx
-├── packages/
-│   ├── contracts/             # Shared Timing Math and schemas
-│   │   ├── src/
-│   │   │   ├── index.ts       # RationalTime calculations, 480p constants
-│   │   │   └── schemas.ts     # Zod timelines and project schemas
-│   │   └── __tests__/         # Vitest Timing unit tests
-│   └── editor/                # Abstract editor adapters (loaders, controllers)
-├── package.json
-├── pnpm-workspace.yaml
-└── README.md                  # This documentation
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=30000;
 ```
 
----
+Project writes use one atomic statement whose condition includes both project
+ID and `expectedRevision`. The affected-row count distinguishes a successful
+write from a stale revision, preventing two competing updates from both
+succeeding.
 
-## 3. Quick Start Guide & Orchestration
+### Same-origin Web routing
 
-### Prerequisites
-- Node.js >= 22 & `pnpm` >= 10
-- Python >= 3.12
-- Docker & Docker Compose (optional for local container testing)
+The browser calls `/api`. In development, Vite proxies that path to FastAPI. In
+Docker, Nginx proxies `/api/` to the API container and disables buffering for
+SSE. Vite build-time variables are not incorrectly supplied as container
+runtime variables.
 
-### Local Dev Setup (Bare Metal)
+## Requirements
 
-1. **Install Workspace Dependencies**:
-   ```bash
-   pnpm install
-   ```
+- Node.js 24 LTS
+- pnpm 10.30.3
+- Python 3.12
+- Docker with Compose v2 for container verification
 
-2. **Set up Python Virtualenvs**:
-   - **API**:
-     ```bash
-     python3 -m venv apps/api/.venv
-     ./apps/api/.venv/bin/pip install -r apps/api/requirements.txt
-     ```
-   - **Worker**:
-     ```bash
-     python3 -m venv apps/worker/.venv
-     ./apps/worker/.venv/bin/pip install -r apps/worker/requirements.txt
-     ```
+## Local development
 
-3. **Start Back-end Services**:
-   - **API (Port 8000)**:
-     ```bash
-     cd apps/api
-     ./.venv/bin/uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-     ```
-   - **Worker (Port 8001)**:
-     ```bash
-     cd apps/worker
-     PYTHONPATH=. .venv/bin/python3 -m app.main
-     ```
+Install Node dependencies:
 
-4. **Start Front-end Web (Port 5173)**:
-   ```bash
-   cd apps/web
-   pnpm dev
-   ```
-
-### Running with Docker Compose
-
-Spin up the entire unified mesh (FastAPI + Worker + Nginx Web) instantly:
 ```bash
-docker compose -f infra/docker/docker-compose.yml up --build
+corepack enable
+corepack prepare pnpm@10.30.3 --activate
+pnpm install --frozen-lockfile
 ```
-- Navigate to http://localhost to access the workbench.
-- API is exposed on http://localhost:8000.
-- Worker is exposed on http://localhost:8001.
 
----
+Create one Python environment and install both service requirements:
 
-## 4. Test Suite Execution
-
-To run all front-end, contracts, and timing tests using Vitest:
 ```bash
+python3 -m venv .venv
+.venv/bin/pip install -r apps/api/requirements.txt
+.venv/bin/pip install -r apps/worker/requirements.txt
+```
+
+Run the API:
+
+```bash
+PYTHONPATH=apps/api DATABASE_URL=sqlite:///aether.db \
+  .venv/bin/python -m uvicorn app.main:app \
+  --host 127.0.0.1 --port 8000
+```
+
+Run the Worker:
+
+```bash
+PYTHONPATH=apps/worker BACKEND_URL=http://127.0.0.1:8000 \
+  WORKER_PORT=8001 .venv/bin/python -m app.main
+```
+
+Run the Web workbench:
+
+```bash
+pnpm --filter @aether/web dev
+```
+
+Open `http://127.0.0.1:5173`.
+
+## Verification
+
+Run the deterministic workspace checks:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm build
 pnpm test
 ```
 
-To run Pytest tests for API and Worker:
-```bash
-# API Tests
-cd apps/api && PYTHONPATH=. .venv/bin/pytest
+Run Python tests:
 
-# Worker Tests
-cd apps/worker && PYTHONPATH=. .venv/bin/pytest
+```bash
+PYTHONPATH=apps/api .venv/bin/python -m pytest apps/api/test_main.py -q
+PYTHONPATH=apps/worker .venv/bin/python -m pytest apps/worker/test_worker.py -q
 ```
 
----
+Run Playwright:
 
-## 5. M0-0 Acceptance Record
+```bash
+pnpm exec playwright install chromium
+pnpm e2e
+```
 
-| Feature Requirement | Status | Verification Command / Proof |
-| :--- | :--- | :--- |
-| **Monorepo Workspace** | Passed | Workspace mapping with pnpm links compiled successfully. |
-| **RationalTime Accuracy** | Passed | Tested via `packages/contracts/__tests__/rationalTime.test.ts`. 100% precision. |
-| **FastAPI + WAL** | Passed | Verified with health-checks indicating journal_mode=WAL. |
-| **Optimistic Lock** | Passed | Tested via `apps/api/test_main.py`. Returns 409 Conflict as specified. |
-| **SSE Tasks Updates** | Passed | Verified with live EventSource listener inside React components. |
-| **FFmpeg/AI Adapters** | Passed | Deployed in `apps/worker` with standalone pytest verification. |
-| **Web Editor layout** | Passed | Verified via Playwright screenshots illustrating complete responsive panels. |
+Run the complete container stack:
 
----
+```bash
+docker compose -f infra/docker/docker-compose.yml config --quiet
+docker compose -f infra/docker/docker-compose.yml up -d --build --wait
+curl --fail http://127.0.0.1/api/health
+docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
+docker compose -f infra/docker/docker-compose.yml exec -T worker ffprobe -version
+docker compose -f infra/docker/docker-compose.yml down --volumes
+```
 
-## 6. Known Limitations & Next-Phase (M1) Recommendations
+The GitHub Actions workflow has three required jobs:
 
-### Known Limitations (M0-0 Baseline)
-- **Mock Transcoding**: FFmpeg and AI interfaces in the worker utilize mocked processing loops. In M1, these must be integrated with real `subprocess` bindings and actual vendor endpoints.
-- **Client Cache Resiliency**: If the back-end drops connection, the frontend automatically falls back to an interactive client-side mockup mode. Real-time offline persistence (e.g. IndexedDB syncing) is deferred to M1.
+1. Lint, build, JavaScript tests, API tests, and Worker tests.
+2. Playwright browser flow with screenshots and HTML report artifacts.
+3. Docker Compose build, health checks, same-origin proxy check, FFmpeg checks,
+   and log artifact.
 
-### Recommendations for M1
-1. **Dynamic Track Management**: Implement UI controls for creating, reordering, and deleting arbitrary tracks directly.
-2. **Real FFmpeg Decoding**: Bind standard webcodecs or FFmpeg WASM inside the canvas monitor to support real visual rendering of the 480p proxy segments.
-3. **Webhooks for Tasks**: Integrate FastAPI background queues with a Redis Broker (e.g. Celery / RQ) to distribute workloads securely to several worker nodes.
+See `docs/evidence/M0-0-VERIFICATION.md` for the evidence policy and current
+limitations. A green job proves only the scope asserted by that job.
+
+## Implemented M0-0 behavior
+
+- Project list, create, query, and update.
+- Atomic revision conflict response (`409 CONCURRENCY_CONFLICT`).
+- Three-panel workbench and bottom timeline.
+- Materials and basic track/clip placement.
+- Bounded 480p proxy specification.
+- Mock render task and live `task_progress` SSE events.
+- Independent Worker HTTP health endpoint.
+- Explicit mock boundaries for FFmpeg, AI provider, and recovery.
+- Reproducible lockfile, Node/pnpm baseline, Docker topology, and CI.
+
+## M0-0 limitations
+
+- FFmpeg adapter methods are mocks; the container contains FFmpeg and ffprobe,
+  but M0-0 does not process real media.
+- AI generation and subtitle methods are mocks and use no provider keys.
+- Task state is in process memory; Redis/Celery durability is deferred.
+- The preview canvas is a workbench placeholder, not a decoding or compositing
+  engine.
+- Offline persistence and multi-device merge UI are deferred.
+- RationalTime is exact only while reduced results remain within the declared
+  JavaScript safe-integer boundary.
+
+These limitations must not be presented as completed production capabilities.
+
+## M1 entry criteria
+
+M1 may start only after the latest feature-branch commit has:
+
+- all three GitHub Actions jobs green;
+- Playwright and Docker artifacts present;
+- no uncommitted changes;
+- a reviewed pull request against `main`;
+- an explicit record of remaining mock boundaries.

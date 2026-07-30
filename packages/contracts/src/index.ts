@@ -7,19 +7,25 @@ export class RationalTime {
     public readonly value: number,
     public readonly timescale: number
   ) {
-    if (timescale <= 0) {
-      throw new Error("timescale must be greater than 0");
-    }
     if (!Number.isSafeInteger(value) || !Number.isSafeInteger(timescale)) {
       throw new Error("RationalTime values must be safe integers");
+    }
+    if (timescale <= 0) {
+      throw new Error("timescale must be greater than 0");
     }
   }
 
   static fromSeconds(seconds: number, timescale = 24000): RationalTime {
+    if (!Number.isFinite(seconds)) {
+      throw new Error("seconds must be finite");
+    }
     return new RationalTime(Math.round(seconds * timescale), timescale);
   }
 
   static fromMilliseconds(ms: number, timescale = 1000): RationalTime {
+    if (!Number.isFinite(ms)) {
+      throw new Error("milliseconds must be finite");
+    }
     return new RationalTime(Math.round(ms * (timescale / 1000)), timescale);
   }
 
@@ -31,55 +37,103 @@ export class RationalTime {
     return (this.value / this.timescale) * 1000;
   }
 
-  // Find Greatest Common Divisor to simplify fractions
-  private gcd(a: number, b: number): number {
-    a = Math.abs(a);
-    b = Math.abs(b);
-    while (b) {
-      const t = b;
-      b = a % b;
-      a = t;
+  private static gcd(a: bigint, b: bigint): bigint {
+    a = a < 0n ? -a : a;
+    b = b < 0n ? -b : b;
+    while (b !== 0n) {
+      const remainder = a % b;
+      a = b;
+      b = remainder;
     }
     return a;
   }
 
+  private static fromBigInts(value: bigint, timescale: bigint): RationalTime {
+    if (timescale <= 0n) {
+      throw new Error("timescale must be greater than 0");
+    }
+    const max = BigInt(Number.MAX_SAFE_INTEGER);
+    const min = BigInt(Number.MIN_SAFE_INTEGER);
+    if (value > max || value < min || timescale > max) {
+      throw new Error("RationalTime result exceeds safe integer range");
+    }
+    return new RationalTime(Number(value), Number(timescale));
+  }
+
   simplify(): RationalTime {
-    const divisor = this.gcd(this.value, this.timescale);
-    return new RationalTime(this.value / divisor, this.timescale / divisor);
+    const value = BigInt(this.value);
+    const timescale = BigInt(this.timescale);
+    const divisor = RationalTime.gcd(value, timescale);
+    return RationalTime.fromBigInts(value / divisor, timescale / divisor);
   }
 
   add(other: RationalTime): RationalTime {
     if (this.timescale === other.timescale) {
-      return new RationalTime(this.value + other.value, this.timescale);
+      return RationalTime.fromBigInts(
+        BigInt(this.value) + BigInt(other.value),
+        BigInt(this.timescale)
+      );
     }
-    const commonTimescale = this.timescale * other.timescale;
-    const selfValue = this.value * other.timescale;
-    const otherValue = other.value * this.timescale;
-    return new RationalTime(selfValue + otherValue, commonTimescale).simplify();
+
+    const leftScale = BigInt(this.timescale);
+    const rightScale = BigInt(other.timescale);
+    const scaleGcd = RationalTime.gcd(leftScale, rightScale);
+    const leftMultiplier = rightScale / scaleGcd;
+    const rightMultiplier = leftScale / scaleGcd;
+    const commonTimescale = leftScale * leftMultiplier;
+    const combinedValue =
+      BigInt(this.value) * leftMultiplier +
+      BigInt(other.value) * rightMultiplier;
+    const resultGcd = RationalTime.gcd(combinedValue, commonTimescale);
+
+    return RationalTime.fromBigInts(
+      combinedValue / resultGcd,
+      commonTimescale / resultGcd
+    );
   }
 
   subtract(other: RationalTime): RationalTime {
     if (this.timescale === other.timescale) {
-      return new RationalTime(this.value - other.value, this.timescale);
+      return RationalTime.fromBigInts(
+        BigInt(this.value) - BigInt(other.value),
+        BigInt(this.timescale)
+      );
     }
-    const commonTimescale = this.timescale * other.timescale;
-    const selfValue = this.value * other.timescale;
-    const otherValue = other.value * this.timescale;
-    return new RationalTime(selfValue - otherValue, commonTimescale).simplify();
+
+    const leftScale = BigInt(this.timescale);
+    const rightScale = BigInt(other.timescale);
+    const scaleGcd = RationalTime.gcd(leftScale, rightScale);
+    const leftMultiplier = rightScale / scaleGcd;
+    const rightMultiplier = leftScale / scaleGcd;
+    const commonTimescale = leftScale * leftMultiplier;
+    const combinedValue =
+      BigInt(this.value) * leftMultiplier -
+      BigInt(other.value) * rightMultiplier;
+    const resultGcd = RationalTime.gcd(combinedValue, commonTimescale);
+
+    return RationalTime.fromBigInts(
+      combinedValue / resultGcd,
+      commonTimescale / resultGcd
+    );
   }
 
   equals(other: RationalTime): boolean {
-    const s1 = this.simplify();
-    const s2 = other.simplify();
-    return s1.value === s2.value && s1.timescale === s2.timescale;
+    return this.compare(other) === 0;
   }
 
   greaterThan(other: RationalTime): boolean {
-    return this.toSeconds() > other.toSeconds();
+    return this.compare(other) > 0;
   }
 
   lessThan(other: RationalTime): boolean {
-    return this.toSeconds() < other.toSeconds();
+    return this.compare(other) < 0;
+  }
+
+  compare(other: RationalTime): -1 | 0 | 1 {
+    const left = BigInt(this.value) * BigInt(other.timescale);
+    const right = BigInt(other.value) * BigInt(this.timescale);
+    if (left === right) return 0;
+    return left < right ? -1 : 1;
   }
 
   toJSON() {

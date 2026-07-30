@@ -1,12 +1,9 @@
-import pytest
-import time
 import threading
 import httpx
-from http.server import HTTPServer
 from app.ffmpeg_adapter import FFmpegAdapter
 from app.ai_provider import AIProviderInterface
 from app.recovery import TaskRecoveryManager
-from app.main import WorkerHealthHandler
+from app.main import create_health_server, initialize_worker
 
 def test_ffmpeg_adapter_mock():
     # Clearly marked as mock adapter tests
@@ -33,20 +30,21 @@ def test_recovery_manager_mock():
     recovered = recovery.scan_and_recover_tasks()
     assert recovered == []
 
-def test_worker_real_http_health_check():
-    # Start the real HTTPServer on a custom port inside a daemon thread for verification
-    test_port = 8019
-    server = HTTPServer(("127.0.0.1", test_port), WorkerHealthHandler)
+def test_worker_reads_backend_url_from_environment(monkeypatch):
+    monkeypatch.setenv("BACKEND_URL", "http://api.internal:8123")
+    components = initialize_worker()
+    assert components.recovery.backend_url == "http://api.internal:8123"
 
+
+def test_worker_real_http_health_check_uses_dynamic_port():
+    server = create_health_server(host="127.0.0.1", port=0)
+    test_port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    # Wait for startup
-    time.sleep(0.5)
-
     try:
-        # Perform HTTP GET request using httpx
-        response = httpx.get(f"http://127.0.0.1:{test_port}/health")
+        with httpx.Client(trust_env=False, timeout=2.0) as client:
+            response = client.get(f"http://127.0.0.1:{test_port}/health")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"

@@ -15,13 +15,14 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
 
   useEffect(() => {
-    let interval: any;
+    let interval: ReturnType<typeof setInterval> | undefined;
     if (isPlaying) {
       interval = setInterval(() => {
         // Advance current time by 1 frame (1/24 seconds)
         const frameTime = new RationalTime(1000, 24000); // 1/24 seconds
         const nextTime = currentTime.add(frameTime);
-        if (nextTime.greaterThan(timelineDuration) && timelineDuration.toSeconds() > 0) {
+        const hasDuration = timelineDuration.greaterThan(new RationalTime(0, 1));
+        if (!nextTime.lessThan(timelineDuration) && hasDuration) {
           setIsPlaying(false);
           onTimeChange(timelineDuration);
         } else {
@@ -29,7 +30,9 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
         }
       }, 41.67); // ~24 fps
     }
-    return () => clearInterval(interval);
+    return () => {
+      if (interval !== undefined) clearInterval(interval);
+    };
   }, [isPlaying, currentTime, timelineDuration, onTimeChange]);
 
   const handlePlayPause = () => {

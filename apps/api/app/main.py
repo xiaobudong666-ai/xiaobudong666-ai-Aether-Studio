@@ -1,249 +1,294 @@
 import asyncio
-import uuid
 import datetime
+import json
 import logging
-from fastapi import FastAPI, Depends, HTTPException, status
+import os
+import uuid
+from contextlib import asynccontextmanager
+from typing import Callable, Dict, Generator, List
+
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select, text, update
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
-from sqlalchemy import text
-from typing import List, Dict
 
 from .database import Base, engine, get_db
 from .models import DBProject
-from .schemas import (
-    CreateProjectRequest,
-    UpdateProjectRequest,
-    ProjectResponse
-)
+from .schemas import CreateProjectRequest, ProjectResponse, UpdateProjectRequest
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api.main")
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+DatabaseDependency = Callable[[], Generator[Session, None, None]]
 
-app = FastAPI(title="Aether Studio API", version="1.0.0")
 
-# SECURITY: Set allow_credentials=False when using wildcards, OR provide proper environment configured origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
 
-# Mocked background tasks in-memory state
-# Keys: taskId, Values: TaskProgressPayload
-active_tasks: Dict[str, dict] = {}
 
-@app.get("/health")
-def health_check(db: Session = Depends(get_db)):
-    journal_mode = "unknown"
-    try:
-        # Execute query to get actual SQLite journal mode
-        res = db.execute(text("PRAGMA journal_mode;")).fetchone()
-        if res:
-            journal_mode = res[0].upper()
-    except Exception as e:
-        logger.error(f"Failed to fetch SQLite journal_mode: {e}")
+def iso_utc(value: datetime.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-    return {
-        "status": "healthy",
-        "service": "api",
-        "database": "sqlite",
-        "journal_mode": journal_mode,
-        "timestamp": datetime.datetime.utcnow().isoformat()
-    }
 
-@app.get("/projects", response_model=List[ProjectResponse])
-def list_projects(db: Session = Depends(get_db)):
-    db_projects = db.query(DBProject).all()
-    results = []
-    for p in db_projects:
-        results.append(ProjectResponse(
-            id=p.id,
-            name=p.name,
-            timeline=p.timeline,
-            materials=p.materials,
-            revision=p.revision,
-            createdAt=p.created_at.isoformat() + "Z",
-            updatedAt=p.updated_at.isoformat() + "Z"
-        ))
-    return results
-
-@app.post("/projects", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
-def create_project(req: CreateProjectRequest, db: Session = Depends(get_db)):
-    project_id = str(uuid.uuid4())
-    now = datetime.datetime.utcnow()
-
-    # Base empty Canonical Timeline v1.1
-    default_timeline = {
-        "version": "1.1",
-        "tracks": []
-    }
-
-    db_project = DBProject(
-        id=project_id,
-        name=req.name,
-        timeline=default_timeline,
-        materials=[],
-        revision=1,
-        created_at=now,
-        updated_at=now
-    )
-    db.add(db_project)
-    db.commit()
-    db.refresh(db_project)
-
+def project_response(project: DBProject) -> ProjectResponse:
     return ProjectResponse(
-        id=db_project.id,
-        name=db_project.name,
-        timeline=db_project.timeline,
-        materials=db_project.materials,
-        revision=db_project.revision,
-        createdAt=db_project.created_at.isoformat() + "Z",
-        updatedAt=db_project.updated_at.isoformat() + "Z"
+        id=project.id,
+        name=project.name,
+        timeline=project.timeline,
+        materials=project.materials,
+        revision=project.revision,
+        createdAt=iso_utc(project.created_at),
+        updatedAt=iso_utc(project.updated_at),
     )
 
-@app.get("/projects/{project_id}", response_model=ProjectResponse)
-def get_project(project_id: str, db: Session = Depends(get_db)):
-    p = db.query(DBProject).filter(DBProject.id == project_id).first()
-    if not p:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": "PROJECT_NOT_FOUND",
-                "message": f"Project {project_id} not found"
-            }
+
+def apply_project_update(
+    db: Session,
+    project_id: str,
+    req: UpdateProjectRequest,
+) -> DBProject:
+    values = {
+        "revision": req.expectedRevision + 1,
+        "updated_at": utc_now(),
+    }
+    if req.name is not None:
+        values["name"] = req.name
+    if req.timeline is not None:
+        values["timeline"] = req.timeline.model_dump()
+    if req.materials is not None:
+        values["materials"] = [material.model_dump() for material in req.materials]
+
+    result = db.execute(
+        update(DBProject)
+        .where(
+            DBProject.id == project_id,
+            DBProject.revision == req.expectedRevision,
         )
-    return ProjectResponse(
-        id=p.id,
-        name=p.name,
-        timeline=p.timeline,
-        materials=p.materials,
-        revision=p.revision,
-        createdAt=p.created_at.isoformat() + "Z",
-        updatedAt=p.updated_at.isoformat() + "Z"
+        .values(**values)
     )
 
-@app.put("/projects/{project_id}", response_model=ProjectResponse)
-def update_project(project_id: str, req: UpdateProjectRequest, db: Session = Depends(get_db)):
-    p = db.query(DBProject).filter(DBProject.id == project_id).first()
-    if not p:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": "PROJECT_NOT_FOUND",
-                "message": f"Project {project_id} not found"
-            }
-        )
-
-    # Check for concurrency conflict
-    if p.revision != req.expectedRevision:
+    if result.rowcount != 1:
+        db.rollback()
+        exists = db.execute(
+            select(DBProject.id).where(DBProject.id == project_id)
+        ).scalar_one_or_none()
+        if exists is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "PROJECT_NOT_FOUND",
+                    "message": f"Project {project_id} not found",
+                },
+            )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "code": "CONCURRENCY_CONFLICT",
-                "message": f"Revision conflict: requested revision {req.expectedRevision} but current is {p.revision}"
-            }
+                "message": (
+                    f"Revision conflict: expected {req.expectedRevision}; "
+                    "the project has already changed"
+                ),
+            },
         )
 
-    # Apply changes
-    if req.name is not None:
-        p.name = req.name
-    if req.timeline is not None:
-        p.timeline = req.timeline.model_dump()
-    if req.materials is not None:
-        p.materials = [m.model_dump() for m in req.materials]
-
-    p.revision += 1
-    p.updated_at = datetime.datetime.utcnow()
-
     db.commit()
-    db.refresh(p)
+    return db.execute(
+        select(DBProject).where(DBProject.id == project_id)
+    ).scalar_one()
 
-    return ProjectResponse(
-        id=p.id,
-        name=p.name,
-        timeline=p.timeline,
-        materials=p.materials,
-        revision=p.revision,
-        createdAt=p.created_at.isoformat() + "Z",
-        updatedAt=p.updated_at.isoformat() + "Z"
+
+def create_app(
+    app_engine: Engine = engine,
+    db_dependency: DatabaseDependency = get_db,
+    render_step_delay: float = 1.0,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        Base.metadata.create_all(bind=app_engine)
+        yield
+
+    created_app = FastAPI(
+        title="Aether Studio API",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
+    created_app.state.active_tasks = {}
+
+    origins = [
+        origin.strip()
+        for origin in os.environ.get(
+            "CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
+    ]
+    created_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-@app.post("/projects/{project_id}/render")
-async def start_render_task(project_id: str, db: Session = Depends(get_db)):
-    p = db.query(DBProject).filter(DBProject.id == project_id).first()
-    if not p:
-        raise HTTPException(status_code=404, detail="Project not found")
+    @created_app.get("/health")
+    def health_check(db: Session = Depends(db_dependency)):
+        journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
+        return {
+            "status": "healthy",
+            "service": "api",
+            "database": "sqlite",
+            "journal_mode": journal_mode,
+            "timestamp": iso_utc(utc_now()),
+        }
 
-    task_id = str(uuid.uuid4())
-    active_tasks[task_id] = {
-        "taskId": task_id,
-        "projectId": project_id,
-        "progress": 0,
-        "status": "pending",
-        "message": "Initializing background render task [MOCK]"
-    }
+    @created_app.get("/projects", response_model=List[ProjectResponse])
+    def list_projects(db: Session = Depends(db_dependency)):
+        projects = db.execute(
+            select(DBProject).order_by(DBProject.created_at.asc())
+        ).scalars()
+        return [project_response(project) for project in projects]
 
-    # Simulate work asynchronously
-    async def simulate_task():
-        try:
-            await asyncio.sleep(1)
-            if task_id in active_tasks:
-                active_tasks[task_id]["status"] = "processing"
-                active_tasks[task_id]["progress"] = 20
-                active_tasks[task_id]["message"] = "Processing timeline frames... [MOCK]"
+    @created_app.post(
+        "/projects",
+        response_model=ProjectResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_project(
+        req: CreateProjectRequest,
+        db: Session = Depends(db_dependency),
+    ):
+        now = utc_now()
+        db_project = DBProject(
+            id=str(uuid.uuid4()),
+            name=req.name,
+            timeline={"version": "1.1", "tracks": []},
+            materials=[],
+            revision=1,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(db_project)
+        db.commit()
+        db.refresh(db_project)
+        return project_response(db_project)
 
-            await asyncio.sleep(1)
-            if task_id in active_tasks:
-                active_tasks[task_id]["progress"] = 50
-                active_tasks[task_id]["message"] = "Generating 480p proxy with FFmpeg... [MOCK]"
+    @created_app.get("/projects/{project_id}", response_model=ProjectResponse)
+    def get_project(project_id: str, db: Session = Depends(db_dependency)):
+        project = db.execute(
+            select(DBProject).where(DBProject.id == project_id)
+        ).scalar_one_or_none()
+        if project is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "PROJECT_NOT_FOUND",
+                    "message": f"Project {project_id} not found",
+                },
+            )
+        return project_response(project)
 
-            await asyncio.sleep(1)
-            if task_id in active_tasks:
-                active_tasks[task_id]["progress"] = 80
-                active_tasks[task_id]["message"] = "Merging audio layers... [MOCK]"
+    @created_app.put("/projects/{project_id}", response_model=ProjectResponse)
+    def update_project(
+        project_id: str,
+        req: UpdateProjectRequest,
+        db: Session = Depends(db_dependency),
+    ):
+        return project_response(apply_project_update(db, project_id, req))
 
-            await asyncio.sleep(1)
-            if task_id in active_tasks:
-                active_tasks[task_id]["progress"] = 100
-                active_tasks[task_id]["status"] = "completed"
-                active_tasks[task_id]["message"] = "Render successfully completed [MOCK]"
-        except Exception as e:
-            if task_id in active_tasks:
-                active_tasks[task_id]["status"] = "failed"
-                active_tasks[task_id]["message"] = f"Task failed: {str(e)} [MOCK]"
+    @created_app.post("/projects/{project_id}/render")
+    async def start_render_task(
+        project_id: str,
+        db: Session = Depends(db_dependency),
+    ):
+        project_exists = db.execute(
+            select(DBProject.id).where(DBProject.id == project_id)
+        ).scalar_one_or_none()
+        if project_exists is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "PROJECT_NOT_FOUND",
+                    "message": f"Project {project_id} not found",
+                },
+            )
 
-    asyncio.create_task(simulate_task())
+        task_id = str(uuid.uuid4())
+        active_tasks: Dict[str, dict] = created_app.state.active_tasks
+        active_tasks[task_id] = {
+            "taskId": task_id,
+            "projectId": project_id,
+            "progress": 0,
+            "status": "pending",
+            "message": "Initializing background render task [MOCK]",
+        }
 
-    return {"taskId": task_id, "status": "pending"}
+        async def simulate_task():
+            steps = (
+                (20, "processing", "Processing timeline frames... [MOCK]"),
+                (50, "processing", "Generating 480p proxy with FFmpeg... [MOCK]"),
+                (80, "processing", "Merging audio layers... [MOCK]"),
+                (100, "completed", "Render successfully completed [MOCK]"),
+            )
+            try:
+                for progress, task_status, message in steps:
+                    await asyncio.sleep(render_step_delay)
+                    if task_id not in active_tasks:
+                        return
+                    active_tasks[task_id].update(
+                        progress=progress,
+                        status=task_status,
+                        message=message,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                logger.exception("Mock render task failed")
+                if task_id in active_tasks:
+                    active_tasks[task_id].update(
+                        status="failed",
+                        message=f"Task failed: {exc} [MOCK]",
+                    )
 
-@app.get("/events")
-async def sse_events():
-    async def event_generator():
-        while True:
-            # Send heartbeat
-            yield f"event: heartbeat\ndata: {{\"timestamp\": \"{datetime.datetime.utcnow().isoformat()}Z\"}}\n\n"
+        asyncio.create_task(simulate_task())
+        return {"taskId": task_id, "status": "pending", "mock": True}
 
-            # Send active tasks status updates
-            for task_id, task in list(active_tasks.items()):
-                yield f"event: task_progress\ndata: {{\n" \
-                      f"  \"taskId\": \"{task['taskId']}\",\n" \
-                      f"  \"projectId\": \"{task['projectId']}\",\n" \
-                      f"  \"progress\": {task['progress']},\n" \
-                      f"  \"status\": \"{task['status']}\",\n" \
-                      f"  \"message\": \"{task['message']}\"\n" \
-                      f"}}\n\n"
+    @created_app.get("/events")
+    async def sse_events(
+        once: bool = Query(
+            False,
+            description="Return one bounded event snapshot; useful for health tests.",
+        )
+    ):
+        async def event_generator():
+            while True:
+                heartbeat = {"timestamp": iso_utc(utc_now())}
+                yield f"event: heartbeat\ndata: {json.dumps(heartbeat)}\n\n"
 
-                # Clean up finished tasks from active streaming list after completion/failure
-                if task["status"] in ["completed", "failed"]:
-                    active_tasks.pop(task_id, None)
+                active_tasks: Dict[str, dict] = created_app.state.active_tasks
+                for task_id, task in list(active_tasks.items()):
+                    yield (
+                        "event: task_progress\n"
+                        f"data: {json.dumps(task, separators=(',', ':'))}\n\n"
+                    )
+                    if task["status"] in {"completed", "failed"}:
+                        active_tasks.pop(task_id, None)
 
-            await asyncio.sleep(0.5)
+                if once:
+                    break
+                await asyncio.sleep(0.5)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    return created_app
+
+
+app = create_app()

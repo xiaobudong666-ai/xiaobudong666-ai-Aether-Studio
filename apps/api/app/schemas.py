@@ -1,9 +1,12 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 class RationalTimeSchema(BaseModel):
-    value: int
-    timescale: int = Field(..., gt=0)
+    value: int = Field(..., ge=-MAX_SAFE_INTEGER, le=MAX_SAFE_INTEGER)
+    timescale: int = Field(..., gt=0, le=MAX_SAFE_INTEGER)
 
 class ClipSchema(BaseModel):
     id: str
@@ -31,6 +34,8 @@ class MaterialSchema(BaseModel):
     duration: Optional[RationalTimeSchema] = None
 
 class ProjectResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: str
     timeline: TimelineSchema
@@ -39,9 +44,6 @@ class ProjectResponse(BaseModel):
     createdAt: str
     updatedAt: str
 
-    class Config:
-        from_attributes = True
-
 class CreateProjectRequest(BaseModel):
     name: str = Field(..., min_length=1)
 
@@ -49,4 +51,4 @@ class UpdateProjectRequest(BaseModel):
     name: Optional[str] = None
     timeline: Optional[TimelineSchema] = None
     materials: Optional[List[MaterialSchema]] = None
-    expectedRevision: int
+    expectedRevision: int = Field(..., ge=0)

@@ -8,6 +8,7 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+pytest-of-root/
 .venv/
 venv/
 env/
@@ -16,6 +17,10 @@ env/
 dist/
 build/
 *.log
+playwright-report/
+test-results/
+.tmp/
+.cache/
 
 # Databases
 *.db

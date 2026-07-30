@@ -2,8 +2,8 @@ import { z } from "zod";
 
 // RationalTime schema for validation
 export const RationalTimeSchema = z.object({
-  value: z.number(),
-  timescale: z.number().positive(),
+  value: z.number().int().safe(),
+  timescale: z.number().int().safe().positive(),
 });
 
 // Timeline Clip schema (Canonical Timeline v1.1)
@@ -45,7 +45,7 @@ export const ProjectSchema = z.object({
   name: z.string(),
   timeline: TimelineSchema,
   materials: z.array(MaterialSchema),
-  revision: z.number(), // auto-save and concurrency conflict protocol
+  revision: z.number().int().nonnegative(), // auto-save and concurrency conflict protocol
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -58,7 +58,7 @@ export const UpdateProjectSchema = z.object({
   name: z.string().optional(),
   timeline: TimelineSchema.optional(),
   materials: z.array(MaterialSchema).optional(),
-  expectedRevision: z.number(), // Optimistic locking revision check
+  expectedRevision: z.number().int().nonnegative(), // Optimistic locking revision check
 });
 
 // DTO Schemas

@@ -57,4 +57,25 @@ describe("TimelineSchema & ProjectSchema Validation", () => {
     const res = TimelineSchema.safeParse(badTimeline);
     expect(res.success).toBe(false);
   });
+
+  test("rejects fractional and unsafe rational time values", () => {
+    expect(
+      TimelineSchema.safeParse({
+        version: "1.1",
+        tracks: [{
+          id: "track-1",
+          name: "Video",
+          type: "video",
+          clips: [{
+            id: "clip-1",
+            trackId: "track-1",
+            materialId: "mat-1",
+            start: { value: 0.5, timescale: 24 },
+            duration: { value: 24, timescale: 24 },
+            sourceIn: { value: 0, timescale: 24 },
+          }],
+        }],
+      }).success
+    ).toBe(false);
+  });
 });

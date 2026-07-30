@@ -3,64 +3,159 @@ name: CI Pipeline
 on:
   push:
     branches:
-      - "main"
+      - main
       - "feat/**"
   pull_request:
     branches:
-      - "main"
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
+    name: Lint, build, and unit tests
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    # Node Setup (Node 24 LTS)
-    - name: Setup Node.js (24 LTS)
-      uses: actions/setup-node@v4
-      with:
-        node-version: 24
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
-    - name: Install pnpm
-      uses: pnpm/action-setup@v3
-      with:
-        version: 10.30.3
+      - name: Install pnpm 10.30.3
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
 
-    # Install using --frozen-lockfile for deterministic deployments
-    - name: Install Node Dependencies
-      run: pnpm install --frozen-lockfile
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
 
-    # Sequence: Install -> Lint -> Type Check -> Test -> Build
-    - name: Run ESLint Checks
-      run: pnpm lint
+      - name: Run ESLint checks
+        run: pnpm lint
 
-    - name: Compile and Type Check
-      run: pnpm build
+      - name: Compile, type-check, and build
+        run: pnpm build
 
-    - name: Run Web and Package Tests
-      run: pnpm test
+      - name: Run web and package tests
+        run: pnpm test
 
-    # Python Setup & Checks
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Install API Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r apps/api/requirements.txt
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/api/requirements.txt
+          pip install -r apps/worker/requirements.txt
 
-    - name: Run API Tests
-      run: |
-        pytest apps/api/test_main.py
+      - name: Run API tests
+        env:
+          PYTHONPATH: apps/api
+        run: python -m pytest apps/api/test_main.py -q
 
-    - name: Install Worker Dependencies
-      run: |
-        pip install -r apps/worker/requirements.txt
+      - name: Run Worker tests
+        env:
+          PYTHONPATH: apps/worker
+        run: python -m pytest apps/worker/test_worker.py -q
 
-    - name: Run Worker Tests
-      run: |
-        pytest apps/worker/test_worker.py
+  playwright:
+    name: Playwright workbench flow
+    needs: build-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm 10.30.3
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API dependencies
+        run: pip install -r apps/api/requirements.txt
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run Playwright
+        run: pnpm e2e
+
+      - name: Upload Playwright evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-evidence
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: error
+          retention-days: 14
+
+  docker-integration:
+    name: Docker Compose integration
+    needs: build-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: docker compose -f infra/docker/docker-compose.yml config --quiet
+
+      - name: Build images
+        run: docker compose -f infra/docker/docker-compose.yml build
+
+      - name: Start healthy stack
+        run: |
+          docker compose -f infra/docker/docker-compose.yml up -d --wait --wait-timeout 180
+          curl --fail --show-error http://127.0.0.1:8000/health
+          curl --fail --show-error http://127.0.0.1:8001/health
+          curl --fail --show-error http://127.0.0.1/healthz
+          curl --fail --show-error http://127.0.0.1/api/health
+
+      - name: Verify FFmpeg and ffprobe in Worker
+        run: |
+          docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
+          docker compose -f infra/docker/docker-compose.yml exec -T worker ffprobe -version
+
+      - name: Capture Docker logs
+        if: always()
+        run: docker compose -f infra/docker/docker-compose.yml logs --no-color > docker-compose.log
+
+      - name: Upload Docker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-compose-evidence
+          path: docker-compose.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stop stack
+        if: always()
+        run: docker compose -f infra/docker/docker-compose.yml down --volumes

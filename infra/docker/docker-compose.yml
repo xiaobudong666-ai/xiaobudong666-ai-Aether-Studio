@@ -10,6 +10,16 @@ services:
     environment:
       - DATABASE_URL=sqlite:////data/aether.db
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   worker:
     build:
@@ -19,7 +29,21 @@ services:
       - "8001:8001"
     environment:
       - BACKEND_URL=http://api:8000
+      - WORKER_PORT=8001
     restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   web:
     build:
@@ -28,11 +52,23 @@ services:
     ports:
       - "80:80"
     depends_on:
-      - api
-      - worker
-    environment:
-      - VITE_API_BASE_URL=http://localhost:8000
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - "-"
+        - "http://127.0.0.1/healthz"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
 volumes:
   sqlite-db:

@@ -13,6 +13,9 @@ describe("RationalTime Timing & Precision Tests", () => {
   });
 
   test("high frame rate precision and non-integer timescales", () => {
+    const frame24 = new RationalTime(1, 24);
+    expect(frame24.add(frame24).equals(new RationalTime(1, 12))).toBe(true);
+
     // 23.976 fps -> NTSC timescale is 24000/1001
     const timescale23976 = 24000; // standard timescale mapping
     const frameDuration23976 = new RationalTime(1001, timescale23976);
@@ -68,5 +71,29 @@ describe("RationalTime Timing & Precision Tests", () => {
     const maxSafe = Number.MAX_SAFE_INTEGER;
     expect(() => new RationalTime(maxSafe, 24000)).not.toThrow();
     expect(() => new RationalTime(maxSafe + 1, 24000)).toThrow();
+    expect(() => RationalTime.fromSeconds(Number.MAX_VALUE, 24000)).toThrow();
+    expect(() => RationalTime.fromMilliseconds(Number.POSITIVE_INFINITY)).toThrow();
+  });
+
+  test("uses exact comparison when floating point values collapse", () => {
+    const maxSafe = Number.MAX_SAFE_INTEGER;
+    const left = new RationalTime(maxSafe - 1, maxSafe);
+    const right = new RationalTime(maxSafe - 2, maxSafe - 1);
+
+    expect(left.toSeconds()).toBe(right.toSeconds());
+    expect(left.greaterThan(right)).toBe(true);
+    expect(right.lessThan(left)).toBe(true);
+    expect(left.equals(right)).toBe(false);
+  });
+
+  test("uses gcd/lcm arithmetic and rejects unsafe results", () => {
+    const left = new RationalTime(1, 3_000_000_000);
+    const right = new RationalTime(1, 1_500_000_000);
+    expect(left.add(right).equals(new RationalTime(1, 1_000_000_000))).toBe(true);
+
+    const maxSafe = Number.MAX_SAFE_INTEGER;
+    expect(() =>
+      new RationalTime(maxSafe, 2).add(new RationalTime(maxSafe, 3))
+    ).toThrow("safe integer range");
   });
 });

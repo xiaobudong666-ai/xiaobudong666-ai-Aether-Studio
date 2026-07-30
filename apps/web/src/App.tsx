@@ -13,8 +13,8 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState<RationalTime>(new RationalTime(0, 24000));
   const [apiError, setApiError] = useState<string | null>(null);
 
-  // Dynamic API Base mapping via Vite environment variables
-  const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+  // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 
   // 1. Fetch projects on load
   const fetchProjects = async () => {
@@ -138,7 +138,7 @@ export default function App() {
         }),
       });
       if (res.status === 409) {
-        alert("Concurrency Conflict Detected! Your project was edited by another process. Overriding with latest server state.");
+        alert("Concurrency Conflict Detected! Your project was edited by another process. Reloading the latest server state.");
         fetchProjectDetail(updatedProj.id);
       } else if (res.ok) {
         const latest = await res.json();
@@ -172,32 +172,40 @@ export default function App() {
     const clipDuration = material.duration || { value: 120000, timescale: 24000 };
 
     // Find if track of material type exists, otherwise create it
-    const trackType = material.type === "video" ? "video" : material.type === "audio" ? "audio" : "subtitle";
-    const tracks = [...currentProject.timeline.tracks];
+    const trackType = material.type === "audio" ? "audio" : "video";
+    const tracks = currentProject.timeline.tracks.map((track) => ({
+      ...track,
+      clips: [...track.clips],
+    }));
     let targetTrack = tracks.find((t) => t.type === trackType);
 
     if (!targetTrack) {
       targetTrack = {
         id: `track-${Math.random().toString(36).substr(2, 9)}`,
         name: `${material.type.charAt(0).toUpperCase() + material.type.slice(1)} Track 1`,
-        type: trackType as any,
+        type: trackType,
         clips: [],
       };
       tracks.push(targetTrack);
     }
 
     // Append clip to the target track using rational time offsets
-    const clipStartOffsetValue = targetTrack.clips.reduce((sum, c) => {
-      // Very basic linear appending: next clip starts after the previous ends
-      const endVal = c.start.value + c.duration.value; // Simplification assuming same timescales for demo
-      return Math.max(sum, endVal);
-    }, 0);
+    let clipStartOffset = new RationalTime(0, clipDuration.timescale);
+    targetTrack.clips.forEach((clip) => {
+      const clipEnd = new RationalTime(
+        clip.start.value,
+        clip.start.timescale,
+      ).add(new RationalTime(clip.duration.value, clip.duration.timescale));
+      if (clipEnd.greaterThan(clipStartOffset)) {
+        clipStartOffset = clipEnd;
+      }
+    });
 
     const newClip: ClipDTO = {
       id: `clip-${Math.random().toString(36).substr(2, 9)}`,
       trackId: targetTrack.id,
       materialId: material.id,
-      start: { value: clipStartOffsetValue, timescale: clipDuration.timescale },
+      start: clipStartOffset.toJSON(),
       duration: clipDuration,
       sourceIn: { value: 0, timescale: clipDuration.timescale },
     };
@@ -231,15 +239,19 @@ export default function App() {
   // Calculate timeline total duration
   const getTimelineDuration = (): RationalTime => {
     if (!currentProject) return new RationalTime(0, 24000);
-    let maxSeconds = 0;
+    let maximum = new RationalTime(0, 24000);
     currentProject.timeline.tracks.forEach((track) => {
       track.clips.forEach((clip) => {
-        const start = clip.start.value / clip.start.timescale;
-        const dur = clip.duration.value / clip.duration.timescale;
-        maxSeconds = Math.max(maxSeconds, start + dur);
+        const end = new RationalTime(
+          clip.start.value,
+          clip.start.timescale,
+        ).add(new RationalTime(clip.duration.value, clip.duration.timescale));
+        if (end.greaterThan(maximum)) {
+          maximum = end;
+        }
       });
     });
-    return RationalTime.fromSeconds(maxSeconds, 24000);
+    return maximum;
   };
 
   const timelineDuration = getTimelineDuration();
