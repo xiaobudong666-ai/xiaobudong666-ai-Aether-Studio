@@ -14,9 +14,16 @@ test("creates a project and receives render progress in the three-panel workbenc
   await page.getByPlaceholder("New project name").fill(projectName);
   await page.getByRole("button", { name: "Create Project" }).click();
 
+  const projectOption = page.getByRole("option", {
+    name: `${projectName} (r1)`,
+  });
+  await expect(projectOption).toHaveCount(1);
+
+  const projectId = await projectOption.getAttribute("value");
+  expect(projectId).toBeTruthy();
   await expect(
-    page.getByRole("option", { name: `${projectName} (r1)` }),
-  ).toBeVisible();
+    page.locator(".project-select-container select"),
+  ).toHaveValue(projectId!);
 
   await page.getByRole("button", { name: /Trigger AI Proxy Render/ }).click();
   await expect(page.getByText(/Task: [a-f0-9]{8}/)).toBeVisible({
