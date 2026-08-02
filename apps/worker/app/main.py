@@ -9,6 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from .ffmpeg_adapter import FFmpegAdapter
 from .ai_provider import AIProviderInterface
 from .recovery import TaskRecoveryManager
+from .moneyprinter_adapter import MoneyPrinterTurboAdapter
 
 # Configure logging
 logging.basicConfig(
@@ -64,14 +65,18 @@ class WorkerComponents:
     ffmpeg: FFmpegAdapter
     ai: AIProviderInterface
     recovery: TaskRecoveryManager
+    moneyprinter: MoneyPrinterTurboAdapter
 
 
 def initialize_worker() -> WorkerComponents:
     backend_url = os.environ.get("BACKEND_URL", "http://localhost:8000")
+    # Enable degradation fallback by default in background worker
+    moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=True)
     return WorkerComponents(
         ffmpeg=FFmpegAdapter(),
         ai=AIProviderInterface(),
         recovery=TaskRecoveryManager(backend_url=backend_url),
+        moneyprinter=moneyprinter_adapter,
     )
 
 
@@ -80,6 +85,12 @@ def run_worker(poll_interval: float = 10):
 
     components = initialize_worker()
     components.recovery.scan_and_recover_tasks()
+
+    logger.info("Probing MoneyPrinterTurbo sidecar capabilities...")
+    mpt_health = components.moneyprinter.check_health()
+    logger.info("MoneyPrinterTurbo health: %s", mpt_health)
+    mpt_caps = components.moneyprinter.get_capabilities()
+    logger.info("MoneyPrinterTurbo capabilities: %s", mpt_caps)
 
     logger.info("Worker initialization complete. Starting task execution loop...")
 

@@ -52,3 +52,11 @@ class UpdateProjectRequest(BaseModel):
     timeline: Optional[TimelineSchema] = None
     materials: Optional[List[MaterialSchema]] = None
     expectedRevision: int = Field(..., ge=0)
+
+
+class MoneyPrinterGenerateRequest(BaseModel):
+    video_subject: str = Field(..., min_length=1)
+    video_aspect: Optional[str] = "9:16"
+    voice_name: Optional[str] = "en-US-JennyNeural"
+    video_concat_mode: Optional[str] = "random"
+    video_clip_duration: Optional[int] = 5
