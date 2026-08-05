@@ -80,6 +80,38 @@ def initialize_worker() -> WorkerComponents:
     )
 
 
+def process_m1_moneyprinter_task(components: WorkerComponents, task_data: dict) -> dict:
+    """
+    Clear, auditable M1-0 call path for a MoneyPrinterTurbo generation request.
+    This demonstrates the end-to-end adapter pipeline (Contract Ready).
+    Real video production is marked as unavailable/unknown at this stage as credentials are not configured.
+    """
+    logger.info("Processing task via MoneyPrinterTurbo Sidecar Adapter: %s", task_data)
+
+    # 1. Check health & capabilities
+    health = components.moneyprinter.check_health()
+    if health.get("status") != "healthy":
+        logger.error("MoneyPrinterTurbo sidecar is unhealthy or unreachable. Aborting task.")
+        return {"status": "failed", "reason": "Sidecar unhealthy or unreachable"}
+
+    # 2. Trigger Generation
+    try:
+        task_id = components.moneyprinter.generate_video(
+            subject=task_data.get("subject", "AI Anime"),
+            aspect=task_data.get("aspect", "9:16"),
+            voice_name=task_data.get("voice_name", "en-US-JennyNeural"),
+        )
+        logger.info("Successfully triggered sidecar generation task: %s", task_id)
+
+        # 3. Poll task status
+        status = components.moneyprinter.get_task_status(task_id)
+        logger.info("Fetched sidecar task status: %s", status)
+        return status
+    except Exception as exc:
+        logger.error("Failed to process MoneyPrinterTurbo task: %s", exc)
+        return {"status": "failed", "reason": str(exc)}
+
+
 def run_worker(poll_interval: float = 10):
     logger.info("Initializing Aether Studio Background Worker...")
 
@@ -97,6 +129,9 @@ def run_worker(poll_interval: float = 10):
     try:
         while True:
             logger.info("Daemon active: polling for pending video rendering and subtitle generation tasks...")
+
+            # Demonstration of the M1 call path for local contract validation:
+            # Under actual production runs, tasks matching a MoneyPrinter pattern would pass through process_m1_moneyprinter_task.
             time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Worker shutting down gracefully.")

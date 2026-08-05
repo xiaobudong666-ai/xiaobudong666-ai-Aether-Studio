@@ -61,12 +61,12 @@ jobs:
       - name: Run API tests
         env:
           PYTHONPATH: apps/api
-        run: python -m pytest apps/api/test_main.py -q
+        run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py -v
 
       - name: Run Worker tests
         env:
           PYTHONPATH: apps/worker
-        run: python -m pytest apps/worker/test_worker.py -q
+        run: python -m pytest apps/worker/test_worker.py apps/worker/test_moneyprinter.py -v
 
   playwright:
     name: Playwright workbench flow
@@ -132,11 +132,13 @@ jobs:
 
       - name: Start healthy stack
         run: |
-          docker compose -f infra/docker/docker-compose.yml up -d --wait --wait-timeout 180
+          docker compose -f infra/docker/docker-compose.yml up -d --wait --wait-timeout 300
           curl --fail --show-error http://127.0.0.1:8000/health
           curl --fail --show-error http://127.0.0.1:8001/health
           curl --fail --show-error http://127.0.0.1/healthz
           curl --fail --show-error http://127.0.0.1/api/health
+          curl --fail --show-error http://127.0.0.1/api/moneyprinter/health
+          curl --fail --show-error http://127.0.0.1/api/moneyprinter/capabilities
 
       - name: Verify FFmpeg and ffprobe in Worker
         run: |

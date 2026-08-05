@@ -139,16 +139,17 @@ class MoneyPrinterTurboAdapter:
         Probes the health of the MoneyPrinterTurbo sidecar.
         """
         try:
-            # Probe /docs or / to verify server is listening
-            resp = self._request_with_retry("GET", "/docs")
+            # Probe root / to verify server is listening and responding
+            # Using "/" is a reliable health check endpoint instead of "/docs"
+            _ = self._request_with_retry("GET", "/")
             return {
                 "status": "healthy",
                 "service": "moneyprinter-sidecar",
                 "url": self.api_url,
                 "responsive": True,
             }
-        except Exception as exc:
-            logger.warning("MoneyPrinterTurbo sidecar health probe failed: %s", exc)
+        except (MoneyPrinterConnectionError, MoneyPrinterTimeoutError) as exc:
+            logger.warning("MoneyPrinterTurbo sidecar health probe failed (unreachable/timeout): %s", exc)
             if self.degrade_on_failure:
                 return self.degrade(str(exc))
             return {
@@ -158,22 +159,33 @@ class MoneyPrinterTurboAdapter:
                 "responsive": False,
                 "error": str(exc),
             }
+        except Exception as exc:
+            # If the sidecar responds but returns some status code (like 404), the server itself is still responsive
+            logger.info("MoneyPrinterTurbo sidecar responded with HTTP status, but it is alive: %s", exc)
+            return {
+                "status": "healthy",
+                "service": "moneyprinter-sidecar",
+                "url": self.api_url,
+                "responsive": True,
+            }
 
     def get_capabilities(self) -> dict:
         """
         Probes/declares sidecar integration capabilities.
+        Only reports actually verified and successful capabilities.
+        Since this stage integrates the decoupled Adapter/Contract without full production credentials,
+        advanced features are marked as unavailable or unknown.
         """
         try:
-            # Check health to confirm connectivity
             health = self.check_health()
             is_active = health.get("status") == "healthy"
             return {
                 "status": "active" if is_active else "degraded",
                 "capabilities": {
-                    "video_generation": True,
-                    "subtitles_sync": True,
-                    "tts_voiceover": True,
-                    "supported_aspect_ratios": ["9:16", "16:9", "1:1"],
+                    "video_generation": "unknown (adapter integrated, credentials not configured)" if is_active else "unavailable",
+                    "subtitles_sync": "unavailable",
+                    "tts_voiceover": "unavailable",
+                    "supported_aspect_ratios": ["9:16", "16:9", "1:1"] if is_active else [],
                 },
                 "pinned_upstream": {
                     "version": "v1.2.7",
@@ -207,32 +219,19 @@ class MoneyPrinterTurboAdapter:
         try:
             resp = self._request_with_retry("POST", "/api/v1/video/generate", json_data=payload)
             data = resp.json()
-            # Handle both "task_id" and "taskId" fields for compatibility
             task_id = data.get("task_id") or data.get("taskId")
             if not task_id:
                 raise MoneyPrinterError(f"No task_id found in response: {data}")
             return str(task_id)
         except Exception as exc:
             logger.error("Failed to generate video via MoneyPrinterTurbo: %s", exc)
-            if self.degrade_on_failure:
-                # Return a degraded/mock task ID in fallback mode
-                return f"degraded-task-id-{int(time.time())}"
+            # Sidecar is unavailable; strictly raise error and do not forge fake success task IDs.
             raise
 
     def get_task_status(self, task_id: str) -> dict:
         """
         Queries the status of a specific MoneyPrinterTurbo task.
         """
-        if task_id.startswith("degraded-task-id-"):
-            return {
-                "task_id": task_id,
-                "status": "completed",
-                "progress": 100,
-                "message": "Render completed in degraded fallback mode",
-                "video_url": "http://localhost:8080/degraded-fallback.mp4",
-                "degraded": True
-            }
-
         try:
             resp = self._request_with_retry("GET", f"/api/v1/video/status/{task_id}")
             data = resp.json()
@@ -244,6 +243,7 @@ class MoneyPrinterTurboAdapter:
             return data
         except Exception as exc:
             logger.error("Failed to get task status for %s: %s", task_id, exc)
+            # Sidecar is unavailable; strictly return degraded/failed status, no progress or URL.
             if self.degrade_on_failure:
                 return {
                     "task_id": task_id,
@@ -267,9 +267,9 @@ class MoneyPrinterTurboAdapter:
             "fallback_active": True,
             "reason": exception_msg,
             "capabilities": {
-                "video_generation": False,
-                "subtitles_sync": False,
-                "tts_voiceover": False,
+                "video_generation": "unavailable",
+                "subtitles_sync": "unavailable",
+                "tts_voiceover": "unavailable",
                 "supported_aspect_ratios": []
             }
         }

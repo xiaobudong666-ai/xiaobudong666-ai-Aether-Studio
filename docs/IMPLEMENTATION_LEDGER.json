@@ -8,7 +8,7 @@
       "evidence": "docs/evidence/M0-0-VERIFICATION.md"
     },
     "M1-0": {
-      "status": "COMPLETED",
+      "status": "IN_PROGRESS",
       "description": "Isolated Sidecar/Adapter integration of MoneyPrinterTurbo based on a fixed, auditable version.",
       "upstream_version": "v1.2.7",
       "upstream_commit": "b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80",

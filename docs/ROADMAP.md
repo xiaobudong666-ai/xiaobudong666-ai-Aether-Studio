@@ -9,8 +9,8 @@ This document outlines the high-level roadmap and current milestone progress for
 - **Commit**: `507f61d3a85b9eb6d14af13426d0353ad05a59f9`
 - **Key Features**: Three-panel workbench React app, FastAPI API, isolated worker, SQLite WAL with optimistic locking, same-origin router topology, Playwright end-to-end tests, and GitHub Actions gates.
 
-### [M1-0] MoneyPrinterTurbo Sidecar Adapter Integration (CURRENT)
-- **Status**: Completed.
+### [M1-0] MoneyPrinterTurbo Sidecar Adapter Integration (IN_PROGRESS)
+- **Status**: In Progress (Refactoring & Verification Phase).
 - **Key Features**:
   - Independent `MoneyPrinterTurboAdapter` in the background Worker and FastAPI API.
   - Pin upstream to a fixed, auditable version of MoneyPrinterTurbo (`v1.2.7`, commit `b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80`).

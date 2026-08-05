@@ -28,7 +28,7 @@ def test_check_health_success(mock_client_class):
     mock_client = MagicMock()
     mock_client_class.return_value.__enter__.return_value = mock_client
 
-    # Mock /docs response
+    # Mock root / response
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_client.get.return_value = mock_response
@@ -39,7 +39,7 @@ def test_check_health_success(mock_client_class):
     assert health["status"] == "healthy"
     assert health["responsive"] is True
     assert health["url"] == "http://mock-mpt:8080"
-    mock_client.get.assert_called_once_with("http://mock-mpt:8080/docs", params=None)
+    mock_client.get.assert_called_once_with("http://mock-mpt:8080/", params=None)
 
 @patch("httpx.Client")
 def test_check_health_failure_no_degrade(mock_client_class):
@@ -66,6 +66,25 @@ def test_check_health_failure_with_degrade(mock_client_class):
     assert health["status"] == "degraded"
     assert health["responsive"] is False
     assert health["fallback_active"] is True
+    assert health["capabilities"]["video_generation"] == "unavailable"
+
+@patch("httpx.Client")
+def test_get_capabilities_success(mock_client_class):
+    mock_client = MagicMock()
+    mock_client_class.return_value.__enter__.return_value = mock_client
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_client.get.return_value = mock_response
+
+    adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1)
+    caps = adapter.get_capabilities()
+
+    assert caps["status"] == "active"
+    assert caps["capabilities"]["video_generation"] == "unknown (adapter integrated, credentials not configured)"
+    assert caps["capabilities"]["subtitles_sync"] == "unavailable"
+    assert caps["capabilities"]["tts_voiceover"] == "unavailable"
+    assert caps["pinned_upstream"]["version"] == "v1.2.7"
+    assert caps["pinned_upstream"]["commit"] == "b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80"
 
 @patch("httpx.Client")
 def test_generate_video_success(mock_client_class):
@@ -84,6 +103,18 @@ def test_generate_video_success(mock_client_class):
     mock_client.post.assert_called_once()
 
 @patch("httpx.Client")
+def test_generate_video_failure_no_forgery(mock_client_class):
+    mock_client = MagicMock()
+    mock_client_class.return_value.__enter__.return_value = mock_client
+    mock_client.post.side_effect = httpx.ConnectError("Connection refused")
+
+    adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1, degrade_on_failure=True)
+
+    # Positive negative test: When Sidecar is disconnected, we MUST NOT fake task ID, but strictly raise.
+    with pytest.raises(MoneyPrinterConnectionError):
+        adapter.generate_video(subject="cats")
+
+@patch("httpx.Client")
 def test_get_task_status_failed_raises_custom_error(mock_client_class):
     mock_client = MagicMock()
     mock_client_class.return_value.__enter__.return_value = mock_client
@@ -97,6 +128,21 @@ def test_get_task_status_failed_raises_custom_error(mock_client_class):
     with pytest.raises(MoneyPrinterTaskFailedError) as exc_info:
         adapter.get_task_status("test-task")
     assert "out of disk" in str(exc_info.value)
+
+@patch("httpx.Client")
+def test_get_task_status_failure_with_degrade_returns_failed_no_forged_success(mock_client_class):
+    mock_client = MagicMock()
+    mock_client_class.return_value.__enter__.return_value = mock_client
+    mock_client.get.side_effect = httpx.ConnectError("Connection refused")
+
+    adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1, degrade_on_failure=True)
+    status_res = adapter.get_task_status("test-task")
+
+    # Positive negative test: When Sidecar is disconnected, status check must return failed with 0 progress and no fake URL
+    assert status_res["status"] == "failed"
+    assert status_res["progress"] == 0
+    assert "degraded" in status_res
+    assert "video_url" not in status_res
 
 @patch("httpx.Client")
 def test_exponential_backoff_retry_on_500(mock_client_class):
