@@ -7,15 +7,15 @@
 #
 # Upgrade Instructions:
 # To upgrade the MoneyPrinterTurbo sidecar:
-# 1. Bump the commit hash / tag in the `build.context` url (e.g. #v1.3.1 or a specific git SHA).
+# 1. Bump the tag in the `build.context` url (e.g. #v1.3.1 or another git tag).
 # 2. Re-run local test suite and container verification to check compatibility with adapter.
 # ==============================================================================
 
 services:
   moneyprinter-sidecar:
-    image: moneyprinterturbo:v1.2.7-b09b0b6bc7
+    image: moneyprinterturbo:v1.2.7
     build:
-      context: https://github.com/harry0703/MoneyPrinterTurbo.git#b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80
+      context: https://github.com/harry0703/MoneyPrinterTurbo.git#v1.2.7
     ports:
       - "8080:8080"
       - "8501:8501"
