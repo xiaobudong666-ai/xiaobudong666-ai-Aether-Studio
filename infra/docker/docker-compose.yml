@@ -22,13 +22,17 @@ services:
     networks:
       - aether-net
     restart: unless-stopped
-    # Fast health check probing the core FastAPI backend on port 8080
+    # Robust health check probing the core FastAPI backend on port 8080.
+    # We gracefully accept HTTP errors (like 404) as indicating the server is alive and responding.
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2)"
+        - "import urllib.request, urllib.error; import sys; \
+           try: urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2) \
+           except urllib.error.HTTPError: sys.exit(0) \
+           except Exception: sys.exit(1)"
       interval: 10s
       timeout: 5s
       retries: 10
