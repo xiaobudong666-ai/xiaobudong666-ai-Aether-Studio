@@ -7,7 +7,7 @@ This document provides the canonical verification evidence and integration docum
 ## 1. Pinned Upstream Specifications
 - **Upstream Repository**: [harry0703/MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo)
 - **Pinned Version Tag**: `v1.2.7`
-- **Pinned Commit Hash**: `b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80`
+- **Pinned Commit Hash**: `475f21147f0808f5ffe3f58af9ab794b28a4da2c`
 - **License**: MIT
 - **Upgrade Strategy**: Upgrading must be done by explicitly updating the `build.context` URL or image tag in `infra/docker/docker-compose.yml`, re-running the unit tests, and verifying same-origin endpoint responses.
 
@@ -18,7 +18,7 @@ All communication to the MoneyPrinterTurbo sidecar is strictly isolated within t
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/moneyprinter/health` | Probes sidecar connectivity by pinging `GET /` |
+| `GET` | `/api/moneyprinter/health` | Probes sidecar connectivity by pinging `GET /openapi.json` |
 | `GET` | `/api/moneyprinter/capabilities` | Returns verified/available features or unknown/unavailable flags |
 | `POST` | `/api/moneyprinter/generate` | Submits automated video generation task (validated via schemas) |
 | `GET` | `/api/moneyprinter/status/{task_id}` | Queries active task execution state and handles exceptions |
@@ -47,7 +47,7 @@ pnpm build
 ```
 
 ### 4.2 Python Test Verification (Pytest)
-Run the 32-test backend python test suites (both standard and moneyprinter adapter coverage):
+Run the 35-test backend python test suites (both standard and moneyprinter adapter coverage):
 ```bash
 # Run FastAPI Backend test suite
 PYTHONPATH=apps/api .venv/bin/python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py -v
@@ -73,8 +73,9 @@ docker compose -f infra/docker/docker-compose.yml config
 The environment is orchestrated using `infra/docker/docker-compose.yml`:
 - **Service Name**: `moneyprinter-sidecar`
 - **Isolation**: Runs inside a dedicated bridge network named `aether-net`.
-- **Health Checks**: Uses lightweight Python-based health probing requesting `http://127.0.0.1:8080/` inside the sidecar.
+- **Health Checks**: Uses lightweight Python-based health probing requesting `http://127.0.0.1:8080/openapi.json` inside the sidecar, requiring a real 2xx response.
 - **Dependency Pipeline**: API and Worker depend on `moneyprinter-sidecar` being fully healthy before starting.
+- **Command Overrides**: Overrides default Streamlit interface launch command with `python3 main.py` to correctly launch the API service on port 8080.
 
 ---
 

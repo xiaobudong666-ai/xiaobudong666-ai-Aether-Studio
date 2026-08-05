@@ -136,20 +136,19 @@ class MoneyPrinterTurboAdapter:
 
     def check_health(self) -> dict:
         """
-        Probes the health of the MoneyPrinterTurbo sidecar.
+        Probes the health of the MoneyPrinterTurbo sidecar using `/openapi.json`.
+        Only a real 2xx HTTP response is considered healthy.
         """
         try:
-            # Probe root / to verify server is listening and responding
-            # Using "/" is a reliable health check endpoint instead of "/docs"
-            _ = self._request_with_retry("GET", "/")
+            resp = self._request_with_retry("GET", "/openapi.json")
             return {
                 "status": "healthy",
                 "service": "moneyprinter-sidecar",
                 "url": self.api_url,
                 "responsive": True,
             }
-        except (MoneyPrinterConnectionError, MoneyPrinterTimeoutError) as exc:
-            logger.warning("MoneyPrinterTurbo sidecar health probe failed (unreachable/timeout): %s", exc)
+        except Exception as exc:
+            logger.warning("MoneyPrinterTurbo sidecar health probe failed: %s", exc)
             if self.degrade_on_failure:
                 return self.degrade(str(exc))
             return {
@@ -158,15 +157,6 @@ class MoneyPrinterTurboAdapter:
                 "url": self.api_url,
                 "responsive": False,
                 "error": str(exc),
-            }
-        except Exception as exc:
-            # If the sidecar responds but returns some status code (like 404), the server itself is still responsive
-            logger.info("MoneyPrinterTurbo sidecar responded with HTTP status, but it is alive: %s", exc)
-            return {
-                "status": "healthy",
-                "service": "moneyprinter-sidecar",
-                "url": self.api_url,
-                "responsive": True,
             }
 
     def get_capabilities(self) -> dict:
@@ -189,7 +179,7 @@ class MoneyPrinterTurboAdapter:
                 },
                 "pinned_upstream": {
                     "version": "v1.2.7",
-                    "commit": "b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80",
+                    "commit": "475f21147f0808f5ffe3f58af9ab794b28a4da2c",
                     "license": "MIT"
                 }
             }
@@ -207,7 +197,8 @@ class MoneyPrinterTurboAdapter:
     ) -> str:
         """
         Submits a video generation task to MoneyPrinterTurbo.
-        Returns the task ID.
+        API Endpoint: POST /api/v1/videos
+        Upstream Response: {"status": 200, "data": {"task_id": "..."}}
         """
         payload = {
             "video_subject": subject,
@@ -217,24 +208,33 @@ class MoneyPrinterTurboAdapter:
             "video_clip_duration": video_clip_duration,
         }
         try:
-            resp = self._request_with_retry("POST", "/api/v1/video/generate", json_data=payload)
-            data = resp.json()
+            resp = self._request_with_retry("POST", "/api/v1/videos", json_data=payload)
+            response_json = resp.json()
+            data = response_json.get("data")
+            if not isinstance(data, dict):
+                raise MoneyPrinterError(f"Expected dict in response 'data', got {type(data)}: {response_json}")
+
             task_id = data.get("task_id") or data.get("taskId")
             if not task_id:
-                raise MoneyPrinterError(f"No task_id found in response: {data}")
+                raise MoneyPrinterError(f"No task_id found in response data: {response_json}")
             return str(task_id)
         except Exception as exc:
             logger.error("Failed to generate video via MoneyPrinterTurbo: %s", exc)
-            # Sidecar is unavailable; strictly raise error and do not forge fake success task IDs.
             raise
 
     def get_task_status(self, task_id: str) -> dict:
         """
         Queries the status of a specific MoneyPrinterTurbo task.
+        API Endpoint: GET /api/v1/tasks/{task_id}
+        Upstream Response: {"status": 200, "data": {"status": "...", "progress": 100, ...}}
         """
         try:
-            resp = self._request_with_retry("GET", f"/api/v1/video/status/{task_id}")
-            data = resp.json()
+            resp = self._request_with_retry("GET", f"/api/v1/tasks/{task_id}")
+            response_json = resp.json()
+            data = response_json.get("data")
+            if not isinstance(data, dict):
+                raise MoneyPrinterError(f"Expected dict in response 'data', got {type(data)}: {response_json}")
+
             status = data.get("status")
             if status == "failed":
                 raise MoneyPrinterTaskFailedError(
@@ -243,7 +243,6 @@ class MoneyPrinterTurboAdapter:
             return data
         except Exception as exc:
             logger.error("Failed to get task status for %s: %s", task_id, exc)
-            # Sidecar is unavailable; strictly return degraded/failed status, no progress or URL.
             if self.degrade_on_failure:
                 return {
                     "task_id": task_id,

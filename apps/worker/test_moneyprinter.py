@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, ANY
 import httpx
 from app.moneyprinter_adapter import (
     MoneyPrinterTurboAdapter,
@@ -28,7 +28,6 @@ def test_check_health_success(mock_client_class):
     mock_client = MagicMock()
     mock_client_class.return_value.__enter__.return_value = mock_client
 
-    # Mock root / response
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_client.get.return_value = mock_response
@@ -39,7 +38,7 @@ def test_check_health_success(mock_client_class):
     assert health["status"] == "healthy"
     assert health["responsive"] is True
     assert health["url"] == "http://mock-mpt:8080"
-    mock_client.get.assert_called_once_with("http://mock-mpt:8080/", params=None)
+    mock_client.get.assert_called_once_with("http://mock-mpt:8080/openapi.json", params=None)
 
 @patch("httpx.Client")
 def test_check_health_failure_no_degrade(mock_client_class):
@@ -53,6 +52,25 @@ def test_check_health_failure_no_degrade(mock_client_class):
     assert health["status"] == "unhealthy"
     assert health["responsive"] is False
     assert "Connection refused" in health["error"]
+
+@patch("httpx.Client")
+def test_check_health_failure_on_404_no_longer_healthy(mock_client_class):
+    # Strict negative check: 404/HTTP Error must NOT be treated as healthy
+    mock_client = MagicMock()
+    mock_client_class.return_value.__enter__.return_value = mock_client
+
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+    mock_response.text = "Not Found"
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "404 Not Found", request=MagicMock(), response=mock_response
+    )
+    mock_client.get.return_value = mock_response
+
+    adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1, degrade_on_failure=False)
+    health = adapter.check_health()
+    assert health["status"] == "unhealthy"
+    assert health["responsive"] is False
 
 @patch("httpx.Client")
 def test_check_health_failure_with_degrade(mock_client_class):
@@ -84,7 +102,7 @@ def test_get_capabilities_success(mock_client_class):
     assert caps["capabilities"]["subtitles_sync"] == "unavailable"
     assert caps["capabilities"]["tts_voiceover"] == "unavailable"
     assert caps["pinned_upstream"]["version"] == "v1.2.7"
-    assert caps["pinned_upstream"]["commit"] == "b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80"
+    assert caps["pinned_upstream"]["commit"] == "475f21147f0808f5ffe3f58af9ab794b28a4da2c"
 
 @patch("httpx.Client")
 def test_generate_video_success(mock_client_class):
@@ -93,14 +111,15 @@ def test_generate_video_success(mock_client_class):
 
     mock_response = MagicMock()
     mock_response.status_code = 200
-    mock_response.json.return_value = {"task_id": "test-task-123"}
+    # Aligned response packaging: {"status": 200, "data": {"task_id": "test-task-123"}}
+    mock_response.json.return_value = {"status": 200, "data": {"task_id": "test-task-123"}}
     mock_client.post.return_value = mock_response
 
     adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1)
     task_id = adapter.generate_video(subject="cats")
 
     assert task_id == "test-task-123"
-    mock_client.post.assert_called_once()
+    mock_client.post.assert_called_once_with("http://mock-mpt:8080/api/v1/videos", json=ANY, params=None)
 
 @patch("httpx.Client")
 def test_generate_video_failure_no_forgery(mock_client_class):
@@ -115,13 +134,46 @@ def test_generate_video_failure_no_forgery(mock_client_class):
         adapter.generate_video(subject="cats")
 
 @patch("httpx.Client")
+def test_get_task_status_success(mock_client_class):
+    mock_client = MagicMock()
+    mock_client_class.return_value.__enter__.return_value = mock_client
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    # Aligned response packaging: {"status": 200, "data": {"status": "completed", "progress": 100, "video_url": "http://foo.mp4"}}
+    mock_response.json.return_value = {
+        "status": 200,
+        "data": {
+            "status": "completed",
+            "progress": 100,
+            "video_url": "http://foo.mp4"
+        }
+    }
+    mock_client.get.return_value = mock_response
+
+    adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1)
+    status_data = adapter.get_task_status("test-task-123")
+
+    assert status_data["status"] == "completed"
+    assert status_data["progress"] == 100
+    assert status_data["video_url"] == "http://foo.mp4"
+    mock_client.get.assert_called_once_with("http://mock-mpt:8080/api/v1/tasks/test-task-123", params=None)
+
+@patch("httpx.Client")
 def test_get_task_status_failed_raises_custom_error(mock_client_class):
     mock_client = MagicMock()
     mock_client_class.return_value.__enter__.return_value = mock_client
 
     mock_response = MagicMock()
     mock_response.status_code = 200
-    mock_response.json.return_value = {"status": "failed", "message": "out of disk"}
+    # Aligned response packaging
+    mock_response.json.return_value = {
+        "status": 200,
+        "data": {
+            "status": "failed",
+            "message": "out of disk"
+        }
+    }
     mock_client.get.return_value = mock_response
 
     adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1)
@@ -160,7 +212,12 @@ def test_exponential_backoff_retry_on_500(mock_client_class):
 
     mock_response_200 = MagicMock()
     mock_response_200.status_code = 200
-    mock_response_200.json.return_value = {"task_id": "success-task"}
+    mock_response_200.json.return_value = {
+        "status": 200,
+        "data": {
+            "task_id": "success-task"
+        }
+    }
 
     mock_client.post.side_effect = [mock_response_500, mock_response_200]
 

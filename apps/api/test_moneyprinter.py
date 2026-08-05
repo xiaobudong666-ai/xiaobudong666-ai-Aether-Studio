@@ -123,6 +123,26 @@ def test_api_adapter_check_health_success(mock_client_class):
     health = adapter.check_health()
     assert health["status"] == "healthy"
     assert health["responsive"] is True
+    mock_client.get.assert_called_once_with("http://mock-mpt:8080/openapi.json", params=None)
+
+@patch("httpx.Client")
+def test_api_adapter_check_health_failure_on_404_no_longer_healthy(mock_client_class):
+    # Strict test: 404/HTTP Error must NOT be treated as healthy
+    mock_client = MagicMock()
+    mock_client_class.return_value.__enter__.return_value = mock_client
+
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+    mock_response.text = "Not Found"
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "404 Not Found", request=MagicMock(), response=mock_response
+    )
+    mock_client.get.return_value = mock_response
+
+    adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1, degrade_on_failure=False)
+    health = adapter.check_health()
+    assert health["status"] == "unhealthy"
+    assert health["responsive"] is False
 
 @patch("httpx.Client")
 def test_api_adapter_generate_video_failure_no_forgery(mock_client_class):

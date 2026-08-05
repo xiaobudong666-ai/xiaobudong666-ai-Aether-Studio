@@ -140,6 +140,18 @@ jobs:
           curl --fail --show-error http://127.0.0.1/api/moneyprinter/health
           curl --fail --show-error http://127.0.0.1/api/moneyprinter/capabilities
 
+      - name: Internal same-origin networking validation
+        run: |
+          # 1. Probe sidecar openapi directly from inside API container
+          docker compose -f infra/docker/docker-compose.yml exec -T api python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=5)"
+          # 2. Probe sidecar openapi directly from inside Worker container
+          docker compose -f infra/docker/docker-compose.yml exec -T worker python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=5)"
+          # 3. Assert sidecar has correct v1.2.7 API schema contracts: POST /api/v1/videos and GET /api/v1/tasks/{task_id}
+          docker compose -f infra/docker/docker-compose.yml exec -T api python -c "import urllib.request, json; \
+            data = json.loads(urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json').read().decode()); \
+            assert '/api/v1/videos' in data['paths'], 'Missing contract: POST /api/v1/videos'; \
+            assert '/api/v1/tasks/{task_id}' in data['paths'], 'Missing contract: GET /api/v1/tasks/{task_id}'"
+
       - name: Verify FFmpeg and ffprobe in Worker
         run: |
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
