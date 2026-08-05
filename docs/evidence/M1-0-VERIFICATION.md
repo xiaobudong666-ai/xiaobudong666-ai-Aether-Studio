@@ -79,6 +79,12 @@ The environment is orchestrated using `infra/docker/docker-compose.yml`:
 
 ---
 
-## 6. Risks & Rollback Procedure
+## 6. Risks & Safe Rollback Procedure
 - **Connection Failures**: If the sidecar goes down, the API adapter triggers a graceful degradation status response (`status: "failed", degraded: True`), reporting zero progress and avoiding forging fake files/URLs.
-- **Rollback Procedure**: In case of regression or sidecar failure, revert the commit changes on the branch, restart the containers with `docker compose down -v && docker compose up -d`, and verify core M0-0 operations remain unharmed.
+- **Safe Rollback Procedure**:
+  - To safely restart or rollback the services, run:
+    ```bash
+    docker compose -f infra/docker/docker-compose.yml down
+    docker compose -f infra/docker/docker-compose.yml up -d --build
+    ```
+  - **Data Protection Boundary**: Do not use the `-v` (or `--volumes`) flag when stopping/rolling back the stack via `docker compose down`. Omitting `-v` guarantees that the SQLite database state, schema tables, and persistent volumes (mapped to `sqlite-db` volume) are perfectly preserved and protected from deletion.

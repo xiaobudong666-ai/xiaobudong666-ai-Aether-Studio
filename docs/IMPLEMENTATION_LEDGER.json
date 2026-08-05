@@ -11,7 +11,7 @@
       "status": "IN_PROGRESS",
       "description": "Isolated Sidecar/Adapter integration of MoneyPrinterTurbo based on a fixed, auditable version.",
       "upstream_version": "v1.2.7",
-      "upstream_commit": "b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80",
+      "upstream_commit": "475f21147f0808f5ffe3f58af9ab794b28a4da2c",
       "license": "MIT",
       "security_boundary": "Access is completely isolated via local same-origin Sidecar/Adapter network requests. No credentials or API tokens are hardcoded. Degradation fallback is provided.",
       "remaining_mock_boundaries": {

@@ -13,7 +13,7 @@ This document outlines the high-level roadmap and current milestone progress for
 - **Status**: In Progress (Refactoring & Verification Phase).
 - **Key Features**:
   - Independent `MoneyPrinterTurboAdapter` in the background Worker and FastAPI API.
-  - Pin upstream to a fixed, auditable version of MoneyPrinterTurbo (`v1.2.7`, commit `b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80`).
+  - Pin upstream to a fixed, auditable version of MoneyPrinterTurbo (`v1.2.7`, commit `475f21147f0808f5ffe3f58af9ab794b28a4da2c`).
   - Implements capability probing, health check, API error mapping, request timeout & exponential retry backoff.
   - Graceful degradation fallback when the sidecar is unreachable.
   - Configuration examples without embedding credentials.

@@ -140,13 +140,13 @@ def test_get_task_status_success(mock_client_class):
 
     mock_response = MagicMock()
     mock_response.status_code = 200
-    # Aligned response packaging: {"status": 200, "data": {"status": "completed", "progress": 100, "video_url": "http://foo.mp4"}}
+    # Aligned upstream v1.2.7 response packaging using state integer (1: completed)
     mock_response.json.return_value = {
         "status": 200,
         "data": {
-            "status": "completed",
+            "state": 1,
             "progress": 100,
-            "video_url": "http://foo.mp4"
+            "combined_videos": ["http://foo.mp4"]
         }
     }
     mock_client.get.return_value = mock_response
@@ -154,6 +154,7 @@ def test_get_task_status_success(mock_client_class):
     adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1)
     status_data = adapter.get_task_status("test-task-123")
 
+    # Aligned and mapped standard statuses
     assert status_data["status"] == "completed"
     assert status_data["progress"] == 100
     assert status_data["video_url"] == "http://foo.mp4"
@@ -166,11 +167,11 @@ def test_get_task_status_failed_raises_custom_error(mock_client_class):
 
     mock_response = MagicMock()
     mock_response.status_code = 200
-    # Aligned response packaging
+    # Aligned response packaging using state integer (-1: failed)
     mock_response.json.return_value = {
         "status": 200,
         "data": {
-            "status": "failed",
+            "state": -1,
             "message": "out of disk"
         }
     }
@@ -179,7 +180,7 @@ def test_get_task_status_failed_raises_custom_error(mock_client_class):
     adapter = MoneyPrinterTurboAdapter(api_url="http://mock-mpt:8080", max_retries=1)
     with pytest.raises(MoneyPrinterTaskFailedError) as exc_info:
         adapter.get_task_status("test-task")
-    assert "out of disk" in str(exc_info.value)
+    assert "failed with state -1" in str(exc_info.value)
 
 @patch("httpx.Client")
 def test_get_task_status_failure_with_degrade_returns_failed_no_forged_success(mock_client_class):

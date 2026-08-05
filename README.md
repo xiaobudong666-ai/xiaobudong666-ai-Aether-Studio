@@ -178,7 +178,7 @@ We have integrated a decoupled, isolated Client Adapter for the **MoneyPrinterTu
 ### Pinned Upstream Specification
 - **Repository**: [MoneyPrinterTurbo/MoneyPrinterTurbo](https://github.com/MoneyPrinterTurbo/MoneyPrinterTurbo)
 - **Version**: `v1.2.7`
-- **Commit SHA**: `b09b0b6bc7fa05e60d3d5f3dfd68377e68e4de80`
+- **Commit SHA**: `475f21147f0808f5ffe3f58af9ab794b28a4da2c`
 - **License**: MIT
 
 ### Architecture & Security Boundary

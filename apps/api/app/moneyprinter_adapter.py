@@ -226,7 +226,11 @@ class MoneyPrinterTurboAdapter:
         """
         Queries the status of a specific MoneyPrinterTurbo task.
         API Endpoint: GET /api/v1/tasks/{task_id}
-        Upstream Response: {"status": 200, "data": {"status": "...", "progress": 100, ...}}
+        Upstream Response: {"status": 200, "data": {"state": 1, "progress": 100, "combined_videos": [...]}}
+        State mapping:
+         - -1: failed
+         - 1: completed
+         - 4: processing
         """
         try:
             resp = self._request_with_retry("GET", f"/api/v1/tasks/{task_id}")
@@ -235,12 +239,35 @@ class MoneyPrinterTurboAdapter:
             if not isinstance(data, dict):
                 raise MoneyPrinterError(f"Expected dict in response 'data', got {type(data)}: {response_json}")
 
-            status = data.get("status")
-            if status == "failed":
+            state = data.get("state")
+            progress = data.get("progress", 0)
+
+            # Map state integer to Aether Studio status string
+            mapped_status = "processing"
+            if state == -1:
+                mapped_status = "failed"
+            elif state == 1:
+                mapped_status = "completed"
+            elif state == 4:
+                mapped_status = "processing"
+            else:
+                mapped_status = "processing"
+
+            if mapped_status == "failed":
                 raise MoneyPrinterTaskFailedError(
-                    f"MoneyPrinterTurbo task {task_id} failed: {data.get('message', 'No details available')}"
+                    f"MoneyPrinterTurbo task {task_id} failed with state {state}"
                 )
-            return data
+
+            # Extract combined video URL if available
+            combined_videos = data.get("combined_videos", [])
+            video_url = combined_videos[0] if combined_videos else None
+
+            return {
+                "task_id": task_id,
+                "status": mapped_status,
+                "progress": progress,
+                "video_url": video_url
+            }
         except Exception as exc:
             logger.error("Failed to get task status for %s: %s", task_id, exc)
             if self.degrade_on_failure:
