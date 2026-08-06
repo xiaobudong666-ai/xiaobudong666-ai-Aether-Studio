@@ -171,6 +171,38 @@ limitations. A green job proves only the scope asserted by that job.
 
 These limitations must not be presented as completed production capabilities.
 
+## M1-0 MoneyPrinterTurbo Sidecar Integration
+
+We have integrated a decoupled, isolated Client Adapter for the **MoneyPrinterTurbo** upstream tool.
+
+### Pinned Upstream Specification
+- **Repository**: [MoneyPrinterTurbo/MoneyPrinterTurbo](https://github.com/MoneyPrinterTurbo/MoneyPrinterTurbo)
+- **Version**: `v1.2.7`
+- **Commit SHA**: `475f21147f0808f5ffe3f58af9ab794b28a4da2c`
+- **License**: MIT
+
+### Architecture & Security Boundary
+The MoneyPrinterTurbo sidecar runs as a completely isolated container next to Aether Studio. Communication happens exclusively through local/same-origin HTTP network requests made by the background Worker and the API:
+- No secrets, personal credentials, or API keys are committed. All configurations are retrieved cleanly via environment variables.
+- **Same-Origin API Routing**: The FastAPI API exposes proxy endpoints under `/api/moneyprinter/*` mapped to `/moneyprinter/*`, maintaining same-origin integrity.
+
+### Integration Capabilities & Health Checks
+- **Health Probing**: The endpoint `/api/moneyprinter/health` verifies connection status and responsiveness of the sidecar.
+- **Capability Detection**: `/api/moneyprinter/capabilities` dynamically probes and reports the sidecar's features (video generation, subtitles, voiceover, and aspect ratio support).
+- **Video Generation**: `POST /api/moneyprinter/generate` submits automated video creation tasks securely with validation schemas.
+- **Status Checking**: `/api/moneyprinter/status/{task_id}` queries progress and handles failures.
+
+### Failure, Timeout & Degradation Boundaries
+- **Timeouts**: Configurable HTTP timeouts protect calls to the sidecar (default `10.0s`).
+- **Retries**: Implements automatic, exponential backoff retries (up to `3` times) for temporary server-side failures (HTTP 429, >=500) or connection timeouts.
+- **Error Mapping**: Converts generic HTTP errors and task failures into explicit, typed exceptions (`MoneyPrinterTimeoutError`, `MoneyPrinterConnectionError`, `MoneyPrinterTaskFailedError`).
+- **Graceful Degradation**: If the MoneyPrinterTurbo sidecar is unreachable or undergoes catastrophic failure, a graceful fallback degradation is triggered. The adapter returns a clean, structured degraded status response and transitions features gracefully without crashing the core worker or API.
+
+### M1-0 Mock Boundary
+- The adapter client interfaces are fully implemented, validated, and integrated.
+- The actual generation of video files depends on a correctly deployed MoneyPrinterTurbo container configured with necessary Pexels/LLM API credentials in production.
+- `video-use` is reserved for M2 and not integrated in M1-0.
+
 ## M1 entry criteria
 
 M1 may start only after the latest feature-branch commit has:

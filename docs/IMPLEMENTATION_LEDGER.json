@@ -1,0 +1,25 @@
+{
+  "project": "Aether Studio",
+  "milestones": {
+    "M0-0": {
+      "status": "ACCEPTED",
+      "commit": "507f61d3a85b9eb6d14af13426d0353ad05a59f9",
+      "description": "Engineering foundation baseline: runnable web workbench, API, isolated worker, shared contracts, container topology, tests, and CI gates.",
+      "evidence": "docs/evidence/M0-0-VERIFICATION.md"
+    },
+    "M1-0": {
+      "status": "IN_PROGRESS",
+      "description": "Isolated Sidecar/Adapter integration of MoneyPrinterTurbo based on a fixed, auditable version.",
+      "upstream_version": "v1.2.7",
+      "upstream_commit": "475f21147f0808f5ffe3f58af9ab794b28a4da2c",
+      "license": "MIT",
+      "security_boundary": "Access is completely isolated via local same-origin Sidecar/Adapter network requests. No credentials or API tokens are hardcoded. Degradation fallback is provided.",
+      "remaining_mock_boundaries": {
+        "ffmpeg_real_media": "Real FFmpeg transcoding/rendering is still a mock; M0-0 behavior remains.",
+        "ai_style_transfer_and_subtitles": "Real AI generation and subtitle processing in AIProvider remains a mock.",
+        "video-use": "video-use is reserved for M2 and not integrated in M1-0."
+      },
+      "next_step": "M2-0 Real Media Pipeline and Video-Use integration"
+    }
+  }
+}

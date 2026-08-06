@@ -16,7 +16,13 @@ from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .models import DBProject
-from .schemas import CreateProjectRequest, ProjectResponse, UpdateProjectRequest
+from .schemas import (
+    CreateProjectRequest,
+    ProjectResponse,
+    UpdateProjectRequest,
+    MoneyPrinterGenerateRequest,
+)
+from .moneyprinter_adapter import MoneyPrinterTurboAdapter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api.main")
@@ -117,6 +123,7 @@ def create_app(
         lifespan=lifespan,
     )
     created_app.state.active_tasks = {}
+    created_app.state.moneyprinter = MoneyPrinterTurboAdapter()
 
     origins = [
         origin.strip()
@@ -144,6 +151,51 @@ def create_app(
             "journal_mode": journal_mode,
             "timestamp": iso_utc(utc_now()),
         }
+
+    @created_app.get("/moneyprinter/health")
+    def moneyprinter_health():
+        adapter: MoneyPrinterTurboAdapter = created_app.state.moneyprinter
+        return adapter.check_health()
+
+    @created_app.get("/moneyprinter/capabilities")
+    def moneyprinter_capabilities():
+        adapter: MoneyPrinterTurboAdapter = created_app.state.moneyprinter
+        return adapter.get_capabilities()
+
+    @created_app.post("/moneyprinter/generate")
+    def moneyprinter_generate(req: MoneyPrinterGenerateRequest):
+        adapter: MoneyPrinterTurboAdapter = created_app.state.moneyprinter
+        try:
+            task_id = adapter.generate_video(
+                subject=req.video_subject,
+                aspect=req.video_aspect,
+                voice_name=req.voice_name,
+                video_concat_mode=req.video_concat_mode,
+                video_clip_duration=req.video_clip_duration,
+            )
+            return {"task_id": task_id, "status": "submitted"}
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "MONEYPRINTER_API_ERROR",
+                    "message": f"Failed to submit task to MoneyPrinterTurbo sidecar: {exc}",
+                }
+            )
+
+    @created_app.get("/moneyprinter/status/{task_id}")
+    def moneyprinter_status(task_id: str):
+        adapter: MoneyPrinterTurboAdapter = created_app.state.moneyprinter
+        try:
+            return adapter.get_task_status(task_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "MONEYPRINTER_STATUS_ERROR",
+                    "message": f"Failed to query task status from MoneyPrinterTurbo sidecar: {exc}",
+                }
+            )
 
     @created_app.get("/projects", response_model=List[ProjectResponse])
     def list_projects(db: Session = Depends(db_dependency)):
