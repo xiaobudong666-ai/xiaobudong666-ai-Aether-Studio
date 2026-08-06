@@ -132,8 +132,14 @@ docker compose -f infra/docker/docker-compose.yml up -d --build --wait
 curl --fail http://127.0.0.1/api/health
 docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
 docker compose -f infra/docker/docker-compose.yml exec -T worker ffprobe -version
-docker compose -f infra/docker/docker-compose.yml down --volumes
+docker compose -f infra/docker/docker-compose.yml down
 ```
+
+The final command intentionally omits `-v`/`--volumes` so local and production
+SQLite data in the `sqlite-db` named volume is preserved. The only permitted
+`--volumes` teardown is the GitHub Actions Docker job: that job assigns a
+unique `COMPOSE_PROJECT_NAME` for each workflow run and removes only its own
+disposable, run-scoped volumes.
 
 The GitHub Actions workflow has three required jobs:
 
@@ -203,12 +209,17 @@ The MoneyPrinterTurbo sidecar runs as a completely isolated container next to Ae
 - The actual generation of video files depends on a correctly deployed MoneyPrinterTurbo container configured with necessary Pexels/LLM API credentials in production.
 - `video-use` is reserved for M2 and not integrated in M1-0.
 
-## M1 entry criteria
+## M1-0 acceptance record
 
-M1 may start only after the latest feature-branch commit has:
+M1-0 is accepted on implementation merge commit
+`1e916bf66e3f9e87cc2329cf6df94333d4f49744` after:
 
-- all three GitHub Actions jobs green;
+- PR #3 was reviewed and merged into `main`;
+- all three required GitHub Actions jobs were green;
 - Playwright and Docker artifacts present;
 - no uncommitted changes;
-- a reviewed pull request against `main`;
 - an explicit record of remaining mock boundaries.
+
+The canonical evidence is `docs/evidence/M1-0-VERIFICATION.md`. This acceptance
+does not start M2: real media processing and `video-use` remain future work and
+require separate authorization.

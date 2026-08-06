@@ -119,6 +119,9 @@ jobs:
     name: Docker Compose integration
     needs: build-and-test
     runs-on: ubuntu-latest
+    env:
+      # Isolate disposable CI resources from local/production Compose projects.
+      COMPOSE_PROJECT_NAME: aether-ci-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Checkout code
@@ -170,6 +173,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Stop stack
+      - name: Stop disposable CI stack and its run-scoped volumes
         if: always()
+        # --volumes is safe only because COMPOSE_PROJECT_NAME is unique to this CI run.
         run: docker compose -f infra/docker/docker-compose.yml down --volumes

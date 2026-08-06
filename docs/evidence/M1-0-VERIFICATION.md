@@ -58,7 +58,7 @@ PYTHONPATH=apps/worker .venv/bin/python -m pytest apps/worker/test_worker.py app
 
 ### 4.3 Frontend End-to-End Flow (Playwright)
 ```bash
-PATH=/app/.venv/bin:$PATH pnpm e2e
+PATH="$PWD/.venv/bin:$PATH" pnpm e2e
 ```
 
 ### 4.4 Docker Compose Validation
@@ -88,3 +88,12 @@ The environment is orchestrated using `infra/docker/docker-compose.yml`:
     docker compose -f infra/docker/docker-compose.yml up -d --build
     ```
   - **Data Protection Boundary**: Do not use the `-v` (or `--volumes`) flag when stopping/rolling back the stack via `docker compose down`. Omitting `-v` guarantees that the SQLite database state, schema tables, and persistent volumes (mapped to `sqlite-db` volume) are perfectly preserved and protected from deletion.
+  - **Disposable CI Exception**: `.github/workflows/ci.yml` assigns a unique `COMPOSE_PROJECT_NAME` to each GitHub Actions run. Only that isolated CI job may use `down --volumes`, and it removes only the disposable volumes in its run-scoped Compose project. This exception does not apply to local or production stacks.
+
+---
+
+## 7. Acceptance Record
+- **Status**: `ACCEPTED`
+- **Implementation PR**: `#3`
+- **Implementation Merge Commit**: `1e916bf66e3f9e87cc2329cf6df94333d4f49744`
+- **Boundary**: M2 remains `FUTURE`; real media processing and `video-use` are not started or authorized by this acceptance.
