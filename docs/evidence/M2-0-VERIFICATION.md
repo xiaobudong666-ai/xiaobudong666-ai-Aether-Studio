@@ -7,11 +7,13 @@
 - Upstream version: `0.1.0`
 - Pinned commit: `92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66`
 - License: MIT
-- Acceptance status: `IN_REVIEW`
+- Acceptance status: `ACCEPTED`
+- Implementation PR: [#5](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/5)
+- Accepted merge commit: `8e81ba20ab33bff5d089f738fe535bb9346e6a28`
+- Authoritative CI: [run 29](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31205880579)
 
-This record describes a candidate milestone. It must not be changed to
-`ACCEPTED` until its pull request is merged and all three GitHub Actions jobs
-have passed for the exact accepted head commit.
+The implementation pull request was merged only after all three GitHub Actions
+jobs passed for head commit `74e1ce273713c4931b2be1947dfb827df2e6f63b`.
 
 ## Implemented path
 
@@ -61,14 +63,14 @@ submitted a draft EDL to the exact pinned `video-use` checkout, and downloaded
 a 114,676-byte MP4. `ffprobe` reported H.264 video, AAC audio, 1280×960 output,
 and 0.832 seconds duration.
 
-## Pending authoritative CI evidence
+## Authoritative CI evidence
 
-- Playwright was not locally executable because the browser download endpoint
-  returned a certificate-time error. The GitHub Actions Playwright job remains
-  required and may not be waived.
-- Docker is not installed in the local execution environment. The GitHub
-  Actions Docker job must build the non-root Sidecar, verify the pinned commit,
-  execute a real upstream render, probe all health endpoints, and upload logs.
+- Lint, build, JavaScript tests, API tests, Worker tests, real FFmpeg tests, and
+  Sidecar tests passed.
+- Playwright passed and uploaded its evidence artifact.
+- Docker Compose built both pinned Sidecars, started a healthy same-origin
+  stack, verified FFmpeg/ffprobe, executed a real video-use render, and uploaded
+  container logs.
 
 ## Explicitly not accepted by M2-0
 

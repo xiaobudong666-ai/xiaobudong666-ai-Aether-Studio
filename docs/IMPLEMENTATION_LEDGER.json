@@ -24,17 +24,19 @@
       "m2_boundary": "M2 was authorized separately after M1-0 acceptance; this record does not pre-accept M2."
     },
     "M2-0": {
-      "status": "IN_REVIEW",
+      "status": "ACCEPTED",
+      "commit": "8e81ba20ab33bff5d089f738fe535bb9346e6a28",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31205880579",
       "description": "Real FFmpeg media processing plus an isolated, pinned browser-use/video-use Sidecar and same-origin project render flow.",
       "upstream_version": "0.1.0",
       "upstream_commit": "92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66",
       "license": "MIT",
       "security_boundary": "The Sidecar runs as a non-root internal service. Uploads use generated media IDs, render requests use validated project/media IDs, and no endpoint accepts an arbitrary host path or shell command.",
       "evidence": "docs/evidence/M2-0-VERIFICATION.md",
-      "acceptance_pending": [
-        "GitHub Actions lint/build/unit job",
-        "GitHub Actions Playwright job",
-        "GitHub Actions Docker Compose job with pinned-upstream real render"
+      "acceptance_evidence": [
+        "GitHub Actions lint/build/unit job passed",
+        "GitHub Actions Playwright job passed with artifact",
+        "GitHub Actions Docker Compose job passed with pinned-upstream real render and logs"
       ],
       "remaining_boundaries": {
         "transcription": "The real ElevenLabs Scribe path is implemented but is unavailable until ELEVENLABS_API_KEY is configured.",
@@ -45,7 +47,7 @@
       }
     },
     "M3-0": {
-      "status": "IN_DEVELOPMENT",
+      "status": "IN_REVIEW",
       "description": "Pinned OpenCut Rust/WASM timing integration and Classic v31 compatibility snapshot export.",
       "upstream_package": "opencut-wasm",
       "upstream_version": "0.2.10",
@@ -54,7 +56,6 @@
       "license": "MIT",
       "evidence": "docs/evidence/M3-0-VERIFICATION.md",
       "acceptance_pending": [
-        "M2-0 merge and closeout",
         "M3 pull request",
         "GitHub Actions lint/build/unit job",
         "GitHub Actions Playwright job",
@@ -63,7 +64,7 @@
       "boundary": "OpenCut Classic is archived and is not deployed as a core runtime. The official rewrite has not released its Editor API, plugin API, MCP server, or headless mode. Compatibility snapshots are explicit exports rather than a claim of one-click bidirectional editor embedding."
     },
     "M4-0": {
-      "status": "IN_DEVELOPMENT",
+      "status": "IN_REVIEW",
       "description": "Feature-gated OpenReel fallback with an actual schema 1.0.0 project export and relinkable media placeholders.",
       "upstream_version": "0.1.1-beta",
       "upstream_commit": "8459024d4c82ee16a2e14537553884a623ae9c4e",

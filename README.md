@@ -207,8 +207,11 @@ named volume, and exposes only validated media/job contracts. An
 `ELEVENLABS_API_KEY` enables the real Scribe transcription path; without it the
 capability is reported as unconfigured and no transcript is fabricated.
 
-See `docs/evidence/M2-0-VERIFICATION.md` for candidate verification and the
-CI evidence still required before acceptance.
+M2-0 is accepted on merge commit
+`8e81ba20ab33bff5d089f738fe535bb9346e6a28`. All three required jobs passed in
+[GitHub Actions run 29](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31205880579),
+including the fixed-upstream real MP4 render. See
+`docs/evidence/M2-0-VERIFICATION.md` for the complete boundary.
 
 ## M3-0 OpenCut compatibility core
 
@@ -292,6 +295,6 @@ M1-0 is accepted on implementation merge commit
 - no uncommitted changes;
 - an explicit record of remaining mock boundaries.
 
-The canonical evidence is `docs/evidence/M1-0-VERIFICATION.md`. This acceptance
-does not start M2: real media processing and `video-use` remain future work and
-require separate authorization.
+The canonical evidence is `docs/evidence/M1-0-VERIFICATION.md`. That acceptance
+did not pre-authorize M2; real media processing and `video-use` were later
+implemented and accepted through a separate milestone and pull request.

@@ -21,8 +21,10 @@ This document outlines the high-level roadmap and current milestone progress for
   - Configuration examples without embedding credentials.
   - Dedicated unit and integration tests verifying HTTP endpoints, timeouts, and fallback modes.
 
-### [M2-0] Real Media Processing and Video-Use (IN REVIEW)
-- **Status**: Implemented on `agent/m2-0-real-media-video-use`; awaiting PR/CI acceptance.
+### [M2-0] Real Media Processing and Video-Use (ACCEPTED)
+- **Status**: Merged and fully verified.
+- **Commit**: `8e81ba20ab33bff5d089f738fe535bb9346e6a28`
+- **CI**: [GitHub Actions run 29](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31205880579)
 - **Evidence**: `docs/evidence/M2-0-VERIFICATION.md`
 - **Key Features**:
   - Replace the Worker FFmpeg mock with actual probe, proxy, and audio extraction operations.
@@ -31,8 +33,8 @@ This document outlines the high-level roadmap and current milestone progress for
   - Add real upload/probe, EDL rendering, task progress, timeline-view, transcription, and artifact endpoints.
   - Connect project timelines to the Sidecar through the same-origin API and expose MP4 downloads.
 
-### [M3-0] OpenCut Compatibility Core (IN DEVELOPMENT)
-- **Status**: Implemented locally after M2-0; PR/CI acceptance remains pending.
+### [M3-0] OpenCut Compatibility Core (IN REVIEW)
+- **Status**: Implemented after M2-0; PR/CI acceptance remains pending.
 - **Evidence**: `docs/evidence/M3-0-VERIFICATION.md`
 - **Boundary**: OpenCut Classic is officially archived and the rewrite's Editor API is not released. Aether integrates the pinned `opencut-wasm@0.2.10` core and a Classic v31 snapshot adapter without making the archived application a runtime dependency.
 - **Key Features**:
@@ -41,8 +43,8 @@ This document outlines the high-level roadmap and current milestone progress for
   - Lazy-load the 3 MB WASM chunk only when OpenCut export is requested.
   - Keep Canonical Timeline persistence and server-side video-use rendering as the source of truth.
 
-### [M4-0] OpenReel Compatibility Adapter (IN DEVELOPMENT)
-- **Status**: Implemented locally after M3-0; PR/CI acceptance remains pending.
+### [M4-0] OpenReel Compatibility Adapter (IN REVIEW)
+- **Status**: Implemented after M3-0; PR/CI acceptance remains pending.
 - **Evidence**: `docs/evidence/M4-0-VERIFICATION.md`
 - **Boundary**: OpenReel remains a feature-flagged fallback, not a second default editor runtime.
 - **Key Features**:
@@ -52,7 +54,7 @@ This document outlines the high-level roadmap and current milestone progress for
   - Keep Aether storage and server-side rendering authoritative.
 
 ### [M5-0] Production Deployment and Launch (READY FOR TARGET)
-- **Status**: Compose hardening, environment template, persistent volumes, and same-origin smoke gates are implemented locally. An actual host change remains blocked on target configuration.
+- **Status**: Compose hardening, environment template, persistent volumes, and same-origin smoke gates are implemented. An actual host change remains blocked on target configuration.
 - **Runbook**: `docs/PRODUCTION_DEPLOYMENT.md`
 - **Implemented safeguards**:
   - MoneyPrinterTurbo and video-use remain internal-only; no Sidecar host ports are published.
