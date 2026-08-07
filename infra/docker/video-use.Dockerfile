@@ -8,8 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/browser-use/video-use.git /opt/video-use \
-    && git -C /opt/video-use checkout --detach "${VIDEO_USE_COMMIT}" \
+RUN git init /opt/video-use \
+    && git -C /opt/video-use remote add origin https://github.com/browser-use/video-use.git \
+    && git -C /opt/video-use fetch --depth 1 origin "${VIDEO_USE_COMMIT}" \
+    && git -C /opt/video-use checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/video-use rev-parse HEAD)" = "${VIDEO_USE_COMMIT}" \
     && rm -rf /opt/video-use/.git
 
