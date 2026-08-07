@@ -28,6 +28,8 @@ services:
     environment:
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
       - VIDEO_USE_MAX_UPLOAD_BYTES=${VIDEO_USE_MAX_UPLOAD_BYTES:-2147483648}
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
       test:
@@ -43,14 +45,14 @@ services:
   moneyprinter-sidecar:
     image: moneyprinterturbo:v1.2.7-475f21147f0808
     build:
-      context: https://github.com/harry0703/MoneyPrinterTurbo.git#475f21147f0808f5ffe3f58af9ab794b28a4da2c
-    ports:
-      - "8080:8080"
-      - "8501:8501"
+      context: ../..
+      dockerfile: infra/docker/moneyprinter.Dockerfile
+      args:
+        MONEYPRINTER_COMMIT: 475f21147f0808f5ffe3f58af9ab794b28a4da2c
     networks:
       - aether-net
-    # Overriding standard Streamlit UI boot command to launch the core API on port 8080
-    command: ["python3", "main.py"]
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     # Fast health check probing the core FastAPI backend openapi contract on port 8080
     healthcheck:
@@ -69,7 +71,7 @@ services:
       context: ../..
       dockerfile: infra/docker/api.Dockerfile
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - sqlite-db:/data
     networks:
@@ -78,6 +80,8 @@ services:
       - DATABASE_URL=sqlite:////data/aether.db
       - MONEYPRINTER_API_URL=http://moneyprinter-sidecar:8080
       - VIDEO_USE_API_URL=http://video-use:8002
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     depends_on:
       moneyprinter-sidecar:
@@ -100,7 +104,7 @@ services:
       context: ../..
       dockerfile: infra/docker/worker.Dockerfile
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     networks:
       - aether-net
     environment:
@@ -108,7 +112,11 @@ services:
       - WORKER_PORT=8001
       - MONEYPRINTER_API_URL=http://moneyprinter-sidecar:8080
       - VIDEO_USE_API_URL=http://video-use:8002
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       api:
         condition: service_healthy
