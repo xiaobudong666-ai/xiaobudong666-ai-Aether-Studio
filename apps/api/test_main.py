@@ -1,5 +1,5 @@
-import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
 from fastapi import HTTPException
@@ -9,6 +9,69 @@ from sqlalchemy.orm import sessionmaker
 from app.database import Base, build_engine
 from app.main import apply_project_update, create_app
 from app.schemas import UpdateProjectRequest
+
+
+class FakeVideoUseAdapter:
+    def __init__(self):
+        self.jobs = {}
+        self.status_calls = {}
+
+    def check_health(self):
+        return {"status": "healthy", "service": "video-use"}
+
+    def get_capabilities(self):
+        return {"render": True, "commit": "92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66"}
+
+    def upload_media(self, project_id, filename, content_type, stream):
+        assert stream.read()
+        return {
+            "mediaId": "media-1",
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": 1.0,
+                "video": {"codec": "h264", "width": 320, "height": 240},
+                "audio": {"codec": "aac", "sampleRate": 48000},
+            },
+        }
+
+    def submit_render(self, payload):
+        assert payload["ranges"] == [
+            {
+                "mediaId": "media-1",
+                "start": 0.0,
+                "end": 1.0,
+                "note": "clip-1",
+            }
+        ]
+        job = {
+            "jobId": "11111111-1111-1111-1111-111111111111",
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued",
+        }
+        self.jobs[job["jobId"]] = job
+        return job
+
+    def get_job_status(self, job_id):
+        calls = self.status_calls.get(job_id, 0) + 1
+        self.status_calls[job_id] = calls
+        completed = calls >= 2
+        return {
+            **self.jobs[job_id],
+            "status": "completed" if completed else "processing",
+            "progress": 100 if completed else 50,
+            "message": "Render completed" if completed else "Rendering",
+        }
+
+    @contextmanager
+    def stream(self, _path):
+        class Response:
+            def iter_bytes(self):
+                yield b"media"
+
+        yield Response()
 
 
 @pytest.fixture()
@@ -32,6 +95,7 @@ def api_context(tmp_path):
         app_engine=test_engine,
         db_dependency=get_test_db,
         render_step_delay=0.01,
+        video_use_adapter=FakeVideoUseAdapter(),
     )
     with TestClient(test_app) as client:
         yield client, test_session
@@ -120,17 +184,52 @@ def test_render_and_sse_emit_real_task_progress_event(api_context):
     client, _ = api_context
     project = create_project(client, "Render Test")
 
+    upload = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": "1"},
+        files={"file": ("source.mp4", b"real-media-bytes", "video/mp4")},
+    )
+    assert upload.status_code == 201
+    updated_project = upload.json()["project"]
+    assert updated_project["revision"] == 2
+    assert updated_project["materials"][0]["id"] == "media-1"
+
+    timeline = {
+        "version": "1.1",
+        "tracks": [
+            {
+                "id": "track-1",
+                "name": "Video Track 1",
+                "type": "video",
+                "clips": [
+                    {
+                        "id": "clip-1",
+                        "trackId": "track-1",
+                        "materialId": "media-1",
+                        "start": {"value": 0, "timescale": 24000},
+                        "duration": {"value": 24000, "timescale": 24000},
+                        "sourceIn": {"value": 0, "timescale": 24000},
+                    }
+                ],
+            }
+        ],
+    }
+    update = client.put(
+        f"/projects/{project['id']}",
+        json={"timeline": timeline, "expectedRevision": 2},
+    )
+    assert update.status_code == 200
+
     render_response = client.post(f"/projects/{project['id']}/render")
     assert render_response.status_code == 200
     task_id = render_response.json()["taskId"]
-    assert render_response.json()["mock"] is True
+    assert render_response.json()["mock"] is False
 
     first_snapshot = client.get("/events?once=true")
     assert first_snapshot.status_code == 200
     assert "event: task_progress" in first_snapshot.text
     assert task_id in first_snapshot.text
 
-    time.sleep(0.08)
     completed_snapshot = client.get("/events?once=true")
     assert f'"taskId":"{task_id}"' in completed_snapshot.text
     assert '"status":"completed"' in completed_snapshot.text

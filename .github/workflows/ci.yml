@@ -57,6 +57,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r apps/api/requirements.txt
           pip install -r apps/worker/requirements.txt
+          pip install -r apps/video_use/requirements.txt
+
+      - name: Install FFmpeg test runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Run API tests
         env:
@@ -67,6 +73,11 @@ jobs:
         env:
           PYTHONPATH: apps/worker
         run: python -m pytest apps/worker/test_worker.py apps/worker/test_moneyprinter.py -v
+
+      - name: Run video-use sidecar tests
+        env:
+          PYTHONPATH: apps/video_use
+        run: python -m pytest apps/video_use/test_main.py -v
 
   playwright:
     name: Playwright workbench flow
@@ -142,6 +153,8 @@ jobs:
           curl --fail --show-error http://127.0.0.1/api/health
           curl --fail --show-error http://127.0.0.1/api/moneyprinter/health
           curl --fail --show-error http://127.0.0.1/api/moneyprinter/capabilities
+          curl --fail --show-error http://127.0.0.1/api/video-use/health
+          curl --fail --show-error http://127.0.0.1/api/video-use/capabilities
 
       - name: Internal same-origin networking validation
         run: |
@@ -159,6 +172,12 @@ jobs:
         run: |
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffprobe -version
+
+      - name: Verify pinned video-use and execute a real render
+        run: |
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use python -c "import app.main as m; assert m.UPSTREAM_COMMIT == '92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66'"
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use sh -c "mkdir -p /media/projects/ci/media && ffmpeg -y -hide_banner -loglevel error -f lavfi -i testsrc=size=320x240:rate=24 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest /media/projects/ci/media/ci-source.mp4"
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use python /service/ci_smoke.py
 
       - name: Capture Docker logs
         if: always()

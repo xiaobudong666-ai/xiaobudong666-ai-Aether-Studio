@@ -1,4 +1,4 @@
-# Aether Studio — M0-0 Engineering Baseline
+# Aether Studio — AI Anime and Short-Video Workbench
 
 Aether Studio is an AI anime and short-video editing project. This repository
 contains the M0-0 engineering foundation: a runnable web workbench, API,
@@ -11,8 +11,9 @@ The repository is independent and does not read, import, or modify `Ai-Eos`.
 | Area | Purpose |
 | --- | --- |
 | `apps/web` | React, TypeScript, and Vite three-panel editing workbench |
-| `apps/api` | FastAPI project CRUD, SQLite WAL, optimistic locking, render mock, and SSE |
-| `apps/worker` | Isolated Python Worker with explicitly mocked FFmpeg, AI, and recovery adapters |
+| `apps/api` | FastAPI project CRUD, uploads, same-origin Sidecar adapters, real render jobs, SQLite WAL, optimistic locking, and SSE |
+| `apps/worker` | Isolated Python Worker with real FFmpeg operations, Sidecar clients, AI provider boundary, and recovery adapter |
+| `apps/video_use` | Internal non-root service for the pinned video-use render, timeline-view, and transcription helpers |
 | `packages/contracts` | Canonical Timeline v1.1 DTOs, validation, error codes, and RationalTime |
 | `packages/editor` | Editor-agnostic material, canvas, and timeline adapter interfaces |
 | `infra/docker` | API, Worker, and same-origin Nginx Web deployment |
@@ -68,12 +69,13 @@ corepack prepare pnpm@10.30.3 --activate
 pnpm install --frozen-lockfile
 ```
 
-Create one Python environment and install both service requirements:
+Create one Python environment and install all service requirements:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r apps/api/requirements.txt
 .venv/bin/pip install -r apps/worker/requirements.txt
+.venv/bin/pip install -r apps/video_use/requirements.txt
 ```
 
 Run the API:
@@ -89,6 +91,18 @@ Run the Worker:
 ```bash
 PYTHONPATH=apps/worker BACKEND_URL=http://127.0.0.1:8000 \
   WORKER_PORT=8001 .venv/bin/python -m app.main
+```
+
+The production Compose stack builds `browser-use/video-use` at the pinned
+commit recorded below. Local direct Sidecar development additionally requires
+an explicit checkout path:
+
+```bash
+PYTHONPATH=apps/video_use \
+  VIDEO_USE_UPSTREAM_ROOT=/absolute/path/to/video-use \
+  VIDEO_USE_MEDIA_ROOT=./.local/video-use-media \
+  .venv/bin/python -m uvicorn app.main:app \
+  --host 127.0.0.1 --port 8002
 ```
 
 Run the Web workbench:
@@ -121,7 +135,7 @@ Run Playwright:
 
 ```bash
 pnpm exec playwright install chromium
-pnpm e2e
+AETHER_PYTHON=.venv/bin/python pnpm e2e
 ```
 
 Run the complete container stack:
@@ -151,22 +165,20 @@ The GitHub Actions workflow has three required jobs:
 See `docs/evidence/M0-0-VERIFICATION.md` for the evidence policy and current
 limitations. A green job proves only the scope asserted by that job.
 
-## Implemented M0-0 behavior
+## Implemented behavior
 
 - Project list, create, query, and update.
 - Atomic revision conflict response (`409 CONCURRENCY_CONFLICT`).
 - Three-panel workbench and bottom timeline.
-- Materials and basic track/clip placement.
-- Bounded 480p proxy specification.
-- Mock render task and live `task_progress` SSE events.
+- Real media upload/probe and basic track/clip placement.
+- Real FFmpeg proxy, audio extraction, and metadata probing.
+- Pinned video-use EDL rendering with live `task_progress` SSE events and MP4 download.
 - Independent Worker HTTP health endpoint.
-- Explicit mock boundaries for FFmpeg, AI provider, and recovery.
+- Explicit remaining mock boundaries for AI provider and recovery.
 - Reproducible lockfile, Node/pnpm baseline, Docker topology, and CI.
 
 ## M0-0 limitations
 
-- FFmpeg adapter methods are mocks; the container contains FFmpeg and ffprobe,
-  but M0-0 does not process real media.
 - AI generation and subtitle methods are mocks and use no provider keys.
 - Task state is in process memory; Redis/Celery durability is deferred.
 - The preview canvas is a workbench placeholder, not a decoding or compositing
@@ -176,6 +188,22 @@ limitations. A green job proves only the scope asserted by that job.
   JavaScript safe-integer boundary.
 
 These limitations must not be presented as completed production capabilities.
+
+## M2-0 video-use and real media
+
+- **Repository**: [browser-use/video-use](https://github.com/browser-use/video-use)
+- **Version**: `0.1.0`
+- **Pinned commit**: `92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66`
+- **License**: MIT
+
+The Docker image verifies the full upstream SHA before installing it. The
+Sidecar is internal-only, runs as a non-root user, stores media in a dedicated
+named volume, and exposes only validated media/job contracts. An
+`ELEVENLABS_API_KEY` enables the real Scribe transcription path; without it the
+capability is reported as unconfigured and no transcript is fabricated.
+
+See `docs/evidence/M2-0-VERIFICATION.md` for candidate verification and the
+CI evidence still required before acceptance.
 
 ## M1-0 MoneyPrinterTurbo Sidecar Integration
 

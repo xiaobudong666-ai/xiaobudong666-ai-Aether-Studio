@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("creates a project and receives render progress in the three-panel workbench", async ({
+test("creates a project and exposes the real-media workbench", async ({
   page,
 }, testInfo) => {
   await page.goto("/");
@@ -25,13 +25,8 @@ test("creates a project and receives render progress in the three-panel workbenc
     page.locator(".project-select-container select"),
   ).toHaveValue(projectId!);
 
-  await page.getByRole("button", { name: /Trigger AI Proxy Render/ }).click();
-  await expect(page.getByText(/Task: [a-f0-9]{8}/)).toBeVisible({
-    timeout: 10_000,
-  });
-  await expect(
-    page.getByText(/pending|processing|completed/, { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByText("Upload Real Media")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Render with video-use/ })).toBeDisabled();
 
   await page.screenshot({
     path: testInfo.outputPath("aether-workbench.png"),

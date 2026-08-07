@@ -7,7 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Dict, Generator, List
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text, update
@@ -23,6 +23,7 @@ from .schemas import (
     MoneyPrinterGenerateRequest,
 )
 from .moneyprinter_adapter import MoneyPrinterTurboAdapter
+from .video_use_adapter import VideoUseAdapter, VideoUseError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api.main")
@@ -111,6 +112,7 @@ def create_app(
     app_engine: Engine = engine,
     db_dependency: DatabaseDependency = get_db,
     render_step_delay: float = 1.0,
+    video_use_adapter: VideoUseAdapter | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -124,6 +126,7 @@ def create_app(
     )
     created_app.state.active_tasks = {}
     created_app.state.moneyprinter = MoneyPrinterTurboAdapter()
+    created_app.state.video_use = video_use_adapter or VideoUseAdapter()
 
     origins = [
         origin.strip()
@@ -197,6 +200,22 @@ def create_app(
                 }
             )
 
+    @created_app.get("/video-use/health")
+    def video_use_health():
+        adapter: VideoUseAdapter = created_app.state.video_use
+        return adapter.check_health()
+
+    @created_app.get("/video-use/capabilities")
+    def video_use_capabilities():
+        adapter: VideoUseAdapter = created_app.state.video_use
+        try:
+            return adapter.get_capabilities()
+        except VideoUseError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "VIDEO_USE_UNAVAILABLE", "message": str(exc)},
+            ) from exc
+
     @created_app.get("/projects", response_model=List[ProjectResponse])
     def list_projects(db: Session = Depends(db_dependency)):
         projects = db.execute(
@@ -251,15 +270,90 @@ def create_app(
     ):
         return project_response(apply_project_update(db, project_id, req))
 
+    @created_app.post("/projects/{project_id}/media", status_code=status.HTTP_201_CREATED)
+    def upload_project_media(
+        project_id: str,
+        expectedRevision: int = Form(..., ge=0),
+        file: UploadFile = File(...),
+        db: Session = Depends(db_dependency),
+    ):
+        project = db.execute(
+            select(DBProject).where(DBProject.id == project_id)
+        ).scalar_one_or_none()
+        if project is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "PROJECT_NOT_FOUND", "message": f"Project {project_id} not found"},
+            )
+        if project.revision != expectedRevision:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CONCURRENCY_CONFLICT",
+                    "message": f"Revision conflict: expected {expectedRevision}",
+                },
+            )
+
+        adapter: VideoUseAdapter = created_app.state.video_use
+        try:
+            uploaded = adapter.upload_media(
+                project_id,
+                file.filename or "media.mp4",
+                file.content_type,
+                file.file,
+            )
+        except VideoUseError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "VIDEO_USE_UPLOAD_FAILED", "message": str(exc)},
+            ) from exc
+        finally:
+            file.file.close()
+
+        metadata = uploaded.get("metadata") or {}
+        duration_seconds = float(metadata.get("durationSeconds") or 0)
+        media_type = "video" if metadata.get("video") else "audio"
+        media_id = uploaded["mediaId"]
+        material = {
+            "id": media_id,
+            "name": uploaded.get("fileName") or file.filename or media_id,
+            "url": f"/api/video-use/media/{project_id}/{media_id}",
+            "type": media_type,
+            "duration": {
+                "value": max(1, round(duration_seconds * 24_000)),
+                "timescale": 24_000,
+            },
+        }
+        materials = [*project.materials, material]
+        updated = apply_project_update(
+            db,
+            project_id,
+            UpdateProjectRequest(materials=materials, expectedRevision=expectedRevision),
+        )
+        return {"material": material, "project": project_response(updated)}
+
+    def proxy_video_use_stream(path: str):
+        adapter: VideoUseAdapter = created_app.state.video_use
+
+        def body():
+            with adapter.stream(path) as response:
+                yield from response.iter_bytes()
+
+        return StreamingResponse(body(), media_type="application/octet-stream")
+
+    @created_app.get("/video-use/media/{project_id}/{media_id}")
+    def stream_project_media(project_id: str, media_id: str):
+        return proxy_video_use_stream(f"/media/{project_id}/{media_id}")
+
     @created_app.post("/projects/{project_id}/render")
-    async def start_render_task(
+    def start_render_task(
         project_id: str,
         db: Session = Depends(db_dependency),
     ):
-        project_exists = db.execute(
-            select(DBProject.id).where(DBProject.id == project_id)
+        project = db.execute(
+            select(DBProject).where(DBProject.id == project_id)
         ).scalar_one_or_none()
-        if project_exists is None:
+        if project is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={
@@ -268,43 +362,72 @@ def create_app(
                 },
             )
 
-        task_id = str(uuid.uuid4())
+        materials = {material["id"]: material for material in project.materials}
+        ordered_clips: list[tuple[float, dict, dict]] = []
+        for track in project.timeline.get("tracks", []):
+            if track.get("type") != "video":
+                continue
+            for clip in track.get("clips", []):
+                material = materials.get(clip.get("materialId"))
+                if material is None or material.get("type") != "video":
+                    continue
+                timeline_start = clip["start"]["value"] / clip["start"]["timescale"]
+                ordered_clips.append((timeline_start, clip, material))
+
+        if not ordered_clips:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "NO_RENDERABLE_VIDEO",
+                    "message": "Upload a video and place it on a video track before rendering",
+                },
+            )
+
+        ranges = []
+        for _timeline_start, clip, material in sorted(ordered_clips, key=lambda value: value[0]):
+            source_in = clip["sourceIn"]["value"] / clip["sourceIn"]["timescale"]
+            duration = clip["duration"]["value"] / clip["duration"]["timescale"]
+            ranges.append(
+                {
+                    "mediaId": material["id"],
+                    "start": source_in,
+                    "end": source_in + duration,
+                    "note": clip.get("id"),
+                }
+            )
+
+        adapter: VideoUseAdapter = created_app.state.video_use
+        try:
+            upstream = adapter.submit_render(
+                {
+                    "projectId": project_id,
+                    "ranges": ranges,
+                    "mode": "preview",
+                    "grade": "auto",
+                    "normalizeAudio": True,
+                }
+            )
+        except VideoUseError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "VIDEO_USE_RENDER_FAILED", "message": str(exc)},
+            ) from exc
+
+        task_id = upstream["jobId"]
         active_tasks: Dict[str, dict] = created_app.state.active_tasks
         active_tasks[task_id] = {
             "taskId": task_id,
             "projectId": project_id,
-            "progress": 0,
-            "status": "pending",
-            "message": "Initializing background render task [MOCK]",
+            "progress": upstream.get("progress", 0),
+            "status": upstream.get("status", "queued"),
+            "message": upstream.get("message", "Queued in video-use"),
+            "engine": "video-use",
         }
+        return {"taskId": task_id, "status": upstream.get("status", "queued"), "mock": False}
 
-        async def simulate_task():
-            steps = (
-                (20, "processing", "Processing timeline frames... [MOCK]"),
-                (50, "processing", "Generating 480p proxy with FFmpeg... [MOCK]"),
-                (80, "processing", "Merging audio layers... [MOCK]"),
-                (100, "completed", "Render successfully completed [MOCK]"),
-            )
-            try:
-                for progress, task_status, message in steps:
-                    await asyncio.sleep(render_step_delay)
-                    if task_id not in active_tasks:
-                        return
-                    active_tasks[task_id].update(
-                        progress=progress,
-                        status=task_status,
-                        message=message,
-                    )
-            except Exception as exc:  # pragma: no cover - defensive boundary
-                logger.exception("Mock render task failed")
-                if task_id in active_tasks:
-                    active_tasks[task_id].update(
-                        status="failed",
-                        message=f"Task failed: {exc} [MOCK]",
-                    )
-
-        asyncio.create_task(simulate_task())
-        return {"taskId": task_id, "status": "pending", "mock": True}
+    @created_app.get("/renders/{task_id}/artifact")
+    def stream_render_artifact(task_id: str):
+        return proxy_video_use_stream(f"/jobs/{task_id}/artifact")
 
     @created_app.get("/events")
     async def sse_events(
@@ -320,6 +443,19 @@ def create_app(
 
                 active_tasks: Dict[str, dict] = created_app.state.active_tasks
                 for task_id, task in list(active_tasks.items()):
+                    if task["status"] not in {"completed", "failed"}:
+                        adapter: VideoUseAdapter = created_app.state.video_use
+                        try:
+                            upstream = adapter.get_job_status(task_id)
+                            task.update(
+                                progress=upstream.get("progress", task["progress"]),
+                                status=upstream.get("status", task["status"]),
+                                message=upstream.get("message", task["message"]),
+                            )
+                            if task["status"] == "completed":
+                                task["artifactUrl"] = f"/api/renders/{task_id}/artifact"
+                        except VideoUseError as exc:
+                            logger.warning("Unable to refresh video-use job %s: %s", task_id, exc)
                     yield (
                         "event: task_progress\n"
                         f"data: {json.dumps(task, separators=(',', ':'))}\n\n"

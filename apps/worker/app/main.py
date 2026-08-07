@@ -10,6 +10,7 @@ from .ffmpeg_adapter import FFmpegAdapter
 from .ai_provider import AIProviderInterface
 from .recovery import TaskRecoveryManager
 from .moneyprinter_adapter import MoneyPrinterTurboAdapter
+from .video_use_adapter import VideoUseAdapter
 
 # Configure logging
 logging.basicConfig(
@@ -66,6 +67,7 @@ class WorkerComponents:
     ai: AIProviderInterface
     recovery: TaskRecoveryManager
     moneyprinter: MoneyPrinterTurboAdapter
+    video_use: VideoUseAdapter
 
 
 def initialize_worker() -> WorkerComponents:
@@ -77,6 +79,7 @@ def initialize_worker() -> WorkerComponents:
         ai=AIProviderInterface(),
         recovery=TaskRecoveryManager(backend_url=backend_url),
         moneyprinter=moneyprinter_adapter,
+        video_use=VideoUseAdapter(),
     )
 
 
@@ -123,6 +126,12 @@ def run_worker(poll_interval: float = 10):
     logger.info("MoneyPrinterTurbo health: %s", mpt_health)
     mpt_caps = components.moneyprinter.get_capabilities()
     logger.info("MoneyPrinterTurbo capabilities: %s", mpt_caps)
+
+    logger.info("Probing video-use sidecar capabilities...")
+    video_use_health = components.video_use.check_health()
+    logger.info("video-use health: %s", video_use_health)
+    if video_use_health.get("status") == "healthy":
+        logger.info("video-use capabilities: %s", components.video_use.get_capabilities())
 
     logger.info("Worker initialization complete. Starting task execution loop...")
 

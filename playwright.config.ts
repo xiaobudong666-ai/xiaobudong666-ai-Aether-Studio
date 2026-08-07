@@ -1,5 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const python = process.env.AETHER_PYTHON || "python3";
+
 export default defineConfig({
   testDir: "./e2e",
   outputDir: "test-results",
@@ -25,7 +27,7 @@ export default defineConfig({
     {
       command:
         "PYTHONPATH=apps/api DATABASE_URL=sqlite:////tmp/aether-playwright.db " +
-        "python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000",
+        `${python} -m uvicorn app.main:app --host 127.0.0.1 --port 8000`,
       url: "http://127.0.0.1:8000/health",
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
