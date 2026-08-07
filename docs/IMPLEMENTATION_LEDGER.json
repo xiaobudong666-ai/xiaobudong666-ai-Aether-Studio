@@ -78,6 +78,19 @@
         "GitHub Actions Docker Compose job"
       ],
       "boundary": "OpenReel is a browser-local fallback. The exported project contains relinkable placeholders rather than media blobs; a separate-window editor URL is shown only when explicitly configured."
+    },
+    "M5-0": {
+      "status": "READY_FOR_TARGET",
+      "description": "Production-shaped Compose hardening, environment template, loopback operator ports, persistent volumes, deployment runbook, and same-origin smoke gate.",
+      "runbook": "docs/PRODUCTION_DEPLOYMENT.md",
+      "acceptance_pending": [
+        "M4-0 acceptance",
+        "M5 pull request and CI",
+        "Production Docker host or container platform",
+        "TLS ingress or explicit private-only access decision",
+        "Target-host backup and real-media smoke verification"
+      ],
+      "boundary": "No host, SSH target, domain, or TLS endpoint has been provided. Repository launch readiness is not represented as an external deployment. Paid provider features remain unavailable until separately configured and tested."
     }
   }
 }

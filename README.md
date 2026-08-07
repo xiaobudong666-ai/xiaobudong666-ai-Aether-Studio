@@ -155,6 +155,11 @@ SQLite data in the `sqlite-db` named volume is preserved. The only permitted
 unique `COMPOSE_PROJECT_NAME` for each workflow run and removes only its own
 disposable, run-scoped volumes.
 
+For a production-shaped launch, copy `infra/docker/.env.example`, keep its
+Compose project name stable, start with `--wait`, and run
+`infra/docker/production-smoke.sh`. The target-specific TLS, backup, provider,
+and acceptance gates are documented in `docs/PRODUCTION_DEPLOYMENT.md`.
+
 The GitHub Actions workflow has three required jobs:
 
 1. Lint, build, JavaScript tests, API tests, and Worker tests.

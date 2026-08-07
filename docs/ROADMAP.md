@@ -51,8 +51,16 @@ This document outlines the high-level roadmap and current milestone progress for
   - Expose a separate-window editor link only when `VITE_OPENREEL_URL` is explicitly configured.
   - Keep Aether storage and server-side rendering authoritative.
 
-### [M5-0] Production Deployment and Launch (BLOCKED ON TARGET CONFIG)
-- **Status**: Deployment manifests and health gates are in progress; a production host/domain and secrets are still required for an actual public launch.
+### [M5-0] Production Deployment and Launch (READY FOR TARGET)
+- **Status**: Compose hardening, environment template, persistent volumes, and same-origin smoke gates are implemented locally. An actual host change remains blocked on target configuration.
+- **Runbook**: `docs/PRODUCTION_DEPLOYMENT.md`
+- **Implemented safeguards**:
+  - MoneyPrinterTurbo and video-use remain internal-only; no Sidecar host ports are published.
+  - Both Sidecar images shallow-fetch and verify their pinned upstream commit; MoneyPrinterTurbo avoids location-specific package mirrors.
+  - API and Worker diagnostic ports bind to loopback only.
+  - The public Web listener is configurable for direct or reverse-proxy deployment.
+  - All services set `no-new-privileges`; persistent volume teardown is excluded from operator commands.
+  - A production smoke script verifies Web, API, and both Sidecar capability paths through the same origin.
 - **Required external configuration**:
   - VPS or container host and domain/TLS termination.
   - ElevenLabs key for Scribe transcription.
