@@ -41,12 +41,15 @@ This document outlines the high-level roadmap and current milestone progress for
   - Lazy-load the 3 MB WASM chunk only when OpenCut export is requested.
   - Keep Canonical Timeline persistence and server-side video-use rendering as the source of truth.
 
-### [M4-0] OpenReel Compatibility Adapter (PLANNED FALLBACK)
-- **Status**: Planned after OpenCut integration.
+### [M4-0] OpenReel Compatibility Adapter (IN DEVELOPMENT)
+- **Status**: Implemented locally after M3-0; PR/CI acceptance remains pending.
+- **Evidence**: `docs/evidence/M4-0-VERIFICATION.md`
 - **Boundary**: OpenReel remains a feature-flagged fallback, not a second default editor runtime.
 - **Key Features**:
-  - Provide a compatibility adapter for the same Canonical Timeline and media contracts.
-  - Prove import/export and preview capability without duplicating Aether project storage.
+  - Export OpenReel's actual `1.0.0` project-file schema from the same Canonical Timeline and media contracts.
+  - Preserve media as explicit relinkable placeholders instead of duplicating browser-local blobs.
+  - Expose a separate-window editor link only when `VITE_OPENREEL_URL` is explicitly configured.
+  - Keep Aether storage and server-side rendering authoritative.
 
 ### [M5-0] Production Deployment and Launch (BLOCKED ON TARGET CONFIG)
 - **Status**: Deployment manifests and health gates are in progress; a production host/domain and secrets are still required for an actual public launch.

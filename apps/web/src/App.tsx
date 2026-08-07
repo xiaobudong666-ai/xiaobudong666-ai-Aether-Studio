@@ -15,6 +15,7 @@ export default function App() {
 
   // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
+  const OPENREEL_URL = (import.meta.env.VITE_OPENREEL_URL || "").trim();
 
   // 1. Fetch projects on load
   const fetchProjects = async () => {
@@ -261,6 +262,21 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportOpenReelProject = async () => {
+    if (!currentProject) return;
+    const { createOpenReelProjectFile } = await import("@aether/editor");
+    const projectFile = createOpenReelProjectFile(currentProject);
+    const blob = new Blob([JSON.stringify(projectFile, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${currentProject.name.replace(/[^a-zA-Z0-9_-]+/g, "-") || "aether-project"}.openreel.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   // Calculate timeline total duration
   const getTimelineDuration = (): RationalTime => {
     if (!currentProject) return new RationalTime(0, 24000);
@@ -320,6 +336,19 @@ export default function App() {
           >
             Export OpenCut Snapshot
           </button>
+          <button
+            type="button"
+            disabled={!currentProject}
+            onClick={handleExportOpenReelProject}
+            title="Export an OpenReel schema 1.0.0 project file with relinkable media placeholders"
+          >
+            Export OpenReel Project
+          </button>
+          {OPENREEL_URL && (
+            <a href={OPENREEL_URL} target="_blank" rel="noreferrer noopener">
+              Open OpenReel
+            </a>
+          )}
         </div>
       </header>
 

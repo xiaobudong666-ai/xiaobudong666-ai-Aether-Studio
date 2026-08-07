@@ -61,6 +61,23 @@
         "GitHub Actions Docker Compose job"
       ],
       "boundary": "OpenCut Classic is archived and is not deployed as a core runtime. The official rewrite has not released its Editor API, plugin API, MCP server, or headless mode. Compatibility snapshots are explicit exports rather than a claim of one-click bidirectional editor embedding."
+    },
+    "M4-0": {
+      "status": "IN_DEVELOPMENT",
+      "description": "Feature-gated OpenReel fallback with an actual schema 1.0.0 project export and relinkable media placeholders.",
+      "upstream_version": "0.1.1-beta",
+      "upstream_commit": "8459024d4c82ee16a2e14537553884a623ae9c4e",
+      "project_schema": "1.0.0",
+      "license": "MIT",
+      "evidence": "docs/evidence/M4-0-VERIFICATION.md",
+      "acceptance_pending": [
+        "M3-0 acceptance",
+        "M4 pull request",
+        "GitHub Actions lint/build/unit job",
+        "GitHub Actions Playwright job",
+        "GitHub Actions Docker Compose job"
+      ],
+      "boundary": "OpenReel is a browser-local fallback. The exported project contains relinkable placeholders rather than media blobs; a separate-window editor URL is shown only when explicitly configured."
     }
   }
 }

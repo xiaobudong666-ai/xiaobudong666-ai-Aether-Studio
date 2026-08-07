@@ -225,6 +225,25 @@ The Classic application is archived and the official rewrite has not released
 its Editor API yet. Aether therefore does not embed or depend on the archived
 runtime. See `docs/evidence/M3-0-VERIFICATION.md` for the exact boundary.
 
+## M4-0 OpenReel fallback compatibility
+
+- **Repository**: [Augani/openreel-video](https://github.com/Augani/openreel-video)
+- **Version**: `0.1.1` beta
+- **Audited commit**: `8459024d4c82ee16a2e14537553884a623ae9c4e`
+- **Project schema**: `1.0.0`
+- **License**: MIT
+
+Aether exports a real OpenReel project file containing settings, media
+placeholders, tracks, clips, trims, transforms, and the authoritative timeline
+duration. OpenReel can relink placeholder assets through its existing project
+import flow. If `VITE_OPENREEL_URL` is configured at build time, the workbench
+also exposes a separate-window link; no URL or untrusted iframe is enabled by
+default.
+
+OpenReel remains a fallback editor. It never owns Aether project persistence,
+server credentials, or final server-side rendering. See
+`docs/evidence/M4-0-VERIFICATION.md`.
+
 ## M1-0 MoneyPrinterTurbo Sidecar Integration
 
 We have integrated a decoupled, isolated Client Adapter for the **MoneyPrinterTurbo** upstream tool.

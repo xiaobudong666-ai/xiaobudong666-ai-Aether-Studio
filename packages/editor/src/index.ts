@@ -1,6 +1,7 @@
 import { RationalTime, MaterialDTO, ClipDTO, TimelineDTO } from "@aether/contracts";
 
 export * from "./opencut";
+export * from "./openreel";
 
 /**
  * IMaterialLoader defines the abstract layer for loading materials
