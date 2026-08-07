@@ -18,8 +18,7 @@ RUN git init /opt/video-use \
 WORKDIR /service
 
 COPY apps/video_use/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir -e /opt/video-use
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY apps/video_use/app /service/app
 COPY apps/video_use/ci_smoke.py /service/ci_smoke.py
