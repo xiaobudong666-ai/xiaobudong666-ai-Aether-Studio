@@ -274,7 +274,10 @@ def create_app(
     upstream_root: Path | None = None,
     executor: ThreadPoolExecutor | None = None,
 ) -> FastAPI:
-    root = Path(media_root or os.environ.get("VIDEO_USE_MEDIA_ROOT", "/media"))
+    root = Path(
+        media_root
+        or os.environ.get("VIDEO_USE_MEDIA_ROOT", ".local/video-use-media")
+    )
     upstream = Path(upstream_root or os.environ.get("VIDEO_USE_UPSTREAM_ROOT", "/opt/video-use"))
     store = MediaStore(root)
     jobs = JobStore(root)
