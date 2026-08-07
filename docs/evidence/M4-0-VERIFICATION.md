@@ -1,13 +1,17 @@
 # M4-0 OpenReel Compatibility Verification
 
-## Candidate scope
+## Accepted scope
 
 - Upstream: [Augani/openreel-video](https://github.com/Augani/openreel-video)
 - Upstream version: `0.1.1` beta
 - Audited commit: `8459024d4c82ee16a2e14537553884a623ae9c4e`
 - Project-file schema: `1.0.0`
 - License: MIT
-- Acceptance status: `IN_DEVELOPMENT`
+- Acceptance status: `ACCEPTED`
+- Implementation PR: [#6](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/6)
+- Accepted merge commit: `35798c63a7614cb4fa4856109d8dc2fb942450fa`
+- Verified head: `ac18a613085842db268c2a6d75f63b9bd95b0efd`
+- Authoritative CI: [run 31](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31207113712)
 
 OpenReel is a client-side editor rather than a backend editing API. Its audited
 serializer writes `{ version: "1.0.0", project, metadata }` and imports missing
@@ -34,6 +38,14 @@ media blobs as placeholders. M4 targets that public project-file contract.
 | TypeScript and Vite production build | Passed |
 | ESLint | Passed |
 | `git diff --check` | Passed |
+
+## Authoritative CI evidence
+
+- Lint, build, JavaScript/WASM tests, API tests, Worker tests, and video-use
+  tests passed.
+- Playwright passed and uploaded its evidence artifact.
+- Docker Compose built the pinned Sidecars, started a healthy same-origin stack,
+  verified FFmpeg/ffprobe, executed a real video-use render, and uploaded logs.
 
 ## Explicit boundaries
 

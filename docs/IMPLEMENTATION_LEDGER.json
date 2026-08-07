@@ -47,7 +47,9 @@
       }
     },
     "M3-0": {
-      "status": "IN_REVIEW",
+      "status": "ACCEPTED",
+      "commit": "35798c63a7614cb4fa4856109d8dc2fb942450fa",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31207113712",
       "description": "Pinned OpenCut Rust/WASM timing integration and Classic v31 compatibility snapshot export.",
       "upstream_package": "opencut-wasm",
       "upstream_version": "0.2.10",
@@ -55,38 +57,45 @@
       "classic_audit_commit": "cf5e79e919144200294fb9fed22a222592a0aeea",
       "license": "MIT",
       "evidence": "docs/evidence/M3-0-VERIFICATION.md",
-      "acceptance_pending": [
-        "M3 pull request",
-        "GitHub Actions lint/build/unit job",
-        "GitHub Actions Playwright job",
-        "GitHub Actions Docker Compose job"
+      "acceptance_evidence": [
+        "Pull request #6 merged after review readiness",
+        "GitHub Actions lint/build/unit job passed",
+        "GitHub Actions Playwright job passed with artifact",
+        "GitHub Actions Docker Compose job passed with real pinned-upstream render"
       ],
       "boundary": "OpenCut Classic is archived and is not deployed as a core runtime. The official rewrite has not released its Editor API, plugin API, MCP server, or headless mode. Compatibility snapshots are explicit exports rather than a claim of one-click bidirectional editor embedding."
     },
     "M4-0": {
-      "status": "IN_REVIEW",
+      "status": "ACCEPTED",
+      "commit": "35798c63a7614cb4fa4856109d8dc2fb942450fa",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31207113712",
       "description": "Feature-gated OpenReel fallback with an actual schema 1.0.0 project export and relinkable media placeholders.",
       "upstream_version": "0.1.1-beta",
       "upstream_commit": "8459024d4c82ee16a2e14537553884a623ae9c4e",
       "project_schema": "1.0.0",
       "license": "MIT",
       "evidence": "docs/evidence/M4-0-VERIFICATION.md",
-      "acceptance_pending": [
-        "M3-0 acceptance",
-        "M4 pull request",
-        "GitHub Actions lint/build/unit job",
-        "GitHub Actions Playwright job",
-        "GitHub Actions Docker Compose job"
+      "acceptance_evidence": [
+        "M3-0 accepted in the same ordered pull request",
+        "Pull request #6 merged after review readiness",
+        "GitHub Actions lint/build/unit job passed",
+        "GitHub Actions Playwright job passed with artifact",
+        "GitHub Actions Docker Compose job passed with real pinned-upstream render"
       ],
       "boundary": "OpenReel is a browser-local fallback. The exported project contains relinkable placeholders rather than media blobs; a separate-window editor URL is shown only when explicitly configured."
     },
     "M5-0": {
       "status": "READY_FOR_TARGET",
+      "commit": "35798c63a7614cb4fa4856109d8dc2fb942450fa",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31207113712",
       "description": "Production-shaped Compose hardening, environment template, loopback operator ports, persistent volumes, deployment runbook, and same-origin smoke gate.",
       "runbook": "docs/PRODUCTION_DEPLOYMENT.md",
-      "acceptance_pending": [
-        "M4-0 acceptance",
-        "M5 pull request and CI",
+      "repository_acceptance_evidence": [
+        "M4-0 accepted in the same ordered pull request",
+        "Pull request #6 merged after all three GitHub Actions jobs passed",
+        "Production smoke gate committed and shell syntax verified"
+      ],
+      "target_pending": [
         "Production Docker host or container platform",
         "TLS ingress or explicit private-only access decision",
         "Target-host backup and real-media smoke verification"
