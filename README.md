@@ -231,7 +231,9 @@ server-side video-use render remain the source of truth.
 
 The Classic application is archived and the official rewrite has not released
 its Editor API yet. Aether therefore does not embed or depend on the archived
-runtime. See `docs/evidence/M3-0-VERIFICATION.md` for the exact boundary.
+runtime. M3-0 was accepted in PR #6 on merge commit
+`35798c63a7614cb4fa4856109d8dc2fb942450fa` after all three CI jobs passed.
+See `docs/evidence/M3-0-VERIFICATION.md` for the exact boundary.
 
 ## M4-0 OpenReel fallback compatibility
 
@@ -249,8 +251,9 @@ also exposes a separate-window link; no URL or untrusted iframe is enabled by
 default.
 
 OpenReel remains a fallback editor. It never owns Aether project persistence,
-server credentials, or final server-side rendering. See
-`docs/evidence/M4-0-VERIFICATION.md`.
+server credentials, or final server-side rendering. M4-0 was accepted in PR #6
+on merge commit `35798c63a7614cb4fa4856109d8dc2fb942450fa` after all three CI
+jobs passed. See `docs/evidence/M4-0-VERIFICATION.md`.
 
 ## M1-0 MoneyPrinterTurbo Sidecar Integration
 

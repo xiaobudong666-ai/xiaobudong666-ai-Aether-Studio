@@ -1,6 +1,6 @@
 # M3-0 OpenCut Compatibility Core Verification
 
-## Candidate scope
+## Accepted scope
 
 - Official rewrite: [opencut-app/opencut](https://github.com/opencut-app/opencut)
 - Audited rewrite commit: `400f097becba5db0fbc305d5a65348cb81c20356`
@@ -9,7 +9,11 @@
 - Pinned package: `opencut-wasm@0.2.10`
 - Package integrity: `sha512-dy+Z9SWwpjLjgmTAMQoMMIUmdbUk9OXoWXLoacl9xT9TCrekIGSeMM0F7bJ1H3VJwwUxbGasaVibvn5AfmeZrg==`
 - License: MIT
-- Acceptance status: `IN_DEVELOPMENT`
+- Acceptance status: `ACCEPTED`
+- Implementation PR: [#6](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/6)
+- Accepted merge commit: `35798c63a7614cb4fa4856109d8dc2fb942450fa`
+- Verified head: `ac18a613085842db268c2a6d75f63b9bd95b0efd`
+- Authoritative CI: [run 31](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31207113712)
 
 The official rewrite states that its Editor API, plugin system, MCP server, and
 headless mode are forthcoming. The official Classic repository states that it
@@ -39,6 +43,14 @@ Rust/WASM core without deploying the archived application.
 | TypeScript and Vite production build | Passed |
 | ESLint | Passed |
 | `git diff --check` | Passed |
+
+## Authoritative CI evidence
+
+- Lint, build, JavaScript/WASM tests, API tests, Worker tests, and video-use
+  tests passed.
+- Playwright passed and uploaded its evidence artifact.
+- Docker Compose built the pinned Sidecars, started a healthy same-origin stack,
+  verified FFmpeg/ffprobe, executed a real video-use render, and uploaded logs.
 
 ## Explicit boundaries
 
