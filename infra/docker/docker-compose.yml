@@ -71,7 +71,7 @@ services:
       context: ../..
       dockerfile: infra/docker/api.Dockerfile
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${AETHER_API_PORT:-8000}:8000"
     volumes:
       - sqlite-db:/data
     networks:
@@ -104,7 +104,7 @@ services:
       context: ../..
       dockerfile: infra/docker/worker.Dockerfile
     ports:
-      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:${AETHER_WORKER_PORT:-8001}:8001"
     networks:
       - aether-net
     environment:
@@ -137,8 +137,10 @@ services:
     build:
       context: ../..
       dockerfile: infra/docker/web.Dockerfile
+      args:
+        VITE_OPENREEL_URL: ${VITE_OPENREEL_URL:-}
     ports:
-      - "80:80"
+      - "${AETHER_HTTP_BIND:-0.0.0.0}:${AETHER_HTTP_PORT:-80}:80"
     networks:
       - aether-net
     depends_on:

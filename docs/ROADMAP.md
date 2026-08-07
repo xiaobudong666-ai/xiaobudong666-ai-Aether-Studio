@@ -21,8 +21,10 @@ This document outlines the high-level roadmap and current milestone progress for
   - Configuration examples without embedding credentials.
   - Dedicated unit and integration tests verifying HTTP endpoints, timeouts, and fallback modes.
 
-### [M2-0] Real Media Processing and Video-Use (IN REVIEW)
-- **Status**: Implemented on `agent/m2-0-real-media-video-use`; awaiting PR/CI acceptance.
+### [M2-0] Real Media Processing and Video-Use (ACCEPTED)
+- **Status**: Merged and fully verified.
+- **Commit**: `8e81ba20ab33bff5d089f738fe535bb9346e6a28`
+- **CI**: [GitHub Actions run 29](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31205880579)
 - **Evidence**: `docs/evidence/M2-0-VERIFICATION.md`
 - **Key Features**:
   - Replace the Worker FFmpeg mock with actual probe, proxy, and audio extraction operations.
@@ -31,23 +33,36 @@ This document outlines the high-level roadmap and current milestone progress for
   - Add real upload/probe, EDL rendering, task progress, timeline-view, transcription, and artifact endpoints.
   - Connect project timelines to the Sidecar through the same-origin API and expose MP4 downloads.
 
-### [M3-0] OpenCut Classic Editor Integration (NEXT)
-- **Status**: Next after M2-0 is accepted.
-- **Boundary**: Use the current production-recommended `opencut-classic` line at an audited commit. The actively rewritten OpenCut main branch is not a stable embedding target yet.
+### [M3-0] OpenCut Compatibility Core (IN REVIEW)
+- **Status**: Implemented after M2-0; PR/CI acceptance remains pending.
+- **Evidence**: `docs/evidence/M3-0-VERIFICATION.md`
+- **Boundary**: OpenCut Classic is officially archived and the rewrite's Editor API is not released. Aether integrates the pinned `opencut-wasm@0.2.10` core and a Classic v31 snapshot adapter without making the archived application a runtime dependency.
 - **Key Features**:
-  - Embed the editor in the Aether workbench through a narrow project/media adapter.
-  - Map OpenCut project state to Canonical Timeline without replacing the server render source of truth.
-  - Preserve same-origin routing, local preview, and server-side final rendering.
+  - Use the real OpenCut Rust/WASM media-time and frame-alignment implementation.
+  - Translate Aether projects, tracks, clips, trims, and media references into an audited compatibility snapshot.
+  - Lazy-load the 3 MB WASM chunk only when OpenCut export is requested.
+  - Keep Canonical Timeline persistence and server-side video-use rendering as the source of truth.
 
-### [M4-0] OpenReel Compatibility Adapter (PLANNED FALLBACK)
-- **Status**: Planned after OpenCut integration.
+### [M4-0] OpenReel Compatibility Adapter (IN REVIEW)
+- **Status**: Implemented after M3-0; PR/CI acceptance remains pending.
+- **Evidence**: `docs/evidence/M4-0-VERIFICATION.md`
 - **Boundary**: OpenReel remains a feature-flagged fallback, not a second default editor runtime.
 - **Key Features**:
-  - Provide a compatibility adapter for the same Canonical Timeline and media contracts.
-  - Prove import/export and preview capability without duplicating Aether project storage.
+  - Export OpenReel's actual `1.0.0` project-file schema from the same Canonical Timeline and media contracts.
+  - Preserve media as explicit relinkable placeholders instead of duplicating browser-local blobs.
+  - Expose a separate-window editor link only when `VITE_OPENREEL_URL` is explicitly configured.
+  - Keep Aether storage and server-side rendering authoritative.
 
-### [M5-0] Production Deployment and Launch (BLOCKED ON TARGET CONFIG)
-- **Status**: Deployment manifests and health gates are in progress; a production host/domain and secrets are still required for an actual public launch.
+### [M5-0] Production Deployment and Launch (READY FOR TARGET)
+- **Status**: Compose hardening, environment template, persistent volumes, and same-origin smoke gates are implemented. An actual host change remains blocked on target configuration.
+- **Runbook**: `docs/PRODUCTION_DEPLOYMENT.md`
+- **Implemented safeguards**:
+  - MoneyPrinterTurbo and video-use remain internal-only; no Sidecar host ports are published.
+  - Both Sidecar images shallow-fetch and verify their pinned upstream commit; MoneyPrinterTurbo avoids location-specific package mirrors.
+  - API and Worker diagnostic ports bind to loopback only.
+  - The public Web listener is configurable for direct or reverse-proxy deployment.
+  - All services set `no-new-privileges`; persistent volume teardown is excluded from operator commands.
+  - A production smoke script verifies Web, API, and both Sidecar capability paths through the same origin.
 - **Required external configuration**:
   - VPS or container host and domain/TLS termination.
   - ElevenLabs key for Scribe transcription.

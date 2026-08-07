@@ -155,6 +155,11 @@ SQLite data in the `sqlite-db` named volume is preserved. The only permitted
 unique `COMPOSE_PROJECT_NAME` for each workflow run and removes only its own
 disposable, run-scoped volumes.
 
+For a production-shaped launch, copy `infra/docker/.env.example`, keep its
+Compose project name stable, start with `--wait`, and run
+`infra/docker/production-smoke.sh`. The target-specific TLS, backup, provider,
+and acceptance gates are documented in `docs/PRODUCTION_DEPLOYMENT.md`.
+
 The GitHub Actions workflow has three required jobs:
 
 1. Lint, build, JavaScript tests, API tests, and Worker tests.
@@ -202,8 +207,50 @@ named volume, and exposes only validated media/job contracts. An
 `ELEVENLABS_API_KEY` enables the real Scribe transcription path; without it the
 capability is reported as unconfigured and no transcript is fabricated.
 
-See `docs/evidence/M2-0-VERIFICATION.md` for candidate verification and the
-CI evidence still required before acceptance.
+M2-0 is accepted on merge commit
+`8e81ba20ab33bff5d089f738fe535bb9346e6a28`. All three required jobs passed in
+[GitHub Actions run 29](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31205880579),
+including the fixed-upstream real MP4 render. See
+`docs/evidence/M2-0-VERIFICATION.md` for the complete boundary.
+
+## M3-0 OpenCut compatibility core
+
+- **Official rewrite repository**: [opencut-app/opencut](https://github.com/opencut-app/opencut)
+- **Audited rewrite commit**: `400f097becba5db0fbc305d5a65348cb81c20356`
+- **Compatibility source**: [opencut-app/opencut-classic](https://github.com/opencut-app/opencut-classic)
+- **Audited Classic commit**: `cf5e79e919144200294fb9fed22a222592a0aeea`
+- **Pinned package**: `opencut-wasm@0.2.10`
+- **License**: MIT
+
+Aether uses OpenCut's published Rust/WASM timing core for deterministic media
+ticks, frame alignment, and Classic v31 compatibility snapshots. The WebAssembly
+chunk is loaded only when the user exports a snapshot, so it does not increase
+the initial workbench JavaScript payload. The snapshot contains the translated
+scene, tracks, clips, and a media manifest while Aether's Canonical Timeline and
+server-side video-use render remain the source of truth.
+
+The Classic application is archived and the official rewrite has not released
+its Editor API yet. Aether therefore does not embed or depend on the archived
+runtime. See `docs/evidence/M3-0-VERIFICATION.md` for the exact boundary.
+
+## M4-0 OpenReel fallback compatibility
+
+- **Repository**: [Augani/openreel-video](https://github.com/Augani/openreel-video)
+- **Version**: `0.1.1` beta
+- **Audited commit**: `8459024d4c82ee16a2e14537553884a623ae9c4e`
+- **Project schema**: `1.0.0`
+- **License**: MIT
+
+Aether exports a real OpenReel project file containing settings, media
+placeholders, tracks, clips, trims, transforms, and the authoritative timeline
+duration. OpenReel can relink placeholder assets through its existing project
+import flow. If `VITE_OPENREEL_URL` is configured at build time, the workbench
+also exposes a separate-window link; no URL or untrusted iframe is enabled by
+default.
+
+OpenReel remains a fallback editor. It never owns Aether project persistence,
+server credentials, or final server-side rendering. See
+`docs/evidence/M4-0-VERIFICATION.md`.
 
 ## M1-0 MoneyPrinterTurbo Sidecar Integration
 
@@ -248,6 +295,6 @@ M1-0 is accepted on implementation merge commit
 - no uncommitted changes;
 - an explicit record of remaining mock boundaries.
 
-The canonical evidence is `docs/evidence/M1-0-VERIFICATION.md`. This acceptance
-does not start M2: real media processing and `video-use` remain future work and
-require separate authorization.
+The canonical evidence is `docs/evidence/M1-0-VERIFICATION.md`. That acceptance
+did not pre-authorize M2; real media processing and `video-use` were later
+implemented and accepted through a separate milestone and pull request.

@@ -13,6 +13,14 @@ pytest-of-root/
 venv/
 env/
 
+# Local credentials and deployment configuration
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
 # Build outputs
 dist/
 build/

@@ -15,6 +15,7 @@ export default function App() {
 
   // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
+  const OPENREEL_URL = (import.meta.env.VITE_OPENREEL_URL || "").trim();
 
   // 1. Fetch projects on load
   const fetchProjects = async () => {
@@ -246,6 +247,36 @@ export default function App() {
     }
   };
 
+  const handleExportOpenCutSnapshot = async () => {
+    if (!currentProject) return;
+    const { createOpenCutCompatibilitySnapshot } = await import("@aether/editor");
+    const snapshot = createOpenCutCompatibilitySnapshot(currentProject);
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${currentProject.name.replace(/[^a-zA-Z0-9_-]+/g, "-") || "aether-project"}.opencut.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportOpenReelProject = async () => {
+    if (!currentProject) return;
+    const { createOpenReelProjectFile } = await import("@aether/editor");
+    const projectFile = createOpenReelProjectFile(currentProject);
+    const blob = new Blob([JSON.stringify(projectFile, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${currentProject.name.replace(/[^a-zA-Z0-9_-]+/g, "-") || "aether-project"}.openreel.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   // Calculate timeline total duration
   const getTimelineDuration = (): RationalTime => {
     if (!currentProject) return new RationalTime(0, 24000);
@@ -272,6 +303,9 @@ export default function App() {
       <header className="editor-header">
         <div className="editor-logo">
           <span>✨</span> Aether Studio AI Anime Workbench
+          <span style={{ fontSize: "11px", color: "#a1a1aa", marginLeft: "8px" }}>
+            OpenCut Core 0.2.10
+          </span>
         </div>
         <div className="project-select-container">
           {apiError && <span style={{ fontSize: "12px", color: "#f59e0b" }}>⚠️ {apiError}</span>}
@@ -294,6 +328,27 @@ export default function App() {
               </option>
             ))}
           </select>
+          <button
+            type="button"
+            disabled={!currentProject}
+            onClick={handleExportOpenCutSnapshot}
+            title="Export a pinned OpenCut Classic compatibility snapshot and media manifest"
+          >
+            Export OpenCut Snapshot
+          </button>
+          <button
+            type="button"
+            disabled={!currentProject}
+            onClick={handleExportOpenReelProject}
+            title="Export an OpenReel schema 1.0.0 project file with relinkable media placeholders"
+          >
+            Export OpenReel Project
+          </button>
+          {OPENREEL_URL && (
+            <a href={OPENREEL_URL} target="_blank" rel="noreferrer noopener">
+              Open OpenReel
+            </a>
+          )}
         </div>
       </header>
 
