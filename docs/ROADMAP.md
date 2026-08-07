@@ -9,8 +9,10 @@ This document outlines the high-level roadmap and current milestone progress for
 - **Commit**: `507f61d3a85b9eb6d14af13426d0353ad05a59f9`
 - **Key Features**: Three-panel workbench React app, FastAPI API, isolated worker, SQLite WAL with optimistic locking, same-origin router topology, Playwright end-to-end tests, and GitHub Actions gates.
 
-### [M1-0] MoneyPrinterTurbo Sidecar Adapter Integration (IN_PROGRESS)
-- **Status**: In Progress (Refactoring & Verification Phase).
+### [M1-0] MoneyPrinterTurbo Sidecar Adapter Integration (ACCEPTED)
+- **Status**: Completed and fully verified.
+- **Commit**: `1e916bf66e3f9e87cc2329cf6df94333d4f49744`
+- **Evidence**: `docs/evidence/M1-0-VERIFICATION.md`
 - **Key Features**:
   - Independent `MoneyPrinterTurboAdapter` in the background Worker and FastAPI API.
   - Pin upstream to a fixed, auditable version of MoneyPrinterTurbo (`v1.2.7`, commit `475f21147f0808f5ffe3f58af9ab794b28a4da2c`).
@@ -20,7 +22,7 @@ This document outlines the high-level roadmap and current milestone progress for
   - Dedicated unit and integration tests verifying HTTP endpoints, timeouts, and fallback modes.
 
 ### [M2-0] Real Media Processing and Video-Use (FUTURE)
-- **Status**: Planned.
+- **Status**: Planned; not started or authorized by the M1-0 acceptance.
 - **Key Features**:
   - Transition from mock FFmpeg processing to actual media composition.
   - Introduce `video-use` capabilities.
