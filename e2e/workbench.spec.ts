@@ -27,6 +27,8 @@ test("creates a project and exposes the real-media workbench", async ({
 
   await expect(page.getByText("Upload Real Media")).toBeVisible();
   await expect(page.getByRole("button", { name: /Render with video-use/ })).toBeDisabled();
+  await expect(page.getByText("OpenCut Core 0.2.10")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Export OpenCut Snapshot" })).toBeEnabled();
 
   await page.screenshot({
     path: testInfo.outputPath("aether-workbench.png"),

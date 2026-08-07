@@ -31,13 +31,15 @@ This document outlines the high-level roadmap and current milestone progress for
   - Add real upload/probe, EDL rendering, task progress, timeline-view, transcription, and artifact endpoints.
   - Connect project timelines to the Sidecar through the same-origin API and expose MP4 downloads.
 
-### [M3-0] OpenCut Classic Editor Integration (NEXT)
-- **Status**: Next after M2-0 is accepted.
-- **Boundary**: Use the current production-recommended `opencut-classic` line at an audited commit. The actively rewritten OpenCut main branch is not a stable embedding target yet.
+### [M3-0] OpenCut Compatibility Core (IN DEVELOPMENT)
+- **Status**: Implemented locally after M2-0; PR/CI acceptance remains pending.
+- **Evidence**: `docs/evidence/M3-0-VERIFICATION.md`
+- **Boundary**: OpenCut Classic is officially archived and the rewrite's Editor API is not released. Aether integrates the pinned `opencut-wasm@0.2.10` core and a Classic v31 snapshot adapter without making the archived application a runtime dependency.
 - **Key Features**:
-  - Embed the editor in the Aether workbench through a narrow project/media adapter.
-  - Map OpenCut project state to Canonical Timeline without replacing the server render source of truth.
-  - Preserve same-origin routing, local preview, and server-side final rendering.
+  - Use the real OpenCut Rust/WASM media-time and frame-alignment implementation.
+  - Translate Aether projects, tracks, clips, trims, and media references into an audited compatibility snapshot.
+  - Lazy-load the 3 MB WASM chunk only when OpenCut export is requested.
+  - Keep Canonical Timeline persistence and server-side video-use rendering as the source of truth.
 
 ### [M4-0] OpenReel Compatibility Adapter (PLANNED FALLBACK)
 - **Status**: Planned after OpenCut integration.

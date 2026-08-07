@@ -205,6 +205,26 @@ capability is reported as unconfigured and no transcript is fabricated.
 See `docs/evidence/M2-0-VERIFICATION.md` for candidate verification and the
 CI evidence still required before acceptance.
 
+## M3-0 OpenCut compatibility core
+
+- **Official rewrite repository**: [opencut-app/opencut](https://github.com/opencut-app/opencut)
+- **Audited rewrite commit**: `400f097becba5db0fbc305d5a65348cb81c20356`
+- **Compatibility source**: [opencut-app/opencut-classic](https://github.com/opencut-app/opencut-classic)
+- **Audited Classic commit**: `cf5e79e919144200294fb9fed22a222592a0aeea`
+- **Pinned package**: `opencut-wasm@0.2.10`
+- **License**: MIT
+
+Aether uses OpenCut's published Rust/WASM timing core for deterministic media
+ticks, frame alignment, and Classic v31 compatibility snapshots. The WebAssembly
+chunk is loaded only when the user exports a snapshot, so it does not increase
+the initial workbench JavaScript payload. The snapshot contains the translated
+scene, tracks, clips, and a media manifest while Aether's Canonical Timeline and
+server-side video-use render remain the source of truth.
+
+The Classic application is archived and the official rewrite has not released
+its Editor API yet. Aether therefore does not embed or depend on the archived
+runtime. See `docs/evidence/M3-0-VERIFICATION.md` for the exact boundary.
+
 ## M1-0 MoneyPrinterTurbo Sidecar Integration
 
 We have integrated a decoupled, isolated Client Adapter for the **MoneyPrinterTurbo** upstream tool.
