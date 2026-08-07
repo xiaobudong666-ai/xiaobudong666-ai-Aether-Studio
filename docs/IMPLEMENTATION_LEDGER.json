@@ -17,11 +17,32 @@
       "security_boundary": "Access is completely isolated via local same-origin Sidecar/Adapter network requests. No credentials or API tokens are hardcoded. Degradation fallback is provided.",
       "evidence": "docs/evidence/M1-0-VERIFICATION.md",
       "remaining_mock_boundaries": {
-        "ffmpeg_real_media": "Real FFmpeg transcoding/rendering is still a mock; M0-0 behavior remains.",
+        "ffmpeg_real_media": "At M1-0 acceptance, real FFmpeg transcoding/rendering was still a mock; M2-0 later replaces this boundary.",
         "ai_style_transfer_and_subtitles": "Real AI generation and subtitle processing in AIProvider remains a mock.",
         "video-use": "video-use is reserved for M2 and not integrated in M1-0."
       },
-      "m2_boundary": "M2 remains FUTURE and is not started or authorized by this M1-0 acceptance."
+      "m2_boundary": "M2 was authorized separately after M1-0 acceptance; this record does not pre-accept M2."
+    },
+    "M2-0": {
+      "status": "IN_REVIEW",
+      "description": "Real FFmpeg media processing plus an isolated, pinned browser-use/video-use Sidecar and same-origin project render flow.",
+      "upstream_version": "0.1.0",
+      "upstream_commit": "92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66",
+      "license": "MIT",
+      "security_boundary": "The Sidecar runs as a non-root internal service. Uploads use generated media IDs, render requests use validated project/media IDs, and no endpoint accepts an arbitrary host path or shell command.",
+      "evidence": "docs/evidence/M2-0-VERIFICATION.md",
+      "acceptance_pending": [
+        "GitHub Actions lint/build/unit job",
+        "GitHub Actions Playwright job",
+        "GitHub Actions Docker Compose job with pinned-upstream real render"
+      ],
+      "remaining_boundaries": {
+        "transcription": "The real ElevenLabs Scribe path is implemented but is unavailable until ELEVENLABS_API_KEY is configured.",
+        "ai_style_transfer": "AIProvider cartoon style transfer remains a mock and is outside this video-use/FFmpeg milestone.",
+        "opencut": "OpenCut Classic editor embedding is M3-0 and is not claimed by M2-0.",
+        "openreel": "OpenReel compatibility is a later feature-flagged fallback and is not claimed by M2-0.",
+        "production_launch": "No public host, domain, TLS endpoint, or production provider secrets have been supplied, so public launch is not claimed."
+      }
     }
   }
 }

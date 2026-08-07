@@ -1,18 +1,50 @@
+import subprocess
 import threading
 from unittest.mock import MagicMock
 import httpx
-from app.ffmpeg_adapter import FFmpegAdapter
+import pytest
+
+from app.ffmpeg_adapter import FFmpegAdapter, MediaProcessingError
 from app.ai_provider import AIProviderInterface
 from app.recovery import TaskRecoveryManager
 from app.main import create_health_server, initialize_worker, process_m1_moneyprinter_task, WorkerComponents
 
-def test_ffmpeg_adapter_mock():
-    # Clearly marked as mock adapter tests
-    adapter = FFmpegAdapter()
+def test_ffmpeg_adapter_executes_real_proxy_audio_and_probe(tmp_path):
+    source = tmp_path / "source.mp4"
+    proxy = tmp_path / "proxy.mp4"
+    audio = tmp_path / "audio.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=320x240:rate=24",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(source),
+        ],
+        check=True,
+    )
+
+    adapter = FFmpegAdapter(timeout_seconds=60)
     assert adapter.target_width == 854
     assert adapter.target_height == 480
-    assert adapter.create_480p_proxy("input.mp4", "output.mp4") is True
-    assert adapter.extract_audio("input.mp4", "output.wav") is True
+    assert adapter.create_480p_proxy(str(source), str(proxy)) is True
+    assert adapter.extract_audio(str(source), str(audio)) is True
+
+    proxy_metadata = adapter.probe_media(proxy)
+    audio_metadata = adapter.probe_media(audio)
+    assert proxy_metadata["video"]["width"] == 854
+    assert proxy_metadata["video"]["height"] == 480
+    assert proxy_metadata["duration_seconds"] == pytest.approx(1.0, abs=0.1)
+    assert audio_metadata["audio"]["sample_rate"] == 16000
+
+
+def test_ffmpeg_adapter_fails_loudly_for_missing_input(tmp_path):
+    adapter = FFmpegAdapter()
+    with pytest.raises(MediaProcessingError, match="does not exist"):
+        adapter.create_480p_proxy(
+            str(tmp_path / "missing.mp4"),
+            str(tmp_path / "proxy.mp4"),
+        )
 
 def test_ai_provider_mock():
     # Clearly marked as mock AI provider tests
@@ -66,7 +98,8 @@ def test_process_m1_moneyprinter_task_healthy():
         ffmpeg=MagicMock(),
         ai=MagicMock(),
         recovery=MagicMock(),
-        moneyprinter=mock_adapter
+        moneyprinter=mock_adapter,
+        video_use=MagicMock(),
     )
 
     res = process_m1_moneyprinter_task(components, {"subject": "nature"})
@@ -87,7 +120,8 @@ def test_process_m1_moneyprinter_task_unhealthy():
         ffmpeg=MagicMock(),
         ai=MagicMock(),
         recovery=MagicMock(),
-        moneyprinter=mock_adapter
+        moneyprinter=mock_adapter,
+        video_use=MagicMock(),
     )
 
     res = process_m1_moneyprinter_task(components, {"subject": "nature"})

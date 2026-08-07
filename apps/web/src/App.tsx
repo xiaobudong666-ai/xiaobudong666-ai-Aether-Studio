@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { RationalTime, ProjectDTO, MaterialDTO, ClipDTO } from "@aether/contracts";
+import { RationalTime, ProjectDTO, ClipDTO } from "@aether/contracts";
 import { AssetLibrary } from "./components/AssetLibrary";
 import { CanvasPreview } from "./components/CanvasPreview";
 import { PropertyInspector } from "./components/PropertyInspector";
@@ -149,17 +149,26 @@ export default function App() {
     }
   };
 
-  // 4. Add Material to current project
-  const handleAddMaterial = (material: MaterialDTO) => {
-    if (!currentProject) return;
-    const updatedMaterials = [...currentProject.materials, material];
-    const updatedProj: ProjectDTO = {
-      ...currentProject,
-      materials: updatedMaterials,
-      revision: currentProject.revision + 1,
-      updatedAt: new Date().toISOString(),
-    };
-    saveProjectState(updatedProj);
+  // 4. Upload and probe real media through the isolated video-use service.
+  const handleUploadMaterial = async (file: File) => {
+    if (!currentProject) throw new Error("Create or select a project first");
+    const data = new FormData();
+    data.append("expectedRevision", String(currentProject.revision));
+    data.append("file", file);
+    const response = await fetch(`${API_BASE}/projects/${currentProject.id}/media`, {
+      method: "POST",
+      body: data,
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.detail?.message || payload?.detail || "Media upload failed");
+    }
+    const payload = await response.json();
+    const updatedProject = payload.project as ProjectDTO;
+    setCurrentProject(updatedProject);
+    setProjects((prev) => prev.map((project) => (
+      project.id === updatedProject.id ? updatedProject : project
+    )));
   };
 
   // 5. Place material on timeline as a clip
@@ -232,7 +241,8 @@ export default function App() {
       method: "POST",
     });
     if (!res.ok) {
-      throw new Error("Trigger render failed");
+      const payload = await res.json().catch(() => null);
+      throw new Error(payload?.detail?.message || "Trigger render failed");
     }
   };
 
@@ -291,7 +301,7 @@ export default function App() {
       <main className="workbench-container">
         <AssetLibrary
           materials={currentProject?.materials || []}
-          onAddMaterial={handleAddMaterial}
+          onUploadMaterial={handleUploadMaterial}
           onAddClipToTimeline={handleAddClipToTimeline}
         />
 
@@ -306,6 +316,9 @@ export default function App() {
           projectId={currentProject?.id || null}
           onTriggerRender={handleTriggerRender}
           apiBase={API_BASE}
+          canRender={Boolean(currentProject?.timeline.tracks.some(
+            (track) => track.type === "video" && track.clips.length > 0,
+          ))}
         />
       </main>
 

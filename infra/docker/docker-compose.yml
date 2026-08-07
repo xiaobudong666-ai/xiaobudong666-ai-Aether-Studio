@@ -4,6 +4,8 @@
 # License Evidence:
 # - Aether Studio core uses MIT License.
 # - Upstream MoneyPrinterTurbo is licensed under MIT License.
+# - Upstream browser-use/video-use is licensed under MIT License and pinned to
+#   commit 92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66.
 #
 # Upgrade Instructions:
 # To upgrade the MoneyPrinterTurbo sidecar:
@@ -12,6 +14,32 @@
 # ==============================================================================
 
 services:
+  video-use:
+    image: aether-video-use:0.1.0-92c2b34e44c2
+    build:
+      context: ../..
+      dockerfile: infra/docker/video-use.Dockerfile
+      args:
+        VIDEO_USE_COMMIT: 92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66
+    networks:
+      - aether-net
+    volumes:
+      - video-use-media:/media
+    environment:
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - VIDEO_USE_MAX_UPLOAD_BYTES=${VIDEO_USE_MAX_UPLOAD_BYTES:-2147483648}
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
   moneyprinter-sidecar:
     image: moneyprinterturbo:v1.2.7-475f21147f0808
     build:
@@ -49,9 +77,12 @@ services:
     environment:
       - DATABASE_URL=sqlite:////data/aether.db
       - MONEYPRINTER_API_URL=http://moneyprinter-sidecar:8080
+      - VIDEO_USE_API_URL=http://video-use:8002
     restart: unless-stopped
     depends_on:
       moneyprinter-sidecar:
+        condition: service_healthy
+      video-use:
         condition: service_healthy
     healthcheck:
       test:
@@ -76,11 +107,14 @@ services:
       - BACKEND_URL=http://api:8000
       - WORKER_PORT=8001
       - MONEYPRINTER_API_URL=http://moneyprinter-sidecar:8080
+      - VIDEO_USE_API_URL=http://video-use:8002
     restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
       moneyprinter-sidecar:
+        condition: service_healthy
+      video-use:
         condition: service_healthy
     healthcheck:
       test:
@@ -122,6 +156,7 @@ services:
 
 volumes:
   sqlite-db:
+  video-use-media:
 
 networks:
   aether-net:

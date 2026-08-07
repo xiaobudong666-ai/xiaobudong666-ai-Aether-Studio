@@ -6,6 +6,7 @@ interface PropertyInspectorProps {
   projectId: string | null;
   onTriggerRender: () => Promise<void>;
   apiBase: string;
+  canRender: boolean;
 }
 
 export interface RenderTask {
@@ -14,6 +15,7 @@ export interface RenderTask {
   progress: number;
   status: string;
   message: string;
+  artifactUrl?: string;
 }
 
 export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
@@ -21,6 +23,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   projectId,
   onTriggerRender,
   apiBase,
+  canRender,
 }) => {
   const [tasks, setTasks] = useState<RenderTask[]>([]);
   const [sseConnected, setSseConnected] = useState(false);
@@ -106,11 +109,11 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
         {/* Rendering Launcher */}
         <div style={{ background: "#1e1e24", padding: "10px", borderRadius: "6px", border: "1px solid #2d2d34", display: "flex", flexDirection: "column", gap: "8px" }}>
           <div style={{ fontWeight: 600, fontSize: "12px", color: "#f59e0b" }}>Render Actions</div>
-          <button onClick={handleRender} disabled={!projectId} style={{ background: "#f59e0b" }}>
-            🚀 Trigger AI Proxy Render
+          <button onClick={handleRender} disabled={!projectId || !canRender} style={{ background: "#f59e0b" }}>
+            🚀 Render with video-use
           </button>
           <div style={{ fontSize: "11px", color: "#71717a" }}>
-            Compiles timeline into a 480p proxy and updates via background process.
+            Uses the pinned video-use pipeline and real FFmpeg. Upload and place a video first.
           </div>
         </div>
 
@@ -128,6 +131,11 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     <span style={{ textTransform: "capitalize" }}>{t.status}</span>
                   </div>
                   <div style={{ fontSize: "11px", color: "#d4d4d8", marginTop: "4px" }}>{t.message}</div>
+                  {t.artifactUrl && (
+                    <a href={t.artifactUrl} style={{ fontSize: "11px", color: "#60a5fa" }}>
+                      Download MP4
+                    </a>
+                  )}
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "4px" }}>
                     <div className="progress-bar-container" style={{ flex: 1 }}>
                       <div className="progress-bar" style={{ width: `${t.progress}%`, backgroundColor: t.status === "completed" ? "#10b981" : t.status === "failed" ? "#ef4444" : "#3b82f6" }} />

@@ -1,0 +1,147 @@
+import subprocess
+import time
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from app.main import UPSTREAM_COMMIT, create_app
+
+
+def make_source(path: Path) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(path),
+        ],
+        check=True,
+    )
+
+
+def make_fake_upstream(root: Path) -> None:
+    helpers = root / "helpers"
+    helpers.mkdir(parents=True)
+    (helpers / "render.py").write_text(
+        """
+import argparse
+import json
+import shutil
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("edl")
+parser.add_argument("-o", "--output", required=True)
+parser.add_argument("--preview", action="store_true")
+parser.add_argument("--draft", action="store_true")
+parser.add_argument("--no-subtitles", action="store_true")
+parser.add_argument("--no-loudnorm", action="store_true")
+args = parser.parse_args()
+edl = json.loads(Path(args.edl).read_text())
+source = Path(edl["sources"][edl["ranges"][0]["source"]])
+shutil.copyfile(source, args.output)
+""".strip()
+    )
+    (helpers / "transcribe.py").write_text("print('transcribe helper')")
+    (helpers / "timeline_view.py").write_text("print('timeline helper')")
+
+
+def wait_for_job(client: TestClient, job_id: str) -> dict:
+    for _ in range(100):
+        payload = client.get(f"/jobs/{job_id}").json()
+        if payload["status"] in {"completed", "failed"}:
+            return payload
+        time.sleep(0.02)
+    raise AssertionError("job did not complete")
+
+
+def test_upload_probe_render_and_download_are_real(tmp_path):
+    upstream = tmp_path / "upstream"
+    make_fake_upstream(upstream)
+    source = tmp_path / "source.mp4"
+    make_source(source)
+
+    with TestClient(create_app(media_root=tmp_path / "media", upstream_root=upstream)) as client:
+        health = client.get("/health").json()
+        assert health["status"] == "healthy"
+        capabilities = client.get("/capabilities").json()
+        assert capabilities["commit"] == UPSTREAM_COMMIT
+        assert capabilities["transcription"]["configured"] is False
+
+        with source.open("rb") as stream:
+            upload = client.post(
+                "/media",
+                data={"projectId": "project-1"},
+                files={"file": ("source.mp4", stream, "video/mp4")},
+            )
+        assert upload.status_code == 201
+        media = upload.json()
+        assert media["metadata"]["video"]["width"] == 320
+        assert media["metadata"]["durationSeconds"] > 0.9
+
+        render = client.post(
+            "/renders",
+            json={
+                "projectId": "project-1",
+                "ranges": [{"mediaId": media["mediaId"], "start": 0, "end": 0.8}],
+                "mode": "preview",
+                "grade": "subtle",
+            },
+        )
+        assert render.status_code == 202
+        job = wait_for_job(client, render.json()["jobId"])
+        assert job["status"] == "completed"
+        assert job["metadata"]["video"]["codec"] == "h264"
+
+        artifact = client.get(f"/jobs/{job['jobId']}/artifact")
+        assert artifact.status_code == 200
+        assert artifact.headers["content-type"] == "video/mp4"
+        assert len(artifact.content) > 1_000
+
+
+def test_render_rejects_unknown_media_and_unsafe_identifiers(tmp_path):
+    upstream = tmp_path / "upstream"
+    make_fake_upstream(upstream)
+    with TestClient(create_app(media_root=tmp_path / "media", upstream_root=upstream)) as client:
+        missing = client.post(
+            "/renders",
+            json={
+                "projectId": "project-1",
+                "ranges": [
+                    {
+                        "mediaId": "00000000-0000-0000-0000-000000000000",
+                        "start": 0,
+                        "end": 1,
+                    }
+                ],
+            },
+        )
+        assert missing.status_code == 404
+
+        unsafe = client.post(
+            "/renders",
+            json={
+                "projectId": "../escape",
+                "ranges": [{"mediaId": "media-1", "start": 0, "end": 1}],
+            },
+        )
+        assert unsafe.status_code == 422
