@@ -103,8 +103,11 @@
       "boundary": "No host, SSH target, domain, or TLS endpoint has been provided. Repository launch readiness is not represented as an external deployment. Paid provider features remain unavailable until separately configured and tested."
     },
     "M5-1": {
-      "status": "IN_REVIEW",
+      "status": "ACCEPTED_ON_MERGE",
       "baseline_commit": "588ca4b9956d4f52abcf2e719a724283afc3b20b",
+      "candidate_pr": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/8",
+      "code_candidate_commit": "489ba8220feb46916a3a700a654828b55b72e768",
+      "code_ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31244761577",
       "description": "Remediate authentication/tenant/quota, Canonical Timeline correctness, large-upload, and persistent render-queue production blockers.",
       "evidence": "docs/evidence/M5-1-PRODUCTION-BLOCKERS-VERIFICATION.md",
       "implemented_controls": [
@@ -116,12 +119,17 @@
         "2 GiB streamed Nginx/API/Sidecar upload ceiling plus tenant storage enforcement",
         "Authenticated full-stack CI smoke and dependency vulnerability gates"
       ],
-      "acceptance_pending": [
-        "Exact pull-request head passes lint/build/unit",
-        "Exact pull-request head passes authenticated desktop and narrow Playwright flows",
-        "Exact pull-request head passes Docker Compose authenticated large-upload and four-second gap render"
+      "acceptance_evidence": [
+        "Code head passed lint/build/unit and Node/Python dependency vulnerability gates",
+        "Code head passed authenticated desktop and 390px Playwright flows with screenshot artifacts",
+        "Code head passed Docker Compose authenticated 17,352,511-byte upload and exact four-second MP4 smoke",
+        "CI credentials were generated per run and masked in GitHub Actions logs"
       ],
-      "boundary": "This entry records a locally verified candidate. It is not ACCEPTED and must not be merged until all three GitHub Actions jobs pass. Public launch still requires a real host, TLS ingress, target backup, and production credentials."
+      "acceptance_pending": [
+        "The documentation-only pull-request head containing this evidence passes all three GitHub Actions jobs",
+        "Pull request #8 merges to main"
+      ],
+      "boundary": "ACCEPTED_ON_MERGE is conditional: it becomes ACCEPTED only when PR #8's current head passes all three gates and merges. Public launch still requires a real host, TLS ingress, target backup, and production credentials."
     }
   }
 }

@@ -39,15 +39,25 @@ This candidate closes the four blockers reproduced against `main@588ca4b9956`:
 - API, Worker, and video-use Python requirement audits: no known vulnerabilities.
 - Python compilation, focused Ruff import/unused checks, and focused Ruff security
   checks passed.
-- Compose configuration and image/runtime integration remain pending the GitHub
-  Runner because Docker is not available in the local Work Mode environment.
-- Local Playwright execution reached server startup but Chromium installation was
-  blocked by a CDN certificate-time 502. The PR Playwright job is therefore an
-  acceptance gate and must provide the desktop/narrow screenshots.
+- Docker is not available in the local Work Mode environment. GitHub Actions run
+  [37](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31244761577)
+  therefore performed the Compose/runtime acceptance on code head
+  `489ba8220feb46916a3a700a654828b55b72e768`.
+- Run 37 passed lint/build/unit/security, authenticated desktop and narrow
+  Playwright, and Docker Compose integration. The authenticated Docker smoke
+  uploaded 17,352,511 bytes, completed the persistent Worker task, downloaded a
+  17,969,326-byte MP4, and measured exactly 4.0 seconds with ffprobe.
+- CI credentials are generated per run and are masked in Actions logs.
+- Playwright evidence includes the login surface plus desktop and 390px workbench
+  screenshots. Screenshot review found and then fixed a narrow-layout overlap;
+  the test now asserts the vertical order of library, canvas, inspector, and
+  timeline before accepting the screenshot.
 
 ## Acceptance gate
 
-Do not merge until the exact PR head passes all three required GitHub Actions jobs:
+Pull request [#8](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/8)
+becomes accepted only after the documentation commit containing this record also
+passes all three required GitHub Actions jobs and the PR is merged:
 
 1. Lint, build, JavaScript/Python unit tests, and real FFmpeg tests.
 2. Playwright authenticated desktop and narrow-viewport flow with screenshots.

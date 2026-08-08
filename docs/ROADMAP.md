@@ -74,8 +74,11 @@ This document outlines the high-level roadmap and current milestone progress for
   - ElevenLabs key for Scribe transcription.
   - MoneyPrinterTurbo provider keys for generation and licensed stock sources.
 
-### [M5-1] Production Blocker Remediation (IN REVIEW)
-- **Status**: Locally verified; acceptance requires the repair PR's full GitHub Actions gate.
+### [M5-1] Production Blocker Remediation (ACCEPTED ON MERGE)
+- **Status**: Code candidate verified in all three GitHub Actions jobs; the milestone becomes accepted when PR #8's documentation head passes the same gate and merges.
+- **PR**: [#8](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/8)
+- **Code CI**: [GitHub Actions run 37](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31244761577)
+- **Code Head**: `489ba8220feb46916a3a700a654828b55b72e768`
 - **Evidence**: `docs/evidence/M5-1-PRODUCTION-BLOCKERS-VERIFICATION.md`
 - **Key Features**:
   - Persistent HttpOnly sessions, scrypt password hashes, owner/editor/viewer RBAC,
