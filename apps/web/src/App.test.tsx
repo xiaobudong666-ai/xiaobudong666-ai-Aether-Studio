@@ -39,7 +39,23 @@ beforeEach(() => {
   vi.stubGlobal("EventSource", MockEventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            id: "owner-1", email: "owner@example.com", displayName: "Owner", role: "owner",
+            tenant: { id: "tenant-1", name: "Aether Test", slug: "aether-test" },
+            quotas: {
+              projects: 50, storageBytes: 1000, storageBytesUsed: 0,
+              concurrentRenders: 2, monthlyRenderSeconds: 1000,
+              monthlyRenderSecondsUsed: 0, period: "2026-08",
+            },
+          }),
+        } as Response;
+      }
       if (init?.method === "POST") {
         return {
           ok: true,
@@ -60,7 +76,7 @@ describe("App Workbench baseline", () => {
   test("renders all workbench regions and uses same-origin API/SSE paths", async () => {
     render(<App />);
 
-    expect(screen.getByText("Library & Materials")).toBeTruthy();
+    expect(await screen.findByText("Library & Materials")).toBeTruthy();
     expect(screen.getByText("Canvas Monitor (480p Proxy Target)")).toBeTruthy();
     expect(screen.getByText("Property Inspector & Tasks")).toBeTruthy();
     expect(screen.getByText(/Timeline tracks/i)).toBeTruthy();
@@ -74,7 +90,7 @@ describe("App Workbench baseline", () => {
   test("creates a project through the proxied API", async () => {
     render(<App />);
 
-    fireEvent.change(screen.getByPlaceholderText("New project name"), {
+    fireEvent.change(await screen.findByPlaceholderText("New project name"), {
       target: { value: createdProject.name },
     });
     fireEvent.click(screen.getByRole("button", { name: "Create Project" }));
@@ -86,7 +102,10 @@ describe("App Workbench baseline", () => {
 
     expect(fetch).toHaveBeenCalledWith(
       "/api/projects",
-      expect.objectContaining({ method: "POST" }),
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-Aether-CSRF": "1" }),
+      }),
     );
   });
 });

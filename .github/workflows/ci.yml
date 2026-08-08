@@ -47,6 +47,9 @@ jobs:
       - name: Run web and package tests
         run: pnpm test
 
+      - name: Audit Node production dependencies
+        run: pnpm audit --prod
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -55,9 +58,16 @@ jobs:
       - name: Install Python test dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install pip-audit==2.10.0
           pip install -r apps/api/requirements.txt
           pip install -r apps/worker/requirements.txt
           pip install -r apps/video_use/requirements.txt
+
+      - name: Audit Python dependencies
+        run: |
+          pip-audit -r apps/api/requirements.txt
+          pip-audit -r apps/worker/requirements.txt
+          pip-audit -r apps/video_use/requirements.txt
 
       - name: Install FFmpeg test runtime
         run: |
@@ -87,6 +97,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Generate disposable browser-test credential
+        run: echo "AETHER_PLAYWRIGHT_PASSWORD=ci-$(openssl rand -hex 24)" >> "$GITHUB_ENV"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -133,10 +146,16 @@ jobs:
     env:
       # Isolate disposable CI resources from local/production Compose projects.
       COMPOSE_PROJECT_NAME: aether-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      AETHER_COOKIE_SECURE: "false"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Generate disposable integration credentials
+        run: |
+          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=ci-$(openssl rand -hex 24)" >> "$GITHUB_ENV"
+          echo "AETHER_WORKER_TOKEN=ci-$(openssl rand -hex 32)" >> "$GITHUB_ENV"
 
       - name: Validate Compose configuration
         run: docker compose -f infra/docker/docker-compose.yml config --quiet
@@ -155,6 +174,7 @@ jobs:
           curl --fail --show-error http://127.0.0.1/api/moneyprinter/capabilities
           curl --fail --show-error http://127.0.0.1/api/video-use/health
           curl --fail --show-error http://127.0.0.1/api/video-use/capabilities
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' --request POST http://127.0.0.1/api/internal/render-tasks/claim)" = "404"
 
       - name: Internal same-origin networking validation
         run: |
@@ -178,6 +198,14 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml exec -T video-use python -c "import app.main as m; assert m.UPSTREAM_COMMIT == '92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66'"
           docker compose -f infra/docker/docker-compose.yml exec -T video-use sh -c "mkdir -p /media/projects/ci/media && ffmpeg -y -hide_banner -loglevel error -f lavfi -i testsrc=size=320x240:rate=24 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest /media/projects/ci/media/ci-source.mp4"
           docker compose -f infra/docker/docker-compose.yml exec -T video-use python /service/ci_smoke.py
+
+      - name: Verify authenticated upload, persistent queue, Worker, and canonical gap render
+        run: |
+          docker compose -f infra/docker/docker-compose.yml exec -T \
+            -e AETHER_SMOKE_EMAIL=admin@aether.local \
+            -e AETHER_SMOKE_PASSWORD="$AETHER_BOOTSTRAP_ADMIN_PASSWORD" \
+            -e AETHER_SMOKE_BASE_URL=http://web/api \
+            worker python /app/authenticated-smoke.py
 
       - name: Capture Docker logs
         if: always()

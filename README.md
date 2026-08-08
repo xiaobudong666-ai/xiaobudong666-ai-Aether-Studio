@@ -11,8 +11,8 @@ The repository is independent and does not read, import, or modify `Ai-Eos`.
 | Area | Purpose |
 | --- | --- |
 | `apps/web` | React, TypeScript, and Vite three-panel editing workbench |
-| `apps/api` | FastAPI project CRUD, uploads, same-origin Sidecar adapters, real render jobs, SQLite WAL, optimistic locking, and SSE |
-| `apps/worker` | Isolated Python Worker with real FFmpeg operations, Sidecar clients, AI provider boundary, and recovery adapter |
+| `apps/api` | FastAPI authentication/RBAC, tenant-scoped project CRUD, quotas, uploads, persistent render queue, SQLite WAL, optimistic locking, and SSE |
+| `apps/worker` | Isolated Python Worker that leases persistent tasks, drives video-use/FFmpeg, retries transient failures, and exposes health |
 | `apps/video_use` | Internal non-root service for the pinned video-use render, timeline-view, and transcription helpers |
 | `packages/contracts` | Canonical Timeline v1.1 DTOs, validation, error codes, and RationalTime |
 | `packages/editor` | Editor-agnostic material, canvas, and timeline adapter interfaces |
@@ -80,13 +80,24 @@ python3 -m venv .venv
 
 Run the API:
 
+Set a unique owner password and a shared random Worker token in the shell (do
+not commit them), then start the API:
+
 ```bash
+read -rsp "Local owner password: " AETHER_BOOTSTRAP_ADMIN_PASSWORD && echo
+export AETHER_BOOTSTRAP_ADMIN_PASSWORD
+export AETHER_WORKER_TOKEN="$(openssl rand -hex 32)"
 PYTHONPATH=apps/api DATABASE_URL=sqlite:///aether.db \
+  AETHER_BOOTSTRAP_ADMIN_EMAIL=admin@aether.local \
+  AETHER_COOKIE_SECURE=false \
   .venv/bin/python -m uvicorn app.main:app \
   --host 127.0.0.1 --port 8000
 ```
 
 Run the Worker:
+
+In the Worker shell, export the same `AETHER_WORKER_TOKEN` value without writing
+it to the repository, then run:
 
 ```bash
 PYTHONPATH=apps/worker BACKEND_URL=http://127.0.0.1:8000 \
@@ -129,6 +140,7 @@ Run Python tests:
 ```bash
 PYTHONPATH=apps/api .venv/bin/python -m pytest apps/api/test_main.py -q
 PYTHONPATH=apps/worker .venv/bin/python -m pytest apps/worker/test_worker.py -q
+PYTHONPATH=apps/video_use .venv/bin/python -m pytest apps/video_use/test_main.py -q
 ```
 
 Run Playwright:
@@ -173,22 +185,28 @@ limitations. A green job proves only the scope asserted by that job.
 ## Implemented behavior
 
 - Project list, create, query, and update.
+- Persistent login sessions, owner/editor/viewer RBAC, tenant isolation, CSRF
+  proof, and project/storage/render quotas.
 - Atomic revision conflict response (`409 CONCURRENCY_CONFLICT`).
 - Three-panel workbench and bottom timeline.
 - Real media upload/probe and basic track/clip placement.
 - Real FFmpeg proxy, audio extraction, and metadata probing.
-- Pinned video-use EDL rendering with live `task_progress` SSE events and MP4 download.
-- Independent Worker HTTP health endpoint.
-- Explicit remaining mock boundaries for AI provider and recovery.
+- Pinned video-use plus Canonical Timeline rendering with exact positions,
+  gaps, overlapping video layers, independent audio, subtitles, and MP4 download.
+- SQLite-backed leased tasks consumed by the Worker, restart recovery,
+  idempotent Sidecar submission, persistent task history, and live SSE progress.
+- Streamed uploads up to 2 GiB at Nginx/API/Sidecar, subject to tenant quota.
 - Reproducible lockfile, Node/pnpm baseline, Docker topology, and CI.
 
-## M0-0 limitations
+## Current limitations
 
 - AI generation and subtitle methods are mocks and use no provider keys.
-- Task state is in process memory; Redis/Celery durability is deferred.
 - The preview canvas is a workbench placeholder, not a decoding or compositing
   engine.
-- Offline persistence and multi-device merge UI are deferred.
+- SQLite is durable for the current single-host Compose topology. Horizontal
+  multi-host scaling still requires a production database/object store and a
+  distributed queue.
+- Offline editing and multi-device merge UI are deferred.
 - RationalTime is exact only while reduced results remain within the declared
   JavaScript safe-integer boundary.
 

@@ -6,6 +6,45 @@ body {
   overflow: hidden;
 }
 
+.auth-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  box-sizing: border-box;
+  background: radial-gradient(circle at top, #24204a 0, #121214 48%);
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 32px;
+  box-sizing: border-box;
+  border: 1px solid #383443;
+  border-radius: 16px;
+  background: rgba(22, 22, 26, 0.96);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+
+.auth-card h1, .auth-card p { margin: 0; }
+.auth-card p { color: #a1a1aa; }
+.auth-card label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.auth-card input { min-height: 42px; }
+.auth-card button { min-height: 42px; }
+.auth-mark { font-size: 34px; }
+.auth-error { color: #fecaca; background: #450a0a; border: 1px solid #7f1d1d; border-radius: 6px; padding: 9px; }
+
+.tenant-badge {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c4b5fd;
+  font-size: 12px;
+}
+
 #root {
   height: 100vh;
   display: flex;
@@ -140,6 +179,16 @@ button:hover {
   background-color: #2563eb;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible {
+  outline: 2px solid #a78bfa;
+  outline-offset: 2px;
+}
+
 button.secondary {
   background-color: #27272a;
   border: 1px solid #3f3f46;
@@ -205,4 +254,29 @@ input:focus, select:focus {
   height: 100%;
   background-color: #3b82f6;
   transition: width 0.3s ease;
+}
+
+@media (max-width: 1100px) {
+  body { overflow: auto; }
+  #root { min-height: 100vh; height: auto; }
+  .editor-header { height: auto; min-height: 56px; align-items: flex-start; gap: 12px; padding: 12px; }
+  .project-select-container { flex-wrap: wrap; justify-content: flex-end; }
+  .workbench-container {
+    grid-template-columns: minmax(220px, 0.8fr) minmax(420px, 1.6fr);
+    height: auto;
+    min-height: 620px;
+  }
+  .workbench-container > :last-child { grid-column: 1 / -1; min-height: 300px; }
+}
+
+@media (max-width: 720px) {
+  .editor-header { flex-direction: column; }
+  .editor-logo { flex-wrap: wrap; }
+  .project-select-container { width: 100%; justify-content: flex-start; }
+  .project-select-container form { width: 100%; }
+  .project-select-container form input { flex: 1; min-width: 120px; }
+  .workbench-container { display: flex; flex-direction: column; min-height: 0; }
+  .workbench-container > * { min-height: 360px; }
+  .timeline-panel { height: 280px; min-height: 280px; }
+  .auth-card { padding: 24px; }
 }

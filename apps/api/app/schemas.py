@@ -15,6 +15,13 @@ class ClipSchema(BaseModel):
     start: RationalTimeSchema
     duration: RationalTimeSchema
     sourceIn: RationalTimeSchema
+    volume: float = Field(default=1.0, ge=0, le=4)
+    opacity: float = Field(default=1.0, ge=0, le=1)
+    x: int = 0
+    y: int = 0
+    width: Optional[int] = Field(default=None, gt=0, le=7680)
+    height: Optional[int] = Field(default=None, gt=0, le=4320)
+    text: Optional[str] = Field(default=None, max_length=2_000)
 
 class TrackSchema(BaseModel):
     id: str
@@ -32,6 +39,7 @@ class MaterialSchema(BaseModel):
     url: str
     type: Literal["video", "audio", "image"]
     duration: Optional[RationalTimeSchema] = None
+    sizeBytes: int = Field(default=0, ge=0)
 
 class ProjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -60,3 +68,24 @@ class MoneyPrinterGenerateRequest(BaseModel):
     voice_name: Optional[str] = "en-US-JennyNeural"
     video_concat_mode: Optional[str] = "random"
     video_clip_duration: Optional[int] = 5
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=1_024)
+
+
+class CreateUserRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    displayName: str = Field(..., min_length=1, max_length=120)
+    password: str = Field(..., min_length=12, max_length=1_024)
+    role: Literal["owner", "editor", "viewer"]
+
+
+class WorkerTaskUpdateRequest(BaseModel):
+    status: Literal["processing", "completed", "failed", "queued"]
+    progress: int = Field(..., ge=0, le=100)
+    message: str = Field(..., min_length=1, max_length=2_000)
+    upstreamJobId: Optional[str] = Field(default=None, max_length=128)
+    error: Optional[str] = Field(default=None, max_length=4_000)
+    retryable: bool = False

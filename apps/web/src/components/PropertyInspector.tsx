@@ -29,6 +29,21 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   const [sseConnected, setSseConnected] = useState(false);
 
   useEffect(() => {
+    if (!projectId) {
+      setTasks([]);
+      return;
+    }
+    let cancelled = false;
+    fetch(`${apiBase}/render-tasks?projectId=${encodeURIComponent(projectId)}`)
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("Task history unavailable")))
+      .then((payload: RenderTask[]) => {
+        if (!cancelled) setTasks(payload);
+      })
+      .catch((error) => console.error(error));
+    return () => { cancelled = true; };
+  }, [apiBase, projectId]);
+
+  useEffect(() => {
     // Dynamically build URL from apiBase prop
     const sseUrl = `${apiBase}/events`;
     const eventSource = new EventSource(sseUrl);
@@ -45,6 +60,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
     eventSource.addEventListener("task_progress", (e: any) => {
       try {
         const payload = JSON.parse(e.data) as RenderTask;
+        if (projectId && payload.projectId !== projectId) return;
         setTasks((prev) => {
           // If task exists, update it. Otherwise insert
           const idx = prev.findIndex((t) => t.taskId === payload.taskId);
@@ -64,7 +80,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
     return () => {
       eventSource.close();
     };
-  }, [apiBase]);
+  }, [apiBase, projectId]);
 
   const handleRender = async () => {
     if (!projectId) return;
@@ -119,7 +135,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
 
         {/* Task Tracker list */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: "150px" }}>
-          <div style={{ fontWeight: 600, fontSize: "12px", color: "#9ca3af", marginBottom: "8px" }}>Live Task Stream (SSE)</div>
+          <div style={{ fontWeight: 600, fontSize: "12px", color: "#9ca3af", marginBottom: "8px" }}>Persistent Task History + Live SSE</div>
           <div style={{ flex: 1, overflowY: "auto" }}>
             {tasks.length === 0 ? (
               <div style={{ color: "#71717a", fontStyle: "italic", fontSize: "12px" }}>No background tasks triggered yet.</div>

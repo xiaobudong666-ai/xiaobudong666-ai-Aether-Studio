@@ -5,12 +5,14 @@ interface AssetLibraryProps {
   materials: MaterialDTO[];
   onUploadMaterial: (file: File) => Promise<void>;
   onAddClipToTimeline: (materialId: string) => void;
+  canEdit: boolean;
 }
 
 export const AssetLibrary: React.FC<AssetLibraryProps> = ({
   materials,
   onUploadMaterial,
   onAddClipToTimeline,
+  canEdit,
 }) => {
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -44,11 +46,13 @@ export const AssetLibrary: React.FC<AssetLibraryProps> = ({
             type="file"
             accept="video/*,audio/*,.mkv,.m4v"
             onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
+            disabled={!canEdit}
             style={{ width: "100%", boxSizing: "border-box" }}
           />
-          <button type="submit" disabled={!selectedFile || uploading} style={{ width: "100%" }}>
+          <button type="submit" disabled={!canEdit || !selectedFile || uploading} style={{ width: "100%" }}>
             {uploading ? "Uploading & probing…" : "Upload Media"}
           </button>
+          {!canEdit && <div style={{ color: "#a1a1aa", fontSize: "11px" }}>Viewer access is read-only.</div>}
           {uploadError && <div style={{ color: "#ef4444", fontSize: "11px" }}>{uploadError}</div>}
         </form>
 
@@ -69,6 +73,7 @@ export const AssetLibrary: React.FC<AssetLibraryProps> = ({
                   <button
                     className="secondary"
                     onClick={() => onAddClipToTimeline(m.id)}
+                    disabled={!canEdit}
                     style={{ padding: "3px 6px", fontSize: "11px", alignSelf: "flex-end", marginTop: "4px" }}
                   >
                     + Place on Track

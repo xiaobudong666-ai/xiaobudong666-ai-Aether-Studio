@@ -1,5 +1,7 @@
 import logging
 
+from .task_queue import TaskQueueClient
+
 logger = logging.getLogger("worker.recovery")
 
 class TaskRecoveryManager:
@@ -7,8 +9,9 @@ class TaskRecoveryManager:
     TaskRecoveryManager identifies tasks interrupted due to worker crashes or network losses,
     and handles graceful resume capabilities.
     """
-    def __init__(self, backend_url: str):
+    def __init__(self, backend_url: str, queue: TaskQueueClient | None = None):
         self.backend_url = backend_url
+        self.queue = queue
         logger.info(f"TaskRecoveryManager configured with backend {backend_url}")
 
     def scan_and_recover_tasks(self) -> list:
@@ -17,7 +20,6 @@ class TaskRecoveryManager:
         recovering them or resetting their state so they can be re-run.
         """
         logger.info("Scanning for interrupted tasks to recover...")
-        # Mocking empty list of recovered tasks
-        recovered_tasks = []
+        recovered_tasks = self.queue.recover() if self.queue is not None else []
         logger.info(f"Scan complete. Recovered {len(recovered_tasks)} tasks.")
         return recovered_tasks

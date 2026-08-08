@@ -15,6 +15,7 @@ COPY apps/worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY apps/worker/app /app/app
+COPY infra/docker/authenticated-smoke.py /app/authenticated-smoke.py
 
 EXPOSE 8001
 

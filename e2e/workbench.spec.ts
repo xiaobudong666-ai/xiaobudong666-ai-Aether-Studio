@@ -1,9 +1,17 @@
 import { expect, test } from "@playwright/test";
 
+const testPassword = process.env.AETHER_PLAYWRIGHT_PASSWORD;
+if (!testPassword) throw new Error("AETHER_PLAYWRIGHT_PASSWORD was not initialized by Playwright config");
+
 test("creates a project and exposes the real-media workbench", async ({
   page,
 }, testInfo) => {
   await page.goto("/");
+
+  await expect(page.getByRole("heading", { name: "Aether Studio" })).toBeVisible();
+  await page.getByLabel("Email").fill("admin@aether.local");
+  await page.getByLabel("Password").fill(testPassword);
+  await page.getByRole("button", { name: "Sign in" }).click();
 
   await expect(page.getByText("Library & Materials")).toBeVisible();
   await expect(page.getByText("Canvas Monitor (480p Proxy Target)")).toBeVisible();
@@ -33,6 +41,21 @@ test("creates a project and exposes the real-media workbench", async ({
 
   await page.screenshot({
     path: testInfo.outputPath("aether-workbench.png"),
+    fullPage: true,
+  });
+});
+
+test("requires authentication and remains usable at a narrow viewport", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await expect(page.getByText("Sign in to your protected workspace")).toBeVisible();
+  await page.getByLabel("Email").fill("admin@aether.local");
+  await page.getByLabel("Password").fill(testPassword);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("Library & Materials")).toBeVisible();
+  await expect(page.getByPlaceholder("New project name")).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath("aether-workbench-mobile.png"),
     fullPage: true,
   });
 });

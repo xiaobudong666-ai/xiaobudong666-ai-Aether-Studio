@@ -74,6 +74,24 @@ This document outlines the high-level roadmap and current milestone progress for
   - ElevenLabs key for Scribe transcription.
   - MoneyPrinterTurbo provider keys for generation and licensed stock sources.
 
+### [M5-1] Production Blocker Remediation (IN REVIEW)
+- **Status**: Locally verified; acceptance requires the repair PR's full GitHub Actions gate.
+- **Evidence**: `docs/evidence/M5-1-PRODUCTION-BLOCKERS-VERIFICATION.md`
+- **Key Features**:
+  - Persistent HttpOnly sessions, scrypt password hashes, owner/editor/viewer RBAC,
+    tenant-scoped projects/media/tasks, CSRF proof, and first-start owner bootstrap.
+  - Enforced project, storage, concurrent-render, and monthly-render-second quotas.
+  - Canonical Timeline FFmpeg composition that preserves exact rational positions,
+    black gaps, overlapping video layers, independent audio, and subtitles.
+  - A database-backed leased render queue consumed by the Worker, with retry,
+    Sidecar idempotency, API restart recovery, persistent history, SSE updates,
+    and authenticated artifact access.
+  - A 2 GiB Nginx/API/Sidecar transport ceiling plus a tenant storage quota.
+  - Authenticated full-stack CI smoke with a media upload larger than 1 MiB and a
+    four-second gap-render assertion.
+  - Production and development JavaScript dependencies plus all three Python
+    requirement sets report no known vulnerabilities at the candidate audit date.
+
 ## Security & Upgrade Boundaries
 - **No hardcoded credentials**: Environment variables handle sidecar configurations.
 - **Upgrades**: Upgrading the sidecar must be done by explicitly bumping the pinned upstream version/commit and running compatibility validation tests.

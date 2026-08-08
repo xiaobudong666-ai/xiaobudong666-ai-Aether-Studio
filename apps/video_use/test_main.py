@@ -2,9 +2,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
+import pytest
 from app.main import UPSTREAM_COMMIT, create_app
+from fastapi.testclient import TestClient
 
 
 def make_source(path: Path) -> None:
@@ -145,3 +145,96 @@ def test_render_rejects_unknown_media_and_unsafe_identifiers(tmp_path):
             },
         )
         assert unsafe.status_code == 422
+
+
+def test_canonical_timeline_render_preserves_gap_overlap_audio_and_idempotency(tmp_path):
+    upstream = tmp_path / "upstream"
+    make_fake_upstream(upstream)
+    source = tmp_path / "source.mp4"
+    make_source(source)
+
+    with TestClient(create_app(media_root=tmp_path / "media", upstream_root=upstream)) as client:
+        with source.open("rb") as stream:
+            media = client.post(
+                "/media",
+                data={"projectId": "canonical-project"},
+                files={"file": ("source.mp4", stream, "video/mp4")},
+            ).json()
+        clip = {
+            "materialId": media["mediaId"],
+            "sourceIn": {"value": 0, "timescale": 24},
+            "duration": {"value": 24, "timescale": 24},
+        }
+        payload = {
+            "projectId": "canonical-project",
+            "requestId": "canonical-task-1",
+            "canonicalTimeline": {
+                "version": "1.1",
+                "duration": {"value": 4, "timescale": 1},
+                "output": {
+                    "width": 320,
+                    "height": 240,
+                    "fps": {"value": 24, "timescale": 1},
+                    "backgroundColor": "black",
+                },
+                "materials": [{"id": media["mediaId"], "type": "video"}],
+                "tracks": [
+                    {
+                        "id": "video-main", "type": "video", "order": 0,
+                        "clips": [
+                            {**clip, "id": "first", "start": {"value": 0, "timescale": 24}},
+                            {**clip, "id": "last", "start": {"value": 72, "timescale": 24}},
+                        ],
+                    },
+                    {
+                        "id": "video-overlay", "type": "video", "order": 1,
+                        "clips": [
+                            {
+                                **clip, "id": "overlay", "start": {"value": 12, "timescale": 24},
+                                "duration": {"value": 12, "timescale": 24},
+                                "width": 160, "height": 120, "x": 8, "y": 8, "opacity": 0.7,
+                            }
+                        ],
+                    },
+                    {
+                        "id": "audio-bed", "type": "audio", "order": 2,
+                        "clips": [
+                            {**clip, "id": "audio", "start": {"value": 48, "timescale": 24}, "volume": 0.4}
+                        ],
+                    },
+                    {
+                        "id": "subtitles", "type": "subtitle", "order": 3,
+                        "clips": [
+                            {
+                                **clip, "id": "subtitle", "start": {"value": 0, "timescale": 24},
+                                "duration": {"value": 12, "timescale": 24},
+                                "text": "Aether subtitle",
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+        render = client.post("/renders", json=payload)
+        assert render.status_code == 202
+        duplicate = client.post("/renders", json=payload)
+        assert duplicate.status_code == 202
+        assert duplicate.json()["jobId"] == render.json()["jobId"]
+        job = wait_for_job(client, render.json()["jobId"])
+        assert job["status"] == "completed", job
+        assert job["metadata"]["durationSeconds"] == pytest.approx(4.0, abs=0.15)
+        artifact = client.get(f"/jobs/{job['jobId']}/artifact")
+        assert artifact.status_code == 200
+        assert len(artifact.content) > 1_000
+        rendered_path = tmp_path / "canonical-render.mp4"
+        rendered_path.write_bytes(artifact.content)
+        gap_pixel = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "2",
+                "-i", str(rendered_path), "-vf", "scale=1:1", "-frames:v", "1",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert gap_pixel and max(gap_pixel) < 20

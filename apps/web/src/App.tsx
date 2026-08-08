@@ -5,6 +5,23 @@ import { CanvasPreview } from "./components/CanvasPreview";
 import { PropertyInspector } from "./components/PropertyInspector";
 import { Timeline } from "./components/Timeline";
 
+interface AuthUser {
+  id: string;
+  email: string;
+  displayName: string;
+  role: "owner" | "editor" | "viewer";
+  tenant: { id: string; name: string; slug: string };
+  quotas: {
+    projects: number;
+    storageBytes: number;
+    storageBytesUsed: number;
+    concurrentRenders: number;
+    monthlyRenderSeconds: number;
+    monthlyRenderSecondsUsed: number;
+    period: string;
+  };
+}
+
 export default function App() {
   const [projects, setProjects] = useState<ProjectDTO[]>([]);
   const [currentProject, setCurrentProject] = useState<ProjectDTO | null>(null);
@@ -12,10 +29,31 @@ export default function App() {
   const [selectedClip, setSelectedClip] = useState<ClipDTO | null>(null);
   const [currentTime, setCurrentTime] = useState<RationalTime>(new RationalTime(0, 24000));
   const [apiError, setApiError] = useState<string | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [loginEmail, setLoginEmail] = useState("admin@aether.local");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState<string | null>(null);
 
   // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
   const OPENREEL_URL = (import.meta.env.VITE_OPENREEL_URL || "").trim();
+  const canEdit = authUser?.role === "owner" || authUser?.role === "editor";
+
+  const stateHeaders = { "X-Aether-CSRF": "1" };
+
+  const loadIdentity = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/auth/me`);
+      if (!response.ok) {
+        setAuthUser(null);
+        return;
+      }
+      setAuthUser(await response.json());
+    } finally {
+      setAuthLoading(false);
+    }
+  };
 
   // 1. Fetch projects on load
   const fetchProjects = async () => {
@@ -30,50 +68,52 @@ export default function App() {
         }
         setApiError(null);
       } else {
-        throw new Error("Failed to fetch projects");
+        const payload = await res.json().catch(() => null);
+        throw new Error(payload?.detail?.message || "Failed to fetch projects");
       }
-    } catch (err: any) {
-      console.warn("Backend API not reachable. Using mock client-side projects.", err);
-      setApiError("Backend offline - Using local mockup state");
-      // Load fallback local project so frontend is always interactive
-      if (projects.length === 0) {
-        const fallbackProject: ProjectDTO = {
-          id: "local-demo-project",
-          name: "Local Mockup Project",
-          timeline: {
-            version: "1.1",
-            tracks: [
-              {
-                id: "track-1",
-                name: "Video Track 1",
-                type: "video",
-                clips: []
-              }
-            ]
-          },
-          materials: [
-            {
-              id: "mat-1",
-              name: "Welcome_Anime.mp4",
-              url: "https://example.com/assets/Welcome_Anime.mp4",
-              type: "video",
-              duration: { value: 120000, timescale: 24000 } // 5 seconds
-            }
-          ],
-          revision: 1,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-        setProjects([fallbackProject]);
-        setCurrentProject(fallbackProject);
-      }
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : "Backend unavailable");
     }
   };
 
   useEffect(() => {
-    fetchProjects();
+    loadIdentity();
+    // Identity is intentionally checked once when the SPA starts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (authUser) fetchProjects();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser?.id]);
+
+  const handleLogin = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setLoginError(null);
+    try {
+      const response = await fetch(`${API_BASE}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        setLoginError(payload?.detail?.message || "Unable to sign in");
+        return;
+      }
+      setAuthUser(await response.json());
+      setLoginPassword("");
+    } catch {
+      setLoginError("The sign-in service is unavailable");
+    }
+  };
+
+  const handleLogout = async () => {
+    await fetch(`${API_BASE}/auth/logout`, { method: "POST", headers: stateHeaders });
+    setAuthUser(null);
+    setProjects([]);
+    setCurrentProject(null);
+  };
 
   const fetchProjectDetail = async (id: string) => {
     try {
@@ -95,7 +135,7 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/projects`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...stateHeaders },
         body: JSON.stringify({ name: newProjectName.trim() }),
       });
       if (res.ok) {
@@ -103,21 +143,12 @@ export default function App() {
         setProjects((prev) => [...prev, newProj]);
         setCurrentProject(newProj);
         setNewProjectName("");
+      } else {
+        const payload = await res.json().catch(() => null);
+        setApiError(payload?.detail?.message || "Project creation failed");
       }
     } catch (err) {
-      // Fallback
-      const newProj: ProjectDTO = {
-        id: "local-" + Math.random().toString(36).substr(2, 9),
-        name: newProjectName.trim(),
-        timeline: { version: "1.1", tracks: [] },
-        materials: [],
-        revision: 1,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      setProjects((prev) => [...prev, newProj]);
-      setCurrentProject(newProj);
-      setNewProjectName("");
+      setApiError(err instanceof Error ? err.message : "Project creation failed");
     }
   };
 
@@ -130,11 +161,10 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/projects/${updatedProj.id}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...stateHeaders },
         body: JSON.stringify({
           name: updatedProj.name,
           timeline: updatedProj.timeline,
-          materials: updatedProj.materials,
           expectedRevision: updatedProj.revision - 1, // Prior revision
         }),
       });
@@ -144,9 +174,12 @@ export default function App() {
       } else if (res.ok) {
         const latest = await res.json();
         setCurrentProject(latest);
+      } else {
+        const payload = await res.json().catch(() => null);
+        throw new Error(payload?.detail?.message || "Project save failed");
       }
     } catch (err) {
-      console.warn("Could not save to backend. State kept locally.", err);
+      setApiError(err instanceof Error ? err.message : "Project save failed");
     }
   };
 
@@ -158,6 +191,7 @@ export default function App() {
     data.append("file", file);
     const response = await fetch(`${API_BASE}/projects/${currentProject.id}/media`, {
       method: "POST",
+      headers: stateHeaders,
       body: data,
     });
     if (!response.ok) {
@@ -218,6 +252,10 @@ export default function App() {
       start: clipStartOffset.toJSON(),
       duration: clipDuration,
       sourceIn: { value: 0, timescale: clipDuration.timescale },
+      volume: 1,
+      opacity: 1,
+      x: 0,
+      y: 0,
     };
 
     targetTrack.clips.push(newClip);
@@ -240,6 +278,7 @@ export default function App() {
     if (!currentProject) return;
     const res = await fetch(`${API_BASE}/projects/${currentProject.id}/render`, {
       method: "POST",
+      headers: stateHeaders,
     });
     if (!res.ok) {
       const payload = await res.json().catch(() => null);
@@ -297,6 +336,26 @@ export default function App() {
 
   const timelineDuration = getTimelineDuration();
 
+  if (authLoading) {
+    return <div className="auth-screen"><div className="auth-card">Loading Aether Studio…</div></div>;
+  }
+
+  if (!authUser) {
+    return (
+      <div className="auth-screen">
+        <form className="auth-card" onSubmit={handleLogin}>
+          <div className="auth-mark">✨</div>
+          <h1>Aether Studio</h1>
+          <p>Sign in to your protected workspace</p>
+          <label>Email<input aria-label="Email" type="email" value={loginEmail} onChange={(event) => setLoginEmail(event.target.value)} required /></label>
+          <label>Password<input aria-label="Password" type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} required /></label>
+          {loginError && <div className="auth-error" role="alert">{loginError}</div>}
+          <button type="submit">Sign in</button>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
       {/* Header */}
@@ -308,6 +367,9 @@ export default function App() {
           </span>
         </div>
         <div className="project-select-container">
+          <span className="tenant-badge" title={`${authUser.role} · ${authUser.email}`}>
+            {authUser.tenant.name} · {authUser.role}
+          </span>
           {apiError && <span style={{ fontSize: "12px", color: "#f59e0b" }}>⚠️ {apiError}</span>}
           <form onSubmit={handleCreateProject} style={{ display: "flex", gap: "6px" }}>
             <input
@@ -315,8 +377,9 @@ export default function App() {
               placeholder="New project name"
               value={newProjectName}
               onChange={(e) => setNewProjectName(e.target.value)}
+              disabled={!canEdit}
             />
-            <button type="submit">Create Project</button>
+            <button type="submit" disabled={!canEdit}>Create Project</button>
           </form>
           <select
             value={currentProject?.id || ""}
@@ -349,6 +412,7 @@ export default function App() {
               Open OpenReel
             </a>
           )}
+          <button type="button" className="secondary" onClick={handleLogout}>Sign out</button>
         </div>
       </header>
 
@@ -358,6 +422,7 @@ export default function App() {
           materials={currentProject?.materials || []}
           onUploadMaterial={handleUploadMaterial}
           onAddClipToTimeline={handleAddClipToTimeline}
+          canEdit={canEdit}
         />
 
         <CanvasPreview
@@ -371,7 +436,7 @@ export default function App() {
           projectId={currentProject?.id || null}
           onTriggerRender={handleTriggerRender}
           apiBase={API_BASE}
-          canRender={Boolean(currentProject?.timeline.tracks.some(
+          canRender={canEdit && Boolean(currentProject?.timeline.tracks.some(
             (track) => track.type === "video" && track.clips.length > 0,
           ))}
         />

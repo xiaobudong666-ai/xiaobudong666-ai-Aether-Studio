@@ -1,6 +1,12 @@
 import { defineConfig, devices } from "@playwright/test";
+import { randomUUID } from "node:crypto";
 
 const python = process.env.AETHER_PYTHON || "python3";
+const testPassword = process.env.AETHER_PLAYWRIGHT_PASSWORD || `local-${randomUUID()}`;
+process.env.AETHER_PLAYWRIGHT_PASSWORD = testPassword;
+if (!/^[A-Za-z0-9_-]{12,128}$/.test(testPassword)) {
+  throw new Error("AETHER_PLAYWRIGHT_PASSWORD must use 12-128 safe characters");
+}
 
 export default defineConfig({
   testDir: "./e2e",
@@ -27,6 +33,9 @@ export default defineConfig({
     {
       command:
         "PYTHONPATH=apps/api DATABASE_URL=sqlite:////tmp/aether-playwright.db " +
+        "AETHER_BOOTSTRAP_ADMIN_EMAIL=admin@aether.local " +
+        `AETHER_BOOTSTRAP_ADMIN_PASSWORD=${testPassword} ` +
+        "AETHER_COOKIE_SECURE=false AETHER_ENFORCE_CSRF=true " +
         `${python} -m uvicorn app.main:app --host 127.0.0.1 --port 8000`,
       url: "http://127.0.0.1:8000/health",
       reuseExistingServer: !process.env.CI,

@@ -101,6 +101,27 @@
         "Target-host backup and real-media smoke verification"
       ],
       "boundary": "No host, SSH target, domain, or TLS endpoint has been provided. Repository launch readiness is not represented as an external deployment. Paid provider features remain unavailable until separately configured and tested."
+    },
+    "M5-1": {
+      "status": "IN_REVIEW",
+      "baseline_commit": "588ca4b9956d4f52abcf2e719a724283afc3b20b",
+      "description": "Remediate authentication/tenant/quota, Canonical Timeline correctness, large-upload, and persistent render-queue production blockers.",
+      "evidence": "docs/evidence/M5-1-PRODUCTION-BLOCKERS-VERIFICATION.md",
+      "implemented_controls": [
+        "Persistent HttpOnly sessions with scrypt password hashes and CSRF proof",
+        "Owner/editor/viewer RBAC and tenant-scoped projects, media, tasks, events, and artifacts",
+        "Project, storage, concurrent-render, and monthly-render-second quotas",
+        "Exact rational Canonical Timeline composition with gaps, overlaps, audio, and subtitles",
+        "Leased SQLite render queue consumed by Worker with idempotent Sidecar submission and restart recovery",
+        "2 GiB streamed Nginx/API/Sidecar upload ceiling plus tenant storage enforcement",
+        "Authenticated full-stack CI smoke and dependency vulnerability gates"
+      ],
+      "acceptance_pending": [
+        "Exact pull-request head passes lint/build/unit",
+        "Exact pull-request head passes authenticated desktop and narrow Playwright flows",
+        "Exact pull-request head passes Docker Compose authenticated large-upload and four-second gap render"
+      ],
+      "boundary": "This entry records a locally verified candidate. It is not ACCEPTED and must not be merged until all three GitHub Actions jobs pass. Public launch still requires a real host, TLS ingress, target backup, and production credentials."
     }
   }
 }
