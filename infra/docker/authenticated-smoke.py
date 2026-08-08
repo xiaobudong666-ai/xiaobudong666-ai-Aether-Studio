@@ -118,7 +118,10 @@ def run_smoke(ffmpeg: str, ffprobe: str, source: Path, artifact: Path) -> None:
         if completed is None:
             raise RuntimeError("Persistent render task did not complete before the smoke timeout")
 
-        download = client.get(completed["artifactUrl"])
+        artifact_path = str(completed["artifactUrl"])
+        if BASE_URL.endswith("/api") and artifact_path.startswith("/api/"):
+            artifact_path = artifact_path.removeprefix("/api")
+        download = client.get(artifact_path)
         download.raise_for_status()
         artifact.write_bytes(download.content)
         metadata = json.loads(

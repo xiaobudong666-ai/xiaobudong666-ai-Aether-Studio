@@ -99,7 +99,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Generate disposable browser-test credential
-        run: echo "AETHER_PLAYWRIGHT_PASSWORD=ci-$(openssl rand -hex 24)" >> "$GITHUB_ENV"
+        run: |
+          password="ci-$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          echo "AETHER_PLAYWRIGHT_PASSWORD=$password" >> "$GITHUB_ENV"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -154,8 +157,12 @@ jobs:
 
       - name: Generate disposable integration credentials
         run: |
-          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=ci-$(openssl rand -hex 24)" >> "$GITHUB_ENV"
-          echo "AETHER_WORKER_TOKEN=ci-$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          password="ci-$(openssl rand -hex 24)"
+          worker_token="ci-$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
+          echo "::add-mask::$worker_token"
+          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
 
       - name: Validate Compose configuration
         run: docker compose -f infra/docker/docker-compose.yml config --quiet
