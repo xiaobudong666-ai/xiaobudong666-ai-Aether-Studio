@@ -357,7 +357,7 @@ export default function App() {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+    <div className="app-shell">
       {/* Header */}
       <header className="editor-header">
         <div className="editor-logo">

@@ -51,9 +51,17 @@ body {
   flex-direction: column;
 }
 
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+}
+
 /* Header styling */
 .editor-header {
-  height: 48px;
+  min-height: 48px;
+  flex: 0 0 auto;
   background-color: #1a1a1e;
   border-bottom: 1px solid #2e2e33;
   display: flex;
@@ -81,9 +89,10 @@ body {
 /* Workbench Grid: Left panel (Assets), Middle (Canvas), Right (Inspector) */
 .workbench-container {
   flex: 1;
+  min-height: 0;
   display: grid;
   grid-template-columns: 280px 1fr 300px;
-  height: calc(100vh - 48px - 220px); /* Adjusting for Header and Timeline bottom panel */
+  height: auto;
   background-color: #0e0e11;
   box-sizing: border-box;
 }
@@ -155,6 +164,7 @@ body {
 /* Timeline bottom panel */
 .timeline-panel {
   height: 220px;
+  flex: 0 0 220px;
   background-color: #121214;
   border-top: 1px solid #2e2e33;
   display: flex;
@@ -256,12 +266,18 @@ input:focus, select:focus {
   transition: width 0.3s ease;
 }
 
+@media (max-width: 1400px) {
+  .editor-header { height: auto; align-items: flex-start; gap: 12px; padding: 12px; }
+  .project-select-container { flex-wrap: wrap; justify-content: flex-end; }
+}
+
 @media (max-width: 1100px) {
   body { overflow: auto; }
   #root { min-height: 100vh; height: auto; }
-  .editor-header { height: auto; min-height: 56px; align-items: flex-start; gap: 12px; padding: 12px; }
-  .project-select-container { flex-wrap: wrap; justify-content: flex-end; }
+  .app-shell { min-height: 100vh; height: auto; }
+  .editor-header { min-height: 56px; }
   .workbench-container {
+    flex: none;
     grid-template-columns: minmax(220px, 0.8fr) minmax(420px, 1.6fr);
     height: auto;
     min-height: 620px;
@@ -277,6 +293,6 @@ input:focus, select:focus {
   .project-select-container form input { flex: 1; min-width: 120px; }
   .workbench-container { display: flex; flex-direction: column; min-height: 0; }
   .workbench-container > * { min-height: 360px; }
-  .timeline-panel { height: 280px; min-height: 280px; }
+  .timeline-panel { height: 280px; min-height: 280px; flex-basis: 280px; }
   .auth-card { padding: 24px; }
 }

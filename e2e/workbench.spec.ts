@@ -49,11 +49,24 @@ test("requires authentication and remains usable at a narrow viewport", async ({
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await expect(page.getByText("Sign in to your protected workspace")).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath("aether-login-mobile.png"),
+    fullPage: true,
+  });
   await page.getByLabel("Email").fill("admin@aether.local");
   await page.getByLabel("Password").fill(testPassword);
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByText("Library & Materials")).toBeVisible();
   await expect(page.getByPlaceholder("New project name")).toBeVisible();
+
+  const libraryBox = await page.getByText("Library & Materials", { exact: true }).boundingBox();
+  const canvasBox = await page.getByText("Canvas Monitor (480p Proxy Target)", { exact: true }).boundingBox();
+  const inspectorBox = await page.getByText("Property Inspector & Tasks", { exact: true }).boundingBox();
+  const timelineBox = await page.getByText("Timeline tracks (Canonical v1.1)", { exact: false }).boundingBox();
+  expect(libraryBox && canvasBox && inspectorBox && timelineBox).toBeTruthy();
+  expect(libraryBox!.y).toBeLessThan(canvasBox!.y);
+  expect(canvasBox!.y).toBeLessThan(inspectorBox!.y);
+  expect(inspectorBox!.y).toBeLessThan(timelineBox!.y);
   await page.screenshot({
     path: testInfo.outputPath("aether-workbench-mobile.png"),
     fullPage: true,
