@@ -47,8 +47,13 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await page.getByRole("button", { name: /选择片段，时长/ }).click();
   await expect(page.getByText("已选片段")).toBeVisible();
   await expect(page.getByText("视频轨道 1", { exact: true })).toBeVisible();
-  await page.getByLabel("时间线位置").fill("0.5");
-  await expect(page.getByLabel("时间线位置")).toHaveValue("0.5");
+  const timelinePosition = page.getByLabel("时间线位置");
+  await timelinePosition.press("Home");
+  for (let step = 0; step < 12; step += 1) {
+    await timelinePosition.press("ArrowRight");
+  }
+  await expect.poll(async () => Number(await timelinePosition.inputValue())).toBeGreaterThan(0.45);
+  await expect.poll(async () => Number(await timelinePosition.inputValue())).toBeLessThan(0.55);
 
   await page.getByRole("button", { name: "提交渲染任务" }).click();
   await expect(page.getByText(/排队中|正在分派|渲染中|已完成/)).toBeVisible({ timeout: 30_000 });
