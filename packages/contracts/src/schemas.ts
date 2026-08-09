@@ -14,6 +14,13 @@ export const ClipSchema = z.object({
   start: RationalTimeSchema,     // Start time in the timeline
   duration: RationalTimeSchema,  // Duration of the clip
   sourceIn: RationalTimeSchema,  // In-point in the source material
+  volume: z.number().min(0).max(4).optional(),
+  opacity: z.number().min(0).max(1).optional(),
+  x: z.number().int().optional(),
+  y: z.number().int().optional(),
+  width: z.number().int().positive().max(7680).optional(),
+  height: z.number().int().positive().max(4320).optional(),
+  text: z.string().max(2000).optional(),
 });
 
 // Timeline Track schema
@@ -36,7 +43,9 @@ export const MaterialSchema = z.object({
   name: z.string(),
   url: z.string(),
   type: z.enum(["video", "audio", "image"]),
+  contentType: z.string().optional(),
   duration: RationalTimeSchema.optional(),
+  sizeBytes: z.number().int().nonnegative().optional(),
 });
 
 // Project schemas with concurrency control
@@ -51,7 +60,7 @@ export const ProjectSchema = z.object({
 });
 
 export const CreateProjectSchema = z.object({
-  name: z.string().min(1, "Project name cannot be empty"),
+  name: z.string().min(1, "项目名称不能为空"),
 });
 
 export const UpdateProjectSchema = z.object({

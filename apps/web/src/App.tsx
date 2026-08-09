@@ -1,9 +1,32 @@
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RationalTime, ProjectDTO, ClipDTO } from "@aether/contracts";
 import { AssetLibrary } from "./components/AssetLibrary";
 import { CanvasPreview } from "./components/CanvasPreview";
 import { PropertyInspector } from "./components/PropertyInspector";
 import { Timeline } from "./components/Timeline";
+import {
+  apiErrorMessage,
+  formatBytes,
+  roleLabel,
+  safeErrorMessage,
+} from "./i18n";
+
+interface AuthUser {
+  id: string;
+  email: string;
+  displayName: string;
+  role: "owner" | "editor" | "viewer";
+  tenant: { id: string; name: string; slug: string };
+  quotas: {
+    projects: number;
+    storageBytes: number;
+    storageBytesUsed: number;
+    concurrentRenders: number;
+    monthlyRenderSeconds: number;
+    monthlyRenderSecondsUsed: number;
+    period: string;
+  };
+}
 
 export default function App() {
   const [projects, setProjects] = useState<ProjectDTO[]>([]);
@@ -12,15 +35,54 @@ export default function App() {
   const [selectedClip, setSelectedClip] = useState<ClipDTO | null>(null);
   const [currentTime, setCurrentTime] = useState<RationalTime>(new RationalTime(0, 24000));
   const [apiError, setApiError] = useState<string | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [loginEmail, setLoginEmail] = useState("admin@aether.local");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
+  const [isSavingProject, setIsSavingProject] = useState(false);
+  const savingProjectRef = useRef(false);
 
   // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
   const OPENREEL_URL = (import.meta.env.VITE_OPENREEL_URL || "").trim();
+  const canEdit = authUser?.role === "owner" || authUser?.role === "editor";
+
+  const stateHeaders = { "X-Aether-CSRF": "1" };
+
+  const handleExpiredSession = (response: Response): boolean => {
+    if (response.status !== 401) return false;
+    setAuthUser(null);
+    setProjects([]);
+    setCurrentProject(null);
+    setLoginError("登录已过期，请重新登录。");
+    return true;
+  };
+
+  const loadIdentity = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/auth/me`);
+      if (!response.ok) {
+        setAuthUser(null);
+        return;
+      }
+      setAuthUser(await response.json());
+    } catch {
+      setAuthUser(null);
+      setLoginError("登录服务暂时不可用，请稍后重试。");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
 
   // 1. Fetch projects on load
   const fetchProjects = async () => {
     try {
       const res = await fetch(`${API_BASE}/projects`);
+      if (handleExpiredSession(res)) return;
       if (res.ok) {
         const data = await res.json();
         setProjects(data);
@@ -30,99 +92,118 @@ export default function App() {
         }
         setApiError(null);
       } else {
-        throw new Error("Failed to fetch projects");
+        const payload = await res.json().catch(() => null);
+        throw new Error(apiErrorMessage(payload, "项目列表加载失败。"));
       }
-    } catch (err: any) {
-      console.warn("Backend API not reachable. Using mock client-side projects.", err);
-      setApiError("Backend offline - Using local mockup state");
-      // Load fallback local project so frontend is always interactive
-      if (projects.length === 0) {
-        const fallbackProject: ProjectDTO = {
-          id: "local-demo-project",
-          name: "Local Mockup Project",
-          timeline: {
-            version: "1.1",
-            tracks: [
-              {
-                id: "track-1",
-                name: "Video Track 1",
-                type: "video",
-                clips: []
-              }
-            ]
-          },
-          materials: [
-            {
-              id: "mat-1",
-              name: "Welcome_Anime.mp4",
-              url: "https://example.com/assets/Welcome_Anime.mp4",
-              type: "video",
-              duration: { value: 120000, timescale: 24000 } // 5 seconds
-            }
-          ],
-          revision: 1,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-        setProjects([fallbackProject]);
-        setCurrentProject(fallbackProject);
-      }
+    } catch (err) {
+      setApiError(safeErrorMessage(err, "服务暂时不可用，请稍后重试。"));
     }
   };
 
   useEffect(() => {
-    fetchProjects();
+    loadIdentity();
+    // Identity is intentionally checked once when the SPA starts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (authUser) fetchProjects();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser?.id]);
+
+  const handleLogin = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (isLoggingIn) return;
+    setIsLoggingIn(true);
+    setLoginError(null);
+    try {
+      const response = await fetch(`${API_BASE}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        setLoginError(apiErrorMessage(payload, "登录失败，请检查邮箱和密码。"));
+        return;
+      }
+      setAuthUser(await response.json());
+      setLoginPassword("");
+      setActionMessage("登录成功，正在载入工作区。");
+    } catch {
+      setLoginError("登录服务暂时不可用，请稍后重试。");
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch(`${API_BASE}/auth/logout`, { method: "POST", headers: stateHeaders });
+    } finally {
+      setActionMessage(null);
+    }
+    setAuthUser(null);
+    setProjects([]);
+    setCurrentProject(null);
+  };
 
   const fetchProjectDetail = async (id: string) => {
     try {
       const res = await fetch(`${API_BASE}/projects/${id}`);
+      if (handleExpiredSession(res)) return;
       if (res.ok) {
         const data = await res.json();
         setCurrentProject(data);
+        setSelectedClip(null);
+        setCurrentTime(new RationalTime(0, 24000));
+        setApiError(null);
+      } else {
+        const payload = await res.json().catch(() => null);
+        setApiError(apiErrorMessage(payload, "项目详情加载失败。"));
       }
     } catch (err) {
-      console.error(err);
+      setApiError(safeErrorMessage(err, "项目详情加载失败。"));
     }
   };
 
   // 2. Create a new project
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newProjectName.trim()) return;
+    if (!newProjectName.trim() || isCreatingProject) return;
+    setIsCreatingProject(true);
 
     try {
       const res = await fetch(`${API_BASE}/projects`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...stateHeaders },
         body: JSON.stringify({ name: newProjectName.trim() }),
       });
+      if (handleExpiredSession(res)) return;
       if (res.ok) {
         const newProj = await res.json();
         setProjects((prev) => [...prev, newProj]);
         setCurrentProject(newProj);
         setNewProjectName("");
+        setSelectedClip(null);
+        setActionMessage(`项目“${newProj.name}”已创建。`);
+      } else {
+        const payload = await res.json().catch(() => null);
+        setApiError(apiErrorMessage(payload, "项目创建失败。"));
       }
     } catch (err) {
-      // Fallback
-      const newProj: ProjectDTO = {
-        id: "local-" + Math.random().toString(36).substr(2, 9),
-        name: newProjectName.trim(),
-        timeline: { version: "1.1", tracks: [] },
-        materials: [],
-        revision: 1,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      setProjects((prev) => [...prev, newProj]);
-      setCurrentProject(newProj);
-      setNewProjectName("");
+      setApiError(safeErrorMessage(err, "项目创建失败。"));
+    } finally {
+      setIsCreatingProject(false);
     }
   };
 
   // 3. Save current project (Update) with optimistic lock checks
-  const saveProjectState = async (updatedProj: ProjectDTO) => {
+  const saveProjectState = async (updatedProj: ProjectDTO): Promise<boolean> => {
+    if (savingProjectRef.current) return false;
+    savingProjectRef.current = true;
+    const previousProject = currentProject;
+    setIsSavingProject(true);
     // Optimistically update locally
     setCurrentProject(updatedProj);
     setProjects((prev) => prev.map((p) => (p.id === updatedProj.id ? updatedProj : p)));
@@ -130,39 +211,61 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/projects/${updatedProj.id}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...stateHeaders },
         body: JSON.stringify({
           name: updatedProj.name,
           timeline: updatedProj.timeline,
-          materials: updatedProj.materials,
           expectedRevision: updatedProj.revision - 1, // Prior revision
         }),
       });
+      if (handleExpiredSession(res)) return false;
       if (res.status === 409) {
-        alert("Concurrency Conflict Detected! Your project was edited by another process. Reloading the latest server state.");
-        fetchProjectDetail(updatedProj.id);
+        const payload = await res.json().catch(() => null);
+        setApiError(apiErrorMessage(payload, "项目已在其他页面更新，正在载入最新版本。"));
+        await fetchProjectDetail(updatedProj.id);
+        return false;
       } else if (res.ok) {
         const latest = await res.json();
         setCurrentProject(latest);
+        setProjects((prev) => prev.map((project) => (
+          project.id === latest.id ? latest : project
+        )));
+        setApiError(null);
+        return true;
+      } else {
+        const payload = await res.json().catch(() => null);
+        throw new Error(apiErrorMessage(payload, "项目保存失败。"));
       }
     } catch (err) {
-      console.warn("Could not save to backend. State kept locally.", err);
+      if (previousProject) {
+        setCurrentProject(previousProject);
+        setProjects((prev) => prev.map((project) => (
+          project.id === previousProject.id ? previousProject : project
+        )));
+      }
+      setApiError(safeErrorMessage(err, "项目保存失败。"));
+      throw err;
+    } finally {
+      savingProjectRef.current = false;
+      setIsSavingProject(false);
     }
   };
 
   // 4. Upload and probe real media through the isolated video-use service.
   const handleUploadMaterial = async (file: File) => {
-    if (!currentProject) throw new Error("Create or select a project first");
+    if (!currentProject) throw new Error("请先创建或选择一个项目。");
     const data = new FormData();
     data.append("expectedRevision", String(currentProject.revision));
     data.append("file", file);
     const response = await fetch(`${API_BASE}/projects/${currentProject.id}/media`, {
       method: "POST",
+      headers: stateHeaders,
       body: data,
     });
+    if (handleExpiredSession(response)) throw new Error("登录已过期，请重新登录。");
     if (!response.ok) {
       const payload = await response.json().catch(() => null);
-      throw new Error(payload?.detail?.message || payload?.detail || "Media upload failed");
+      throw new Error(apiErrorMessage(payload, "媒体上传失败。"));
     }
     const payload = await response.json();
     const updatedProject = payload.project as ProjectDTO;
@@ -170,10 +273,11 @@ export default function App() {
     setProjects((prev) => prev.map((project) => (
       project.id === updatedProject.id ? updatedProject : project
     )));
+    setActionMessage(`素材“${file.name}”已上传并完成媒体信息检测。`);
   };
 
   // 5. Place material on timeline as a clip
-  const handleAddClipToTimeline = (materialId: string) => {
+  const handleAddClipToTimeline = async (materialId: string) => {
     if (!currentProject) return;
     const material = currentProject.materials.find((m) => m.id === materialId);
     if (!material) return;
@@ -192,7 +296,7 @@ export default function App() {
     if (!targetTrack) {
       targetTrack = {
         id: `track-${Math.random().toString(36).substr(2, 9)}`,
-        name: `${material.type.charAt(0).toUpperCase() + material.type.slice(1)} Track 1`,
+        name: material.type === "audio" ? "音频轨道 1" : "视频轨道 1",
         type: trackType,
         clips: [],
       };
@@ -218,6 +322,10 @@ export default function App() {
       start: clipStartOffset.toJSON(),
       duration: clipDuration,
       sourceIn: { value: 0, timescale: clipDuration.timescale },
+      volume: 1,
+      opacity: 1,
+      x: 0,
+      y: 0,
     };
 
     targetTrack.clips.push(newClip);
@@ -232,7 +340,10 @@ export default function App() {
       updatedAt: new Date().toISOString(),
     };
 
-    saveProjectState(updatedProj);
+    const saved = await saveProjectState(updatedProj);
+    if (!saved) return;
+    setSelectedClip(newClip);
+    setActionMessage(`素材“${material.name}”已添加到时间线。`);
   };
 
   // 6. Trigger backend render task
@@ -240,11 +351,14 @@ export default function App() {
     if (!currentProject) return;
     const res = await fetch(`${API_BASE}/projects/${currentProject.id}/render`, {
       method: "POST",
+      headers: stateHeaders,
     });
+    if (handleExpiredSession(res)) throw new Error("登录已过期，请重新登录。");
     if (!res.ok) {
       const payload = await res.json().catch(() => null);
-      throw new Error(payload?.detail?.message || "Trigger render failed");
+      throw new Error(apiErrorMessage(payload, "渲染任务提交失败。"));
     }
+    setActionMessage("渲染任务已提交，可以离开页面后再回来查看进度。");
   };
 
   const handleExportOpenCutSnapshot = async () => {
@@ -260,6 +374,7 @@ export default function App() {
     link.download = `${currentProject.name.replace(/[^a-zA-Z0-9_-]+/g, "-") || "aether-project"}.opencut.json`;
     link.click();
     URL.revokeObjectURL(url);
+    setActionMessage("OpenCut 兼容快照已导出。");
   };
 
   const handleExportOpenReelProject = async () => {
@@ -275,6 +390,7 @@ export default function App() {
     link.download = `${currentProject.name.replace(/[^a-zA-Z0-9_-]+/g, "-") || "aether-project"}.openreel.json`;
     link.click();
     URL.revokeObjectURL(url);
+    setActionMessage("OpenReel 项目文件已导出。");
   };
 
   // Calculate timeline total duration
@@ -296,35 +412,75 @@ export default function App() {
   };
 
   const timelineDuration = getTimelineDuration();
+  const previewMaterial = currentProject?.materials.find(
+    (material) => material.id === selectedClip?.materialId,
+  ) || currentProject?.materials.find((material) => material.type === "video") || null;
+
+  if (authLoading) {
+    return <div className="auth-screen"><div className="auth-card">正在加载 Aether Studio…</div></div>;
+  }
+
+  if (!authUser) {
+    return (
+      <div className="auth-screen">
+        <form className="auth-card" onSubmit={handleLogin}>
+          <h1>Aether Studio</h1>
+          <p>登录你的安全漫剧工作区</p>
+          <label>邮箱<input aria-label="邮箱" type="email" value={loginEmail} onChange={(event) => setLoginEmail(event.target.value)} required /></label>
+          <label>密码<input aria-label="密码" type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} required /></label>
+          {loginError && <div className="auth-error" role="alert">{loginError}</div>}
+          <button type="submit" disabled={isLoggingIn}>
+            {isLoggingIn ? "正在登录…" : "登录"}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+    <div className="app-shell">
       {/* Header */}
       <header className="editor-header">
         <div className="editor-logo">
-          <span>✨</span> Aether Studio AI Anime Workbench
-          <span style={{ fontSize: "11px", color: "#a1a1aa", marginLeft: "8px" }}>
-            OpenCut Core 0.2.10
+          Aether Studio · AI 漫剧工作台
+          <span style={{ fontSize: "12px", color: "#a1a1aa", marginLeft: "8px" }}>
+            OpenCut 内核 0.2.10
           </span>
         </div>
         <div className="project-select-container">
-          {apiError && <span style={{ fontSize: "12px", color: "#f59e0b" }}>⚠️ {apiError}</span>}
+          <span className="tenant-badge" title={`${roleLabel(authUser.role)} · ${authUser.email}`}>
+            {authUser.tenant.name} · {roleLabel(authUser.role)}
+          </span>
+          <span className="quota-badge" title="当前团队资源使用情况">
+            项目 {projects.length}/{authUser.quotas.projects} · 存储 {formatBytes(authUser.quotas.storageBytesUsed)}/{formatBytes(authUser.quotas.storageBytes)} · 本月渲染 {authUser.quotas.monthlyRenderSecondsUsed}/{authUser.quotas.monthlyRenderSeconds} 秒
+          </span>
+          {apiError && <span style={{ fontSize: "12px", color: "#f59e0b" }}>{apiError}</span>}
           <form onSubmit={handleCreateProject} style={{ display: "flex", gap: "6px" }}>
             <input
               type="text"
-              placeholder="New project name"
+              aria-label="新项目名称"
+              placeholder="输入新项目名称"
               value={newProjectName}
               onChange={(e) => setNewProjectName(e.target.value)}
+              disabled={!canEdit}
             />
-            <button type="submit">Create Project</button>
+            <button
+              type="submit"
+              disabled={!canEdit || isCreatingProject || !newProjectName.trim()}
+            >
+              {isCreatingProject ? "正在创建…" : "创建项目"}
+            </button>
           </form>
           <select
+            aria-label="选择项目"
             value={currentProject?.id || ""}
             onChange={(e) => fetchProjectDetail(e.target.value)}
+            disabled={projects.length === 0}
           >
+            {projects.length === 0 && <option value="">暂无项目</option>}
             {projects.map((p) => (
               <option key={p.id} value={p.id}>
-                {p.name} (r{p.revision})
+                {p.name}（版本 {p.revision}）
               </option>
             ))}
           </select>
@@ -332,25 +488,33 @@ export default function App() {
             type="button"
             disabled={!currentProject}
             onClick={handleExportOpenCutSnapshot}
-            title="Export a pinned OpenCut Classic compatibility snapshot and media manifest"
+            title="导出固定版本的 OpenCut Classic 兼容快照和素材清单"
           >
-            Export OpenCut Snapshot
+            导出 OpenCut 快照
           </button>
           <button
             type="button"
             disabled={!currentProject}
             onClick={handleExportOpenReelProject}
-            title="Export an OpenReel schema 1.0.0 project file with relinkable media placeholders"
+            title="导出 OpenReel 1.0.0 项目文件，素材可在外部重新关联"
           >
-            Export OpenReel Project
+            导出 OpenReel 项目
           </button>
           {OPENREEL_URL && (
             <a href={OPENREEL_URL} target="_blank" rel="noreferrer noopener">
-              Open OpenReel
+              打开 OpenReel
             </a>
           )}
+          <button type="button" className="secondary" onClick={handleLogout}>退出登录</button>
         </div>
       </header>
+
+      {actionMessage && (
+        <div className="status-banner" role="status" aria-live="polite">
+          {actionMessage}
+          <button type="button" aria-label="关闭提示" onClick={() => setActionMessage(null)}>关闭</button>
+        </div>
+      )}
 
       {/* Main workbench */}
       <main className="workbench-container">
@@ -358,12 +522,15 @@ export default function App() {
           materials={currentProject?.materials || []}
           onUploadMaterial={handleUploadMaterial}
           onAddClipToTimeline={handleAddClipToTimeline}
+          canEdit={canEdit && !isSavingProject}
+          hasProject={Boolean(currentProject)}
         />
 
         <CanvasPreview
           currentTime={currentTime}
           onTimeChange={setCurrentTime}
           timelineDuration={timelineDuration}
+          previewMaterial={previewMaterial}
         />
 
         <PropertyInspector
@@ -371,7 +538,7 @@ export default function App() {
           projectId={currentProject?.id || null}
           onTriggerRender={handleTriggerRender}
           apiBase={API_BASE}
-          canRender={Boolean(currentProject?.timeline.tracks.some(
+          canRender={canEdit && !isSavingProject && Boolean(currentProject?.timeline.tracks.some(
             (track) => track.type === "video" && track.clips.length > 0,
           ))}
         />

@@ -1,15 +1,16 @@
-import os
-import time
 import json
 import logging
+import os
 import threading
+import time
 from dataclasses import dataclass
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from .ffmpeg_adapter import FFmpegAdapter
 from .ai_provider import AIProviderInterface
-from .recovery import TaskRecoveryManager
+from .ffmpeg_adapter import FFmpegAdapter
 from .moneyprinter_adapter import MoneyPrinterTurboAdapter
+from .recovery import TaskRecoveryManager
+from .task_queue import TaskQueueClient, TaskQueueError
 from .video_use_adapter import VideoUseAdapter
 
 # Configure logging
@@ -43,7 +44,7 @@ class WorkerHealthHandler(BaseHTTPRequestHandler):
 
 
 def create_health_server(
-    host: str = "0.0.0.0",
+    host: str = "0.0.0.0",  # noqa: S104 - isolated container health endpoint
     port: int = 8001,
 ) -> HTTPServer:
     return HTTPServer((host, port), WorkerHealthHandler)
@@ -68,19 +69,71 @@ class WorkerComponents:
     recovery: TaskRecoveryManager
     moneyprinter: MoneyPrinterTurboAdapter
     video_use: VideoUseAdapter
+    queue: TaskQueueClient | None = None
 
 
 def initialize_worker() -> WorkerComponents:
     backend_url = os.environ.get("BACKEND_URL", "http://localhost:8000")
+    queue = TaskQueueClient(backend_url=backend_url)
     # Enable degradation fallback by default in background worker
     moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=True)
     return WorkerComponents(
         ffmpeg=FFmpegAdapter(),
         ai=AIProviderInterface(),
-        recovery=TaskRecoveryManager(backend_url=backend_url),
+        recovery=TaskRecoveryManager(backend_url=backend_url, queue=queue),
         moneyprinter=moneyprinter_adapter,
         video_use=VideoUseAdapter(),
+        queue=queue,
     )
+
+
+def process_render_task(components: WorkerComponents, task: dict, poll_interval: float = 0.5) -> dict:
+    if components.queue is None:
+        raise TaskQueueError("Worker task queue is not configured")
+    task_id = task["taskId"]
+    upstream_job_id = task.get("upstreamJobId")
+    try:
+        if not upstream_job_id:
+            submitted = components.video_use.submit_render(task["renderPayload"])
+            upstream_job_id = submitted["jobId"]
+            components.queue.update(
+                task_id,
+                status="processing",
+                progress=int(submitted.get("progress", 0)),
+                message="任务已提交至视频渲染服务",
+                upstream_job_id=upstream_job_id,
+            )
+
+        deadline = time.monotonic() + float(os.environ.get("AETHER_RENDER_TIMEOUT_SECONDS", "3600"))
+        while time.monotonic() < deadline:
+            upstream = components.video_use.get_job_status(upstream_job_id)
+            upstream_status = str(upstream.get("status", "processing"))
+            progress = int(upstream.get("progress", 0))
+            message = str(upstream.get("message", upstream_status))
+            if upstream_status == "completed":
+                return components.queue.update(
+                    task_id, status="completed", progress=100, message=message,
+                    upstream_job_id=upstream_job_id,
+                )
+            if upstream_status == "failed":
+                return components.queue.update(
+                    task_id, status="failed", progress=100, message=message,
+                    upstream_job_id=upstream_job_id, error=message,
+                    retryable=bool(upstream.get("retryable", False)),
+                )
+            components.queue.update(
+                task_id, status="processing", progress=progress, message=message,
+                upstream_job_id=upstream_job_id,
+            )
+            time.sleep(poll_interval)
+        raise TimeoutError("Render exceeded the worker timeout")
+    except Exception as exc:
+        logger.exception("Render task %s failed in worker", task_id)
+        return components.queue.update(
+            task_id, status="failed", progress=int(task.get("progress", 0)),
+            message="工作节点将在短暂故障后自动重试", upstream_job_id=upstream_job_id,
+            error=str(exc), retryable=True,
+        )
 
 
 def process_m1_moneyprinter_task(components: WorkerComponents, task_data: dict) -> dict:
@@ -137,11 +190,12 @@ def run_worker(poll_interval: float = 10):
 
     try:
         while True:
-            logger.info("Daemon active: polling for pending video rendering and subtitle generation tasks...")
-
-            # Demonstration of the M1 call path for local contract validation:
-            # Under actual production runs, tasks matching a MoneyPrinter pattern would pass through process_m1_moneyprinter_task.
-            time.sleep(poll_interval)
+            task = components.queue.claim() if components.queue is not None else None
+            if task is None:
+                time.sleep(poll_interval)
+                continue
+            logger.info("Claimed render task %s", task["taskId"])
+            process_render_task(components, task)
     except KeyboardInterrupt:
         logger.info("Worker shutting down gracefully.")
 

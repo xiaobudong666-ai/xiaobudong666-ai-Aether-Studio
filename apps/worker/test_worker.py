@@ -1,13 +1,20 @@
 import subprocess
 import threading
 from unittest.mock import MagicMock
+
 import httpx
 import pytest
-
-from app.ffmpeg_adapter import FFmpegAdapter, MediaProcessingError
 from app.ai_provider import AIProviderInterface
+from app.ffmpeg_adapter import FFmpegAdapter, MediaProcessingError
+from app.main import (
+    WorkerComponents,
+    create_health_server,
+    initialize_worker,
+    process_m1_moneyprinter_task,
+    process_render_task,
+)
 from app.recovery import TaskRecoveryManager
-from app.main import create_health_server, initialize_worker, process_m1_moneyprinter_task, WorkerComponents
+
 
 def test_ffmpeg_adapter_executes_real_proxy_audio_and_probe(tmp_path):
     source = tmp_path / "source.mp4"
@@ -67,6 +74,7 @@ def test_worker_reads_backend_url_from_environment(monkeypatch):
     monkeypatch.setenv("BACKEND_URL", "http://api.internal:8123")
     components = initialize_worker()
     assert components.recovery.backend_url == "http://api.internal:8123"
+    assert components.queue.backend_url == "http://api.internal:8123"
 
 
 def test_worker_real_http_health_check_uses_dynamic_port():
@@ -128,3 +136,48 @@ def test_process_m1_moneyprinter_task_unhealthy():
     assert res["status"] == "failed"
     assert "reason" in res
     mock_adapter.generate_video.assert_not_called()
+
+
+def test_worker_claimed_render_is_submitted_polled_and_persisted():
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    video_use = MagicMock()
+    video_use.submit_render.return_value = {
+        "jobId": "upstream-1", "status": "queued", "progress": 0, "message": "Queued"
+    }
+    video_use.get_job_status.side_effect = [
+        {"status": "processing", "progress": 50, "message": "Rendering"},
+        {"status": "completed", "progress": 100, "message": "Done"},
+    ]
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=video_use, queue=queue,
+    )
+    task = {
+        "taskId": "task-1", "progress": 0,
+        "renderPayload": {"projectId": "project-1", "requestId": "task-1"},
+        "upstreamJobId": None,
+    }
+    result = process_render_task(components, task, poll_interval=0)
+    assert result["status"] == "completed"
+    video_use.submit_render.assert_called_once_with(task["renderPayload"])
+    assert queue.update.call_count == 3
+    assert queue.update.call_args.kwargs["upstream_job_id"] == "upstream-1"
+
+
+def test_worker_requeues_transient_video_use_failure():
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    video_use = MagicMock()
+    video_use.submit_render.side_effect = RuntimeError("temporary network failure")
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=video_use, queue=queue,
+    )
+    result = process_render_task(
+        components,
+        {"taskId": "task-retry", "progress": 0, "renderPayload": {"projectId": "p"}},
+        poll_interval=0,
+    )
+    assert result["status"] == "failed"
+    assert result["retryable"] is True

@@ -1,22 +1,50 @@
+import secrets
 from unittest.mock import MagicMock, patch
-import pytest
+
 import httpx
-from fastapi.testclient import TestClient
+import pytest
+from app.database import Base, build_engine
 from app.main import create_app
 from app.moneyprinter_adapter import (
-    MoneyPrinterTurboAdapter,
-    MoneyPrinterError,
-    MoneyPrinterTimeoutError,
     MoneyPrinterConnectionError,
-    MoneyPrinterTaskFailedError,
+    MoneyPrinterTurboAdapter,
 )
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
+
+OWNER_PASSWORD = secrets.token_urlsafe(24)
+
 
 @pytest.fixture()
-def mpt_client():
-    test_app = create_app()
+def mpt_client(tmp_path):
+    test_engine = build_engine(f"sqlite:///{tmp_path / 'moneyprinter.db'}")
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+    def get_test_db():
+        db = sessions()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    test_app = create_app(
+        app_engine=test_engine,
+        db_dependency=get_test_db,
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="owner@example.com",
+        cookie_secure=False,
+        enforce_csrf=True,
+    )
     test_app.state.moneyprinter = MagicMock()
     with TestClient(test_app) as client:
+        assert client.post(
+            "/auth/login",
+            json={"email": "owner@example.com", "password": OWNER_PASSWORD},
+        ).status_code == 200
+        client.headers.update({"X-Aether-CSRF": "1"})
         yield client, test_app.state.moneyprinter
+    Base.metadata.drop_all(bind=test_engine)
+    test_engine.dispose()
 
 def test_api_moneyprinter_health(mpt_client):
     client, mock_adapter = mpt_client
@@ -76,6 +104,9 @@ def test_api_moneyprinter_generate_failure(mpt_client):
 
 def test_api_moneyprinter_status(mpt_client):
     client, mock_adapter = mpt_client
+    mock_adapter.generate_video.return_value = "mpt-task-789"
+    assert client.post("/moneyprinter/generate", json={"video_subject": "status test"}).status_code == 200
+    mock_adapter.reset_mock()
     mock_adapter.get_task_status.return_value = {
         "task_id": "mpt-task-789",
         "status": "completed",
@@ -89,6 +120,9 @@ def test_api_moneyprinter_status(mpt_client):
 
 def test_api_moneyprinter_status_failure(mpt_client):
     client, mock_adapter = mpt_client
+    mock_adapter.generate_video.return_value = "mpt-task-789"
+    assert client.post("/moneyprinter/generate", json={"video_subject": "status failure"}).status_code == 200
+    mock_adapter.reset_mock()
     mock_adapter.get_task_status.side_effect = Exception("API offline")
 
     response = client.get("/moneyprinter/status/mpt-task-789")
