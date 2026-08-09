@@ -119,7 +119,7 @@ def apply_project_update(
             status_code=422,
             detail={
                 "code": "MATERIALS_SERVER_MANAGED",
-                "message": "Project materials can only be changed through the media API",
+                "message": "项目素材只能通过媒体上传接口修改",
             },
         )
     values = {"revision": req.expectedRevision + 1, "updated_at": utc_now()}
@@ -143,13 +143,13 @@ def apply_project_update(
         if exists is None:
             raise HTTPException(
                 status_code=404,
-                detail={"code": "PROJECT_NOT_FOUND", "message": f"Project {project_id} not found"},
+                detail={"code": "PROJECT_NOT_FOUND", "message": "未找到该项目"},
             )
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "CONCURRENCY_CONFLICT",
-                "message": f"Revision conflict: expected {req.expectedRevision}; the project has already changed",
+                "message": "项目版本冲突，服务器中的项目已经发生变化",
             },
         )
     db.commit()
@@ -199,7 +199,7 @@ def create_app(
             _app.state.setup_required = bootstrap is None
         yield
 
-    created_app = FastAPI(title="Aether Studio API", version="1.1.0", lifespan=lifespan)
+    created_app = FastAPI(title="Aether Studio 接口服务", version="1.1.0", lifespan=lifespan)
     created_app.state.moneyprinter = MoneyPrinterTurboAdapter()
     created_app.state.video_use = video_use_adapter or VideoUseAdapter()
     created_app.state.setup_required = False
@@ -229,7 +229,7 @@ def create_app(
             and request.headers.get("x-aether-csrf") != "1"
         ):
             return Response(
-                content=json.dumps({"detail": {"code": "CSRF_REQUIRED", "message": "Missing same-origin request proof"}}),
+                content=json.dumps({"detail": {"code": "CSRF_REQUIRED", "message": "缺少同源请求校验信息"}}, ensure_ascii=False),
                 status_code=403,
                 media_type="application/json",
             )
@@ -248,7 +248,7 @@ def create_app(
         if project is None:
             raise HTTPException(
                 status_code=404,
-                detail={"code": "PROJECT_NOT_FOUND", "message": f"Project {project_id} not found"},
+                detail={"code": "PROJECT_NOT_FOUND", "message": "未找到该项目"},
             )
         return project
 
@@ -267,7 +267,7 @@ def create_app(
 
     def require_internal_token(x_worker_token: str | None) -> None:
         if not resolved_worker_token or not x_worker_token or not hmac.compare_digest(resolved_worker_token, x_worker_token):
-            raise HTTPException(status_code=401, detail={"code": "WORKER_AUTH_FAILED", "message": "Invalid worker token"})
+            raise HTTPException(status_code=401, detail={"code": "WORKER_AUTH_FAILED", "message": "工作节点认证失败"})
 
     @created_app.get("/health")
     def health_check(db: Session = Depends(db_dependency)):
@@ -285,7 +285,7 @@ def create_app(
     def login(req: LoginRequest, response: Response, db: Session = Depends(db_dependency)):
         user = db.execute(select(DBUser).where(DBUser.email == normalize_email(req.email))).scalar_one_or_none()
         if user is None or not user.is_active or not verify_password(req.password, user.password_hash):
-            raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "Email or password is incorrect"})
+            raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "邮箱或密码不正确"})
         tenant = db.execute(select(DBTenant).where(DBTenant.id == user.tenant_id)).scalar_one()
         _session, token = create_session(db, user, utc_now(), session_hours)
         set_session_cookie(response, token, session_hours, resolved_cookie_secure)
@@ -322,7 +322,7 @@ def create_app(
         require_roles(context, "owner")
         email = normalize_email(req.email)
         if db.execute(select(DBUser.id).where(DBUser.email == email)).scalar_one_or_none():
-            raise HTTPException(status_code=409, detail={"code": "EMAIL_EXISTS", "message": "A user with this email already exists"})
+            raise HTTPException(status_code=409, detail={"code": "EMAIL_EXISTS", "message": "该邮箱已经存在"})
         now = utc_now()
         user = DBUser(
             id=str(uuid.uuid4()), tenant_id=context.tenant_id, email=email,
@@ -350,7 +350,8 @@ def create_app(
                 video_concat_mode=req.video_concat_mode, video_clip_duration=req.video_clip_duration,
             )
         except Exception as exc:
-            raise HTTPException(status_code=502, detail={"code": "MONEYPRINTER_API_ERROR", "message": f"Failed to submit task to MoneyPrinterTurbo sidecar: {exc}"}) from exc
+            logger.exception("MoneyPrinterTurbo task submission failed")
+            raise HTTPException(status_code=502, detail={"code": "MONEYPRINTER_API_ERROR", "message": "MoneyPrinterTurbo 任务提交失败"}) from exc
         now = utc_now()
         db.add(DBExternalTask(id=task_id, tenant_id=context.tenant_id, requested_by=context.user_id, engine="moneyprinter", status="submitted", created_at=now, updated_at=now))
         db.commit()
@@ -360,11 +361,12 @@ def create_app(
     def moneyprinter_status(task_id: str, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
         task = db.execute(select(DBExternalTask).where(DBExternalTask.id == task_id, DBExternalTask.tenant_id == context.tenant_id)).scalar_one_or_none()
         if task is None:
-            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "Task not found"})
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "未找到该任务"})
         try:
             payload = created_app.state.moneyprinter.get_task_status(task_id)
         except Exception as exc:
-            raise HTTPException(status_code=502, detail={"code": "MONEYPRINTER_STATUS_ERROR", "message": f"Failed to query task status: {exc}"}) from exc
+            logger.exception("MoneyPrinterTurbo status query failed")
+            raise HTTPException(status_code=502, detail={"code": "MONEYPRINTER_STATUS_ERROR", "message": "MoneyPrinterTurbo 任务状态查询失败"}) from exc
         task.status = str(payload.get("status", task.status))
         task.updated_at = utc_now()
         db.commit()
@@ -379,7 +381,8 @@ def create_app(
         try:
             return created_app.state.video_use.get_capabilities()
         except VideoUseError as exc:
-            raise HTTPException(status_code=502, detail={"code": "VIDEO_USE_UNAVAILABLE", "message": str(exc)}) from exc
+            logger.exception("video-use capabilities query failed")
+            raise HTTPException(status_code=502, detail={"code": "VIDEO_USE_UNAVAILABLE", "message": "视频处理服务暂时不可用"}) from exc
 
     @created_app.get("/projects", response_model=list[ProjectResponse])
     def list_projects(context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
@@ -396,7 +399,7 @@ def create_app(
         tenant = db.execute(tenant_query).scalar_one()
         count = db.execute(select(func.count(DBProject.id)).where(DBProject.tenant_id == context.tenant_id)).scalar_one()
         if count >= tenant.project_quota:
-            raise HTTPException(status_code=429, detail={"code": "PROJECT_QUOTA_EXCEEDED", "message": "Project quota reached"})
+            raise HTTPException(status_code=429, detail={"code": "PROJECT_QUOTA_EXCEEDED", "message": "项目数量已达到配额上限"})
         now = utc_now()
         project = DBProject(
             id=str(uuid.uuid4()), tenant_id=context.tenant_id, owner_id=context.user_id,
@@ -426,14 +429,14 @@ def create_app(
         require_roles(context, "owner", "editor")
         project = project_for_tenant(db, project_id, context)
         if project.revision != expectedRevision:
-            raise HTTPException(status_code=409, detail={"code": "CONCURRENCY_CONFLICT", "message": f"Revision conflict: expected {expectedRevision}"})
+            raise HTTPException(status_code=409, detail={"code": "CONCURRENCY_CONFLICT", "message": "项目版本冲突，请重新载入后再操作"})
         file.file.seek(0, os.SEEK_END)
         upload_size = file.file.tell()
         file.file.seek(0)
         if upload_size <= 0:
-            raise HTTPException(status_code=422, detail={"code": "EMPTY_UPLOAD", "message": "Uploaded media is empty"})
+            raise HTTPException(status_code=422, detail={"code": "EMPTY_UPLOAD", "message": "上传的媒体文件为空"})
         if upload_size > max_upload_bytes:
-            raise HTTPException(status_code=413, detail={"code": "UPLOAD_TOO_LARGE", "message": "Media exceeds the configured upload limit"})
+            raise HTTPException(status_code=413, detail={"code": "UPLOAD_TOO_LARGE", "message": "媒体文件超过系统允许的上传大小"})
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == context.tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
@@ -441,7 +444,7 @@ def create_app(
         )
         if reservation.rowcount != 1:
             db.rollback()
-            raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "Tenant storage quota reached"})
+            raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
         try:
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
@@ -452,6 +455,7 @@ def create_app(
             material = {
                 "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,
                 "url": f"/api/video-use/media/{project_id}/{media_id}", "type": media_type,
+                "contentType": file.content_type or ("video/mp4" if media_type == "video" else "audio/mpeg"),
                 "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
                 "sizeBytes": int(metadata.get("sizeBytes") or upload_size),
             }
@@ -464,24 +468,71 @@ def create_app(
             db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
             db.commit()
             if isinstance(exc, VideoUseError):
-                raise HTTPException(status_code=502, detail={"code": "VIDEO_USE_UPLOAD_FAILED", "message": str(exc)}) from exc
+                logger.exception("video-use media upload failed")
+                raise HTTPException(status_code=502, detail={"code": "VIDEO_USE_UPLOAD_FAILED", "message": "视频处理服务未能完成媒体上传"}) from exc
             raise
         finally:
             file.file.close()
         return {"material": material, "project": project_response(updated)}
 
-    def proxy_video_use_stream(path: str):
+    def proxy_video_use_stream(
+        path: str,
+        request: Request,
+        media_type: str = "application/octet-stream",
+    ):
+        forwarded_headers = {
+            header: request.headers[header]
+            for header in ("range", "if-range")
+            if header in request.headers
+        }
+        stream_context = created_app.state.video_use.stream(
+            path,
+            headers=forwarded_headers or None,
+        )
+        try:
+            upstream = stream_context.__enter__()
+        except VideoUseError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "VIDEO_USE_UNAVAILABLE",
+                    "message": "视频处理服务暂时不可用",
+                },
+            ) from exc
+
+        response_headers = {
+            header: upstream.headers[header]
+            for header in (
+                "accept-ranges",
+                "cache-control",
+                "content-disposition",
+                "content-length",
+                "content-range",
+            )
+            if header in upstream.headers
+        }
+
         def body():
-            with created_app.state.video_use.stream(path) as response:
-                yield from response.iter_bytes()
-        return StreamingResponse(body(), media_type="application/octet-stream")
+            try:
+                yield from upstream.iter_bytes()
+            finally:
+                stream_context.__exit__(None, None, None)
+
+        return StreamingResponse(
+            body(),
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", media_type),
+            headers=response_headers,
+        )
 
     @created_app.get("/video-use/media/{project_id}/{media_id}")
-    def stream_project_media(project_id: str, media_id: str, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
+    def stream_project_media(project_id: str, media_id: str, request: Request, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
         project = project_for_tenant(db, project_id, context)
-        if not any(material.get("id") == media_id for material in project.materials):
-            raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND", "message": "Media not found"})
-        return proxy_video_use_stream(f"/media/{project_id}/{media_id}")
+        material = next((item for item in project.materials if item.get("id") == media_id), None)
+        if material is None:
+            raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND", "message": "未找到该媒体文件"})
+        media_type = material.get("contentType") or ("video/mp4" if material.get("type") == "video" else "audio/mpeg")
+        return proxy_video_use_stream(f"/media/{project_id}/{media_id}", request, media_type)
 
     @created_app.post("/projects/{project_id}/render", status_code=202)
     def start_render_task(project_id: str, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
@@ -496,7 +547,7 @@ def create_app(
         refresh_quota_period(db, tenant)
         active = db.execute(select(func.count(DBRenderTask.id)).where(DBRenderTask.tenant_id == context.tenant_id, DBRenderTask.status.in_(ACTIVE_TASK_STATES))).scalar_one()
         if active >= tenant.concurrent_render_quota:
-            raise HTTPException(status_code=429, detail={"code": "RENDER_CONCURRENCY_QUOTA_EXCEEDED", "message": "Concurrent render quota reached"})
+            raise HTTPException(status_code=429, detail={"code": "RENDER_CONCURRENCY_QUOTA_EXCEEDED", "message": "同时渲染的任务数已达到上限"})
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == context.tenant_id, DBTenant.render_seconds_used + reserved_seconds <= DBTenant.monthly_render_seconds_quota)
@@ -504,14 +555,14 @@ def create_app(
         )
         if reservation.rowcount != 1:
             db.rollback()
-            raise HTTPException(status_code=429, detail={"code": "RENDER_SECONDS_QUOTA_EXCEEDED", "message": "Monthly render-seconds quota reached"})
+            raise HTTPException(status_code=429, detail={"code": "RENDER_SECONDS_QUOTA_EXCEEDED", "message": "本月可用渲染时长已用完"})
         now = utc_now()
         task_id = str(uuid.uuid4())
         payload["requestId"] = task_id
         task = DBRenderTask(
             id=task_id, tenant_id=context.tenant_id, project_id=project_id,
             requested_by=context.user_id, status="queued", progress=0,
-            message="Queued for a render worker", engine="video-use", render_payload=payload,
+            message="任务已进入渲染队列", engine="video-use", render_payload=payload,
             attempts=0, max_attempts=3, reserved_seconds=reserved_seconds,
             created_at=now, updated_at=now,
         )
@@ -529,11 +580,11 @@ def create_app(
         return [task_response(task) for task in tasks]
 
     @created_app.get("/renders/{task_id}/artifact")
-    def stream_render_artifact(task_id: str, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
+    def stream_render_artifact(task_id: str, request: Request, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
         task = db.execute(select(DBRenderTask).where(DBRenderTask.id == task_id, DBRenderTask.tenant_id == context.tenant_id)).scalar_one_or_none()
         if task is None or task.status != "completed" or not task.upstream_job_id:
-            raise HTTPException(status_code=404, detail={"code": "ARTIFACT_NOT_FOUND", "message": "Render artifact not found"})
-        return proxy_video_use_stream(f"/jobs/{task.upstream_job_id}/artifact")
+            raise HTTPException(status_code=404, detail={"code": "ARTIFACT_NOT_FOUND", "message": "未找到可下载的渲染成片"})
+        return proxy_video_use_stream(f"/jobs/{task.upstream_job_id}/artifact", request, "video/mp4")
 
     @created_app.post("/internal/render-tasks/recover")
     def recover_tasks(
@@ -549,7 +600,7 @@ def create_app(
             task.status = "processing" if task.upstream_job_id else "queued"
             task.lease_owner = None
             task.lease_expires_at = None
-            task.message = "Recovered after worker lease expired"
+            task.message = "工作节点租约过期后已恢复任务"
             task.updated_at = now
             recovered.append(task.id)
         db.commit()
@@ -606,9 +657,9 @@ def create_app(
         require_internal_token(x_worker_token)
         task = db.execute(select(DBRenderTask).where(DBRenderTask.id == task_id)).scalar_one_or_none()
         if task is None:
-            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "Task not found"})
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "未找到该任务"})
         if task.lease_owner != x_worker_id:
-            raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "Worker no longer owns this task lease"})
+            raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去该任务租约"})
         now = utc_now()
         if req.upstreamJobId:
             task.upstream_job_id = req.upstreamJobId

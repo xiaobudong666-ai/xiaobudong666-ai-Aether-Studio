@@ -100,7 +100,7 @@ def process_render_task(components: WorkerComponents, task: dict, poll_interval:
                 task_id,
                 status="processing",
                 progress=int(submitted.get("progress", 0)),
-                message=str(submitted.get("message", "Submitted to video-use")),
+                message="任务已提交至视频渲染服务",
                 upstream_job_id=upstream_job_id,
             )
 
@@ -131,7 +131,7 @@ def process_render_task(components: WorkerComponents, task: dict, poll_interval:
         logger.exception("Render task %s failed in worker", task_id)
         return components.queue.update(
             task_id, status="failed", progress=int(task.get("progress", 0)),
-            message="Worker will retry after a transient failure", upstream_job_id=upstream_job_id,
+            message="工作节点将在短暂故障后自动重试", upstream_job_id=upstream_job_id,
             error=str(exc), retryable=True,
         )
 

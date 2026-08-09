@@ -67,7 +67,7 @@ class RenderRange(BaseModel):
     def range_is_nonempty(cls, value: float, info):
         start = info.data.get("start")
         if start is not None and value <= start:
-            raise ValueError("end must be greater than start")
+            raise ValueError("结束时间必须晚于开始时间")
         return value
 
 
@@ -138,7 +138,7 @@ class RenderJobRequest(BaseModel):
     @model_validator(mode="after")
     def has_render_definition(self):
         if not self.ranges and self.canonicalTimeline is None:
-            raise ValueError("ranges or canonicalTimeline is required")
+            raise ValueError("必须提供剪辑范围或标准时间线")
         return self
 
 
@@ -171,7 +171,7 @@ class TimelineViewJobRequest(BaseModel):
     def range_is_nonempty(cls, value: float, info):
         start = info.data.get("start")
         if start is not None and value <= start:
-            raise ValueError("end must be greater than start")
+            raise ValueError("结束时间必须晚于开始时间")
         return value
 
 
@@ -188,7 +188,7 @@ class JobStore:
                     payload.update(
                         status="failed",
                         progress=100,
-                        message="Interrupted by a Sidecar restart; safe to retry",
+                        message="渲染服务重启导致任务中断，可以安全重试",
                         retryable=True,
                         updatedAt=utc_now(),
                     )
@@ -221,7 +221,7 @@ class JobStore:
                 "kind": kind,
                 "status": "queued",
                 "progress": 0,
-                "message": "Queued",
+                "message": "任务已排队",
                 "createdAt": utc_now(),
                 "updatedAt": utc_now(),
                 "artifact": None,
@@ -526,13 +526,13 @@ def create_app(
         (job_dir / "ffmpeg-command.json").write_text(
             json.dumps(command, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        jobs.update(job_id, progress=25, message="Rendering Canonical Timeline with FFmpeg")
+        jobs.update(job_id, progress=25, message="正在使用 FFmpeg 渲染标准时间线")
         run_checked(command)
 
     def execute_render(job: dict[str, Any], request: RenderJobRequest) -> None:
         job_id = job["jobId"]
         try:
-            jobs.update(job_id, status="processing", progress=10, message="Preparing EDL")
+            jobs.update(job_id, status="processing", progress=10, message="正在准备剪辑清单")
             job_dir = store.job_dir(request.projectId, job_id)
             output = job_dir / "final.mp4"
             if request.canonicalTimeline is not None:
@@ -560,14 +560,14 @@ def create_app(
                 command.append("--no-subtitles")
                 if not request.normalizeAudio:
                     command.append("--no-loudnorm")
-                jobs.update(job_id, progress=25, message="Rendering with pinned video-use")
+                jobs.update(job_id, progress=25, message="正在使用固定版本的 video-use 渲染")
                 run_checked(command)
             metadata = probe(output)
             jobs.update(
                 job_id,
                 status="completed",
                 progress=100,
-                message="Render completed",
+                message="成片渲染完成",
                 artifact=str(output.relative_to(store.root)),
                 metadata=metadata,
             )
@@ -592,7 +592,7 @@ def create_app(
                 command.extend(["--language", request.language])
             if request.numSpeakers:
                 command.extend(["--num-speakers", str(request.numSpeakers)])
-            jobs.update(job_id, status="processing", progress=20, message="Transcribing with Scribe")
+            jobs.update(job_id, status="processing", progress=20, message="正在生成字幕文本")
             run_checked(command, timeout=1_800)
             transcript = project_dir / "edit" / "transcripts" / f"{source.stem}.json"
             if not transcript.is_file():
@@ -601,7 +601,7 @@ def create_app(
                 job_id,
                 status="completed",
                 progress=100,
-                message="Transcription completed",
+                message="字幕文本生成完成",
                 artifact=str(transcript.relative_to(store.root)),
             )
         except Exception as exc:  # pragma: no cover - assertion via public API
@@ -613,7 +613,7 @@ def create_app(
             source = store.find_media(request.projectId, request.mediaId)
             job_dir = store.job_dir(request.projectId, job_id)
             output = job_dir / "timeline.png"
-            jobs.update(job_id, status="processing", progress=20, message="Building timeline view")
+            jobs.update(job_id, status="processing", progress=20, message="正在生成时间线视图")
             run_checked(
                 [
                     sys.executable,
@@ -632,7 +632,7 @@ def create_app(
                 job_id,
                 status="completed",
                 progress=100,
-                message="Timeline view completed",
+                message="时间线视图生成完成",
                 artifact=str(output.relative_to(store.root)),
             )
         except Exception as exc:  # pragma: no cover - assertion via public API
@@ -680,7 +680,7 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in ALLOWED_EXTENSIONS:
-            raise HTTPException(status_code=415, detail="Unsupported media extension")
+            raise HTTPException(status_code=415, detail="不支持该媒体文件扩展名")
         media_id = str(uuid.uuid4())
         destination = store.media_dir(projectId) / f"{media_id}{suffix}"
         size = 0
@@ -689,7 +689,7 @@ def create_app(
                 while chunk := await file.read(1024 * 1024):
                     size += len(chunk)
                     if size > MAX_UPLOAD_BYTES:
-                        raise HTTPException(status_code=413, detail="Media file is too large")
+                        raise HTTPException(status_code=413, detail="媒体文件过大")
                     output.write(chunk)
             metadata = probe(destination)
         except Exception:
@@ -711,7 +711,7 @@ def create_app(
         try:
             source = store.find_media(project_id, media_id)
         except (ValueError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail="Media not found") from exc
+            raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         return FileResponse(source, filename=source.name)
 
     @app.post("/renders", status_code=status.HTTP_202_ACCEPTED)
@@ -722,7 +722,7 @@ def create_app(
             except FileNotFoundError as exc:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Media not found: {item.mediaId}",
+                    detail=f"未找到媒体文件：{item.mediaId}",
                 ) from exc
         if request.canonicalTimeline is not None:
             for track in request.canonicalTimeline.tracks:
@@ -732,7 +732,7 @@ def create_app(
                     try:
                         store.find_media(request.projectId, clip.materialId)
                     except FileNotFoundError as exc:
-                        raise HTTPException(status_code=404, detail=f"Media not found: {clip.materialId}") from exc
+                        raise HTTPException(status_code=404, detail=f"未找到媒体文件：{clip.materialId}") from exc
         try:
             job, should_execute = jobs.create_or_get(request.projectId, "render", request.requestId)
         except ValueError as exc:
@@ -747,7 +747,7 @@ def create_app(
         try:
             store.find_media(request.projectId, request.mediaId)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Media not found") from exc
+            raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         job = jobs.create(request.projectId, "transcription")
         pool.submit(execute_transcription, job, request)
         return job
@@ -757,7 +757,7 @@ def create_app(
         try:
             store.find_media(request.projectId, request.mediaId)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Media not found") from exc
+            raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         job = jobs.create(request.projectId, "timeline-view")
         pool.submit(execute_timeline_view, job, request)
         return job
@@ -767,24 +767,24 @@ def create_app(
         try:
             validate_identifier(job_id, "jobId")
         except ValueError as exc:
-            raise HTTPException(status_code=404, detail="Job not found") from exc
+            raise HTTPException(status_code=404, detail="未找到该任务") from exc
         job = jobs.get(job_id)
         if job is None:
-            raise HTTPException(status_code=404, detail="Job not found")
+            raise HTTPException(status_code=404, detail="未找到该任务")
         return job
 
     @app.get("/jobs/{job_id}/artifact")
     def get_job_artifact(job_id: str):
         job = jobs.get(job_id)
         if job is None or job.get("status") != "completed" or not job.get("artifact"):
-            raise HTTPException(status_code=404, detail="Artifact not available")
+            raise HTTPException(status_code=404, detail="成片文件尚不可用")
         artifact = (store.root / job["artifact"]).resolve()
         try:
             artifact.relative_to(store.root)
         except ValueError as exc:
-            raise HTTPException(status_code=404, detail="Artifact not available") from exc
+            raise HTTPException(status_code=404, detail="成片文件尚不可用") from exc
         if not artifact.is_file():
-            raise HTTPException(status_code=404, detail="Artifact not available")
+            raise HTTPException(status_code=404, detail="成片文件尚不可用")
         return FileResponse(artifact, filename=artifact.name)
 
     return app

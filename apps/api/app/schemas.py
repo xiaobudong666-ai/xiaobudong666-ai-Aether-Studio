@@ -38,6 +38,7 @@ class MaterialSchema(BaseModel):
     name: str
     url: str
     type: Literal["video", "audio", "image"]
+    contentType: Optional[str] = None
     duration: Optional[RationalTimeSchema] = None
     sizeBytes: int = Field(default=0, ge=0)
 

@@ -102,10 +102,18 @@ class VideoUseAdapter:
         return self._json(self._request("GET", f"/jobs/{job_id}"))
 
     @contextmanager
-    def stream(self, path: str) -> Iterator[httpx.Response]:
+    def stream(
+        self,
+        path: str,
+        headers: dict[str, str] | None = None,
+    ) -> Iterator[httpx.Response]:
         try:
             with httpx.Client(timeout=None, trust_env=False) as client:
-                with client.stream("GET", f"{self.api_url}{path}") as response:
+                with client.stream(
+                    "GET",
+                    f"{self.api_url}{path}",
+                    headers=headers,
+                ) as response:
                     response.raise_for_status()
                     yield response
         except httpx.TimeoutException as exc:

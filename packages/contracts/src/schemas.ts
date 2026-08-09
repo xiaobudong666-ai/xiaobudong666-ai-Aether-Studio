@@ -43,6 +43,7 @@ export const MaterialSchema = z.object({
   name: z.string(),
   url: z.string(),
   type: z.enum(["video", "audio", "image"]),
+  contentType: z.string().optional(),
   duration: RationalTimeSchema.optional(),
   sizeBytes: z.number().int().nonnegative().optional(),
 });
@@ -59,7 +60,7 @@ export const ProjectSchema = z.object({
 });
 
 export const CreateProjectSchema = z.object({
-  name: z.string().min(1, "Project name cannot be empty"),
+  name: z.string().min(1, "项目名称不能为空"),
 });
 
 export const UpdateProjectSchema = z.object({

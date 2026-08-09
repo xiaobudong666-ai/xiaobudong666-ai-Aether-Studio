@@ -26,7 +26,7 @@ class MockEventSource {
 
 const createdProject = {
   id: "project-1",
-  name: "Launch Trailer",
+  name: "发布预告片",
   timeline: { version: "1.1", tracks: [] },
   materials: [],
   revision: 1,
@@ -72,14 +72,15 @@ beforeEach(() => {
   );
 });
 
-describe("App Workbench baseline", () => {
+describe("Aether Studio 中文工作台", () => {
   test("renders all workbench regions and uses same-origin API/SSE paths", async () => {
     render(<App />);
 
-    expect(await screen.findByText("Library & Materials")).toBeTruthy();
-    expect(screen.getByText("Canvas Monitor (480p Proxy Target)")).toBeTruthy();
-    expect(screen.getByText("Property Inspector & Tasks")).toBeTruthy();
-    expect(screen.getByText(/Timeline tracks/i)).toBeTruthy();
+    expect(await screen.findByText("素材库")).toBeTruthy();
+    expect(screen.getByText("画面监看 · 480p 代理目标")).toBeTruthy();
+    expect(screen.getByText("属性与任务")).toBeTruthy();
+    expect(screen.getByText(/时间线轨道/)).toBeTruthy();
+    expect(screen.getByText(/项目 0\/50/)).toBeTruthy();
 
     await waitFor(() => {
       expect(fetch).toHaveBeenCalledWith("/api/projects");
@@ -90,15 +91,17 @@ describe("App Workbench baseline", () => {
   test("creates a project through the proxied API", async () => {
     render(<App />);
 
-    fireEvent.change(await screen.findByPlaceholderText("New project name"), {
+    fireEvent.change(await screen.findByPlaceholderText("输入新项目名称"), {
       target: { value: createdProject.name },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Create Project" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
 
     await waitFor(() => {
-      expect(screen.getByRole("option", { name: "Launch Trailer (r1)" }))
+      expect(screen.getByRole("option", { name: "发布预告片（版本 1）" }))
         .toBeTruthy();
     });
+
+    expect(screen.getByRole("status").textContent).toContain("已创建");
 
     expect(fetch).toHaveBeenCalledWith(
       "/api/projects",

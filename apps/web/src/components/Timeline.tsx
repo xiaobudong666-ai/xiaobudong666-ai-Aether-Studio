@@ -1,5 +1,6 @@
 import React from "react";
 import { TimelineDTO, ClipDTO, RationalTime } from "@aether/contracts";
+import { localizeTrackName, trackTypeLabel } from "../i18n";
 
 interface TimelineProps {
   timeline: TimelineDTO;
@@ -29,10 +30,10 @@ export const Timeline: React.FC<TimelineProps> = ({
       {/* Timeline Controls / Ruler Header */}
       <div style={{ height: "32px", background: "#1a1a1e", borderBottom: "1px solid #2e2e33", display: "flex", alignItems: "center", padding: "0 12px", justifyContent: "space-between" }}>
         <div style={{ display: "flex", gap: "12px", alignItems: "center", fontSize: "12px", fontWeight: "bold", color: "#d4d4d8" }}>
-          <span>🎬 Timeline tracks (Canonical v1.1)</span>
+          <span>时间线轨道（标准格式 v1.1）</span>
         </div>
-        <div style={{ fontSize: "11px", color: "#a1a1aa" }}>
-          Scale: {PIXELS_PER_SECOND}px/sec | Time: {currentSeconds.toFixed(3)}s
+        <div style={{ fontSize: "12px", color: "#a1a1aa" }}>
+          比例：{PIXELS_PER_SECOND} 像素/秒 · 时间：{currentSeconds.toFixed(3)} 秒
         </div>
       </div>
 
@@ -56,8 +57,8 @@ export const Timeline: React.FC<TimelineProps> = ({
         </div>
 
         {timeline.tracks.length === 0 ? (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#71717a", fontStyle: "italic", fontSize: "13px" }}>
-            No tracks added yet. Materials added will automatically create tracks.
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#a1a1aa", fontStyle: "italic", fontSize: "13px" }}>
+            还没有轨道。把素材添加到时间线后会自动创建对应轨道。
           </div>
         ) : (
           timeline.tracks.map((track) => (
@@ -90,8 +91,8 @@ export const Timeline: React.FC<TimelineProps> = ({
                   zIndex: 2,
                 }}
               >
-                <div>{track.name}</div>
-                <div style={{ fontSize: "10px", color: "#71717a", textTransform: "capitalize" }}>{track.type}</div>
+                <div>{localizeTrackName(track.name, track.type)}</div>
+                <div style={{ fontSize: "12px", color: "#a1a1aa" }}>{trackTypeLabel(track.type)}</div>
               </div>
 
               {/* Track Body / Clips viewport */}
@@ -114,9 +115,11 @@ export const Timeline: React.FC<TimelineProps> = ({
                   const isSelected = selectedClipId === clip.id;
 
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={clip.id}
                       onClick={(e) => handleClipClick(e, clip)}
+                      aria-label={`选择片段，时长 ${clipDurSec.toFixed(2)} 秒`}
                       style={{
                         position: "absolute",
                         left: `${left}px`,
@@ -136,10 +139,10 @@ export const Timeline: React.FC<TimelineProps> = ({
                         boxShadow: "0 2px 4px rgba(0,0,0,0.3)",
                       }}
                     >
-                      <div style={{ fontSize: "11px", fontWeight: "bold", color: "#fff", whiteSpace: "nowrap", textOverflow: "ellipsis", overflow: "hidden" }}>
-                        Clip ({clipDurSec.toFixed(2)}s)
+                      <div style={{ fontSize: "12px", fontWeight: "bold", color: "#fff", whiteSpace: "nowrap", textOverflow: "ellipsis", overflow: "hidden" }}>
+                        片段（{clipDurSec.toFixed(2)} 秒）
                       </div>
-                    </div>
+                    </button>
                   );
                 })}
               </div>

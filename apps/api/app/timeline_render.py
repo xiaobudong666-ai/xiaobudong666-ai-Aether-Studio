@@ -61,7 +61,7 @@ def build_render_payload(project) -> tuple[dict[str, Any], int]:
             status_code=422,
             detail={
                 "code": "NO_RENDERABLE_VIDEO",
-                "message": "Upload a video and place it on a video track before rendering",
+                "message": "请先上传视频并将其添加到视频轨道后再渲染",
             },
         )
 
@@ -69,7 +69,7 @@ def build_render_payload(project) -> tuple[dict[str, Any], int]:
     if duration <= 0:
         raise HTTPException(
             status_code=422,
-            detail={"code": "EMPTY_TIMELINE", "message": "Timeline duration must be positive"},
+            detail={"code": "EMPTY_TIMELINE", "message": "时间线必须包含有效时长"},
         )
     duration_rational = {
         "value": duration.numerator,

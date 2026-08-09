@@ -24,7 +24,7 @@ def normalize_email(value: str) -> str:
 
 def hash_password(password: str) -> str:
     if len(password) < 12:
-        raise ValueError("Password must contain at least 12 characters")
+        raise ValueError("密码至少需要 12 个字符")
     salt = secrets.token_bytes(16)
     derived = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
     return f"scrypt$16384$8$1${salt.hex()}${derived.hex()}"
@@ -108,7 +108,7 @@ def require_auth(request: Request, db: Session, now) -> AuthContext:
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "AUTH_REQUIRED", "message": "Sign in to continue"},
+            detail={"code": "AUTH_REQUIRED", "message": "请先登录后再继续操作"},
         )
     row = db.execute(
         select(DBSession, DBUser)
@@ -122,7 +122,7 @@ def require_auth(request: Request, db: Session, now) -> AuthContext:
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "SESSION_EXPIRED", "message": "Your session expired; sign in again"},
+            detail={"code": "SESSION_EXPIRED", "message": "登录已过期，请重新登录"},
         )
     session, user = row
     session.last_seen_at = now
@@ -140,7 +140,7 @@ def require_roles(context: AuthContext, *allowed: str) -> None:
     if context.role not in allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "PERMISSION_DENIED", "message": "Your role cannot perform this action"},
+            detail={"code": "PERMISSION_DENIED", "message": "当前角色没有执行此操作的权限"},
         )
 
 
@@ -175,7 +175,7 @@ def bootstrap_identity(
         id=str(uuid.uuid4()),
         tenant_id=tenant.id,
         email=email,
-        display_name=os.environ.get("AETHER_BOOTSTRAP_ADMIN_NAME", "Aether Owner"),
+        display_name=os.environ.get("AETHER_BOOTSTRAP_ADMIN_NAME", "Aether 所有者"),
         password_hash=hash_password(password),
         role="owner",
         is_active=True,

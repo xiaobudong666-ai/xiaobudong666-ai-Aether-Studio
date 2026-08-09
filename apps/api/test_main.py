@@ -75,10 +75,21 @@ class FakeVideoUseAdapter:
         }
 
     @contextmanager
-    def stream(self, _path):
+    def stream(self, _path, headers=None):
+        payload = b"media"
+        range_header = (headers or {}).get("range")
+
         class Response:
+            status_code = 206 if range_header else 200
+            headers = {
+                "accept-ranges": "bytes",
+                "content-type": "video/mp4",
+                "content-length": "3" if range_header else str(len(payload)),
+                **({"content-range": "bytes 0-2/5"} if range_header else {}),
+            }
+
             def iter_bytes(self):
-                yield b"media"
+                yield payload[:3] if range_header else payload
 
         yield Response()
 
@@ -266,6 +277,21 @@ def test_render_and_sse_emit_real_task_progress_event(api_context):
     updated_project = upload.json()["project"]
     assert updated_project["revision"] == 2
     assert updated_project["materials"][0]["id"] == "media-1"
+    assert updated_project["materials"][0]["contentType"] == "video/mp4"
+    media_stream = client.get(
+        f"/video-use/media/{project['id']}/media-1",
+    )
+    assert media_stream.status_code == 200
+    assert media_stream.headers["content-type"] == "video/mp4"
+    assert media_stream.content == b"media"
+    media_range = client.get(
+        f"/video-use/media/{project['id']}/media-1",
+        headers={"Range": "bytes=0-2"},
+    )
+    assert media_range.status_code == 206
+    assert media_range.headers["accept-ranges"] == "bytes"
+    assert media_range.headers["content-range"] == "bytes 0-2/5"
+    assert media_range.content == b"med"
 
     timeline = {
         "version": "1.1",
@@ -343,6 +369,13 @@ def test_render_and_sse_emit_real_task_progress_event(api_context):
     persisted = client.get(f"/render-tasks?projectId={project['id']}").json()
     assert persisted[0]["status"] == "completed"
     assert client.get(f"/renders/{task_id}/artifact").content == b"media"
+    artifact_range = client.get(
+        f"/renders/{task_id}/artifact",
+        headers={"Range": "bytes=0-2"},
+    )
+    assert artifact_range.status_code == 206
+    assert artifact_range.headers["content-range"] == "bytes 0-2/5"
+    assert artifact_range.content == b"med"
 
 
 def test_render_payload_preserves_gap_multitrack_audio_and_exact_rational_time(api_context):

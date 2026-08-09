@@ -214,6 +214,42 @@ jobs:
             -e AETHER_SMOKE_BASE_URL=http://web/api \
             worker python /app/authenticated-smoke.py
 
+      - name: Setup Node.js 24 for full-browser production flow
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm 10.30.3 for full-browser production flow
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Install browser test dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Generate a real browser upload fixture
+        run: |
+          mkdir -p e2e/fixtures
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use \
+            ffmpeg -y -hide_banner -loglevel error \
+            -f lavfi -i testsrc=size=640x360:rate=24 \
+            -f lavfi -i sine=frequency=660:sample_rate=48000 \
+            -t 2 -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart \
+            /tmp/browser-real.mp4
+          docker compose -f infra/docker/docker-compose.yml cp \
+            video-use:/tmp/browser-real.mp4 e2e/fixtures/browser-real.mp4
+
+      - name: Run real browser upload-to-download flow
+        env:
+          AETHER_PRODUCTION_E2E: "1"
+          AETHER_PRODUCTION_E2E_URL: http://127.0.0.1
+          AETHER_PRODUCTION_E2E_EMAIL: admin@aether.local
+        run: |
+          export AETHER_PRODUCTION_E2E_PASSWORD="$AETHER_BOOTSTRAP_ADMIN_PASSWORD"
+          pnpm exec playwright test --config=playwright.production.config.ts
+
       - name: Capture Docker logs
         if: always()
         run: docker compose -f infra/docker/docker-compose.yml logs --no-color > docker-compose.log
@@ -224,6 +260,17 @@ jobs:
         with:
           name: docker-compose-evidence
           path: docker-compose.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload real browser production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-browser-evidence
+          path: |
+            playwright-report-production/
+            test-results-production/
           if-no-files-found: error
           retention-days: 14
 
