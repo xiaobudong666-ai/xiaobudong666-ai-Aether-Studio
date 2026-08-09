@@ -37,6 +37,10 @@ test("中文登录、项目创建和兼容文件导出均可操作", async ({ pa
   await expect(page.getByRole("status")).toContainText("已创建");
 
   await expect(page.getByText("上传真实媒体")).toBeVisible();
+  await expect(page.getByRole("button", { name: "选择媒体文件" })).toBeVisible();
+  await expect(page.getByText("尚未选择文件")).toBeVisible();
+  await expect(page.getByText("Choose File")).toHaveCount(0);
+  await expect(page.getByText("No file chosen")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "提交渲染任务" })).toBeDisabled();
   await expect(page.getByText("OpenCut 内核 0.2.10")).toBeVisible();
 

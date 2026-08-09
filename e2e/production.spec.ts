@@ -23,6 +23,7 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await expect(page.getByRole("option", { name: `${projectName}（版本 1）` })).toHaveCount(1);
 
   await page.getByLabel("选择媒体文件").setInputFiles(fixturePath);
+  await expect(page.getByText("已选择：browser-real.mp4")).toBeVisible();
   await page.getByRole("button", { name: "上传媒体" }).click();
   await expect(page.getByText("browser-real.mp4", { exact: true })).toBeVisible({ timeout: 60_000 });
   await expect(page.getByRole("status")).toContainText("已上传并完成媒体信息检测");

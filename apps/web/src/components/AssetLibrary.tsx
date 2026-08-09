@@ -60,12 +60,25 @@ export const AssetLibrary: React.FC<AssetLibraryProps> = ({
           <input
             ref={inputRef}
             type="file"
+            className="native-file-input"
             aria-label="选择媒体文件"
             accept="video/*,audio/*,.mkv,.m4v"
             onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
             disabled={!canEdit || !hasProject}
-            style={{ width: "100%", boxSizing: "border-box" }}
           />
+          <div className="file-picker-row">
+            <button
+              type="button"
+              className="secondary file-picker-button"
+              onClick={() => inputRef.current?.click()}
+              disabled={!canEdit || !hasProject}
+            >
+              {selectedFile ? "重新选择文件" : "选择媒体文件"}
+            </button>
+            <span className="selected-file-name" aria-live="polite">
+              {selectedFile ? `已选择：${selectedFile.name}` : "尚未选择文件"}
+            </span>
+          </div>
           <button type="submit" disabled={!canEdit || !hasProject || !selectedFile || uploading} style={{ width: "100%" }}>
             {uploading ? "正在上传并检测媒体信息…" : "上传媒体"}
           </button>
