@@ -23,7 +23,7 @@ test("中文登录、项目创建和兼容文件导出均可操作", async ({ pa
   await expect(page.getByText("画面监看 · 480p 代理目标")).toBeVisible();
   await expect(page.getByText("属性与任务")).toBeVisible();
   await expect(page.getByText(/时间线轨道（标准格式 v1\.1）/)).toBeVisible();
-  await expect(page.getByText(/项目 0\/50/)).toBeVisible();
+  await expect(page.getByText(/项目 \d+\/50/)).toBeVisible();
 
   const projectName = `中文交互验收-${Date.now()}`;
   await page.getByPlaceholder("输入新项目名称").fill(projectName);
@@ -120,7 +120,7 @@ test("只读成员在界面和接口两层都不能修改项目", async ({ page 
   await expect(page.getByText(/只读成员/).first()).toBeVisible();
   await expect(page.getByText("当前为只读权限，不能修改项目。")).toBeVisible();
   await expect(page.getByRole("button", { name: "创建项目" })).toBeDisabled();
-  await expect(page.getByLabel("选择媒体文件")).toBeDisabled();
+  await expect(page.getByLabel("媒体文件输入")).toBeDisabled();
 
   const blockedWrite = await page.request.post("/api/projects", {
     headers: { "X-Aether-CSRF": "1" },

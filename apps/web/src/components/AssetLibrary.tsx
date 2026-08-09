@@ -61,7 +61,7 @@ export const AssetLibrary: React.FC<AssetLibraryProps> = ({
             ref={inputRef}
             type="file"
             className="native-file-input"
-            aria-label="选择媒体文件"
+            aria-label="媒体文件输入"
             accept="video/*,audio/*,.mkv,.m4v"
             onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
             disabled={!canEdit || !hasProject}
