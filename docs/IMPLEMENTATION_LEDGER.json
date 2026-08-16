@@ -103,7 +103,7 @@
       "boundary": "No host, SSH target, domain, or TLS endpoint has been provided. Repository launch readiness is not represented as an external deployment. Paid provider features remain unavailable until separately configured and tested."
     },
     "M5-1": {
-      "status": "ACCEPTED_ON_MERGE",
+      "status": "ACCEPTED",
       "baseline_commit": "588ca4b9956d4f52abcf2e719a724283afc3b20b",
       "candidate_pr": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/8",
       "code_candidate_commit": "489ba8220feb46916a3a700a654828b55b72e768",
@@ -125,11 +125,11 @@
         "Code head passed Docker Compose authenticated 17,352,511-byte upload and exact four-second MP4 smoke",
         "CI credentials were generated per run and masked in GitHub Actions logs"
       ],
-      "acceptance_pending": [
-        "The documentation-only pull-request head containing this evidence passes all three GitHub Actions jobs",
-        "Pull request #8 merges to main"
+      "acceptance_completed": [
+        "The documentation-only pull-request head passed all three GitHub Actions jobs",
+        "Pull request #8 merged to main on 2026-08-09T19:05:30Z"
       ],
-      "boundary": "ACCEPTED_ON_MERGE is conditional: it becomes ACCEPTED only when PR #8's current head passes all three gates and merges. Public launch still requires a real host, TLS ingress, target backup, and production credentials."
+      "boundary": "ACCEPTED records repository milestone acceptance after PR #8 merged. Public launch still requires a real host, TLS ingress, target backup, production credentials, and separate production authorization."
     }
   }
 }

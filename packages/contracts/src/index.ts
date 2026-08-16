@@ -173,7 +173,23 @@ export interface TaskProgressPayload {
   taskId: string;
   projectId: string;
   progress: number; // 0 to 100
-  status: "pending" | "processing" | "completed" | "failed";
+  status:
+    | "queued"
+    | "dispatching"
+    | "processing"
+    | "completed"
+    | "failed"
+    | "canceled"
+    | "partial"
+    | "unknown";
+  canonicalStatus:
+    | "QUEUED"
+    | "RUNNING"
+    | "SUCCEEDED"
+    | "FAILED"
+    | "CANCELED"
+    | "PARTIAL"
+    | "UNKNOWN";
   message: string;
 }
 

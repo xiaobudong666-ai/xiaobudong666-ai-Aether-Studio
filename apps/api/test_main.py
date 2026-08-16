@@ -1,4 +1,6 @@
 import secrets
+import datetime
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -6,10 +8,13 @@ import pytest
 from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import apply_project_update, create_app
-from app.models import DBTenant, DBUser
-from app.schemas import UpdateProjectRequest
+from app.migrations import ensure_schema
+from app.models import DBAssetVersion, DBRenderTask, DBTenant, DBUser
+from app.schemas import UpdateProjectRequest, WorkerTaskUpdateRequest
+from app.task_status import canonical_task_status, database_status_values, legacy_task_status
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
 OWNER_PASSWORD = secrets.token_urlsafe(24)
@@ -185,6 +190,12 @@ def test_project_list_create_query_update_and_not_found(api_context):
 def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
     client, test_session = api_context
     owner_project = create_project(client, "Owner tenant project")
+    owner_upload = client.post(
+        f"/projects/{owner_project['id']}/media",
+        data={"expectedRevision": "1"},
+        files={"file": ("owner.mp4", b"owner-media", "video/mp4")},
+    ).json()
+    owner_asset_id = owner_upload["assetVersion"]["id"]
     assert client.post(
         "/admin/users",
         json={
@@ -199,6 +210,13 @@ def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
     ).status_code == 200
     same_tenant_viewer.headers.update({"X-Aether-CSRF": "1"})
     assert same_tenant_viewer.get(f"/projects/{owner_project['id']}").status_code == 200
+    assert same_tenant_viewer.get(
+        f"/projects/{owner_project['id']}/asset-versions"
+    ).status_code == 200
+    assert same_tenant_viewer.post(
+        f"/projects/{owner_project['id']}/asset-versions/{owner_asset_id}/rights-snapshots",
+        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL"},
+    ).status_code == 403
     assert same_tenant_viewer.post("/projects", json={"name": "Viewer cannot create"}).status_code == 403
     assert same_tenant_viewer.put(
         f"/projects/{owner_project['id']}",
@@ -230,6 +248,12 @@ def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
     isolated.headers.update({"X-Aether-CSRF": "1"})
     assert isolated.get("/projects").json() == []
     assert isolated.get(f"/projects/{owner_project['id']}").status_code == 404
+    assert isolated.get(
+        f"/projects/{owner_project['id']}/asset-versions"
+    ).status_code == 404
+    assert isolated.get(
+        f"/projects/{owner_project['id']}/asset-versions/{owner_asset_id}/rights-check"
+    ).status_code == 404
     assert isolated.post("/projects", json={"name": "Tenant B project"}).status_code == 201
     denied = isolated.post("/projects", json={"name": "Over Tenant B quota"})
     assert denied.status_code == 429
@@ -551,3 +575,229 @@ def test_render_task_survives_api_restart(tmp_path):
 
     Base.metadata.drop_all(bind=test_engine)
     test_engine.dispose()
+
+
+def test_asset_version_hash_rights_window_and_immutability(api_context):
+    client, sessions = api_context
+    project = create_project(client, "Typed asset foundation")
+    payload = b"immutable-media-payload"
+    upload = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": "1"},
+        files={"file": ("source.mp4", payload, "video/mp4")},
+    )
+    assert upload.status_code == 201
+    asset = upload.json()["assetVersion"]
+    assert asset["versionNo"] == 1
+    assert asset["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert client.get(f"/projects/{project['id']}/asset-versions").json() == [asset]
+
+    missing = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset['id']}/rights-check",
+        params={"purpose": "EXPORT"},
+    )
+    assert missing.status_code == 200
+    assert missing.json()["code"] == "RIGHTS_MISSING"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expired = client.post(
+        f"/projects/{project['id']}/asset-versions/{asset['id']}/rights-snapshots",
+        json={
+            "status": "ALLOWED",
+            "purpose": "EXPORT",
+            "territory": "GLOBAL",
+            "validFrom": (now - datetime.timedelta(days=2)).isoformat(),
+            "validUntil": (now - datetime.timedelta(days=1)).isoformat(),
+            "evidenceRef": "evidence://expired-test",
+        },
+    )
+    assert expired.status_code == 201
+    decision = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset['id']}/rights-check",
+        params={"purpose": "EXPORT"},
+    ).json()
+    assert decision["allowed"] is False
+    assert decision["code"] == "RIGHTS_EXPIRED"
+
+    allowed = client.post(
+        f"/projects/{project['id']}/asset-versions/{asset['id']}/rights-snapshots",
+        json={
+            "status": "ALLOWED",
+            "purpose": "EXPORT",
+            "territory": "GLOBAL",
+            "validFrom": (now - datetime.timedelta(minutes=1)).isoformat(),
+            "validUntil": (now + datetime.timedelta(days=1)).isoformat(),
+            "evidenceRef": "evidence://owner-approved",
+        },
+    )
+    assert allowed.status_code == 201
+    assert client.get(
+        f"/projects/{project['id']}/asset-versions/{asset['id']}/rights-check",
+        params={"purpose": "EXPORT"},
+    ).json()["allowed"] is True
+
+    db = sessions()
+    try:
+        persisted = db.get(DBAssetVersion, asset["id"])
+        persisted.sha256 = "0" * 64
+        with pytest.raises(ValueError, match="immutable"):
+            db.commit()
+        db.rollback()
+        assert db.get(DBAssetVersion, asset["id"]).sha256 == hashlib.sha256(payload).hexdigest()
+    finally:
+        db.close()
+
+
+def _complete_render_candidate(client: TestClient, project: dict) -> tuple[dict, dict]:
+    upload = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": "1"},
+        files={"file": ("source.mp4", b"candidate-media", "video/mp4")},
+    ).json()
+    media_id = upload["material"]["id"]
+    timeline = {
+        "version": "1.1",
+        "tracks": [{
+            "id": "video", "name": "Video", "type": "video",
+            "clips": [{
+                "id": "clip", "trackId": "video", "materialId": media_id,
+                "start": {"value": 0, "timescale": 24},
+                "duration": {"value": 24, "timescale": 24},
+                "sourceIn": {"value": 0, "timescale": 24},
+            }],
+        }],
+    }
+    assert client.put(
+        f"/projects/{project['id']}",
+        json={"timeline": timeline, "expectedRevision": 2},
+    ).status_code == 200
+    task = client.post(f"/projects/{project['id']}/render").json()
+    assert task["canonicalStatus"] == "QUEUED"
+    worker_headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "candidate-worker"}
+    claim = client.post("/internal/render-tasks/claim", headers=worker_headers).json()
+    assert claim["canonicalStatus"] == "RUNNING"
+    completed = client.post(
+        f"/internal/render-tasks/{task['taskId']}/update",
+        headers=worker_headers,
+        json={
+            "status": "completed",
+            "progress": 100,
+            "message": "Render completed",
+            "upstreamJobId": "22222222-2222-2222-2222-222222222222",
+        },
+    )
+    assert completed.status_code == 200
+    assert completed.json()["canonicalStatus"] == "SUCCEEDED"
+    candidates = client.get(f"/projects/{project['id']}/candidates").json()
+    assert len(candidates) == 1
+    assert candidates[0]["status"] == "READY"
+    return upload, candidates[0]
+
+
+def test_candidate_adoption_rights_idempotency_and_canonical_status(api_context):
+    client, sessions = api_context
+    project = create_project(client, "Candidate adoption")
+    upload, candidate = _complete_render_candidate(client, project)
+    asset = upload["assetVersion"]
+
+    blocked = client.post(
+        f"/projects/{project['id']}/candidates/{candidate['id']}/adopt",
+        headers={"Idempotency-Key": "adopt-without-rights"},
+        json={"reason": "Owner selected candidate"},
+    )
+    assert blocked.status_code == 422
+    assert blocked.json()["detail"]["code"] == "RIGHTS_CHECK_FAILED"
+    assert blocked.json()["detail"]["failures"][0]["code"] == "RIGHTS_MISSING"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    assert client.post(
+        f"/projects/{project['id']}/asset-versions/{asset['id']}/rights-snapshots",
+        json={
+            "status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL",
+            "validFrom": (now - datetime.timedelta(minutes=1)).isoformat(),
+            "validUntil": (now + datetime.timedelta(days=1)).isoformat(),
+            "evidenceRef": "evidence://export-approved",
+        },
+    ).status_code == 201
+    endpoint = f"/projects/{project['id']}/candidates/{candidate['id']}/adopt"
+    first = client.post(
+        endpoint,
+        headers={"Idempotency-Key": "adopt-candidate-0001"},
+        json={"reason": "Owner selected candidate"},
+    )
+    assert first.status_code == 201
+    assert first.json()["revisionNo"] == 1
+    repeated = client.post(
+        endpoint,
+        headers={"Idempotency-Key": "adopt-candidate-0001"},
+        json={"reason": "Owner selected candidate"},
+    )
+    assert repeated.status_code == 201
+    assert repeated.json()["id"] == first.json()["id"]
+    conflict = client.post(
+        endpoint,
+        headers={"Idempotency-Key": "adopt-candidate-0002"},
+        json={"reason": "Duplicate adoption must fail"},
+    )
+    assert conflict.status_code == 409
+    masters = client.get(f"/projects/{project['id']}/masters").json()
+    assert [master["id"] for master in masters] == [first.json()["id"]]
+
+    db = sessions()
+    try:
+        task = db.get(DBRenderTask, candidate["taskId"])
+        assert task.status == "SUCCEEDED"
+    finally:
+        db.close()
+
+
+def test_task_status_aliases_are_read_compatible_and_new_writes_are_canonical():
+    assert canonical_task_status("dispatching") == "RUNNING"
+    assert canonical_task_status("completed") == "SUCCEEDED"
+    assert legacy_task_status("PARTIAL") == "partial"
+    assert {"queued", "QUEUED"}.issubset(database_status_values("QUEUED"))
+    assert WorkerTaskUpdateRequest(
+        status="processing", progress=10, message="working"
+    ).status == "RUNNING"
+    with pytest.raises(ValueError, match="Unsupported task status"):
+        canonical_task_status("invented")
+
+
+def test_additive_migration_preserves_legacy_project_and_creates_typed_tables(tmp_path):
+    database_path = tmp_path / "legacy.db"
+    legacy_engine = build_engine(f"sqlite:///{database_path}")
+    with legacy_engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE projects (
+                id VARCHAR PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                timeline JSON NOT NULL,
+                materials JSON NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+        """))
+        connection.execute(
+            text("""
+                INSERT INTO projects
+                    (id, name, timeline, materials, revision, created_at, updated_at)
+                VALUES
+                    ('legacy-project', 'Legacy', '{"version":"1.1","tracks":[]}', '[]', 1,
+                     '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')
+            """)
+        )
+
+    ensure_schema(legacy_engine)
+    schema = inspect(legacy_engine)
+    assert {
+        "asset_versions", "rights_snapshots", "candidates", "adoptions", "master_revisions"
+    }.issubset(schema.get_table_names())
+    assert {"tenant_id", "owner_id"}.issubset(
+        {column["name"] for column in schema.get_columns("projects")}
+    )
+    with legacy_engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT name FROM projects WHERE id = 'legacy-project'")
+        ).scalar_one() == "Legacy"
+    legacy_engine.dispose()

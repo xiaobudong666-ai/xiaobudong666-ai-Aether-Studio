@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import hmac
 import json
 import logging
@@ -26,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .auth import (
@@ -45,16 +47,35 @@ from .auth import (
 )
 from .database import engine, get_db
 from .migrations import ensure_schema
-from .models import DBExternalTask, DBProject, DBRenderTask, DBSession, DBTenant, DBUser
+from .models import (
+    DBAdoption,
+    DBAssetVersion,
+    DBCandidate,
+    DBExternalTask,
+    DBMasterRevision,
+    DBProject,
+    DBRenderTask,
+    DBRightsSnapshot,
+    DBSession,
+    DBTenant,
+    DBUser,
+)
 from .moneyprinter_adapter import MoneyPrinterTurboAdapter
 from .schemas import (
+    AdoptCandidateRequest,
     CreateProjectRequest,
+    CreateRightsSnapshotRequest,
     CreateUserRequest,
     LoginRequest,
     MoneyPrinterGenerateRequest,
     ProjectResponse,
     UpdateProjectRequest,
     WorkerTaskUpdateRequest,
+)
+from .task_status import (
+    canonical_task_status,
+    database_status_values,
+    legacy_task_status,
 )
 from .timeline_render import build_render_payload
 from .video_use_adapter import VideoUseAdapter, VideoUseError
@@ -63,7 +84,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api.main")
 
 DatabaseDependency = Callable[[], Generator[Session, None, None]]
-ACTIVE_TASK_STATES = {"queued", "dispatching", "processing"}
+ACTIVE_TASK_STATES = database_status_values("QUEUED", "RUNNING")
 
 
 def utc_now() -> datetime.datetime:
@@ -89,22 +110,108 @@ def project_response(project: DBProject) -> ProjectResponse:
 
 
 def task_response(task: DBRenderTask) -> dict:
+    canonical_status = canonical_task_status(task.status)
     payload = {
         "taskId": task.id,
         "projectId": task.project_id,
         "progress": task.progress,
-        "status": task.status,
+        "status": legacy_task_status(canonical_status),
+        "canonicalStatus": canonical_status,
         "message": task.message,
         "engine": task.engine,
         "attempts": task.attempts,
         "createdAt": iso_utc(task.created_at),
         "updatedAt": iso_utc(task.updated_at),
     }
-    if task.status == "completed":
+    if canonical_status == "SUCCEEDED":
         payload["artifactUrl"] = f"/api/renders/{task.id}/artifact"
     if task.error:
         payload["error"] = task.error
     return payload
+
+
+def asset_version_response(asset: DBAssetVersion) -> dict:
+    return {
+        "id": asset.id,
+        "projectId": asset.project_id,
+        "mediaId": asset.media_id,
+        "versionNo": asset.version_no,
+        "sha256": asset.sha256,
+        "mediaType": asset.media_type,
+        "contentType": asset.content_type,
+        "sizeBytes": asset.size_bytes,
+        "probe": asset.probe_json,
+        "createdBy": asset.created_by,
+        "createdAt": iso_utc(asset.created_at),
+    }
+
+
+def rights_snapshot_response(snapshot: DBRightsSnapshot) -> dict:
+    return {
+        "id": snapshot.id,
+        "assetVersionId": snapshot.asset_version_id,
+        "status": snapshot.status,
+        "purpose": snapshot.purpose,
+        "territory": snapshot.territory,
+        "validFrom": iso_utc(snapshot.valid_from) if snapshot.valid_from else None,
+        "validUntil": iso_utc(snapshot.valid_until) if snapshot.valid_until else None,
+        "evidenceRef": snapshot.evidence_ref,
+        "capturedBy": snapshot.captured_by,
+        "capturedAt": iso_utc(snapshot.captured_at),
+    }
+
+
+def _as_utc(value: datetime.datetime | None) -> datetime.datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
+
+
+def rights_decision(snapshot: DBRightsSnapshot | None, now: datetime.datetime) -> dict:
+    if snapshot is None:
+        return {"allowed": False, "code": "RIGHTS_MISSING"}
+    if snapshot.status != "ALLOWED":
+        return {"allowed": False, "code": f"RIGHTS_{snapshot.status}"}
+    valid_from = _as_utc(snapshot.valid_from)
+    valid_until = _as_utc(snapshot.valid_until)
+    if valid_from is not None and now < valid_from:
+        return {"allowed": False, "code": "RIGHTS_NOT_YET_VALID"}
+    if valid_until is not None and now >= valid_until:
+        return {"allowed": False, "code": "RIGHTS_EXPIRED"}
+    return {"allowed": True, "code": "RIGHTS_ALLOWED"}
+
+
+def candidate_response(candidate: DBCandidate) -> dict:
+    return {
+        "id": candidate.id,
+        "projectId": candidate.project_id,
+        "taskId": candidate.task_id,
+        "artifactRef": candidate.artifact_ref,
+        "inputRevision": candidate.input_revision,
+        "status": candidate.status,
+        "createdAt": iso_utc(candidate.created_at),
+    }
+
+
+def master_response(master: DBMasterRevision, adoption: DBAdoption) -> dict:
+    return {
+        "id": master.id,
+        "projectId": master.project_id,
+        "revisionNo": master.revision_no,
+        "artifactRef": master.artifact_ref,
+        "sha256": master.sha256,
+        "createdAt": iso_utc(master.created_at),
+        "adoption": {
+            "id": adoption.id,
+            "candidateId": adoption.candidate_id,
+            "adoptedBy": adoption.adopted_by,
+            "adoptedAt": iso_utc(adoption.adopted_at),
+            "reason": adoption.reason,
+            "supersedesId": adoption.supersedes_id,
+        },
+    }
 
 
 def apply_project_update(
@@ -113,6 +220,7 @@ def apply_project_update(
     req: UpdateProjectRequest,
     tenant_id: str | None = None,
     allow_materials: bool = False,
+    commit: bool = True,
 ) -> DBProject:
     if req.materials is not None and not allow_materials:
         raise HTTPException(
@@ -152,7 +260,10 @@ def apply_project_update(
                 "message": "项目版本冲突，服务器中的项目已经发生变化",
             },
         )
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     query = select(DBProject).where(DBProject.id == project_id)
     if tenant_id is not None:
         query = query.where(DBProject.tenant_id == tenant_id)
@@ -251,6 +362,40 @@ def create_app(
                 detail={"code": "PROJECT_NOT_FOUND", "message": "未找到该项目"},
             )
         return project
+
+    def asset_for_tenant(
+        db: Session,
+        project_id: str,
+        asset_version_id: str,
+        context: AuthContext,
+    ) -> DBAssetVersion:
+        asset = db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.id == asset_version_id,
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == context.tenant_id,
+            )
+        ).scalar_one_or_none()
+        if asset is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "ASSET_VERSION_NOT_FOUND", "message": "未找到该资产版本"},
+            )
+        return asset
+
+    def latest_rights_snapshot(
+        db: Session,
+        asset_version_id: str,
+        purpose: str | None = None,
+    ) -> DBRightsSnapshot | None:
+        query = select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_version_id,
+        )
+        if purpose:
+            query = query.where(DBRightsSnapshot.purpose == purpose)
+        return db.execute(
+            query.order_by(DBRightsSnapshot.captured_at.desc()).limit(1)
+        ).scalar_one_or_none()
 
     def refresh_quota_period(db: Session, tenant: DBTenant) -> bool:
         period = utc_now().strftime("%Y-%m")
@@ -437,6 +582,10 @@ def create_app(
             raise HTTPException(status_code=422, detail={"code": "EMPTY_UPLOAD", "message": "上传的媒体文件为空"})
         if upload_size > max_upload_bytes:
             raise HTTPException(status_code=413, detail={"code": "UPLOAD_TOO_LARGE", "message": "媒体文件超过系统允许的上传大小"})
+        digest = hashlib.sha256()
+        while chunk := file.file.read(1024 * 1024):
+            digest.update(chunk)
+        file.file.seek(0)
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == context.tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
@@ -462,9 +611,36 @@ def create_app(
             updated = apply_project_update(
                 db, project_id,
                 UpdateProjectRequest(materials=[*project.materials, material], expectedRevision=expectedRevision),
-                tenant_id=context.tenant_id, allow_materials=True,
+                tenant_id=context.tenant_id, allow_materials=True, commit=False,
             )
+            next_version = (
+                db.execute(
+                    select(func.max(DBAssetVersion.version_no)).where(
+                        DBAssetVersion.project_id == project_id,
+                        DBAssetVersion.media_id == media_id,
+                    )
+                ).scalar_one_or_none()
+                or 0
+            ) + 1
+            asset_version = DBAssetVersion(
+                id=str(uuid.uuid4()),
+                tenant_id=context.tenant_id,
+                project_id=project_id,
+                media_id=media_id,
+                version_no=next_version,
+                sha256=digest.hexdigest(),
+                media_type=media_type,
+                content_type=material["contentType"],
+                size_bytes=material["sizeBytes"],
+                probe_json=metadata,
+                created_by=context.user_id,
+                created_at=utc_now(),
+            )
+            db.add(asset_version)
+            db.commit()
+            db.refresh(asset_version)
         except Exception as exc:
+            db.rollback()
             db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
             db.commit()
             if isinstance(exc, VideoUseError):
@@ -473,7 +649,80 @@ def create_app(
             raise
         finally:
             file.file.close()
-        return {"material": material, "project": project_response(updated)}
+        return {
+            "material": material,
+            "assetVersion": asset_version_response(asset_version),
+            "project": project_response(updated),
+        }
+
+    @created_app.get("/projects/{project_id}/asset-versions")
+    def list_asset_versions(
+        project_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        project_for_tenant(db, project_id, context)
+        assets = db.execute(
+            select(DBAssetVersion)
+            .where(
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == context.tenant_id,
+            )
+            .order_by(DBAssetVersion.created_at.asc())
+        ).scalars()
+        return [asset_version_response(asset) for asset in assets]
+
+    @created_app.post(
+        "/projects/{project_id}/asset-versions/{asset_version_id}/rights-snapshots",
+        status_code=201,
+    )
+    def create_rights_snapshot(
+        project_id: str,
+        asset_version_id: str,
+        req: CreateRightsSnapshotRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        project_for_tenant(db, project_id, context)
+        asset_for_tenant(db, project_id, asset_version_id, context)
+        snapshot = DBRightsSnapshot(
+            id=str(uuid.uuid4()),
+            tenant_id=context.tenant_id,
+            project_id=project_id,
+            asset_version_id=asset_version_id,
+            status=req.status,
+            purpose=req.purpose.strip(),
+            territory=req.territory.strip(),
+            valid_from=req.validFrom,
+            valid_until=req.validUntil,
+            evidence_ref=req.evidenceRef,
+            captured_by=context.user_id,
+            captured_at=utc_now(),
+        )
+        db.add(snapshot)
+        db.commit()
+        db.refresh(snapshot)
+        return rights_snapshot_response(snapshot)
+
+    @created_app.get(
+        "/projects/{project_id}/asset-versions/{asset_version_id}/rights-check",
+    )
+    def check_asset_rights(
+        project_id: str,
+        asset_version_id: str,
+        purpose: str | None = Query(default=None, max_length=120),
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        project_for_tenant(db, project_id, context)
+        asset_for_tenant(db, project_id, asset_version_id, context)
+        snapshot = latest_rights_snapshot(db, asset_version_id, purpose)
+        return {
+            "assetVersionId": asset_version_id,
+            **rights_decision(snapshot, utc_now()),
+            "snapshot": rights_snapshot_response(snapshot) if snapshot else None,
+        }
 
     def proxy_video_use_stream(
         path: str,
@@ -561,7 +810,7 @@ def create_app(
         payload["requestId"] = task_id
         task = DBRenderTask(
             id=task_id, tenant_id=context.tenant_id, project_id=project_id,
-            requested_by=context.user_id, status="queued", progress=0,
+            requested_by=context.user_id, status="QUEUED", progress=0,
             message="任务已进入渲染队列", engine="video-use", render_payload=payload,
             attempts=0, max_attempts=3, reserved_seconds=reserved_seconds,
             created_at=now, updated_at=now,
@@ -582,7 +831,7 @@ def create_app(
     @created_app.get("/renders/{task_id}/artifact")
     def stream_render_artifact(task_id: str, request: Request, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
         task = db.execute(select(DBRenderTask).where(DBRenderTask.id == task_id, DBRenderTask.tenant_id == context.tenant_id)).scalar_one_or_none()
-        if task is None or task.status != "completed" or not task.upstream_job_id:
+        if task is None or canonical_task_status(task.status) != "SUCCEEDED" or not task.upstream_job_id:
             raise HTTPException(status_code=404, detail={"code": "ARTIFACT_NOT_FOUND", "message": "未找到可下载的渲染成片"})
         return proxy_video_use_stream(f"/jobs/{task.upstream_job_id}/artifact", request, "video/mp4")
 
@@ -594,10 +843,10 @@ def create_app(
     ):
         require_internal_token(x_worker_token)
         now = utc_now()
-        stale = list(db.execute(select(DBRenderTask).where(DBRenderTask.status.in_({"dispatching", "processing"}), DBRenderTask.lease_expires_at < now)).scalars())
+        stale = list(db.execute(select(DBRenderTask).where(DBRenderTask.status.in_(database_status_values("RUNNING")), DBRenderTask.lease_expires_at < now)).scalars())
         recovered = []
         for task in stale:
-            task.status = "processing" if task.upstream_job_id else "queued"
+            task.status = "RUNNING" if task.upstream_job_id else "QUEUED"
             task.lease_owner = None
             task.lease_expires_at = None
             task.message = "工作节点租约过期后已恢复任务"
@@ -619,7 +868,7 @@ def create_app(
         claim_query = (
             select(DBRenderTask)
             .where(
-                DBRenderTask.status.in_({"queued", "dispatching", "processing"}),
+                DBRenderTask.status.in_(database_status_values("QUEUED", "RUNNING")),
                 or_(DBRenderTask.lease_expires_at.is_(None), DBRenderTask.lease_expires_at < now),
             )
             .order_by(DBRenderTask.created_at.asc())
@@ -631,11 +880,11 @@ def create_app(
         if task is None:
             response.status_code = 204
             return response
-        if task.status in {"queued", "dispatching"} and not task.upstream_job_id:
-            task.status = "dispatching"
+        if not task.upstream_job_id:
+            task.status = "RUNNING"
             task.attempts += 1
         else:
-            task.status = "processing"
+            task.status = "RUNNING"
         task.lease_owner = x_worker_id
         task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         task.updated_at = now
@@ -666,22 +915,259 @@ def create_app(
         task.progress = req.progress
         task.message = req.message
         task.error = req.error
-        if req.status == "failed" and req.retryable and task.attempts < task.max_attempts:
-            task.status = "queued"
+        if req.status == "FAILED" and req.retryable and task.attempts < task.max_attempts:
+            task.status = "QUEUED"
             task.upstream_job_id = None
             task.lease_owner = None
             task.lease_expires_at = None
         else:
             task.status = req.status
-            if req.status in {"completed", "failed"}:
+            if req.status in {"SUCCEEDED", "FAILED", "CANCELED", "PARTIAL"}:
                 task.completed_at = now
                 task.lease_owner = None
                 task.lease_expires_at = None
             else:
                 task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         task.updated_at = now
+        if req.status == "SUCCEEDED":
+            existing_candidate = db.execute(
+                select(DBCandidate).where(DBCandidate.task_id == task.id)
+            ).scalar_one_or_none()
+            if existing_candidate is None:
+                project = db.execute(
+                    select(DBProject).where(DBProject.id == task.project_id)
+                ).scalar_one()
+                db.add(
+                    DBCandidate(
+                        id=str(uuid.uuid4()),
+                        tenant_id=task.tenant_id,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        artifact_ref=f"/api/renders/{task.id}/artifact",
+                        input_revision=project.revision,
+                        status="READY",
+                        created_at=now,
+                    )
+                )
         db.commit()
         return task_response(task)
+
+    @created_app.get("/projects/{project_id}/candidates")
+    def list_candidates(
+        project_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        project_for_tenant(db, project_id, context)
+        candidates = db.execute(
+            select(DBCandidate)
+            .where(
+                DBCandidate.project_id == project_id,
+                DBCandidate.tenant_id == context.tenant_id,
+            )
+            .order_by(DBCandidate.created_at.desc())
+        ).scalars()
+        return [candidate_response(candidate) for candidate in candidates]
+
+    @created_app.post(
+        "/projects/{project_id}/candidates/{candidate_id}/adopt",
+        status_code=201,
+    )
+    def adopt_candidate(
+        project_id: str,
+        candidate_id: str,
+        req: AdoptCandidateRequest,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        project_for_tenant(db, project_id, context)
+        if idempotency_key is None or not 8 <= len(idempotency_key) <= 128:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "IDEMPOTENCY_KEY_REQUIRED",
+                    "message": "采用候选需要 8–128 字符的幂等键",
+                },
+            )
+        existing = db.execute(
+            select(DBAdoption).where(
+                DBAdoption.tenant_id == context.tenant_id,
+                DBAdoption.idempotency_key == idempotency_key,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if existing.project_id != project_id or existing.candidate_id != candidate_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "IDEMPOTENCY_KEY_REUSED",
+                        "message": "该幂等键已用于其他采用操作",
+                    },
+                )
+            master = db.execute(
+                select(DBMasterRevision).where(DBMasterRevision.adoption_id == existing.id)
+            ).scalar_one()
+            return master_response(master, existing)
+
+        candidate = db.execute(
+            select(DBCandidate).where(
+                DBCandidate.id == candidate_id,
+                DBCandidate.project_id == project_id,
+                DBCandidate.tenant_id == context.tenant_id,
+            )
+        ).scalar_one_or_none()
+        if candidate is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "CANDIDATE_NOT_FOUND", "message": "未找到该候选成片"},
+            )
+        if candidate.status != "READY":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "CANDIDATE_NOT_ADOPTABLE", "message": "候选当前不可采用"},
+            )
+
+        supersedes = None
+        if req.supersedesId:
+            supersedes = db.execute(
+                select(DBAdoption).where(
+                    DBAdoption.id == req.supersedesId,
+                    DBAdoption.project_id == project_id,
+                    DBAdoption.tenant_id == context.tenant_id,
+                )
+            ).scalar_one_or_none()
+            if supersedes is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "SUPERSEDED_ADOPTION_NOT_FOUND", "message": "未找到被替代的采用记录"},
+                )
+
+        task = db.execute(
+            select(DBRenderTask).where(
+                DBRenderTask.id == candidate.task_id,
+                DBRenderTask.tenant_id == context.tenant_id,
+            )
+        ).scalar_one()
+        media_ids = {
+            str(clip.get("materialId"))
+            for track in (task.render_payload.get("canonicalTimeline", {}).get("tracks") or [])
+            for clip in (track.get("clips") or [])
+            if clip.get("materialId")
+        }
+        rights_failures = []
+        for media_id in sorted(media_ids):
+            asset = db.execute(
+                select(DBAssetVersion)
+                .where(
+                    DBAssetVersion.project_id == project_id,
+                    DBAssetVersion.tenant_id == context.tenant_id,
+                    DBAssetVersion.media_id == media_id,
+                )
+                .order_by(DBAssetVersion.version_no.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if asset is None:
+                rights_failures.append({"mediaId": media_id, "code": "ASSET_VERSION_MISSING"})
+                continue
+            decision = rights_decision(
+                latest_rights_snapshot(db, asset.id, "EXPORT"),
+                utc_now(),
+            )
+            if not decision["allowed"]:
+                rights_failures.append(
+                    {"mediaId": media_id, "assetVersionId": asset.id, "code": decision["code"]}
+                )
+        if rights_failures:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "RIGHTS_CHECK_FAILED",
+                    "message": "候选采用前的资产权利检查未通过",
+                    "failures": rights_failures,
+                },
+            )
+
+        now = utc_now()
+        revision_no = (
+            db.execute(
+                select(func.max(DBMasterRevision.revision_no)).where(
+                    DBMasterRevision.project_id == project_id,
+                )
+            ).scalar_one_or_none()
+            or 0
+        ) + 1
+        adoption = DBAdoption(
+            id=str(uuid.uuid4()),
+            tenant_id=context.tenant_id,
+            project_id=project_id,
+            candidate_id=candidate.id,
+            adopted_by=context.user_id,
+            adopted_at=now,
+            reason=req.reason.strip(),
+            supersedes_id=supersedes.id if supersedes else None,
+            idempotency_key=idempotency_key,
+        )
+        master = DBMasterRevision(
+            id=str(uuid.uuid4()),
+            tenant_id=context.tenant_id,
+            project_id=project_id,
+            adoption_id=adoption.id,
+            revision_no=revision_no,
+            artifact_ref=candidate.artifact_ref,
+            sha256=None,
+            created_at=now,
+        )
+        candidate.status = "ADOPTED"
+        db.add_all([adoption, master])
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            concurrent = db.execute(
+                select(DBAdoption).where(
+                    DBAdoption.tenant_id == context.tenant_id,
+                    DBAdoption.idempotency_key == idempotency_key,
+                )
+            ).scalar_one_or_none()
+            if (
+                concurrent is not None
+                and concurrent.project_id == project_id
+                and concurrent.candidate_id == candidate_id
+            ):
+                concurrent_master = db.execute(
+                    select(DBMasterRevision).where(
+                        DBMasterRevision.adoption_id == concurrent.id,
+                    )
+                ).scalar_one()
+                return master_response(concurrent_master, concurrent)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ADOPTION_CONFLICT",
+                    "message": "候选已经被采用或母版修订发生并发冲突",
+                },
+            ) from exc
+        return master_response(master, adoption)
+
+    @created_app.get("/projects/{project_id}/masters")
+    def list_master_revisions(
+        project_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        project_for_tenant(db, project_id, context)
+        rows = db.execute(
+            select(DBMasterRevision, DBAdoption)
+            .join(DBAdoption, DBAdoption.id == DBMasterRevision.adoption_id)
+            .where(
+                DBMasterRevision.project_id == project_id,
+                DBMasterRevision.tenant_id == context.tenant_id,
+            )
+            .order_by(DBMasterRevision.revision_no.desc())
+        ).all()
+        return [master_response(master, adoption) for master, adoption in rows]
 
     @created_app.get("/events")
     async def sse_events(
