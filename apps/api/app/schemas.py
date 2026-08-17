@@ -1,6 +1,9 @@
+from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .task_status import canonical_task_status
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
@@ -84,9 +87,38 @@ class CreateUserRequest(BaseModel):
 
 
 class WorkerTaskUpdateRequest(BaseModel):
-    status: Literal["processing", "completed", "failed", "queued"]
+    status: Literal[
+        "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED", "PARTIAL", "UNKNOWN"
+    ]
     progress: int = Field(..., ge=0, le=100)
     message: str = Field(..., min_length=1, max_length=2_000)
     upstreamJobId: Optional[str] = Field(default=None, max_length=128)
     error: Optional[str] = Field(default=None, max_length=4_000)
     retryable: bool = False
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, value: str) -> str:
+        return canonical_task_status(value)
+
+
+class CreateRightsSnapshotRequest(BaseModel):
+    status: Literal["ALLOWED", "DENIED", "REVOKED", "UNKNOWN"]
+    purpose: str = Field(..., min_length=1, max_length=120)
+    territory: str = Field(default="GLOBAL", min_length=1, max_length=120)
+    validFrom: Optional[datetime] = None
+    validUntil: Optional[datetime] = None
+    evidenceRef: Optional[str] = Field(default=None, max_length=2_000)
+
+    @field_validator("validUntil")
+    @classmethod
+    def validate_window(cls, value: Optional[datetime], info):
+        valid_from = info.data.get("validFrom")
+        if value is not None and valid_from is not None and value <= valid_from:
+            raise ValueError("validUntil must be later than validFrom")
+        return value
+
+
+class AdoptCandidateRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=2_000)
+    supersedesId: Optional[str] = Field(default=None, max_length=128)

@@ -1,5 +1,12 @@
 import { test, expect, describe } from "vitest";
-import { TimelineSchema, ProjectSchema } from "../src/schemas";
+import {
+  AssetVersionSchema,
+  CandidateSchema,
+  ProjectSchema,
+  RightsSnapshotSchema,
+  TimelineSchema,
+  canonicalTaskStatus,
+} from "../src/schemas";
 
 describe("TimelineSchema & ProjectSchema Validation", () => {
   test("validate valid timelines and projects", () => {
@@ -77,5 +84,50 @@ describe("TimelineSchema & ProjectSchema Validation", () => {
         }],
       }).success
     ).toBe(false);
+  });
+
+  test("normalizes legacy task aliases into canonical states", () => {
+    expect(canonicalTaskStatus("queued")).toBe("QUEUED");
+    expect(canonicalTaskStatus("dispatching")).toBe("RUNNING");
+    expect(canonicalTaskStatus("completed")).toBe("SUCCEEDED");
+    expect(canonicalTaskStatus("PARTIAL")).toBe("PARTIAL");
+    expect(() => canonicalTaskStatus("invented")).toThrow();
+  });
+
+  test("validates typed asset, rights and candidate contracts", () => {
+    expect(AssetVersionSchema.safeParse({
+      id: "asset-1",
+      projectId: "project-1",
+      mediaId: "media-1",
+      versionNo: 1,
+      sha256: "a".repeat(64),
+      mediaType: "video",
+      contentType: "video/mp4",
+      sizeBytes: 42,
+      probe: { durationSeconds: 1 },
+      createdBy: "user-1",
+      createdAt: new Date().toISOString(),
+    }).success).toBe(true);
+    expect(RightsSnapshotSchema.safeParse({
+      id: "rights-1",
+      assetVersionId: "asset-1",
+      status: "ALLOWED",
+      purpose: "EXPORT",
+      territory: "GLOBAL",
+      validFrom: null,
+      validUntil: null,
+      evidenceRef: "evidence://owner-approved",
+      capturedBy: "user-1",
+      capturedAt: new Date().toISOString(),
+    }).success).toBe(true);
+    expect(CandidateSchema.safeParse({
+      id: "candidate-1",
+      projectId: "project-1",
+      taskId: "task-1",
+      artifactRef: "/api/renders/task-1/artifact",
+      inputRevision: 3,
+      status: "READY",
+      createdAt: new Date().toISOString(),
+    }).success).toBe(true);
   });
 });

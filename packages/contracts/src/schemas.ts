@@ -70,6 +70,91 @@ export const UpdateProjectSchema = z.object({
   expectedRevision: z.number().int().nonnegative(), // Optimistic locking revision check
 });
 
+export const CanonicalTaskStatusSchema = z.enum([
+  "QUEUED",
+  "RUNNING",
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELED",
+  "PARTIAL",
+  "UNKNOWN",
+]);
+
+const legacyTaskStatuses = {
+  queued: "QUEUED",
+  dispatching: "RUNNING",
+  processing: "RUNNING",
+  completed: "SUCCEEDED",
+  failed: "FAILED",
+  canceled: "CANCELED",
+  cancelled: "CANCELED",
+  partial: "PARTIAL",
+  unknown: "UNKNOWN",
+} as const;
+
+export function canonicalTaskStatus(status: string): CanonicalTaskStatusDTO {
+  const canonical = (
+    status in legacyTaskStatuses
+      ? legacyTaskStatuses[status as keyof typeof legacyTaskStatuses]
+      : status
+  );
+  return CanonicalTaskStatusSchema.parse(canonical);
+}
+
+export const AssetVersionSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  mediaId: z.string().min(1),
+  versionNo: z.number().int().positive(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  mediaType: z.enum(["video", "audio", "image"]),
+  contentType: z.string().nullable(),
+  sizeBytes: z.number().int().nonnegative(),
+  probe: z.record(z.unknown()),
+  createdBy: z.string().min(1),
+  createdAt: z.string().min(1),
+});
+
+export const RightsSnapshotSchema = z.object({
+  id: z.string().min(1),
+  assetVersionId: z.string().min(1),
+  status: z.enum(["ALLOWED", "DENIED", "REVOKED", "UNKNOWN"]),
+  purpose: z.string().min(1),
+  territory: z.string().min(1),
+  validFrom: z.string().nullable(),
+  validUntil: z.string().nullable(),
+  evidenceRef: z.string().nullable(),
+  capturedBy: z.string().min(1),
+  capturedAt: z.string().min(1),
+});
+
+export const CandidateSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  taskId: z.string().min(1),
+  artifactRef: z.string().min(1),
+  inputRevision: z.number().int().positive(),
+  status: z.enum(["READY", "ADOPTED"]),
+  createdAt: z.string().min(1),
+});
+
+export const MasterRevisionSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  revisionNo: z.number().int().positive(),
+  artifactRef: z.string().min(1),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+  createdAt: z.string().min(1),
+  adoption: z.object({
+    id: z.string().min(1),
+    candidateId: z.string().min(1),
+    adoptedBy: z.string().min(1),
+    adoptedAt: z.string().min(1),
+    reason: z.string().min(1),
+    supersedesId: z.string().nullable(),
+  }),
+});
+
 // DTO Schemas
 export type RationalTimeDTO = z.infer<typeof RationalTimeSchema>;
 export type ClipDTO = z.infer<typeof ClipSchema>;
@@ -79,3 +164,8 @@ export type MaterialDTO = z.infer<typeof MaterialSchema>;
 export type ProjectDTO = z.infer<typeof ProjectSchema>;
 export type CreateProjectDTO = z.infer<typeof CreateProjectSchema>;
 export type UpdateProjectDTO = z.infer<typeof UpdateProjectSchema>;
+export type CanonicalTaskStatusDTO = z.infer<typeof CanonicalTaskStatusSchema>;
+export type AssetVersionDTO = z.infer<typeof AssetVersionSchema>;
+export type RightsSnapshotDTO = z.infer<typeof RightsSnapshotSchema>;
+export type CandidateDTO = z.infer<typeof CandidateSchema>;
+export type MasterRevisionDTO = z.infer<typeof MasterRevisionSchema>;
