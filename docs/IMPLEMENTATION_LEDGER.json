@@ -130,6 +130,38 @@
         "Pull request #8 merged to main on 2026-08-09T19:05:30Z"
       ],
       "boundary": "ACCEPTED records repository milestone acceptance after PR #8 merged. Public launch still requires a real host, TLS ingress, target backup, production credentials, and separate production authorization."
+    },
+    "IM-1/IM-2": {
+      "status": "ACCEPTED",
+      "baseline_commit": "e876958b54e2fca1af5409150d3a9a29e857a9fa",
+      "candidate_pr": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/9",
+      "code_candidate_commit": "60b2f7d21a7a6c14958b4b8bc5d3e0c762acf03e",
+      "merge_commit": "88a8a76762e1820036dddbf61546bff0c3cf5f85",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31959023181",
+      "description": "Introduce the typed, tenant-scoped asset/rights/task/candidate/adoption/master foundation required for governed workbench operations.",
+      "evidence": "docs/evidence/IM1-IM2-FOUNDATION-VERIFICATION.md",
+      "implemented_controls": [
+        "Immutable asset versions with SHA-256, probe metadata and tenant/project scope",
+        "Immutable rights snapshots with status, purpose, territory and validity windows",
+        "Canonical task-state persistence with legacy read compatibility",
+        "Render candidates, explicit idempotent adoption and immutable master revisions",
+        "Export-rights enforcement before candidate adoption",
+        "Additive migration, tenant isolation, immutability, rights and idempotency regression tests"
+      ],
+      "acceptance_evidence": [
+        "Sixty-nine local automated tests passed",
+        "GitHub Actions lint/build/unit and dependency-audit job passed",
+        "GitHub Actions Playwright workbench flow passed and uploaded evidence",
+        "GitHub Actions Docker integration, real render and browser upload-to-download flow passed and uploaded evidence",
+        "Pull request #9 merged to main on 2026-08-17"
+      ],
+      "remaining_boundaries": {
+        "workbench_ui": "Typed backend records are not yet exposed as complete M08/M09/M10 workbench operations.",
+        "providers_and_plugins": "No real AI provider, face/person replacement provider, wardrobe/background provider or short-video plugin is integrated.",
+        "production_launch": "No deployment, public endpoint, production data or production credential is authorized.",
+        "commercial_use": "Independent security, legal/compliance and finance/tax review remain mandatory before commercial use."
+      },
+      "boundary": "Repository milestone acceptance does not authorize the proposed IM-3/IM-5 code batch, deployment, production data, real providers/plugins or commercial operation."
     }
   }
 }

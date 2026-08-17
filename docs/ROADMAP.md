@@ -95,6 +95,25 @@ This document outlines the high-level roadmap and current milestone progress for
   - Production and development JavaScript dependencies plus all three Python
     requirement sets report no known vulnerabilities at the candidate audit date.
 
+### [IM-1/IM-2] Typed Asset and Adoption Foundation (ACCEPTED)
+- **Status**: Merged and fully verified as a repository milestone.
+- **PR**: [#9](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/9)
+- **Merge commit**: `88a8a76762e1820036dddbf61546bff0c3cf5f85`
+- **CI**: [GitHub Actions run 46](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/31959023181)
+- **Evidence**: `docs/evidence/IM1-IM2-FOUNDATION-VERIFICATION.md`
+- **Key Features**:
+  - Immutable, tenant-scoped asset versions with SHA-256 and probe metadata.
+  - Immutable rights snapshots with purpose, territory and validity-window decisions.
+  - Canonical task-state persistence with legacy response compatibility.
+  - Render candidates, explicit idempotent adoption and immutable master revisions.
+  - Rights enforcement before candidate adoption plus migration and tenant-isolation coverage.
+- **Boundary**: The accepted increment does not include a workbench UI for the new records, a real AI provider, a short-video plugin, production deployment or commercial approval.
+
+### [IM-3/IM-5] Governed Workbench Operations (PROPOSED)
+- **Status**: Awaiting owner approval; no code implementation is authorized by this roadmap entry.
+- **Approval package**: `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md`
+- **Proposed outcome**: Expose asset/rights governance, canonical task states, candidate adoption and master revisions in the existing React workbench without adding providers, plugins, migrations or deployment changes.
+
 ## Security & Upgrade Boundaries
 - **No hardcoded credentials**: Environment variables handle sidecar configurations.
 - **Upgrades**: Upgrading the sidecar must be done by explicitly bumping the pinned upstream version/commit and running compatibility validation tests.

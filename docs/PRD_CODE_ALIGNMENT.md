@@ -1,7 +1,7 @@
 # Aether Studio PRD–Code Alignment
 
-> Baseline: `main@e876958b54e2fca1af5409150d3a9a29e857a9fa`
-> Review date: 2026-08-16
+> Baseline: `main@88a8a76762e1820036dddbf61546bff0c3cf5f85`
+> Review date: 2026-08-17
 > Status vocabulary: `IMPLEMENTED`, `PARTIAL`, `NOT_IMPLEMENTED`, `EXTERNAL_GATE`
 > Boundary: this matrix records repository facts; it does not claim production deployment or commercial approval.
 
@@ -15,17 +15,17 @@
 | M04 image-to-video/action | PARTIAL | video-use/FFmpeg sidecar and media pipeline | Versioned reference/mapping inputs and controlled model adapter remain |
 | M05 face/person replacement | NOT_IMPLEMENTED | No approved real provider | Consent, safety, controlled generation and review remain |
 | M06 wardrobe/background | NOT_IMPLEMENTED | No approved real provider | Versioned transformation inputs, quality and review remain |
-| M07 smart editing | PARTIAL | Rational timeline, tracks/clips, FFmpeg render, OpenCut/OpenReel exports | Candidate/adoption/master authority and richer editing UI remain |
-| M08 assets and rights | PARTIAL | Upload, probe, project material JSON, tenant storage quota | `AssetVersion`, `RightsSnapshot`, evidence and hold enforcement are introduced in IM-2 and require validation |
-| M09 task center | PARTIAL | Persistent leased render queue, recovery, retry, SSE | Canonical status compatibility is introduced in IM-2; full Attempt/Checkpoint/DeadLetter/UI remains |
-| M10 finished media | PARTIAL | Authenticated render artifact download | Candidate, Adoption and MasterRevision are introduced in IM-2; publication/withdrawal remains |
+| M07 smart editing | PARTIAL | Rational timeline, tracks/clips, FFmpeg render, OpenCut/OpenReel exports, candidate/adoption/master authority | Candidate adoption UI and richer editing UI remain |
+| M08 assets and rights | PARTIAL | Upload, probe, immutable `AssetVersion`, `RightsSnapshot`, rights-window decisions and tenant storage quota | Workbench governance UI, rights-history view and hold enforcement remain |
+| M09 task center | PARTIAL | Persistent leased render queue, recovery, retry, SSE and canonical status compatibility | Explicit canonical-status UI plus full Attempt/Checkpoint/DeadLetter remain |
+| M10 finished media | PARTIAL | Authenticated artifacts, Candidate, explicit Adoption and immutable MasterRevision | Candidate/master UI, publication and withdrawal remain |
 | M11 metering and plans | PARTIAL | Project/storage/concurrency/monthly render quotas | Quote/Reservation/Usage/Settlement ledger remains |
 | M12 team and permissions | PARTIAL | Session auth, owner/editor/viewer RBAC, tenant isolation | Membership, policy, data scope, approval and segregation-of-duties UI remain |
 | M13 settings | PARTIAL | Environment configuration and isolated adapters | ConfigVersion, SecretVersion, connector registry and publish/rollback remain |
 | Production launch | EXTERNAL_GATE | Compose/runbook/CI smoke path exists | Host, TLS, backup, provider credentials, load evidence and explicit production approval remain |
 | Commercial use | EXTERNAL_GATE | No claim | Independent security, legal/compliance and finance/tax review remain mandatory |
 
-## IM-1/IM-2 approved increment
+## IM-1/IM-2 accepted increment
 
 - Correct M5-1 post-merge repository evidence.
 - Add immutable typed asset versions and rights snapshots without removing legacy project materials.
@@ -33,4 +33,16 @@
 - Store new render-task writes with canonical states while preserving legacy read compatibility.
 - Add tenant isolation, idempotency, rights-window and migration regression tests.
 
-No real AI provider, short-video plugin, paid call, production data, deployment, or PostgreSQL big-bang migration is part of this increment.
+Pull request [#9](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/9) passed all three CI jobs and merged to `main` as `88a8a76762e1820036dddbf61546bff0c3cf5f85`.
+
+No real AI provider, short-video plugin, paid call, production data, deployment, or PostgreSQL big-bang migration was part of this increment.
+
+## Proposed IM-3/IM-5 increment
+
+The next recommended batch exposes the accepted M08/M09/M10 backend foundation in the existing React workbench:
+
+- asset-version and rights governance UI;
+- canonical task-state presentation;
+- candidate adoption and master-revision UI.
+
+The detailed scope and approval wording are in `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md`. This proposal is not coding authorization.
