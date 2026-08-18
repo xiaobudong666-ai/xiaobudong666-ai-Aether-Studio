@@ -166,8 +166,8 @@
     "IM-3/IM-5": {
       "status": "LOCAL_VERIFIED_CANDIDATE",
       "baseline_commit": "7959759814bfe5a0d1c65a0bd5c4a85139a9427b",
-      "candidate_pr": "PENDING_REMOTE_PR",
-      "code_candidate_commit": "PENDING_REMOTE_COMMIT",
+      "candidate_pr": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11",
+      "code_candidate_commit": "4185f18e06b3ed74085e1c6be250e5258deaf045",
       "ci_run": "PENDING",
       "description": "Expose accepted asset rights, canonical task, candidate adoption and immutable master capabilities as governed React workbench operations.",
       "approval": "Owner approved sections 9.1 and conditional 9.2 of docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md on 2026-08-18.",

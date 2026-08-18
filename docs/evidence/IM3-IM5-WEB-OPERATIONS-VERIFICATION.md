@@ -2,8 +2,8 @@
 
 > Status: `LOCAL_VERIFIED_CANDIDATE / CI_PENDING`
 > Baseline: `main@7959759814bfe5a0d1c65a0bd5c4a85139a9427b`
-> Candidate commit: `PENDING_REMOTE_COMMIT`
-> Candidate PR: `PENDING_REMOTE_PR`
+> Code candidate commit: `4185f18e06b3ed74085e1c6be250e5258deaf045`
+> Candidate PR: [#11](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11)
 > CI run: `PENDING`
 > Verification date: 2026-08-18
 
