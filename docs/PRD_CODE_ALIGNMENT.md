@@ -39,12 +39,12 @@ No real AI provider, short-video plugin, paid call, production data, deployment,
 
 ## Approved IM-3/IM-5 implementation candidate
 
-The owner approved the bounded batch on 2026-08-18. The local candidate now exposes the accepted M08/M09/M10 backend foundation in the existing React workbench:
+The owner approved the bounded batch on 2026-08-18. Draft pull request [#11](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11) now exposes the accepted M08/M09/M10 backend foundation in the existing React workbench:
 
 - asset-version and rights governance UI;
 - canonical task-state presentation;
 - candidate adoption and master-revision UI.
 
-The detailed scope and approval record are in `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md`; local results and pending remote gates are in `docs/evidence/IM3-IM5-WEB-OPERATIONS-VERIFICATION.md`.
+The detailed scope and approval record are in `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md`. GitHub Actions [Pipeline #51](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32089357299) passed all three jobs; exact verification is in `docs/evidence/IM3-IM5-WEB-OPERATIONS-VERIFICATION.md`.
 
-This candidate is not accepted or merged. GitHub Actions, draft-PR review and separate owner merge approval remain mandatory. No real AI provider, short-video plugin, paid call, production data, deployment or commercial operation is included.
+This candidate is not accepted or merged. Separate owner approval is required before formal review and again before merge. No real AI provider, short-video plugin, paid call, production data, deployment or commercial operation is included.

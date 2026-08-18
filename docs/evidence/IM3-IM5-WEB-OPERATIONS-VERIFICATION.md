@@ -1,10 +1,10 @@
 # IM-3/IM-5 Governed Workbench Operations — Verification
 
-> Status: `LOCAL_VERIFIED_CANDIDATE / CI_PENDING`
+> Status: `CI_VERIFIED_DRAFT_CANDIDATE`
 > Baseline: `main@7959759814bfe5a0d1c65a0bd5c4a85139a9427b`
 > Code candidate commit: `4185f18e06b3ed74085e1c6be250e5258deaf045`
 > Candidate PR: [#11](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11)
-> CI run: `PENDING`
+> CI run: [Pipeline #51](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32089357299)
 > Verification date: 2026-08-18
 
 ## 1. Authorization recorded
@@ -72,7 +72,18 @@ PR #10 merged to `main` as `7959759814bfe5a0d1c65a0bd5c4a85139a9427b` before thi
 
 The browser tests could not execute locally because this sandbox did not contain Chromium and its browser download proxy returned an invalid/truncated archive plus a certificate-time 502. The API and Vite servers both started successfully before browser launch. This is recorded as an environment limitation, not a passed browser gate. GitHub Actions browser and Docker jobs remain mandatory.
 
-## 5. New CI browser evidence requested
+## 5. CI verification
+
+GitHub Actions Pipeline #51 completed successfully against the draft-PR candidate:
+
+- lint, compilation, type checks, production build, unit/package tests and Node/Python production dependency audits passed;
+- API, Worker and video-use regression tests passed;
+- Playwright workbench flow passed and uploaded evidence;
+- Docker Compose built and reached a healthy stack;
+- FFmpeg/ffprobe, pinned video-use, real render, authenticated upload, persistent queue, Worker and canonical task state passed;
+- both production-browser governance flows passed and uploaded their evidence.
+
+The production browser suite contains two explicit flows:
 
 The production browser suite now contains two explicit flows:
 
@@ -87,14 +98,8 @@ The production browser suite now contains two explicit flows:
 - No deployment or public endpoint.
 - No publish, withdraw, delete, replace, supersede or social-platform action.
 
-## 7. Pending gates
+## 7. Remaining gate
 
-1. publish the exact candidate to a remote implementation branch;
-2. open a draft pull request against `main`;
-3. pass GitHub Actions lint/build/unit and dependency audits;
-4. pass Playwright workbench evidence;
-5. pass Docker real-render plus both production-browser governance flows;
-6. update this record with exact candidate commit, PR and CI run;
-7. obtain separate owner approval before merge.
+The candidate must remain a draft until the owner separately authorizes formal review. Merge requires another explicit owner approval after that review.
 
-Until all pending gates are complete, `LOCAL_VERIFIED_CANDIDATE` must not be represented as accepted, merged, deployed, production-ready or commercially approved.
+`CI_VERIFIED_DRAFT_CANDIDATE` must not be represented as accepted, merged, deployed, production-ready or commercially approved. Independent security, legal/compliance and finance/tax review remain mandatory before formal commercial use.

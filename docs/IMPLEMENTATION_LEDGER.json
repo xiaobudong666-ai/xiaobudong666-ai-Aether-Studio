@@ -164,11 +164,11 @@
       "boundary": "Repository milestone acceptance does not authorize the proposed IM-3/IM-5 code batch, deployment, production data, real providers/plugins or commercial operation."
     },
     "IM-3/IM-5": {
-      "status": "LOCAL_VERIFIED_CANDIDATE",
+      "status": "CI_VERIFIED_DRAFT_CANDIDATE",
       "baseline_commit": "7959759814bfe5a0d1c65a0bd5c4a85139a9427b",
       "candidate_pr": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11",
       "code_candidate_commit": "4185f18e06b3ed74085e1c6be250e5258deaf045",
-      "ci_run": "PENDING",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32089357299",
       "description": "Expose accepted asset rights, canonical task, candidate adoption and immutable master capabilities as governed React workbench operations.",
       "approval": "Owner approved sections 9.1 and conditional 9.2 of docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md on 2026-08-18.",
       "evidence": "docs/evidence/IM3-IM5-WEB-OPERATIONS-VERIFICATION.md",
@@ -185,16 +185,19 @@
         "Eleven contract tests and four editor tests passed",
         "Twenty-three API, twenty-three Worker and three video-use tests passed",
         "Web and package lint/type checks plus the production web build passed",
-        "All five Playwright tests were collected; local execution is blocked only by the sandbox Chromium download certificate and remains mandatory in CI"
+        "All five Playwright tests were collected locally; GitHub Actions later passed the browser gates"
+      ],
+      "ci_verification": [
+        "Lint, build, unit/package tests and Node/Python production dependency audits passed",
+        "API, Worker and video-use regression tests passed",
+        "Playwright workbench flow passed and uploaded evidence",
+        "Docker real-render, authenticated queue/Worker path and both production-browser governance flows passed and uploaded evidence"
       ],
       "remaining_gates": [
-        "Remote candidate commit and draft pull request",
-        "GitHub Actions lint/build/unit and dependency audits",
-        "GitHub Actions Playwright evidence",
-        "GitHub Actions Docker real-browser and real-render evidence",
-        "Separate owner approval before merge"
+        "Separate owner approval to move the draft pull request to formal review",
+        "Separate owner approval before merge after formal review"
       ],
-      "boundary": "LOCAL_VERIFIED_CANDIDATE is not acceptance. No new dependency, backend migration, real provider/plugin, paid call, production data, deployment, public access, feature-PR merge or commercial operation is authorized."
+      "boundary": "CI_VERIFIED_DRAFT_CANDIDATE is not acceptance. No new dependency, backend migration, real provider/plugin, paid call, production data, deployment, public access, feature-PR merge or commercial operation is authorized."
     }
   }
 }
