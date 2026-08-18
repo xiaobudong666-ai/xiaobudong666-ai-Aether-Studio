@@ -1,6 +1,7 @@
 import React, { useRef, useState } from "react";
-import { MaterialDTO } from "@aether/contracts";
+import { AssetVersionDTO, MaterialDTO } from "@aether/contracts";
 import { formatBytes, materialTypeLabel, safeErrorMessage } from "../i18n";
+import { AssetGovernance } from "./AssetGovernance";
 
 interface AssetLibraryProps {
   materials: MaterialDTO[];
@@ -8,6 +9,10 @@ interface AssetLibraryProps {
   onAddClipToTimeline: (materialId: string) => Promise<void>;
   canEdit: boolean;
   hasProject: boolean;
+  projectId: string | null;
+  assetVersions: AssetVersionDTO[];
+  apiBase: string;
+  onSessionExpired: () => void;
 }
 
 export const AssetLibrary: React.FC<AssetLibraryProps> = ({
@@ -16,6 +21,10 @@ export const AssetLibrary: React.FC<AssetLibraryProps> = ({
   onAddClipToTimeline,
   canEdit,
   hasProject,
+  projectId,
+  assetVersions,
+  apiBase,
+  onSessionExpired,
 }) => {
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -95,6 +104,9 @@ export const AssetLibrary: React.FC<AssetLibraryProps> = ({
           ) : (
             materials.map((m) => {
               const seconds = m.duration ? m.duration.value / m.duration.timescale : 0;
+              const assetVersion = assetVersions
+                .filter((version) => version.mediaId === m.id)
+                .sort((left, right) => right.versionNo - left.versionNo)[0];
               return (
                 <div key={m.id} className="material-card" style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: "4px" }}>
                   <div style={{ fontWeight: 500, wordBreak: "break-all" }}>{m.name}</div>
@@ -109,6 +121,17 @@ export const AssetLibrary: React.FC<AssetLibraryProps> = ({
                   >
                     {placingMaterialId === m.id ? "正在添加…" : "+ 添加到时间线"}
                   </button>
+                  {projectId && assetVersion ? (
+                    <AssetGovernance
+                      apiBase={apiBase}
+                      projectId={projectId}
+                      assetVersion={assetVersion}
+                      canEdit={canEdit}
+                      onSessionExpired={onSessionExpired}
+                    />
+                  ) : (
+                    <div className="empty-note">该素材尚无可用的版本治理记录。</div>
+                  )}
                 </div>
               );
             })

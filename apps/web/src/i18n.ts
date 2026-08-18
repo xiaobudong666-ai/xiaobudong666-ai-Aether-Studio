@@ -29,7 +29,34 @@ const TASK_STATUS_LABELS: Record<string, string> = {
   processing: "渲染中",
   completed: "已完成",
   failed: "失败",
+  canceled: "已取消",
+  cancelled: "已取消",
+  partial: "部分完成",
+  unknown: "状态待确认",
   pending: "等待中",
+  QUEUED: "排队中",
+  RUNNING: "处理中",
+  SUCCEEDED: "已完成",
+  FAILED: "失败",
+  CANCELED: "已取消",
+  PARTIAL: "部分完成",
+  UNKNOWN: "状态待确认",
+};
+
+const RIGHTS_DECISION_LABELS: Record<string, string> = {
+  RIGHTS_ALLOWED: "允许导出",
+  RIGHTS_MISSING: "缺少权利记录",
+  RIGHTS_DENIED: "权利被拒绝",
+  RIGHTS_REVOKED: "权利已撤销",
+  RIGHTS_UNKNOWN: "权利待确认",
+  RIGHTS_NOT_YET_VALID: "尚未生效",
+  RIGHTS_EXPIRED: "权利已过期",
+  ASSET_VERSION_MISSING: "缺少素材版本",
+};
+
+const CANDIDATE_STATUS_LABELS: Record<string, string> = {
+  READY: "待采纳",
+  ADOPTED: "已采纳",
 };
 
 const API_ERROR_LABELS: Record<string, string> = {
@@ -53,6 +80,12 @@ const API_ERROR_LABELS: Record<string, string> = {
   RENDER_SECONDS_QUOTA_EXCEEDED: "本月可用渲染时长已用完。",
   ARTIFACT_NOT_FOUND: "成片尚不可下载或已经失效。",
   TASK_NOT_FOUND: "未找到该任务。",
+  CANDIDATE_NOT_FOUND: "未找到该候选成片。",
+  CANDIDATE_NOT_ADOPTABLE: "该候选成片当前不可采纳。",
+  IDEMPOTENCY_KEY_REQUIRED: "采纳请求缺少有效的幂等标识。",
+  IDEMPOTENCY_KEY_REUSED: "该操作标识已用于其他采纳请求，请刷新后重试。",
+  ADOPTION_CONFLICT: "候选已被采纳或母版版本发生冲突，正在刷新数据。",
+  RIGHTS_CHECK_FAILED: "素材权利检查未通过，不能采纳为母版。",
   EMAIL_EXISTS: "该邮箱已经存在。",
   VIDEO_USE_UNAVAILABLE: "视频处理服务暂时不可用。",
 };
@@ -79,18 +112,40 @@ export function taskStatusLabel(status: string): string {
   return TASK_STATUS_LABELS[status] || "状态未知";
 }
 
+export function rightsDecisionLabel(code: string): string {
+  return RIGHTS_DECISION_LABELS[code] || "权利状态待确认";
+}
+
+export function candidateStatusLabel(status: string): string {
+  return CANDIDATE_STATUS_LABELS[status] || "候选状态待确认";
+}
+
 export function taskMessageLabel(status: string): string {
   switch (status) {
     case "queued":
+    case "QUEUED":
       return "任务已进入渲染队列。";
     case "dispatching":
+    case "RUNNING":
       return "正在分配渲染资源。";
     case "processing":
       return "正在生成成片，请保持页面开启或稍后回来查看。";
     case "completed":
+    case "SUCCEEDED":
       return "成片已生成，可以下载。";
     case "failed":
+    case "FAILED":
       return "渲染失败，请检查素材后重试；技术详情已记录到服务日志。";
+    case "canceled":
+    case "cancelled":
+    case "CANCELED":
+      return "任务已取消。";
+    case "partial":
+    case "PARTIAL":
+      return "任务已结束，但仅生成了部分结果。";
+    case "unknown":
+    case "UNKNOWN":
+      return "任务状态尚未确认，请刷新后重新查询。";
     default:
       return "任务状态正在更新。";
   }

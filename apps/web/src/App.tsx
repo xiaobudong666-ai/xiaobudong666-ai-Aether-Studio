@@ -1,5 +1,11 @@
-import { useEffect, useRef, useState } from "react";
-import { RationalTime, ProjectDTO, ClipDTO } from "@aether/contracts";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AssetVersionDTO,
+  AssetVersionSchema,
+  RationalTime,
+  ProjectDTO,
+  ClipDTO,
+} from "@aether/contracts";
 import { AssetLibrary } from "./components/AssetLibrary";
 import { CanvasPreview } from "./components/CanvasPreview";
 import { PropertyInspector } from "./components/PropertyInspector";
@@ -31,6 +37,7 @@ interface AuthUser {
 export default function App() {
   const [projects, setProjects] = useState<ProjectDTO[]>([]);
   const [currentProject, setCurrentProject] = useState<ProjectDTO | null>(null);
+  const [assetVersions, setAssetVersions] = useState<AssetVersionDTO[]>([]);
   const [newProjectName, setNewProjectName] = useState("");
   const [selectedClip, setSelectedClip] = useState<ClipDTO | null>(null);
   const [currentTime, setCurrentTime] = useState<RationalTime>(new RationalTime(0, 24000));
@@ -53,12 +60,17 @@ export default function App() {
 
   const stateHeaders = { "X-Aether-CSRF": "1" };
 
-  const handleExpiredSession = (response: Response): boolean => {
-    if (response.status !== 401) return false;
+  const expireSession = useCallback(() => {
     setAuthUser(null);
     setProjects([]);
     setCurrentProject(null);
+    setAssetVersions([]);
     setLoginError("登录已过期，请重新登录。");
+  }, []);
+
+  const handleExpiredSession = (response: Response): boolean => {
+    if (response.status !== 401) return false;
+    expireSession();
     return true;
   };
 
@@ -146,6 +158,7 @@ export default function App() {
     setAuthUser(null);
     setProjects([]);
     setCurrentProject(null);
+    setAssetVersions([]);
   };
 
   const fetchProjectDetail = async (id: string) => {
@@ -158,12 +171,23 @@ export default function App() {
         setSelectedClip(null);
         setCurrentTime(new RationalTime(0, 24000));
         setApiError(null);
+        const versionsResponse = await fetch(`${API_BASE}/projects/${id}/asset-versions`);
+        if (handleExpiredSession(versionsResponse)) return;
+        if (versionsResponse.ok) {
+          const versionsPayload = await versionsResponse.json();
+          if (!Array.isArray(versionsPayload)) throw new Error("素材版本列表格式异常");
+          setAssetVersions(versionsPayload.map((version) => AssetVersionSchema.parse(version)));
+        } else {
+          setAssetVersions([]);
+          setApiError("素材版本信息加载失败，项目内容仍可查看。");
+        }
       } else {
         const payload = await res.json().catch(() => null);
         setApiError(apiErrorMessage(payload, "项目详情加载失败。"));
       }
     } catch (err) {
       setApiError(safeErrorMessage(err, "项目详情加载失败。"));
+      setAssetVersions([]);
     }
   };
 
@@ -184,6 +208,7 @@ export default function App() {
         const newProj = await res.json();
         setProjects((prev) => [...prev, newProj]);
         setCurrentProject(newProj);
+        setAssetVersions([]);
         setNewProjectName("");
         setSelectedClip(null);
         setActionMessage(`项目“${newProj.name}”已创建。`);
@@ -273,6 +298,13 @@ export default function App() {
     setProjects((prev) => prev.map((project) => (
       project.id === updatedProject.id ? updatedProject : project
     )));
+    const parsedAssetVersion = AssetVersionSchema.safeParse(payload.assetVersion);
+    if (parsedAssetVersion.success) {
+      setAssetVersions((previous) => [
+        ...previous.filter((version) => version.id !== parsedAssetVersion.data.id),
+        parsedAssetVersion.data,
+      ]);
+    }
     setActionMessage(`素材“${file.name}”已上传并完成媒体信息检测。`);
   };
 
@@ -524,6 +556,10 @@ export default function App() {
           onAddClipToTimeline={handleAddClipToTimeline}
           canEdit={canEdit && !isSavingProject}
           hasProject={Boolean(currentProject)}
+          projectId={currentProject?.id || null}
+          assetVersions={assetVersions}
+          apiBase={API_BASE}
+          onSessionExpired={expireSession}
         />
 
         <CanvasPreview
@@ -538,9 +574,11 @@ export default function App() {
           projectId={currentProject?.id || null}
           onTriggerRender={handleTriggerRender}
           apiBase={API_BASE}
+          canEdit={canEdit && !isSavingProject}
           canRender={canEdit && !isSavingProject && Boolean(currentProject?.timeline.tracks.some(
             (track) => track.type === "video" && track.clips.length > 0,
           ))}
+          onSessionExpired={expireSession}
         />
       </main>
 
