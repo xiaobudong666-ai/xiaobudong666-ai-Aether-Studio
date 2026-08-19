@@ -69,10 +69,14 @@ jobs:
           pip-audit -r apps/worker/requirements.txt
           pip-audit -r apps/video_use/requirements.txt
 
-      - name: Install FFmpeg test runtime
+      - name: Verify FFmpeg test runtime
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version
+          ffprobe -version
 
       - name: Run API tests
         env:
