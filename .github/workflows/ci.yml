@@ -74,11 +74,6 @@ jobs:
           PYTHONPATH: apps/api
         run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py -v
 
-      - name: Run Worker tests
-        env:
-          PYTHONPATH: apps/worker
-        run: python -m pytest apps/worker/test_worker.py apps/worker/test_moneyprinter.py -v
-
   playwright:
     name: Playwright workbench flow
     needs: build-and-test
@@ -189,6 +184,14 @@ jobs:
         run: |
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffprobe -version
+
+      - name: Run Worker tests in FFmpeg container
+        run: |
+          docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_worker.py worker:/tmp/test_worker.py
+          docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_moneyprinter.py worker:/tmp/test_moneyprinter.py
+          docker compose -f infra/docker/docker-compose.yml exec -T \
+            -e PYTHONPATH=/app worker \
+            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py -v
 
       - name: Run video-use sidecar tests in FFmpeg container
         run: |
