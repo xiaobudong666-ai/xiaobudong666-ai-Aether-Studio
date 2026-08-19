@@ -1,11 +1,12 @@
 # IM-3/IM-5 Governed Workbench Operations — Verification
 
-> Status: `CI_VERIFIED_DRAFT_CANDIDATE`
+> Status: `FORMAL_REVIEW_REMEDIATED_AWAITING_FINAL_HEAD_CI`
 > Baseline: `main@7959759814bfe5a0d1c65a0bd5c4a85139a9427b`
-> Code candidate commit: `4185f18e06b3ed74085e1c6be250e5258deaf045`
+> Reviewed code candidate: `02e3854912ab6eb6030b0d72b214dd7c81f9857e`
 > Candidate PR: [#11](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11)
-> CI run: [Pipeline #51](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32089357299)
-> Verification date: 2026-08-18
+> Last complete CI run before review remediation: [Pipeline #52](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32090298013)
+> Review-remediation run: [Pipeline #59](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32228398136)
+> Verification updated: 2026-08-19
 
 ## 1. Authorization recorded
 
@@ -58,7 +59,7 @@ PR #10 merged to `main` as `7959759814bfe5a0d1c65a0bd5c4a85139a9427b` before thi
 
 | Gate | Result |
 |---|---|
-| Web component/unit tests | 7 passed |
+| Web component/unit tests | 10 passed, including 3 project-switch isolation regressions |
 | Contract tests | 11 passed |
 | Editor tests | 4 passed |
 | API tests | 23 passed |
@@ -85,8 +86,6 @@ GitHub Actions Pipeline #51 completed successfully against the draft-PR candidat
 
 The production browser suite contains two explicit flows:
 
-The production browser suite now contains two explicit flows:
-
 1. real upload → asset version → missing rights → allowed immutable snapshot → timeline render → canonical success → one adoption → master display/download;
 2. real upload → render candidate → adoption attempt without export rights → server rejection with per-media reason and no master.
 
@@ -98,8 +97,23 @@ The production browser suite now contains two explicit flows:
 - No deployment or public endpoint.
 - No publish, withdraw, delete, replace, supersede or social-platform action.
 
-## 7. Remaining gate
+## 7. Formal review finding and remediation
 
-The candidate must remain a draft until the owner separately authorizes formal review. Merge requires another explicit owner approval after that review.
+The owner authorized PR #11 to enter formal review. Review identified one blocking frontend isolation defect: a response started for a previously selected project could arrive after a project switch and overwrite the newly selected project's detail, task, candidate or master state.
 
-`CI_VERIFIED_DRAFT_CANDIDATE` must not be represented as accepted, merged, deployed, production-ready or commercially approved. Independent security, legal/compliance and finance/tax review remain mandatory before formal commercial use.
+The remediation:
+
+- invalidates prior project-detail, task-history and finished-media request generations;
+- verifies both the request generation and current project before committing asynchronous results;
+- clears project-scoped UI state during a switch;
+- filters rendered task state to the selected project;
+- prevents late upload/save/adoption continuations from overwriting another project's UI;
+- adds three delayed-response regression tests covering project detail, canonical task history and candidate/master lists.
+
+Pipeline #59 passed ESLint, TypeScript compilation, the production build, all web/package tests and the Node dependency audit. Its FFmpeg package-install step remained in progress because of runner/package-source delay when this evidence update was committed; no code-test failure was reported.
+
+## 8. Remaining gate
+
+The new final-head CI run triggered by this evidence commit must complete successfully. After that, formal review may be recorded as passed with no unresolved blocking feedback.
+
+Merge still requires a separate explicit owner approval. The candidate must not be represented as merged, deployed, production-ready or commercially approved. Independent security, legal/compliance and finance/tax review remain mandatory before formal commercial use.
