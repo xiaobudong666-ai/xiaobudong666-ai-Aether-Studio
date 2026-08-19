@@ -1,4 +1,4 @@
-import React, { useCallback, useState, useEffect } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   CanonicalTaskStatusDTO,
   ClipDTO,
@@ -75,29 +75,48 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   const [sseConnected, setSseConnected] = useState(false);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const projectIdRef = useRef(projectId);
+  const loadRequestIdRef = useRef(0);
+  projectIdRef.current = projectId;
 
   const loadTasks = useCallback(async () => {
-    if (!projectId) {
+    const activeProjectId = projectId;
+    const requestId = ++loadRequestIdRef.current;
+    const isCurrentRequest = () => (
+      loadRequestIdRef.current === requestId
+      && projectIdRef.current === activeProjectId
+    );
+    if (!activeProjectId) {
       setTasks([]);
       setTaskError(null);
       return;
     }
     try {
-      const response = await fetch(`${apiBase}/render-tasks?projectId=${encodeURIComponent(projectId)}`);
+      const response = await fetch(`${apiBase}/render-tasks?projectId=${encodeURIComponent(activeProjectId)}`);
+      if (!isCurrentRequest()) return;
       if (response.status === 401) {
         onSessionExpired();
         return;
       }
       if (!response.ok) throw new Error("任务历史加载失败");
       const payload = await response.json();
+      if (!isCurrentRequest()) return;
       if (!Array.isArray(payload)) throw new Error("任务历史格式异常");
       const parsed = payload.map((task) => RenderTaskSchema.parse(task));
       setTasks(mergeTasks([], parsed));
       setTaskError(null);
     } catch {
-      setTaskError("任务历史暂时无法加载；已有数据已保留，可以手动刷新。");
+      if (isCurrentRequest()) {
+        setTaskError("任务历史暂时无法加载；已有数据已保留，可以手动刷新。");
+      }
     }
   }, [apiBase, onSessionExpired, projectId]);
+
+  useEffect(() => {
+    setTasks([]);
+    setTaskError(null);
+    setSubmitting(false);
+  }, [projectId]);
 
   useEffect(() => {
     void loadTasks();
@@ -134,16 +153,21 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
 
   const handleRender = async () => {
     if (!projectId) return;
+    const activeProjectId = projectId;
     setSubmitting(true);
     setTaskError(null);
     try {
       await onTriggerRender();
     } catch (err) {
-      setTaskError(safeErrorMessage(err, "渲染任务提交失败，请稍后重试。"));
+      if (projectIdRef.current === activeProjectId) {
+        setTaskError(safeErrorMessage(err, "渲染任务提交失败，请稍后重试。"));
+      }
     } finally {
-      setSubmitting(false);
+      if (projectIdRef.current === activeProjectId) setSubmitting(false);
     }
   };
+
+  const projectTasks = tasks.filter((task) => task.projectId === projectId);
 
   return (
     <div className="panel" style={{ height: "100%", borderRight: "none" }}>
@@ -197,10 +221,10 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             </button>
           </div>
           <div style={{ flex: 1, overflowY: "auto" }}>
-            {tasks.length === 0 ? (
+            {projectTasks.length === 0 ? (
               <div style={{ color: "#a1a1aa", fontStyle: "italic", fontSize: "12px" }}>还没有提交后台任务。</div>
             ) : (
-              tasks.map((t) => {
+              projectTasks.map((t) => {
                 const canonicalStatus = resolvedTaskStatus(t);
                 const updatedLabel = taskDateLabel(t);
                 const statusClass = canonicalStatus === "SUCCEEDED"
@@ -259,7 +283,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
           projectId={projectId}
           canEdit={canEdit}
           onSessionExpired={onSessionExpired}
-          refreshToken={tasks
+          refreshToken={projectTasks
             .filter((task) => resolvedTaskStatus(task) === "SUCCEEDED")
             .map((task) => `${task.taskId}:${task.updatedAt || task.createdAt || ""}`)
             .join("|")}
