@@ -1,5 +1,5 @@
 import React from "react";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FinishedMediaPanel } from "./FinishedMediaPanel";
 import { PropertyInspector } from "./PropertyInspector";
@@ -235,11 +235,6 @@ describe("project switch isolation", () => {
       expect(fetchMock).toHaveBeenCalledWith("/api/projects/project-old");
     });
 
-    act(() => {
-      selector.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    // React's controlled select needs the target value supplied through fireEvent.
-    const { fireEvent } = await import("@testing-library/react");
     fireEvent.change(selector, { target: { value: "project-new" } });
 
     expect(await screen.findByText("new.mp4", { exact: true })).toBeTruthy();
