@@ -3,6 +3,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FinishedMediaPanel } from "./FinishedMediaPanel";
 import { PropertyInspector } from "./PropertyInspector";
+import App from "../App";
 
 class MockEventSource {
   onopen: (() => void) | null = null;
@@ -157,4 +158,100 @@ describe("project switch isolation", () => {
     expect(screen.queryByText("任务：old-task")).toBeNull();
     expect(screen.getByText("任务：new-task")).toBeTruthy();
   });
+
+  test("keeps the latest project detail when an earlier selection resolves late", async () => {
+    vi.stubGlobal("EventSource", MockEventSource);
+    let resolveOldProject!: (response: Response) => void;
+    const oldProjectResponse = new Promise<Response>((resolve) => {
+      resolveOldProject = resolve;
+    });
+    const baseProject = {
+      timeline: { version: "1.1", tracks: [] },
+      revision: 1,
+      createdAt: "2026-08-19T00:00:00Z",
+      updatedAt: "2026-08-19T00:00:00Z",
+    };
+    const oldProject = {
+      ...baseProject,
+      id: "project-old",
+      name: "旧项目",
+      materials: [{
+        id: "media-old",
+        name: "old.mp4",
+        url: "/api/media/media-old",
+        type: "video",
+      }],
+    };
+    const newProject = {
+      ...baseProject,
+      id: "project-new",
+      name: "新项目",
+      materials: [{
+        id: "media-new",
+        name: "new.mp4",
+        url: "/api/media/media-new",
+        type: "video",
+      }],
+    };
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/auth/me") {
+        return Promise.resolve(jsonResponse({
+          id: "owner-1",
+          email: "owner@example.com",
+          displayName: "Owner",
+          role: "owner",
+          tenant: { id: "tenant-1", name: "Aether Test", slug: "aether-test" },
+          quotas: {
+            projects: 50,
+            storageBytes: 1000,
+            storageBytesUsed: 0,
+            concurrentRenders: 2,
+            monthlyRenderSeconds: 1000,
+            monthlyRenderSecondsUsed: 0,
+            period: "2026-08",
+          },
+        }));
+      }
+      if (url === "/api/projects") {
+        return Promise.resolve(jsonResponse([oldProject, newProject]));
+      }
+      if (url === "/api/projects/project-old") return oldProjectResponse;
+      if (url === "/api/projects/project-new") {
+        return Promise.resolve(jsonResponse(newProject));
+      }
+      if (url === "/api/projects/project-new/asset-versions") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse([]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    const selector = await screen.findByLabelText("选择项目");
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith("/api/projects/project-old");
+    });
+
+    act(() => {
+      selector.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    // React's controlled select needs the target value supplied through fireEvent.
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.change(selector, { target: { value: "project-new" } });
+
+    expect(await screen.findByText("new.mp4", { exact: true })).toBeTruthy();
+
+    await act(async () => {
+      resolveOldProject(jsonResponse(oldProject));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("old.mp4", { exact: true })).toBeNull();
+    expect(screen.getByText("new.mp4", { exact: true })).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalledWith("/api/projects/project-old/asset-versions");
+  });
+
 });
