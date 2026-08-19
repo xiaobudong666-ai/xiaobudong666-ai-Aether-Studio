@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   CandidateDTO,
   CandidateSchema,
@@ -74,6 +74,9 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
   const [rightsFailures, setRightsFailures] = useState<RightsFailure[]>([]);
   const [intent, setIntent] = useState<AdoptionIntent | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const projectIdRef = useRef(projectId);
+  const loadRequestIdRef = useRef(0);
+  projectIdRef.current = projectId;
 
   useEffect(() => {
     setCandidates([]);
@@ -83,10 +86,18 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
     setSuccess(null);
     setRightsFailures([]);
     setCopiedId(null);
+    setLoading(false);
+    setSubmitting(false);
   }, [projectId]);
 
   const loadFinishedMedia = useCallback(async (preserveError = false) => {
-    if (!projectId) {
+    const activeProjectId = projectId;
+    const requestId = ++loadRequestIdRef.current;
+    const isCurrentRequest = () => (
+      loadRequestIdRef.current === requestId
+      && projectIdRef.current === activeProjectId
+    );
+    if (!activeProjectId) {
       setCandidates([]);
       setMasters([]);
       setIntent(null);
@@ -97,9 +108,10 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
     if (!preserveError) setError(null);
     try {
       const [candidateResponse, masterResponse] = await Promise.all([
-        fetch(`${apiBase}/projects/${encodeURIComponent(projectId)}/candidates`),
-        fetch(`${apiBase}/projects/${encodeURIComponent(projectId)}/masters`),
+        fetch(`${apiBase}/projects/${encodeURIComponent(activeProjectId)}/candidates`),
+        fetch(`${apiBase}/projects/${encodeURIComponent(activeProjectId)}/masters`),
       ]);
+      if (!isCurrentRequest()) return;
       if (candidateResponse.status === 401 || masterResponse.status === 401) {
         onSessionExpired();
         return;
@@ -117,12 +129,15 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
         candidateResponse.json(),
         masterResponse.json(),
       ]);
+      if (!isCurrentRequest()) return;
       setCandidates(parseCandidates(candidatePayload));
       setMasters(parseMasters(masterPayload));
     } catch {
-      setError("候选成片或母版暂时无法加载，已有数据已保留。");
+      if (isCurrentRequest()) {
+        setError("候选成片或母版暂时无法加载，已有数据已保留。");
+      }
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
   }, [apiBase, onSessionExpired, projectId]);
 
@@ -145,6 +160,7 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
   const submitAdoption = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!projectId || !intent || submitting) return;
+    const activeProjectId = projectId;
     const reason = intent.reason.trim();
     setError(null);
     setSuccess(null);
@@ -161,7 +177,7 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
     setSubmitting(true);
     try {
       const response = await fetch(
-        `${apiBase}/projects/${encodeURIComponent(projectId)}/candidates/${encodeURIComponent(intent.candidateId)}/adopt`,
+        `${apiBase}/projects/${encodeURIComponent(activeProjectId)}/candidates/${encodeURIComponent(intent.candidateId)}/adopt`,
         {
           method: "POST",
           headers: {
@@ -172,11 +188,13 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
           body: JSON.stringify({ reason }),
         },
       );
+      if (projectIdRef.current !== activeProjectId) return;
       if (response.status === 401) {
         onSessionExpired();
         return;
       }
       const payload = await response.json().catch(() => null);
+      if (projectIdRef.current !== activeProjectId) return;
       if (response.status === 403) {
         setError("当前账号没有采纳候选成片的权限。");
         return;
@@ -209,7 +227,9 @@ export const FinishedMediaPanel: React.FC<FinishedMediaPanelProps> = ({
       setIntent(null);
       await loadFinishedMedia(true);
     } catch {
-      setError("采纳请求未完成；本次操作标识已保留，可以安全重试。");
+      if (projectIdRef.current === activeProjectId) {
+        setError("采纳请求未完成；本次操作标识已保留，可以安全重试。");
+      }
     } finally {
       setSubmitting(false);
     }
