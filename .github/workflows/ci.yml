@@ -111,7 +111,7 @@ jobs:
         run: pip install -r apps/api/requirements.txt
 
       - name: Install Chromium
-        run: pnpm exec playwright install --with-deps chromium
+        run: pnpm exec playwright install chromium
 
       - name: Run Playwright
         run: pnpm e2e
@@ -226,7 +226,7 @@ jobs:
       - name: Install browser test dependencies
         run: |
           pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright install chromium
 
       - name: Generate a real browser upload fixture
         run: |
