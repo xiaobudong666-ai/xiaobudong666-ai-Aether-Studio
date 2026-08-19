@@ -69,15 +69,6 @@ jobs:
           pip-audit -r apps/worker/requirements.txt
           pip-audit -r apps/video_use/requirements.txt
 
-      - name: Verify FFmpeg test runtime
-        run: |
-          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            sudo apt-get update -o Acquire::Retries=3
-            sudo apt-get install -y ffmpeg
-          fi
-          ffmpeg -version
-          ffprobe -version
-
       - name: Run API tests
         env:
           PYTHONPATH: apps/api
@@ -87,11 +78,6 @@ jobs:
         env:
           PYTHONPATH: apps/worker
         run: python -m pytest apps/worker/test_worker.py apps/worker/test_moneyprinter.py -v
-
-      - name: Run video-use sidecar tests
-        env:
-          PYTHONPATH: apps/video_use
-        run: python -m pytest apps/video_use/test_main.py -v
 
   playwright:
     name: Playwright workbench flow
@@ -203,6 +189,12 @@ jobs:
         run: |
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffprobe -version
+
+      - name: Run video-use sidecar tests in FFmpeg container
+        run: |
+          docker compose -f infra/docker/docker-compose.yml cp apps/video_use/test_main.py video-use:/tmp/test_main.py
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use \
+            python -m pytest /tmp/test_main.py -v
 
       - name: Verify pinned video-use and execute a real render
         run: |
