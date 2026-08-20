@@ -128,6 +128,21 @@ This document outlines the high-level roadmap and current milestone progress for
 - **Formal review**: FR-01 was resolved; unresolved blocking feedback is 0.
 - **Boundary**: Acceptance records repository state only. It does not authorize or claim a real provider/plugin/model, paid call, production data, deployment, public access or commercial operation.
 
+### [IM-6/IM-8] One-Click Short-Video Workbench (DRAFT APPROVAL PACKAGE)
+- **Status**: Documentation-only proposal awaiting separate formal review, merge and implementation authorization.
+- **Authoritative baseline**: `main@46c7804a50bf439b7046e19fd04764bb5b63ca16`
+- **Approval package**: `docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md`
+- **Proposed controls**:
+  - guided existing/new-project selection with owner/editor write permissions and viewer read-only behavior;
+  - ordered existing-media selection plus bounded sequential uploads;
+  - deterministic Canonical Timeline 1.1 layout using original or fixed clip duration;
+  - explicit existing-timeline replacement confirmation and optimistic-revision conflict handling;
+  - AssetVersion mapping and mandatory export-rights preflight;
+  - one client-side render submission with project/request-generation isolation;
+  - handoff to canonical task, Candidate and existing explicit Adoption/MasterRevision operations.
+- **Explicit exclusions**: no AI generation, digital avatar, face/person replacement, wardrobe/background transformation, provider/plugin/model, paid call, dependency, backend API/model, migration, Worker, deployment or public access.
+- **Boundary**: Approval-package completion is not implementation. Any functional branch, review and merge require separate owner authorization.
+
 ## Security & Upgrade Boundaries
 - **No hardcoded credentials**: Environment variables handle sidecar configurations.
 - **Upgrades**: Upgrading the sidecar must be done by explicitly bumping the pinned upstream version/commit and running compatibility validation tests.
