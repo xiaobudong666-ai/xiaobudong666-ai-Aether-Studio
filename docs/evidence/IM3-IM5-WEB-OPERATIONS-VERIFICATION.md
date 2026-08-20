@@ -1,22 +1,23 @@
 # IM-3/IM-5 Governed Workbench Operations — Verification
 
-> Status: `FORMAL_REVIEW_REMEDIATED_AWAITING_FINAL_HEAD_CI`
+> Status: `ACCEPTED_REPOSITORY_MILESTONE`
 > Baseline: `main@7959759814bfe5a0d1c65a0bd5c4a85139a9427b`
-> Reviewed code candidate: `02e3854912ab6eb6030b0d72b214dd7c81f9857e`
+> Final reviewed head: `4f125209ad664f3f90f397cf386115704c6fa471`
 > Candidate PR: [#11](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11)
-> Last complete CI run before review remediation: [Pipeline #52](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32090298013)
-> Review-remediation run: [Pipeline #59](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32228398136)
-> Verification updated: 2026-08-19
+> Final-head CI: [Pipeline #64](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32230132028)
+> Merge commit: `main@378e4db17ed0120a94707df48c55257f422a3fc7`
+> Merged at: `2026-08-20T17:01:42Z`
+> Verification updated: 2026-08-21 (UTC+8)
 
 ## 1. Authorization recorded
 
 The Aether Studio one-person OPC owner authorized PR #10 to be reviewed and merged, then authorized implementation under sections 9.1 and conditional 9.2 of `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md`.
 
-The same authorization explicitly withheld approval for new dependencies, backend migrations, real plugins or models, paid calls, production data, deployment, public access and merge of the resulting feature pull request.
+The owner subsequently authorized PR #11 to enter formal review and separately authorized merge of the exact reviewed head after final CI passed. New dependencies, backend migrations, real plugins or models, paid calls, production data, deployment and public access remained explicitly outside scope.
 
 PR #10 merged to `main` as `7959759814bfe5a0d1c65a0bd5c4a85139a9427b` before this implementation branch was created.
 
-## 2. Implemented candidate
+## 2. Accepted implementation
 
 ### IM-3 — asset version and rights governance
 
@@ -75,7 +76,7 @@ The browser tests could not execute locally because this sandbox did not contain
 
 ## 5. CI verification
 
-GitHub Actions Pipeline #51 completed successfully against the draft-PR candidate:
+GitHub Actions [Pipeline #64](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32230132028) completed successfully against the final reviewed head:
 
 - lint, compilation, type checks, production build, unit/package tests and Node/Python production dependency audits passed;
 - API, Worker and video-use regression tests passed;
@@ -110,10 +111,20 @@ The remediation:
 - prevents late upload/save/adoption continuations from overwriting another project's UI;
 - adds three delayed-response regression tests covering project detail, canonical task history and candidate/master lists.
 
-Pipeline #59 passed ESLint, TypeScript compilation, the production build, all web/package tests and the Node dependency audit. Its FFmpeg package-install step remained in progress because of runner/package-source delay when this evidence update was committed; no code-test failure was reported.
+The final remediation moved FFmpeg-dependent Worker and video-use tests into the existing project containers and removed redundant hosted-runner system-package installation. It introduced no new dependency, migration, provider, plugin, model, paid call, deployment or public access.
 
-## 8. Remaining gate
+Pipeline #64 passed all three jobs: lint/build/unit and dependency audits; Playwright workbench flow; and Docker integration with Worker/video-use tests, real FFmpeg rendering and both production-browser governance flows. Formal review recorded unresolved blocking feedback as **0**.
 
-The new final-head CI run triggered by this evidence commit must complete successfully. After that, formal review may be recorded as passed with no unresolved blocking feedback.
+## 8. Repository acceptance and remaining external gates
 
-Merge still requires a separate explicit owner approval. The candidate must not be represented as merged, deployed, production-ready or commercially approved. Independent security, legal/compliance and finance/tax review remain mandatory before formal commercial use.
+The owner separately authorized merge of reviewed head `4f125209ad664f3f90f397cf386115704c6fa471`. PR #11 merged to `main` as `378e4db17ed0120a94707df48c55257f422a3fc7` at `2026-08-20T17:01:42Z`.
+
+This completes the IM-3/IM-5 repository milestone. It does **not** represent or authorize:
+
+- deployment or public access;
+- production data or production credentials;
+- a real provider, plugin or model;
+- paid calls;
+- commercial operation.
+
+Any subsequent functional change or merge requires separate authorization. Independent security, legal/compliance and finance/tax review remain mandatory before formal commercial use.
