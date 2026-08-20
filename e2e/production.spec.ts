@@ -171,6 +171,7 @@ test("一键短视频在权利缺失时零渲染，治理后复用上传并仅�
   await page.getByRole("button", { name: "确认追加快照" }).click();
   await expect(page.getByText("允许导出")).toBeVisible();
 
+  await page.getByRole("button", { name: "返回快速制作" }).click();
   await page.getByRole("button", { name: "重新预检并继续" }).click();
   await expect(page.getByText("状态：任务已提交")).toBeVisible({ timeout: 60_000 });
   await expect(page.getByText("已完成", { exact: true })).toBeVisible({ timeout: 180_000 });

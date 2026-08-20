@@ -473,11 +473,13 @@ export function QuickCreatePanel({
       <section className="quick-create-entry" aria-label="快速制作入口">
         <div>
           <strong>一键短视频制作</strong>
-          <span>复用现有项目、素材治理、时间线与渲染任务；不会自动采纳或发布。</span>
+          <span>{resume
+            ? "已保留上传结果；完成素材治理后返回即可重新预检，不会重复上传。"
+            : "复用现有项目、素材治理、时间线与渲染任务；不会自动采纳或发布。"}</span>
         </div>
         {canEdit ? (
-          <button type="button" disabled={busy} onClick={() => { setOpen(true); setPhase("EDITING"); }}>
-            快速制作短视频
+          <button type="button" disabled={busy} onClick={() => { setOpen(true); if (phase === "IDLE") setPhase("EDITING"); }}>
+            {resume ? "返回快速制作" : "快速制作短视频"}
           </button>
         ) : <span className="empty-note">当前为只读权限，仅可查看现有项目和成片。</span>}
       </section>
@@ -530,7 +532,7 @@ export function QuickCreatePanel({
       <div className="quick-create-actions">
         <button type="button" className="secondary" disabled={working || busy} onClick={preflight}>执行预检</button>
         <button type="button" disabled={phase !== "READY" || !confirmRender || busy} onClick={execute}>一键生成短视频</button>
-        {(resume || (phase === "BLOCKED" && rights.some((result) => !result.check.allowed))) && <button type="button" className="secondary" onClick={onOpenGovernance}>前往素材治理</button>}
+        {(resume || (phase === "BLOCKED" && rights.some((result) => !result.check.allowed))) && <button type="button" className="secondary" onClick={() => { setOpen(false); onOpenGovernance(); }}>前往素材治理</button>}
         {resume && <button type="button" onClick={resumeAfterGovernance}>重新预检并继续</button>}
         {taskId && <button type="button" className="secondary" onClick={onViewTask}>查看任务</button>}
         {taskId && taskStatus === "SUCCEEDED" && <button type="button" className="secondary" onClick={onViewFinished}>查看候选成片</button>}

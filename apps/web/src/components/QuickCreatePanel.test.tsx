@@ -133,6 +133,12 @@ describe("QuickCreatePanel", () => {
     expect(checkRights).toHaveBeenCalledTimes(1);
     expect(saveTimeline).not.toHaveBeenCalled();
     expect(submitRender).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "前往素材治理" }));
+    expect(props.onOpenGovernance).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "返回快速制作" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "返回快速制作" }));
+    expect(screen.getByRole("button", { name: "重新预检并继续" })).toBeTruthy();
   });
 
   test("resume after explicit governance reuses upload and submits one deterministic timeline", async () => {
