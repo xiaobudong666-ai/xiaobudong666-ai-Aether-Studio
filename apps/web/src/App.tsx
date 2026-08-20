@@ -776,7 +776,16 @@ export default function App() {
         submitRender={quickSubmitRender}
         refreshRenderTasks={quickRefreshRenderTasks}
         isProjectActive={(projectId) => selectedProjectIdRef.current === projectId}
-        onOpenGovernance={() => document.getElementById("asset-library-region")?.scrollIntoView({ behavior: "smooth" })}
+        onOpenGovernance={() => {
+          const governance = document.querySelector<HTMLDetailsElement>(
+            "#asset-library-region details.governance-section",
+          );
+          if (governance) {
+            governance.open = true;
+            governance.scrollIntoView({ behavior: "smooth", block: "center" });
+            governance.querySelector<HTMLElement>("summary")?.focus();
+          }
+        }}
         onViewTask={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
         onViewFinished={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
       />

@@ -164,7 +164,7 @@ test("一键短视频在权利缺失时零渲染，治理后复用上传并仅�
   await expect(page.getByText(/排队中|正在分派|渲染中|已完成/)).toHaveCount(0);
 
   await page.getByRole("button", { name: "前往素材治理" }).click();
-  await page.getByText("素材治理 · v1").click();
+  await expect(page.getByText("素材治理 · v1")).toBeVisible();
   await page.getByRole("button", { name: "记录权利快照" }).click();
   await page.getByLabel("证据引用").fill("evidence://quick-create-playwright-approved");
   await page.getByLabel(/确认追加新的不可变快照/).check();
