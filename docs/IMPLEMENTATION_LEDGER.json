@@ -203,6 +203,45 @@
         "future_changes": "Any subsequent functional branch, dependency, migration, provider/plugin, deployment or merge requires separate authorization."
       },
       "boundary": "ACCEPTED records repository milestone acceptance only. It does not authorize deployment, public access, real providers/plugins/models, paid calls, production data or commercial operation."
+    },
+    "IM-6/IM-8": {
+      "status": "DRAFT_FOR_OWNER_APPROVAL",
+      "baseline_commit": "46c7804a50bf439b7046e19fd04764bb5b63ca16",
+      "approval_package": "docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md",
+      "description": "Compose accepted project, media, timeline, rights, render-task and candidate capabilities into a governed one-click short-video workbench flow.",
+      "proposed_controls": [
+        "Existing or new project selection with owner/editor writes and viewer read-only behavior",
+        "Ordered existing-media selection plus bounded sequential uploads",
+        "Deterministic Canonical Timeline 1.1 construction using original or fixed clip duration",
+        "Explicit timeline replacement confirmation and optimistic revision conflict handling",
+        "AssetVersion mapping and mandatory export-rights preflight",
+        "Single client-side render submission with project and request-generation isolation",
+        "Canonical task and Candidate handoff without automatic Adoption or MasterRevision creation"
+      ],
+      "authorized_document_files": [
+        "docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md",
+        "docs/ROADMAP.md",
+        "docs/IMPLEMENTATION_LEDGER.json",
+        "docs/PRD_CODE_ALIGNMENT.md"
+      ],
+      "proposed_function_files": [
+        "apps/web/src/components/QuickCreatePanel.tsx",
+        "apps/web/src/components/QuickCreatePanel.test.tsx",
+        "apps/web/src/App.tsx",
+        "apps/web/src/index.css",
+        "apps/web/src/i18n.ts",
+        "apps/web/src/i18n.test.ts",
+        "apps/web/src/App.test.tsx",
+        "e2e/workbench.spec.ts",
+        "e2e/production.spec.ts"
+      ],
+      "remaining_gates": [
+        "Formal review and merge of the documentation-only approval package",
+        "Separate explicit owner approval before any IM-6/IM-8 feature code",
+        "All code tests, scope audit and draft feature pull request",
+        "Separate formal review and merge authorization for the future feature pull request"
+      ],
+      "boundary": "DRAFT_FOR_OWNER_APPROVAL is planning evidence only. It does not authorize feature code, dependencies, backend APIs/models, migrations, Workers, real providers/plugins/models, paid calls, deployment, public access, production data or commercial operation."
     }
   }
 }

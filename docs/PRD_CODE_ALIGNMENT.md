@@ -1,6 +1,6 @@
 # Aether Studio PRD–Code Alignment
 
-> Baseline: `main@378e4db17ed0120a94707df48c55257f422a3fc7`
+> Baseline: `main@46c7804a50bf439b7046e19fd04764bb5b63ca16`
 > Review date: 2026-08-21 (UTC+8)
 > Status vocabulary: `IMPLEMENTED`, `PARTIAL`, `NOT_IMPLEMENTED`, `EXTERNAL_GATE`
 > Boundary: this matrix records repository facts; it does not claim production deployment or commercial approval.
@@ -54,3 +54,19 @@ The final reviewed head `4f125209ad664f3f90f397cf386115704c6fa471` passed all th
 Detailed scope and evidence remain in `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md` and `docs/evidence/IM3-IM5-WEB-OPERATIONS-VERIFICATION.md`.
 
 This repository acceptance does not authorize or claim a real AI provider, short-video plugin, paid call, production data, deployment, public access or commercial operation. Independent security, legal/compliance and finance/tax review remain mandatory before commercial use.
+
+## Proposed IM-6/IM-8 approval package
+
+The documentation-only proposal is based on `main@46c7804a50bf439b7046e19fd04764bb5b63ca16` and does not change any status in the alignment matrix.
+
+If separately reviewed, merged and then explicitly approved for implementation, the bounded increment would connect existing repository capabilities into a governed one-click media-to-short-video flow:
+
+- M01: guided existing/new-project selection and optimistic-revision protection;
+- M07: deterministic Canonical Timeline 1.1 auto-layout using original or fixed clip duration;
+- M08: AssetVersion mapping and mandatory export-rights preflight;
+- M09: single render submission followed by canonical task/SSE tracking;
+- M10: Candidate handoff while preserving separate explicit Adoption and immutable MasterRevision operations.
+
+The proposed implementation contains no real AI generation, digital avatar, face/person replacement, wardrobe/background transformation, provider/plugin/model, paid call, dependency, backend API/model, migration, Worker, deployment or public access. The exact proposed code file allowlist, state machine, permissions, API mapping, exceptions and acceptance cases are defined in `docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md`.
+
+Approval-package completion is not code implementation or test passage. Formal review, merge and later feature coding each require separate authorization.
