@@ -23,6 +23,9 @@ test("中文登录、项目创建和兼容文件导出均可操作", async ({ pa
   await expect(page.getByText("画面监看 · 480p 代理目标")).toBeVisible();
   await expect(page.getByText("属性与任务")).toBeVisible();
   await expect(page.getByText(/时间线轨道（标准格式 v1\.1）/)).toBeVisible();
+  await expect(page.getByText("一键短视频制作", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "快速制作短视频" })).toBeVisible();
+  await expect(page.getByText(/不会自动采纳或发布/)).toBeVisible();
   await expect(page.getByText(/项目 \d+\/50/)).toBeVisible();
 
   const projectName = `中文交互验收-${Date.now()}`;
@@ -121,6 +124,8 @@ test("只读成员在界面和接口两层都不能修改项目", async ({ page 
   await expect(page.getByText("当前为只读权限，不能修改项目。")).toBeVisible();
   await expect(page.getByRole("button", { name: "创建项目" })).toBeDisabled();
   await expect(page.getByLabel("媒体文件输入")).toBeDisabled();
+  await expect(page.getByText(/当前为只读权限，仅可查看/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "快速制作短视频" })).toHaveCount(0);
 
   const blockedWrite = await page.request.post("/api/projects", {
     headers: { "X-Aether-CSRF": "1" },

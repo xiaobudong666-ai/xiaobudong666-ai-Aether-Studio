@@ -59,6 +59,25 @@ const CANDIDATE_STATUS_LABELS: Record<string, string> = {
   ADOPTED: "已采纳",
 };
 
+const QUICK_CREATE_PHASE_LABELS: Record<string, string> = {
+  IDLE: "未开始",
+  EDITING: "编辑中",
+  VALIDATING: "正在预检",
+  READY: "可以生成",
+  CREATING_PROJECT: "正在创建项目",
+  UPLOADING: "正在上传",
+  RIGHTS_CHECKING: "正在检查权利",
+  ARRANGING: "正在自动排布",
+  SAVING: "正在保存时间线",
+  SUBMITTING: "正在提交渲染",
+  TRACKING: "任务已提交",
+  BLOCKED: "已阻断",
+  PARTIAL: "部分完成",
+  CONFLICT: "并发冲突",
+  AMBIGUOUS: "提交结果待确认",
+  FAILED: "未完成",
+};
+
 const API_ERROR_LABELS: Record<string, string> = {
   AUTH_REQUIRED: "请先登录后再继续操作。",
   SESSION_EXPIRED: "登录已过期，请重新登录。",
@@ -118,6 +137,10 @@ export function rightsDecisionLabel(code: string): string {
 
 export function candidateStatusLabel(status: string): string {
   return CANDIDATE_STATUS_LABELS[status] || "候选状态待确认";
+}
+
+export function quickCreatePhaseLabel(phase: string): string {
+  return QUICK_CREATE_PHASE_LABELS[phase] || "状态待确认";
 }
 
 export function taskMessageLabel(status: string): string {

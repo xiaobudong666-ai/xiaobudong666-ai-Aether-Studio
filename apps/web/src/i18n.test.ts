@@ -4,6 +4,7 @@ import {
   candidateStatusLabel,
   localizeTrackName,
   materialTypeLabel,
+  quickCreatePhaseLabel,
   roleLabel,
   rightsDecisionLabel,
   safeErrorMessage,
@@ -31,6 +32,8 @@ describe("中文文案映射", () => {
       "RIGHTS_EXPIRED",
     ].map(rightsDecisionLabel)).not.toContain("权利状态待确认");
     expect(candidateStatusLabel("READY")).toBe("待采纳");
+    expect(quickCreatePhaseLabel("RIGHTS_CHECKING")).toBe("正在检查权利");
+    expect(quickCreatePhaseLabel("AMBIGUOUS")).toBe("提交结果待确认");
     expect(apiErrorMessage({ detail: { code: "UPLOAD_TOO_LARGE" } }, "失败")).toContain("上传大小");
   });
 
