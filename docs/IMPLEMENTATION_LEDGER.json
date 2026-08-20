@@ -164,13 +164,15 @@
       "boundary": "Repository milestone acceptance does not authorize the proposed IM-3/IM-5 code batch, deployment, production data, real providers/plugins or commercial operation."
     },
     "IM-3/IM-5": {
-      "status": "CI_VERIFIED_DRAFT_CANDIDATE",
+      "status": "ACCEPTED",
       "baseline_commit": "7959759814bfe5a0d1c65a0bd5c4a85139a9427b",
       "candidate_pr": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11",
-      "code_candidate_commit": "4185f18e06b3ed74085e1c6be250e5258deaf045",
-      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32089357299",
+      "code_candidate_commit": "4f125209ad664f3f90f397cf386115704c6fa471",
+      "merge_commit": "378e4db17ed0120a94707df48c55257f422a3fc7",
+      "merged_at": "2026-08-20T17:01:42Z",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32230132028",
       "description": "Expose accepted asset rights, canonical task, candidate adoption and immutable master capabilities as governed React workbench operations.",
-      "approval": "Owner approved sections 9.1 and conditional 9.2 of docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md on 2026-08-18.",
+      "approval": "Owner approved sections 9.1 and conditional 9.2 on 2026-08-18, formal review on 2026-08-19, and merge of the exact reviewed head after final CI passed.",
       "evidence": "docs/evidence/IM3-IM5-WEB-OPERATIONS-VERIFICATION.md",
       "implemented_controls": [
         "Asset-version display with SHA-256, probe metadata and export-rights decision",
@@ -178,26 +180,29 @@
         "Canonical task-state authority with legacy fallback, timestamp deduplication, UNKNOWN requery and SSE preservation",
         "Candidate adoption with stable per-intent idempotency key, double-submit prevention and rights-failure details",
         "Immutable master-revision list with authenticated downloads and copyable identifiers",
+        "Project-switch request isolation for project detail, task history, candidate and master state",
         "Two production-browser flows covering allowed adoption and missing-rights blocking"
       ],
-      "local_verification": [
-        "Seven web component/unit tests passed",
-        "Eleven contract tests and four editor tests passed",
-        "Twenty-three API, twenty-three Worker and three video-use tests passed",
-        "Web and package lint/type checks plus the production web build passed",
-        "All five Playwright tests were collected locally; GitHub Actions later passed the browser gates"
+      "verification": [
+        "Ten web component/unit tests passed, including three project-switch isolation regressions",
+        "Eleven contract tests, four editor tests, twenty-three API tests, twenty-three Worker tests and three video-use tests passed",
+        "Web/package lint, type checks, production build and production dependency audits passed",
+        "Playwright workbench flow passed",
+        "Docker integration passed with real FFmpeg rendering, persistent queue and both production-browser governance flows"
       ],
-      "ci_verification": [
-        "Lint, build, unit/package tests and Node/Python production dependency audits passed",
-        "API, Worker and video-use regression tests passed",
-        "Playwright workbench flow passed and uploaded evidence",
-        "Docker real-render, authenticated queue/Worker path and both production-browser governance flows passed and uploaded evidence"
+      "acceptance_evidence": [
+        "Formal review identified FR-01 and verified its remediation",
+        "Final reviewed head 4f125209ad664f3f90f397cf386115704c6fa471 passed all three jobs in GitHub Actions Pipeline #64",
+        "Formal review recorded unresolved blocking feedback as 0",
+        "Pull request #11 merged to main as 378e4db17ed0120a94707df48c55257f422a3fc7 on 2026-08-20T17:01:42Z"
       ],
-      "remaining_gates": [
-        "Separate owner approval to move the draft pull request to formal review",
-        "Separate owner approval before merge after formal review"
-      ],
-      "boundary": "CI_VERIFIED_DRAFT_CANDIDATE is not acceptance. No new dependency, backend migration, real provider/plugin, paid call, production data, deployment, public access, feature-PR merge or commercial operation is authorized."
+      "remaining_boundaries": {
+        "providers_and_plugins": "No real AI provider, face/person replacement provider, wardrobe/background provider or short-video plugin is integrated or authorized.",
+        "production_launch": "No deployment, public endpoint, production data or production credential is authorized.",
+        "commercial_use": "Independent security, legal/compliance and finance/tax review remain mandatory before commercial use.",
+        "future_changes": "Any subsequent functional branch, dependency, migration, provider/plugin, deployment or merge requires separate authorization."
+      },
+      "boundary": "ACCEPTED records repository milestone acceptance only. It does not authorize deployment, public access, real providers/plugins/models, paid calls, production data or commercial operation."
     }
   }
 }

@@ -109,20 +109,24 @@ This document outlines the high-level roadmap and current milestone progress for
   - Rights enforcement before candidate adoption plus migration and tenant-isolation coverage.
 - **Boundary**: The accepted increment does not include a workbench UI for the new records, a real AI provider, a short-video plugin, production deployment or commercial approval.
 
-### [IM-3/IM-5] Governed Workbench Operations (CI-VERIFIED DRAFT CANDIDATE)
-- **Status**: Owner-approved implementation is in draft PR #11 and all three CI jobs pass; formal review and merge remain separately unauthorized.
+### [IM-3/IM-5] Governed Workbench Operations (ACCEPTED)
+- **Status**: PR #11 passed formal review, all three final-head CI jobs, and merged to `main` as a repository milestone.
 - **Baseline**: `7959759814bfe5a0d1c65a0bd5c4a85139a9427b`
-- **Draft PR**: [#11](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11)
-- **CI**: [Pipeline #51](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32089357299)
+- **PR**: [#11](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/11)
+- **Reviewed head**: `4f125209ad664f3f90f397cf386115704c6fa471`
+- **Merge commit**: `378e4db17ed0120a94707df48c55257f422a3fc7`
+- **Final CI**: [Pipeline #64](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32230132028)
 - **Approval package**: `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md`
 - **Evidence**: `docs/evidence/IM3-IM5-WEB-OPERATIONS-VERIFICATION.md`
-- **Implemented candidate**:
+- **Accepted controls**:
   - Asset-version, hash, probe and export-rights governance in the existing asset library.
   - Owner/editor immutable rights-snapshot capture with viewer read-only behavior.
   - Canonical task states, newest-update deduplication, preserved SSE and explicit `UNKNOWN` recovery.
   - Candidate adoption with stable idempotency, rights-failure details and immutable master revisions.
+  - Project-switch isolation guards plus three delayed-response regression tests.
   - Production-browser coverage for allowed adoption and missing-rights blocking.
-- **Boundary**: CI verification is not repository acceptance. No provider/plugin, dependency, API route, migration, deployment, public access or commercial authorization was added.
+- **Formal review**: FR-01 was resolved; unresolved blocking feedback is 0.
+- **Boundary**: Acceptance records repository state only. It does not authorize or claim a real provider/plugin/model, paid call, production data, deployment, public access or commercial operation.
 
 ## Security & Upgrade Boundaries
 - **No hardcoded credentials**: Environment variables handle sidecar configurations.
