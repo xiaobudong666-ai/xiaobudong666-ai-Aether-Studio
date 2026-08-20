@@ -1,5 +1,11 @@
-import { useEffect, useRef, useState } from "react";
-import { RationalTime, ProjectDTO, ClipDTO } from "@aether/contracts";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AssetVersionDTO,
+  AssetVersionSchema,
+  RationalTime,
+  ProjectDTO,
+  ClipDTO,
+} from "@aether/contracts";
 import { AssetLibrary } from "./components/AssetLibrary";
 import { CanvasPreview } from "./components/CanvasPreview";
 import { PropertyInspector } from "./components/PropertyInspector";
@@ -31,6 +37,7 @@ interface AuthUser {
 export default function App() {
   const [projects, setProjects] = useState<ProjectDTO[]>([]);
   const [currentProject, setCurrentProject] = useState<ProjectDTO | null>(null);
+  const [assetVersions, setAssetVersions] = useState<AssetVersionDTO[]>([]);
   const [newProjectName, setNewProjectName] = useState("");
   const [selectedClip, setSelectedClip] = useState<ClipDTO | null>(null);
   const [currentTime, setCurrentTime] = useState<RationalTime>(new RationalTime(0, 24000));
@@ -45,6 +52,8 @@ export default function App() {
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [isSavingProject, setIsSavingProject] = useState(false);
   const savingProjectRef = useRef(false);
+  const selectedProjectIdRef = useRef<string | null>(null);
+  const projectDetailRequestIdRef = useRef(0);
 
   // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
@@ -53,12 +62,19 @@ export default function App() {
 
   const stateHeaders = { "X-Aether-CSRF": "1" };
 
-  const handleExpiredSession = (response: Response): boolean => {
-    if (response.status !== 401) return false;
+  const expireSession = useCallback(() => {
     setAuthUser(null);
     setProjects([]);
     setCurrentProject(null);
+    setAssetVersions([]);
+    selectedProjectIdRef.current = null;
+    projectDetailRequestIdRef.current += 1;
     setLoginError("登录已过期，请重新登录。");
+  }, []);
+
+  const handleExpiredSession = (response: Response): boolean => {
+    if (response.status !== 401) return false;
+    expireSession();
     return true;
   };
 
@@ -146,24 +162,52 @@ export default function App() {
     setAuthUser(null);
     setProjects([]);
     setCurrentProject(null);
+    setAssetVersions([]);
+    selectedProjectIdRef.current = null;
+    projectDetailRequestIdRef.current += 1;
   };
 
   const fetchProjectDetail = async (id: string) => {
+    const requestId = ++projectDetailRequestIdRef.current;
+    selectedProjectIdRef.current = id;
+    const isCurrentRequest = () => (
+      projectDetailRequestIdRef.current === requestId
+      && selectedProjectIdRef.current === id
+    );
+    setAssetVersions([]);
+    setSelectedClip(null);
     try {
       const res = await fetch(`${API_BASE}/projects/${id}`);
       if (handleExpiredSession(res)) return;
+      if (!isCurrentRequest()) return;
       if (res.ok) {
         const data = await res.json();
+        if (!isCurrentRequest()) return;
         setCurrentProject(data);
         setSelectedClip(null);
         setCurrentTime(new RationalTime(0, 24000));
         setApiError(null);
+        const versionsResponse = await fetch(`${API_BASE}/projects/${id}/asset-versions`);
+        if (handleExpiredSession(versionsResponse)) return;
+        if (!isCurrentRequest()) return;
+        if (versionsResponse.ok) {
+          const versionsPayload = await versionsResponse.json();
+          if (!isCurrentRequest()) return;
+          if (!Array.isArray(versionsPayload)) throw new Error("素材版本列表格式异常");
+          setAssetVersions(versionsPayload.map((version) => AssetVersionSchema.parse(version)));
+        } else {
+          setAssetVersions([]);
+          setApiError("素材版本信息加载失败，项目内容仍可查看。");
+        }
       } else {
         const payload = await res.json().catch(() => null);
         setApiError(apiErrorMessage(payload, "项目详情加载失败。"));
       }
     } catch (err) {
-      setApiError(safeErrorMessage(err, "项目详情加载失败。"));
+      if (isCurrentRequest()) {
+        setApiError(safeErrorMessage(err, "项目详情加载失败。"));
+        setAssetVersions([]);
+      }
     }
   };
 
@@ -183,7 +227,10 @@ export default function App() {
       if (res.ok) {
         const newProj = await res.json();
         setProjects((prev) => [...prev, newProj]);
+        selectedProjectIdRef.current = newProj.id;
+        projectDetailRequestIdRef.current += 1;
         setCurrentProject(newProj);
+        setAssetVersions([]);
         setNewProjectName("");
         setSelectedClip(null);
         setActionMessage(`项目“${newProj.name}”已创建。`);
@@ -203,6 +250,7 @@ export default function App() {
     if (savingProjectRef.current) return false;
     savingProjectRef.current = true;
     const previousProject = currentProject;
+    const activeProjectId = updatedProj.id;
     setIsSavingProject(true);
     // Optimistically update locally
     setCurrentProject(updatedProj);
@@ -221,11 +269,19 @@ export default function App() {
       if (handleExpiredSession(res)) return false;
       if (res.status === 409) {
         const payload = await res.json().catch(() => null);
-        setApiError(apiErrorMessage(payload, "项目已在其他页面更新，正在载入最新版本。"));
-        await fetchProjectDetail(updatedProj.id);
+        if (selectedProjectIdRef.current === activeProjectId) {
+          setApiError(apiErrorMessage(payload, "项目已在其他页面更新，正在载入最新版本。"));
+          await fetchProjectDetail(updatedProj.id);
+        }
         return false;
       } else if (res.ok) {
         const latest = await res.json();
+        if (selectedProjectIdRef.current !== activeProjectId) {
+          setProjects((prev) => prev.map((project) => (
+            project.id === latest.id ? latest : project
+          )));
+          return false;
+        }
         setCurrentProject(latest);
         setProjects((prev) => prev.map((project) => (
           project.id === latest.id ? latest : project
@@ -238,7 +294,9 @@ export default function App() {
       }
     } catch (err) {
       if (previousProject) {
-        setCurrentProject(previousProject);
+        if (selectedProjectIdRef.current === activeProjectId) {
+          setCurrentProject(previousProject);
+        }
         setProjects((prev) => prev.map((project) => (
           project.id === previousProject.id ? previousProject : project
         )));
@@ -254,6 +312,7 @@ export default function App() {
   // 4. Upload and probe real media through the isolated video-use service.
   const handleUploadMaterial = async (file: File) => {
     if (!currentProject) throw new Error("请先创建或选择一个项目。");
+    const activeProjectId = currentProject.id;
     const data = new FormData();
     data.append("expectedRevision", String(currentProject.revision));
     data.append("file", file);
@@ -268,11 +327,19 @@ export default function App() {
       throw new Error(apiErrorMessage(payload, "媒体上传失败。"));
     }
     const payload = await response.json();
+    if (selectedProjectIdRef.current !== activeProjectId) return;
     const updatedProject = payload.project as ProjectDTO;
     setCurrentProject(updatedProject);
     setProjects((prev) => prev.map((project) => (
       project.id === updatedProject.id ? updatedProject : project
     )));
+    const parsedAssetVersion = AssetVersionSchema.safeParse(payload.assetVersion);
+    if (parsedAssetVersion.success) {
+      setAssetVersions((previous) => [
+        ...previous.filter((version) => version.id !== parsedAssetVersion.data.id),
+        parsedAssetVersion.data,
+      ]);
+    }
     setActionMessage(`素材“${file.name}”已上传并完成媒体信息检测。`);
   };
 
@@ -524,6 +591,10 @@ export default function App() {
           onAddClipToTimeline={handleAddClipToTimeline}
           canEdit={canEdit && !isSavingProject}
           hasProject={Boolean(currentProject)}
+          projectId={currentProject?.id || null}
+          assetVersions={assetVersions}
+          apiBase={API_BASE}
+          onSessionExpired={expireSession}
         />
 
         <CanvasPreview
@@ -538,9 +609,11 @@ export default function App() {
           projectId={currentProject?.id || null}
           onTriggerRender={handleTriggerRender}
           apiBase={API_BASE}
+          canEdit={canEdit && !isSavingProject}
           canRender={canEdit && !isSavingProject && Boolean(currentProject?.timeline.tracks.some(
             (track) => track.type === "video" && track.clips.length > 0,
           ))}
+          onSessionExpired={expireSession}
         />
       </main>
 

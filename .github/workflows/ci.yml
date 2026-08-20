@@ -69,25 +69,10 @@ jobs:
           pip-audit -r apps/worker/requirements.txt
           pip-audit -r apps/video_use/requirements.txt
 
-      - name: Install FFmpeg test runtime
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
       - name: Run API tests
         env:
           PYTHONPATH: apps/api
         run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py -v
-
-      - name: Run Worker tests
-        env:
-          PYTHONPATH: apps/worker
-        run: python -m pytest apps/worker/test_worker.py apps/worker/test_moneyprinter.py -v
-
-      - name: Run video-use sidecar tests
-        env:
-          PYTHONPATH: apps/video_use
-        run: python -m pytest apps/video_use/test_main.py -v
 
   playwright:
     name: Playwright workbench flow
@@ -126,7 +111,7 @@ jobs:
         run: pip install -r apps/api/requirements.txt
 
       - name: Install Chromium
-        run: pnpm exec playwright install --with-deps chromium
+        run: pnpm exec playwright install chromium
 
       - name: Run Playwright
         run: pnpm e2e
@@ -200,6 +185,20 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffmpeg -version
           docker compose -f infra/docker/docker-compose.yml exec -T worker ffprobe -version
 
+      - name: Run Worker tests in FFmpeg container
+        run: |
+          docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_worker.py worker:/tmp/test_worker.py
+          docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_moneyprinter.py worker:/tmp/test_moneyprinter.py
+          docker compose -f infra/docker/docker-compose.yml exec -T \
+            -e PYTHONPATH=/app worker \
+            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py -v
+
+      - name: Run video-use sidecar tests in FFmpeg container
+        run: |
+          docker compose -f infra/docker/docker-compose.yml cp apps/video_use/test_main.py video-use:/tmp/test_main.py
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use \
+            python -m pytest /tmp/test_main.py -v
+
       - name: Verify pinned video-use and execute a real render
         run: |
           docker compose -f infra/docker/docker-compose.yml exec -T video-use python -c "import app.main as m; assert m.UPSTREAM_COMMIT == '92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66'"
@@ -227,7 +226,7 @@ jobs:
       - name: Install browser test dependencies
         run: |
           pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright install chromium
 
       - name: Generate a real browser upload fixture
         run: |

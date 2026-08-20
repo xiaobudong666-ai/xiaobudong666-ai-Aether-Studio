@@ -28,6 +28,15 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await expect(page.getByText("browser-real.mp4", { exact: true })).toBeVisible({ timeout: 60_000 });
   await expect(page.getByRole("status")).toContainText("已上传并完成媒体信息检测");
 
+  await page.getByText("素材治理 · v1").click();
+  await expect(page.getByText("缺少权利记录")).toBeVisible();
+  await expect(page.getByText(/画面 \d+×\d+/)).toBeVisible();
+  await page.getByRole("button", { name: "记录权利快照" }).click();
+  await page.getByLabel("证据引用").fill("evidence://playwright-export-approved");
+  await page.getByLabel(/确认追加新的不可变快照/).check();
+  await page.getByRole("button", { name: "确认追加快照" }).click();
+  await expect(page.getByText("允许导出")).toBeVisible();
+
   const video = page.getByLabel("预览素材 browser-real.mp4");
   await expect(video).toBeVisible();
   await expect.poll(async () => video.evaluate((element) => (element as HTMLVideoElement).readyState), {
@@ -61,10 +70,26 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await expect(page.getByRole("link", { name: "下载 MP4 成片" })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("06-render-completed.png"), fullPage: true });
 
+  await expect(page.getByRole("button", { name: "采纳为母版" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "采纳为母版" }).click();
+  await page.getByLabel("采纳原因").fill("浏览器端到端验收确认");
+  await page.getByLabel(/确认这是一次明确采纳/).check();
+  await page.getByRole("button", { name: "确认采纳" }).click();
+  await expect(page.getByText("母版 v1")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("link", { name: "下载母版" })).toBeVisible();
+
+  const masterDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("link", { name: "下载母版" }).click();
+  const masterDownload = await masterDownloadPromise;
+  const masterDownloadPath = await masterDownload.path();
+  expect(masterDownloadPath).toBeTruthy();
+  expect((await stat(masterDownloadPath!)).size).toBeGreaterThan(1_000);
+
   await page.reload();
   await expect(page.getByText("素材库", { exact: true })).toBeVisible();
   await page.getByLabel("选择项目").selectOption({ label: `${projectName}（版本 3）` });
   await expect(page.getByText("已完成", { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("母版 v1")).toBeVisible({ timeout: 30_000 });
 
   const downloadPromise = page.waitForEvent("download");
   await page.getByRole("link", { name: "下载 MP4 成片" }).click();
@@ -80,4 +105,36 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   ));
   expect(hasHorizontalOverflow).toBe(false);
   await page.screenshot({ path: testInfo.outputPath("07-real-flow-mobile.png"), fullPage: true });
+});
+
+test("缺失导出权利时服务端阻断候选采纳并展示逐素材原因", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.getByLabel("邮箱").fill(email);
+  await page.getByLabel("密码").fill(password);
+  await page.getByRole("button", { name: "登录" }).click();
+  await expect(page.getByText("素材库", { exact: true })).toBeVisible();
+
+  const projectName = `权利阻断验收-${Date.now()}`;
+  await page.getByPlaceholder("输入新项目名称").fill(projectName);
+  await page.getByRole("button", { name: "创建项目" }).click();
+  await expect(page.getByRole("option", { name: `${projectName}（版本 1）` })).toHaveCount(1);
+
+  await page.getByLabel("媒体文件输入").setInputFiles(fixturePath);
+  await page.getByRole("button", { name: "上传媒体" }).click();
+  await expect(page.getByText("browser-real.mp4", { exact: true })).toBeVisible({ timeout: 60_000 });
+  await page.getByRole("button", { name: "+ 添加到时间线" }).click();
+  await expect(page.getByRole("button", { name: "提交渲染任务" })).toBeEnabled();
+  await page.getByRole("button", { name: "提交渲染任务" }).click();
+  await expect(page.getByText("已完成", { exact: true })).toBeVisible({ timeout: 180_000 });
+
+  await expect(page.getByRole("button", { name: "采纳为母版" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "采纳为母版" }).click();
+  await page.getByLabel("采纳原因").fill("本操作应被权利门禁拒绝");
+  await page.getByLabel(/确认这是一次明确采纳/).check();
+  await page.getByRole("button", { name: "确认采纳" }).click();
+
+  await expect(page.getByText("素材权利检查未通过，不能采纳为母版。")).toBeVisible();
+  await expect(page.locator(".rights-failures")).toContainText("缺少权利记录");
+  await expect(page.getByText("母版 v1")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("08-rights-blocked.png"), fullPage: true });
 });

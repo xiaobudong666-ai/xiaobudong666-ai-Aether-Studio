@@ -1,8 +1,9 @@
 # IM-3/IM-5 Governed Workbench Operations — Coding Approval Package
 
-> Status: `DRAFT_FOR_OWNER_APPROVAL`
+> Status: `APPROVED_FOR_IMPLEMENTATION`
 > Prepared: 2026-08-17
-> Authoritative baseline: `main@88a8a76762e1820036dddbf61546bff0c3cf5f85`
+> Approved: 2026-08-18
+> Authoritative baseline: `main@7959759814bfe5a0d1c65a0bd5c4a85139a9427b`
 > Depends on: accepted IM-1/IM-2 foundation in PR #9
 > Decision owner: Aether Studio one-person OPC owner
 
@@ -262,4 +263,4 @@ To authorize implementation, the owner must provide this exact or materially equ
 
 > I approve implementation of IM-3/IM-5 exactly as defined in `docs/approvals/IM3-IM5-WEB-OPERATIONS-CODING-APPROVAL.md` section 9.1, including the conditional test-only changes in section 9.2 when demonstrably necessary. I do not authorize new dependencies, backend models or migrations, real providers/plugins, paid calls, production data, deployment, public access, merge to main or commercial operation. Any scope delta requires separate approval.
 
-Until that approval is recorded, this file is planning evidence only and no IM-3/IM-5 feature code may be written.
+Owner approval was recorded on 2026-08-18 using materially equivalent wording and explicitly included sections 9.1 and conditional 9.2. The approval authorizes implementation only; it does not authorize merge, deployment, public access, real providers/plugins, paid calls, production data or commercial operation.

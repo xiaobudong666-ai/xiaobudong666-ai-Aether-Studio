@@ -128,6 +128,37 @@ export const RightsSnapshotSchema = z.object({
   capturedAt: z.string().min(1),
 });
 
+export const RightsDecisionCodeSchema = z.enum([
+  "RIGHTS_ALLOWED",
+  "RIGHTS_MISSING",
+  "RIGHTS_DENIED",
+  "RIGHTS_REVOKED",
+  "RIGHTS_UNKNOWN",
+  "RIGHTS_NOT_YET_VALID",
+  "RIGHTS_EXPIRED",
+]);
+
+export const RightsCheckSchema = z.object({
+  assetVersionId: z.string().min(1),
+  allowed: z.boolean(),
+  code: RightsDecisionCodeSchema,
+  snapshot: RightsSnapshotSchema.nullable(),
+});
+
+export const RenderTaskSchema = z.object({
+  taskId: z.string().min(1),
+  projectId: z.string().min(1),
+  progress: z.number().min(0).max(100),
+  status: z.string().min(1),
+  canonicalStatus: CanonicalTaskStatusSchema.optional(),
+  message: z.string(),
+  artifactUrl: z.string().optional(),
+  attempts: z.number().int().nonnegative().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
+  error: z.string().optional(),
+});
+
 export const CandidateSchema = z.object({
   id: z.string().min(1),
   projectId: z.string().min(1),
@@ -167,5 +198,8 @@ export type UpdateProjectDTO = z.infer<typeof UpdateProjectSchema>;
 export type CanonicalTaskStatusDTO = z.infer<typeof CanonicalTaskStatusSchema>;
 export type AssetVersionDTO = z.infer<typeof AssetVersionSchema>;
 export type RightsSnapshotDTO = z.infer<typeof RightsSnapshotSchema>;
+export type RightsDecisionCodeDTO = z.infer<typeof RightsDecisionCodeSchema>;
+export type RightsCheckDTO = z.infer<typeof RightsCheckSchema>;
+export type RenderTaskDTO = z.infer<typeof RenderTaskSchema>;
 export type CandidateDTO = z.infer<typeof CandidateSchema>;
 export type MasterRevisionDTO = z.infer<typeof MasterRevisionSchema>;

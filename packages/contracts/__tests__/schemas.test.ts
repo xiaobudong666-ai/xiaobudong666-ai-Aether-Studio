@@ -3,6 +3,8 @@ import {
   AssetVersionSchema,
   CandidateSchema,
   ProjectSchema,
+  RenderTaskSchema,
+  RightsCheckSchema,
   RightsSnapshotSchema,
   TimelineSchema,
   canonicalTaskStatus,
@@ -128,6 +130,32 @@ describe("TimelineSchema & ProjectSchema Validation", () => {
       inputRevision: 3,
       status: "READY",
       createdAt: new Date().toISOString(),
+    }).success).toBe(true);
+    expect(RightsCheckSchema.safeParse({
+      assetVersionId: "asset-1",
+      allowed: false,
+      code: "RIGHTS_EXPIRED",
+      snapshot: {
+        id: "rights-1",
+        assetVersionId: "asset-1",
+        status: "ALLOWED",
+        purpose: "EXPORT",
+        territory: "GLOBAL",
+        validFrom: null,
+        validUntil: "2026-08-01T00:00:00Z",
+        evidenceRef: null,
+        capturedBy: "user-1",
+        capturedAt: "2026-07-01T00:00:00Z",
+      },
+    }).success).toBe(true);
+    expect(RenderTaskSchema.safeParse({
+      taskId: "task-1",
+      projectId: "project-1",
+      progress: 100,
+      status: "completed",
+      canonicalStatus: "SUCCEEDED",
+      message: "done",
+      updatedAt: "2026-08-18T00:00:00Z",
     }).success).toBe(true);
   });
 });

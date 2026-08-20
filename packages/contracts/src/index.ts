@@ -191,6 +191,11 @@ export interface TaskProgressPayload {
     | "PARTIAL"
     | "UNKNOWN";
   message: string;
+  artifactUrl?: string;
+  attempts?: number;
+  createdAt?: string;
+  updatedAt?: string;
+  error?: string;
 }
 
 export type SSEEvent =
