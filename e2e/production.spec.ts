@@ -29,7 +29,7 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await expect(page.getByRole("status")).toContainText("已上传并完成媒体信息检测");
 
   await page.getByText("素材治理 · v1").click();
-  await expect(page.getByText("缺少权利记录")).toBeVisible();
+  await expect(page.getByLabel("快速制作权利预检结果").getByText("缺少权利记录")).toBeVisible();
   await expect(page.getByText(/画面 \d+×\d+/)).toBeVisible();
   await page.getByRole("button", { name: "记录权利快照" }).click();
   await page.getByLabel("证据引用").fill("evidence://playwright-export-approved");
