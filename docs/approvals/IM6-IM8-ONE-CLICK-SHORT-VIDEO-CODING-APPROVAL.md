@@ -47,7 +47,7 @@
 | `GET /projects/{project_id}/asset-versions` | 对齐 Material 与 AssetVersion | 只读 |
 | `GET /projects/{project_id}/asset-versions/{asset_version_id}/rights-check` | 提交前权利预检 | 只读 |
 | `POST /projects/{project_id}/render` | 只提交一次渲染任务 | 写入，owner/editor |
-| `GET /render-tasks?project_id=...` | 刷新规范任务状态 | 只读 |
+| `GET /render-tasks?projectId=...` | 刷新规范任务状态 | 只读 |
 | `GET /projects/{project_id}/candidates` | 渲染成功后交接候选成片 | 只读 |
 | `GET /projects/{project_id}/masters` | 查看已有不可变母版 | 只读 |
 | `GET /events` | 接收规范任务进度 | 只读流 |
@@ -105,8 +105,9 @@
 | “选择素材” | 面板打开 | 选择既有素材或本地文件 |
 | “上移/下移” | 对应素材存在 | 调整确定性顺序 |
 | “移除” | 至少保留 1 个素材 | 从本次草稿移除，不删除仓库素材 |
-| “执行预检” | 字段校验通过 | 读取项目修订、素材版本和权利状态，不写入 |
-| “一键生成短视频” | 预检通过且已确认 | 按第 3.4 节执行写入链路 |
+| “执行预检” | 字段校验通过 | 读取项目修订及既有素材版本和权利状态；本地文件仅校验输入，上传前不得声称权利已通过 |
+| “一键生成短视频” | 既有素材预检通过、本地文件输入校验通过且已确认 | 按第 3.4 节执行写入链路；新上传素材仍须在取得 AssetVersion 后通过权利检查 |
+| “重新预检并继续” | 因 `RIGHTS_MISSING` 等权利状态进入 BLOCKED，且本次已上传素材仍可复用 | 重新读取项目、AssetVersion 和权利状态；通过后从保存/渲染前安全节点继续，不重复上传 |
 | “取消” | 尚未开始写入 | 清空本次内存草稿并关闭 |
 | “查看任务” | 渲染请求已返回 taskId | 聚焦现有任务面板 |
 | “查看候选成片” | 任务规范状态为 SUCCEEDED | 聚焦现有 FinishedMediaPanel |
@@ -121,14 +122,17 @@
 2. 新建模式下调用一次 `POST /projects`；当前项目模式下重新读取项目修订。
 3. 按确认顺序逐个调用现有媒体上传 API，并逐项记录成功或失败。
 4. 任一上传失败时停止后续自动步骤，保留已经由服务端成功创建的不可变素材版本，展示“部分完成”，不得伪造回滚。
-5. 根据成功素材生成确定性 Canonical Timeline 1.1。
-6. 当前时间线非空且未确认覆盖时停止，不得写入。
-7. 使用最新 `expectedRevision` 调用一次 `PUT /projects/{project_id}`。
-8. 对本次时间线引用的每个 AssetVersion 执行权利检查。
-9. 任一权利检查非 `RIGHTS_ALLOWED` 时进入 BLOCKED，列出素材、版本和原因，不提交渲染。
-10. 所有权利检查通过后，且 `confirmRender=true`，调用一次 `POST /projects/{project_id}/render`。
-11. 收到 taskId 后交由现有任务/SSE/候选成片界面继续跟踪。
-12. 不调用 adoption API，不创建 MasterRevision。
+5. 上传成功后重新读取项目 AssetVersion 列表，将每个新 mediaId 映射到同项目 AssetVersion；不得在上传前把新文件标记为权利已通过。
+6. 对本次将使用的每个 AssetVersion 执行权利检查。
+7. 任一权利检查非 `RIGHTS_ALLOWED` 时进入 BLOCKED，列出素材、版本和原因，不保存新时间线、不提交渲染；`RIGHTS_MISSING` 时引导用户前往现有 Asset Governance 的“记录权利快照”流程，不得自动创建、默认允许或伪造权利快照。
+8. BLOCKED 后保留已经由服务端成功创建的 mediaId/AssetVersion 引用；用户显式完成权利治理并返回后，“重新预检并继续”必须重新读取项目修订和权利状态，通过后复用已上传版本，不得重复上传。
+9. 根据全部已通过权利检查的素材生成确定性 Canonical Timeline 1.1。
+10. 当前时间线非空且未确认覆盖时停止，不得写入。
+11. 使用重新读取的最新 `expectedRevision` 调用一次 `PUT /projects/{project_id}`。
+12. 保存完成后、提交渲染前再次检查本次运行 token、projectId、项目修订和权利结果仍属于当前请求；任何失效均停止并要求重新预检。
+13. 所有权利检查通过后，且 `confirmRender=true`，调用一次 `POST /projects/{project_id}/render`。
+14. 收到 taskId 后交由现有任务/SSE/候选成片界面继续跟踪。
+15. 不调用 adoption API，不创建 MasterRevision。
 
 ## 4. IM-7——确定性时间线自动排布
 
@@ -170,6 +174,15 @@
 
 无法映射 AssetVersion、接口异常或未知状态均按阻塞处理，不得按允许处理。
 
+本地新文件的权利生命周期必须遵循以下边界：
+
+1. 上传前只能校验文件数量、类型、大小和可探测属性；此时尚无 AssetVersion，不得显示 `RIGHTS_ALLOWED`。
+2. 上传成功并取得 mediaId/AssetVersion 后才调用现有 rights-check API。
+3. 新 AssetVersion 没有 RightsSnapshot 时应得到 `RIGHTS_MISSING` 并进入 BLOCKED；渲染请求次数必须为 0。
+4. 用户只能通过现有 Asset Governance 显式记录权利快照；快速制作流程不得代替用户作出权利声明，也不得自动调用或伪造权利写入。
+5. 用户完成治理后返回快速制作流程，客户端重新读取项目修订、AssetVersion 和 rights-check；仅在全部为 `RIGHTS_ALLOWED` 时继续。
+6. 恢复执行须复用已上传的 mediaId/AssetVersion，且在保存时间线和提交渲染前重新验证当前 projectId 与运行 token，避免重复上传和跨项目污染。
+
 ### 5.2 单次提交保护
 
 - 主按钮在进入 SUBMITTING 后立即禁用。
@@ -193,17 +206,17 @@
 |---|---|---|---|
 | `IDLE` | 面板关闭或草稿为空 | 打开 | 用户打开 |
 | `EDITING` | 面板打开 | 编辑字段、排序、取消、预检 | 预检或取消 |
-| `VALIDATING` | 点击预检 | 只读校验 | READY/BLOCKED/FAILED |
-| `READY` | 字段、修订、素材映射和权利均通过 | 一键生成、返回编辑 | 用户确认 |
+| `VALIDATING` | 点击预检或治理后重新预检 | 只读校验；本地新文件上传前仅校验输入 | READY/BLOCKED/FAILED |
+| `READY` | 字段、修订及既有素材映射/权利通过；本地新文件输入通过但权利仍标记待上传后检查 | 一键生成、返回编辑 | 用户确认 |
 | `CREATING_PROJECT` | 新建项目模式 | 等待 | 成功或失败 |
 | `UPLOADING` | 存在新文件 | 显示逐项进度 | 全部成功或部分失败 |
 | `ARRANGING` | 素材可排布 | 构建内存时间线 | SAVING/FAILED |
 | `SAVING` | 通过覆盖与修订检查 | 等待一次 PUT | RIGHTS_CHECKING/CONFLICT/FAILED |
-| `RIGHTS_CHECKING` | 时间线保存成功 | 只读检查 | SUBMITTING/BLOCKED/FAILED |
+| `RIGHTS_CHECKING` | 已取得全部 AssetVersion，或治理后重新预检 | 只读检查 | ARRANGING/SUBMITTING/BLOCKED/FAILED |
 | `SUBMITTING` | 权利全通过且确认渲染 | 禁止重复点击 | TRACKING/AMBIGUOUS/FAILED |
 | `TRACKING` | taskId 已确认 | 查看任务 | 规范终态 |
 | `SUCCEEDED` | 规范成功 | 查看候选成片 | 用户关闭 |
-| `BLOCKED` | 权利/映射/输入阻断 | 返回编辑或治理素材 | 重新预检 |
+| `BLOCKED` | 权利/映射/输入阻断 | 返回编辑或前往现有 Asset Governance；禁止保存新时间线和提交渲染 | 重新预检通过后复用已上传版本继续 |
 | `PARTIAL` | 部分上传已成功 | 查看成功项，手动继续 | 用户处理 |
 | `CONFLICT` | 项目修订冲突 | 刷新项目 | 重新编辑 |
 | `FAILED` | 可解释失败 | 返回编辑 | 用户处理 |
@@ -249,6 +262,8 @@
 - `status: PENDING | UPLOADING | UPLOADED | FAILED`
 - `mediaId?`
 - `assetVersionId?`
+- `rightsStatus?`
+- `rightsCheckedAt?`
 - `errorCode?`
 - `errorMessage?`
 
@@ -276,7 +291,8 @@
 | 413/配额错误 | 标明文件和服务端原因，停止后续上传 |
 | 上传部分成功 | 进入 PARTIAL，列出已成功的不可变版本和失败项 |
 | AssetVersion 未映射 | 进入 BLOCKED |
-| 权利非允许 | 进入 BLOCKED，逐素材展示原因 |
+| 权利非允许 | 进入 BLOCKED，逐素材展示原因；`RIGHTS_MISSING` 引导至现有治理界面，禁止自动创建快照 |
+| 治理后重新预检 | 重新读取项目修订、AssetVersion 和权利状态；复用已上传版本，不重复上传 |
 | 权利接口 5xx/网络失败 | 不按允许处理 |
 | render POST 响应未知 | 刷新任务列表，不自动重复提交 |
 | 任务 UNKNOWN | 显示重新查询，不显示成片 |
@@ -335,7 +351,7 @@
 | ID | 验收场景 | 通过条件 |
 |---|---|---|
 | QC-01 | owner 使用 2 个已有素材 | 顺序确定，时间线无重叠，只保存一次 |
-| QC-02 | editor 上传 2 个新素材 | 逐个上传、映射版本、排布、权利预检、只提交一个 render |
+| QC-02 | editor 上传 2 个新素材 | 逐个上传并映射版本；初始缺少快照时进入 BLOCKED，保存新时间线和 render POST 均为 0；用户在现有治理界面显式记录 ALLOWED 快照后，重新预检复用原版本、不重复上传，最终只保存一次并只提交一个 render |
 | QC-03 | 固定 3 秒模式 | 每个已知源素材不超过源时长，RationalTime 精确 |
 | QC-04 | 当前时间线非空 | 未确认覆盖时零写入 |
 | QC-05 | viewer 打开面板 | 可看不可写，网络层无 POST/PUT |
