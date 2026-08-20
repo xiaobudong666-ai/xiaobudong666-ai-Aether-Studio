@@ -45,6 +45,44 @@ interface AuthUser {
   };
 }
 
+function parseProjectPayload(payload: unknown): ProjectDTO {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return ProjectSchema.parse(payload);
+  }
+  const project = payload as Record<string, unknown>;
+  const timeline = project.timeline;
+  if (!timeline || typeof timeline !== "object" || Array.isArray(timeline)) {
+    return ProjectSchema.parse(payload);
+  }
+  const timelineRecord = timeline as Record<string, unknown>;
+  const tracks = timelineRecord.tracks;
+  if (!Array.isArray(tracks)) return ProjectSchema.parse(payload);
+
+  const normalized = {
+    ...project,
+    timeline: {
+      ...timelineRecord,
+      tracks: tracks.map((track) => {
+        if (!track || typeof track !== "object" || Array.isArray(track)) return track;
+        const trackRecord = track as Record<string, unknown>;
+        if (!Array.isArray(trackRecord.clips)) return track;
+        return {
+          ...trackRecord,
+          clips: trackRecord.clips.map((clip) => {
+            if (!clip || typeof clip !== "object" || Array.isArray(clip)) return clip;
+            const normalizedClip = { ...(clip as Record<string, unknown>) };
+            for (const field of ["width", "height", "text"]) {
+              if (normalizedClip[field] === null) delete normalizedClip[field];
+            }
+            return normalizedClip;
+          }),
+        };
+      }),
+    },
+  };
+  return ProjectSchema.parse(normalized);
+}
+
 export default function App() {
   const [projects, setProjects] = useState<ProjectDTO[]>([]);
   const [currentProject, setCurrentProject] = useState<ProjectDTO | null>(null);
@@ -465,7 +503,7 @@ export default function App() {
       const payload = await response.json().catch(() => null);
       throw new Error(apiErrorMessage(payload, "快速制作项目创建失败。"));
     }
-    const snapshot = { project: ProjectSchema.parse(await response.json()), assetVersions: [] };
+    const snapshot = { project: parseProjectPayload(await response.json()), assetVersions: [] };
     activateQuickSnapshot(snapshot);
     setActionMessage(`项目“${snapshot.project.name}”已创建，正在继续快速制作。`);
     return snapshot;
@@ -491,7 +529,7 @@ export default function App() {
     const versionsPayload = await versionsResponse.json();
     if (!Array.isArray(versionsPayload)) throw new Error("素材版本列表格式异常。");
     const snapshot = {
-      project: ProjectSchema.parse(await projectResponse.json()),
+      project: parseProjectPayload(await projectResponse.json()),
       assetVersions: versionsPayload.map((version) => AssetVersionSchema.parse(version)),
     };
     activateQuickSnapshot(snapshot);
@@ -518,7 +556,7 @@ export default function App() {
     }
     const payload = await response.json();
     const result = {
-      project: ProjectSchema.parse(payload.project),
+      project: parseProjectPayload(payload.project),
       assetVersion: AssetVersionSchema.parse(payload.assetVersion),
     };
     if (selectedProjectIdRef.current !== projectId) {
@@ -570,7 +608,7 @@ export default function App() {
         const payload = await response.json().catch(() => null);
         throw new Error(apiErrorMessage(payload, "自动排布时间线保存失败。"));
       }
-      const saved = ProjectSchema.parse(await response.json());
+      const saved = parseProjectPayload(await response.json());
       if (selectedProjectIdRef.current !== saved.id) throw new Error("活动项目已变化，渲染未提交。");
       setCurrentProject(saved);
       setProjects((previous) => previous.map((candidate) => candidate.id === saved.id ? saved : candidate));
