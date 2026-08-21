@@ -4,11 +4,22 @@ import {
   AssetVersionSchema,
   RationalTime,
   ProjectDTO,
+  ProjectSchema,
   ClipDTO,
+  RenderTaskDTO,
+  RenderTaskSchema,
+  RightsCheckDTO,
+  RightsCheckSchema,
+  TimelineDTO,
 } from "@aether/contracts";
 import { AssetLibrary } from "./components/AssetLibrary";
 import { CanvasPreview } from "./components/CanvasPreview";
 import { PropertyInspector } from "./components/PropertyInspector";
+import {
+  QuickCreatePanel,
+  QuickProjectSnapshot,
+  QuickUploadResult,
+} from "./components/QuickCreatePanel";
 import { Timeline } from "./components/Timeline";
 import {
   apiErrorMessage,
@@ -32,6 +43,44 @@ interface AuthUser {
     monthlyRenderSecondsUsed: number;
     period: string;
   };
+}
+
+function parseProjectPayload(payload: unknown): ProjectDTO {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return ProjectSchema.parse(payload);
+  }
+  const project = payload as Record<string, unknown>;
+  const timeline = project.timeline;
+  if (!timeline || typeof timeline !== "object" || Array.isArray(timeline)) {
+    return ProjectSchema.parse(payload);
+  }
+  const timelineRecord = timeline as Record<string, unknown>;
+  const tracks = timelineRecord.tracks;
+  if (!Array.isArray(tracks)) return ProjectSchema.parse(payload);
+
+  const normalized = {
+    ...project,
+    timeline: {
+      ...timelineRecord,
+      tracks: tracks.map((track) => {
+        if (!track || typeof track !== "object" || Array.isArray(track)) return track;
+        const trackRecord = track as Record<string, unknown>;
+        if (!Array.isArray(trackRecord.clips)) return track;
+        return {
+          ...trackRecord,
+          clips: trackRecord.clips.map((clip) => {
+            if (!clip || typeof clip !== "object" || Array.isArray(clip)) return clip;
+            const normalizedClip = { ...(clip as Record<string, unknown>) };
+            for (const field of ["width", "height", "text"]) {
+              if (normalizedClip[field] === null) delete normalizedClip[field];
+            }
+            return normalizedClip;
+          }),
+        };
+      }),
+    },
+  };
+  return ProjectSchema.parse(normalized);
 }
 
 export default function App() {
@@ -428,6 +477,175 @@ export default function App() {
     setActionMessage("渲染任务已提交，可以离开页面后再回来查看进度。");
   };
 
+  const activateQuickSnapshot = (snapshot: QuickProjectSnapshot) => {
+    selectedProjectIdRef.current = snapshot.project.id;
+    projectDetailRequestIdRef.current += 1;
+    setCurrentProject(snapshot.project);
+    setProjects((previous) => {
+      const exists = previous.some((project) => project.id === snapshot.project.id);
+      return exists
+        ? previous.map((project) => project.id === snapshot.project.id ? snapshot.project : project)
+        : [...previous, snapshot.project];
+    });
+    setAssetVersions(snapshot.assetVersions);
+    setSelectedClip(null);
+    setCurrentTime(new RationalTime(0, 24000));
+  };
+
+  const quickCreateProject = async (name: string): Promise<QuickProjectSnapshot> => {
+    const response = await fetch(`${API_BASE}/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...stateHeaders },
+      body: JSON.stringify({ name }),
+    });
+    if (handleExpiredSession(response)) throw new Error("登录已过期，请重新登录。");
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(apiErrorMessage(payload, "快速制作项目创建失败。"));
+    }
+    const snapshot = { project: parseProjectPayload(await response.json()), assetVersions: [] };
+    activateQuickSnapshot(snapshot);
+    setActionMessage(`项目“${snapshot.project.name}”已创建，正在继续快速制作。`);
+    return snapshot;
+  };
+
+  const quickReloadProject = async (projectId: string): Promise<QuickProjectSnapshot> => {
+    const requestId = ++projectDetailRequestIdRef.current;
+    selectedProjectIdRef.current = projectId;
+    const [projectResponse, versionsResponse] = await Promise.all([
+      fetch(`${API_BASE}/projects/${projectId}`),
+      fetch(`${API_BASE}/projects/${projectId}/asset-versions`),
+    ]);
+    if (handleExpiredSession(projectResponse) || handleExpiredSession(versionsResponse)) {
+      throw new Error("登录已过期，请重新登录。");
+    }
+    if (requestId !== projectDetailRequestIdRef.current || selectedProjectIdRef.current !== projectId) {
+      throw new Error("活动项目已变化，本次响应已丢弃。");
+    }
+    if (!projectResponse.ok || !versionsResponse.ok) {
+      const payload = await (!projectResponse.ok ? projectResponse : versionsResponse).json().catch(() => null);
+      throw new Error(apiErrorMessage(payload, "项目或素材版本重新加载失败。"));
+    }
+    const versionsPayload = await versionsResponse.json();
+    if (!Array.isArray(versionsPayload)) throw new Error("素材版本列表格式异常。");
+    const snapshot = {
+      project: parseProjectPayload(await projectResponse.json()),
+      assetVersions: versionsPayload.map((version) => AssetVersionSchema.parse(version)),
+    };
+    activateQuickSnapshot(snapshot);
+    return snapshot;
+  };
+
+  const quickUploadMedia = async (
+    projectId: string,
+    expectedRevision: number,
+    file: File,
+  ): Promise<QuickUploadResult> => {
+    const data = new FormData();
+    data.append("expectedRevision", String(expectedRevision));
+    data.append("file", file);
+    const response = await fetch(`${API_BASE}/projects/${projectId}/media`, {
+      method: "POST",
+      headers: stateHeaders,
+      body: data,
+    });
+    if (handleExpiredSession(response)) throw new Error("登录已过期，请重新登录。");
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(apiErrorMessage(payload, `素材“${file.name}”上传失败。`));
+    }
+    const payload = await response.json();
+    const result = {
+      project: parseProjectPayload(payload.project),
+      assetVersion: AssetVersionSchema.parse(payload.assetVersion),
+    };
+    if (selectedProjectIdRef.current !== projectId) {
+      throw new Error("活动项目已变化，已停止后续快速制作步骤。");
+    }
+    setCurrentProject(result.project);
+    setProjects((previous) => previous.map((project) => (
+      project.id === result.project.id ? result.project : project
+    )));
+    setAssetVersions((previous) => [
+      ...previous.filter((version) => version.id !== result.assetVersion.id),
+      result.assetVersion,
+    ]);
+    return result;
+  };
+
+  const quickCheckRights = async (
+    projectId: string,
+    assetVersionId: string,
+  ): Promise<RightsCheckDTO> => {
+    const response = await fetch(`${API_BASE}/projects/${projectId}/asset-versions/${assetVersionId}/rights-check?purpose=EXPORT`);
+    if (handleExpiredSession(response)) throw new Error("登录已过期，请重新登录。");
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(apiErrorMessage(payload, "素材权利检查失败。"));
+    }
+    return RightsCheckSchema.parse(await response.json());
+  };
+
+  const quickSaveTimeline = async (
+    project: ProjectDTO,
+    timeline: TimelineDTO,
+  ): Promise<ProjectDTO> => {
+    if (savingProjectRef.current) throw new Error("当前另有项目保存操作，请稍后重新预检。");
+    savingProjectRef.current = true;
+    setIsSavingProject(true);
+    try {
+      const response = await fetch(`${API_BASE}/projects/${project.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...stateHeaders },
+        body: JSON.stringify({ name: project.name, timeline, expectedRevision: project.revision }),
+      });
+      if (handleExpiredSession(response)) throw new Error("登录已过期，请重新登录。");
+      if (response.status === 409) {
+        await quickReloadProject(project.id);
+        throw new Error("项目发生并发冲突，已加载最新版本；请重新预检，不会自动覆盖。");
+      }
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(apiErrorMessage(payload, "自动排布时间线保存失败。"));
+      }
+      const saved = parseProjectPayload(await response.json());
+      if (selectedProjectIdRef.current !== saved.id) throw new Error("活动项目已变化，渲染未提交。");
+      setCurrentProject(saved);
+      setProjects((previous) => previous.map((candidate) => candidate.id === saved.id ? saved : candidate));
+      return saved;
+    } finally {
+      savingProjectRef.current = false;
+      setIsSavingProject(false);
+    }
+  };
+
+  const quickSubmitRender = async (projectId: string): Promise<RenderTaskDTO> => {
+    const response = await fetch(`${API_BASE}/projects/${projectId}/render`, {
+      method: "POST",
+      headers: stateHeaders,
+    });
+    if (handleExpiredSession(response)) throw new Error("登录已过期，请重新登录。");
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(apiErrorMessage(payload, "渲染任务提交失败。"));
+    }
+    const task = RenderTaskSchema.parse(await response.json());
+    setActionMessage(`渲染任务 ${task.taskId} 已提交，可以离开页面后再回来查看。`);
+    return task;
+  };
+
+  const quickRefreshRenderTasks = async (projectId: string): Promise<RenderTaskDTO[]> => {
+    const response = await fetch(`${API_BASE}/render-tasks?projectId=${encodeURIComponent(projectId)}`);
+    if (handleExpiredSession(response)) throw new Error("登录已过期，请重新登录。");
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(apiErrorMessage(payload, "渲染任务刷新失败。"));
+    }
+    const payload = await response.json();
+    if (!Array.isArray(payload)) throw new Error("渲染任务列表格式异常。");
+    return payload.map((task) => RenderTaskSchema.parse(task));
+  };
+
   const handleExportOpenCutSnapshot = async () => {
     if (!currentProject) return;
     const { createOpenCutCompatibilitySnapshot } = await import("@aether/editor");
@@ -583,19 +801,48 @@ export default function App() {
         </div>
       )}
 
+      <QuickCreatePanel
+        role={authUser.role}
+        currentProject={currentProject}
+        assetVersions={assetVersions}
+        busy={isCreatingProject || isSavingProject}
+        createProject={quickCreateProject}
+        reloadProject={quickReloadProject}
+        uploadMedia={quickUploadMedia}
+        checkRights={quickCheckRights}
+        saveTimeline={quickSaveTimeline}
+        submitRender={quickSubmitRender}
+        refreshRenderTasks={quickRefreshRenderTasks}
+        isProjectActive={(projectId) => selectedProjectIdRef.current === projectId}
+        onOpenGovernance={() => {
+          const governance = document.querySelector<HTMLDetailsElement>(
+            "#asset-library-region details.governance-section",
+          );
+          if (governance) {
+            governance.open = true;
+            governance.scrollIntoView({ behavior: "smooth", block: "center" });
+            governance.querySelector<HTMLElement>("summary")?.focus();
+          }
+        }}
+        onViewTask={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
+        onViewFinished={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
+      />
+
       {/* Main workbench */}
       <main className="workbench-container">
-        <AssetLibrary
-          materials={currentProject?.materials || []}
-          onUploadMaterial={handleUploadMaterial}
-          onAddClipToTimeline={handleAddClipToTimeline}
-          canEdit={canEdit && !isSavingProject}
-          hasProject={Boolean(currentProject)}
-          projectId={currentProject?.id || null}
-          assetVersions={assetVersions}
-          apiBase={API_BASE}
-          onSessionExpired={expireSession}
-        />
+        <div id="asset-library-region">
+          <AssetLibrary
+            materials={currentProject?.materials || []}
+            onUploadMaterial={handleUploadMaterial}
+            onAddClipToTimeline={handleAddClipToTimeline}
+            canEdit={canEdit && !isSavingProject}
+            hasProject={Boolean(currentProject)}
+            projectId={currentProject?.id || null}
+            assetVersions={assetVersions}
+            apiBase={API_BASE}
+            onSessionExpired={expireSession}
+          />
+        </div>
 
         <CanvasPreview
           currentTime={currentTime}
@@ -604,17 +851,19 @@ export default function App() {
           previewMaterial={previewMaterial}
         />
 
-        <PropertyInspector
-          selectedClip={selectedClip}
-          projectId={currentProject?.id || null}
-          onTriggerRender={handleTriggerRender}
-          apiBase={API_BASE}
-          canEdit={canEdit && !isSavingProject}
-          canRender={canEdit && !isSavingProject && Boolean(currentProject?.timeline.tracks.some(
-            (track) => track.type === "video" && track.clips.length > 0,
-          ))}
-          onSessionExpired={expireSession}
-        />
+        <div id="property-inspector-region">
+          <PropertyInspector
+            selectedClip={selectedClip}
+            projectId={currentProject?.id || null}
+            onTriggerRender={handleTriggerRender}
+            apiBase={API_BASE}
+            canEdit={canEdit && !isSavingProject}
+            canRender={canEdit && !isSavingProject && Boolean(currentProject?.timeline.tracks.some(
+              (track) => track.type === "video" && track.clips.length > 0,
+            ))}
+            onSessionExpired={expireSession}
+          />
+        </div>
       </main>
 
       {/* Timeline panel */}

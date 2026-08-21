@@ -81,6 +81,8 @@ describe("Aether Studio 中文工作台", () => {
     expect(screen.getByText("画面监看 · 480p 代理目标")).toBeTruthy();
     expect(screen.getByText("属性与任务")).toBeTruthy();
     expect(screen.getByText(/时间线轨道/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "快速制作短视频" })).toBeTruthy();
+    expect(screen.getByText(/不会自动采纳或发布/)).toBeTruthy();
     expect(screen.getByText(/项目 0\/50/)).toBeTruthy();
 
     await waitFor(() => {
