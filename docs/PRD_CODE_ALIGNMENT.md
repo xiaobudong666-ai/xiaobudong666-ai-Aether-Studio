@@ -1,6 +1,6 @@
 # Aether Studio PRD–Code Alignment
 
-> Baseline: `main@46c7804a50bf439b7046e19fd04764bb5b63ca16`
+> Baseline: `main@526ddcf354571c68bf54ea4e3ea057592fdd472d`
 > Review date: 2026-08-21 (UTC+8)
 > Status vocabulary: `IMPLEMENTED`, `PARTIAL`, `NOT_IMPLEMENTED`, `EXTERNAL_GATE`
 > Boundary: this matrix records repository facts; it does not claim production deployment or commercial approval.
@@ -9,16 +9,16 @@
 
 | PRD domain | Status | Reusable repository capability | Remaining boundary |
 |---|---|---|---|
-| M01 project workbench | PARTIAL | Tenant-scoped project CRUD, optimistic revision, React workbench | Full content tree, templates, archive/delete governance and 13-module navigation remain |
+| M01 project workbench | PARTIAL | Tenant-scoped project CRUD, optimistic revision, React workbench and governed current/new-project quick-create entry | Full content tree, templates, archive/delete governance and 13-module navigation remain |
 | M02 AI comic creation | PARTIAL | MoneyPrinter adapter and structured project/timeline foundation | Story bible, shot production authority and real provider quality gates remain |
 | M03 digital avatar | NOT_IMPLEMENTED | Provider-neutral adapter boundary only | Identity consent, training, voice/appearance versions and revocation chain remain |
 | M04 image-to-video/action | PARTIAL | video-use/FFmpeg sidecar and media pipeline | Versioned reference/mapping inputs and controlled model adapter remain |
 | M05 face/person replacement | NOT_IMPLEMENTED | No approved real provider | Consent, safety, controlled generation and review remain |
 | M06 wardrobe/background | NOT_IMPLEMENTED | No approved real provider | Versioned transformation inputs, quality and review remain |
-| M07 smart editing | PARTIAL | Rational timeline, tracks/clips, FFmpeg render, OpenCut/OpenReel exports, accepted candidate adoption and immutable master UI | Richer editing operations remain |
-| M08 assets and rights | PARTIAL | Upload, probe, immutable `AssetVersion`, `RightsSnapshot`, rights-window decisions, tenant storage quota and accepted governance UI | Full rights-history view and hold enforcement remain |
-| M09 task center | PARTIAL | Persistent leased render queue, recovery, retry, SSE, canonical status authority and accepted canonical-state UI | Full Attempt/Checkpoint/DeadLetter operations remain |
-| M10 finished media | PARTIAL | Authenticated artifacts, Candidate, explicit Adoption, immutable MasterRevision and accepted candidate/master UI | Publication and withdrawal remain |
+| M07 smart editing | PARTIAL | Rational timeline, tracks/clips, FFmpeg render, OpenCut/OpenReel exports and accepted deterministic original/fixed-duration quick layout | Transitions, effects, rhythm analysis and richer editing operations remain |
+| M08 assets and rights | PARTIAL | Upload, probe, immutable `AssetVersion`, `RightsSnapshot`, rights-window decisions, accepted governance UI and mandatory quick-create export-rights preflight | Full rights-history view and hold enforcement remain |
+| M09 task center | PARTIAL | Persistent leased render queue, recovery, retry, SSE, canonical status authority and accepted single-submit quick-create handoff | Full Attempt/Checkpoint/DeadLetter operations remain |
+| M10 finished media | PARTIAL | Authenticated artifacts, Candidate, explicit Adoption, immutable MasterRevision and accepted quick-create Candidate handoff | Publication and withdrawal remain |
 | M11 metering and plans | PARTIAL | Project/storage/concurrency/monthly render quotas | Quote/Reservation/Usage/Settlement ledger remains |
 | M12 team and permissions | PARTIAL | Session auth, owner/editor/viewer RBAC, tenant isolation | Membership, policy, data scope, approval and segregation-of-duties UI remain |
 | M13 settings | PARTIAL | Environment configuration and isolated adapters | ConfigVersion, SecretVersion, connector registry and publish/rollback remain |
@@ -55,18 +55,20 @@ Detailed scope and evidence remain in `docs/approvals/IM3-IM5-WEB-OPERATIONS-COD
 
 This repository acceptance does not authorize or claim a real AI provider, short-video plugin, paid call, production data, deployment, public access or commercial operation. Independent security, legal/compliance and finance/tax review remain mandatory before commercial use.
 
-## Proposed IM-6/IM-8 approval package
+## Accepted IM-6/IM-8 repository increment
 
-The documentation-only proposal is based on `main@46c7804a50bf439b7046e19fd04764bb5b63ca16` and does not change any status in the alignment matrix.
+The owner approved the bounded implementation defined by `docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md`, then separately authorized formal review and merge of the exact final head.
 
-If separately reviewed, merged and then explicitly approved for implementation, the bounded increment would connect existing repository capabilities into a governed one-click media-to-short-video flow:
+Pull request [#14](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/14) connects existing repository capabilities into a governed one-click media-to-short-video flow:
 
-- M01: guided existing/new-project selection and optimistic-revision protection;
+- M01: current/new-project selection, owner/editor execution, viewer read-only behavior and optimistic-revision protection;
 - M07: deterministic Canonical Timeline 1.1 auto-layout using original or fixed clip duration;
-- M08: AssetVersion mapping and mandatory export-rights preflight;
-- M09: single render submission followed by canonical task/SSE tracking;
+- M08: AssetVersion mapping, mandatory export-rights preflight and a blocked-governance-resume path that reuses uploaded versions;
+- M09: exactly one client-side render submission followed by canonical task/SSE tracking;
 - M10: Candidate handoff while preserving separate explicit Adoption and immutable MasterRevision operations.
 
-The proposed implementation contains no real AI generation, digital avatar, face/person replacement, wardrobe/background transformation, provider/plugin/model, paid call, dependency, backend API/model, migration, Worker, deployment or public access. The exact proposed code file allowlist, state machine, permissions, API mapping, exceptions and acceptance cases are defined in `docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md`.
+The final reviewed head `9563d0af76e93f25d30be60b2806392749da6358` passed all jobs in [Pipeline #83](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32416784651) and merged to `main` as `526ddcf354571c68bf54ea4e3ea057592fdd472d`.
 
-Approval-package completion is not code implementation or test passage. Formal review, merge and later feature coding each require separate authorization.
+The accepted diff contains only the nine function/test files allowed by section 11.1 of the approval package. It adds no dependency, backend API/model, migration, Worker, real provider/plugin/model, paid call, deployment or public access. It does not implement AI generation, digital avatar, face/person replacement or wardrobe/background transformation.
+
+Detailed scope, final-head verification and the remaining external gates are recorded in `docs/evidence/IM6-IM8-ONE-CLICK-SHORT-VIDEO-VERIFICATION.md`. Repository acceptance is not production or commercial approval; independent security, legal/compliance and finance/tax review remain mandatory before formal commercial use.

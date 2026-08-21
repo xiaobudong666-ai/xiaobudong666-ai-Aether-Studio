@@ -128,20 +128,27 @@ This document outlines the high-level roadmap and current milestone progress for
 - **Formal review**: FR-01 was resolved; unresolved blocking feedback is 0.
 - **Boundary**: Acceptance records repository state only. It does not authorize or claim a real provider/plugin/model, paid call, production data, deployment, public access or commercial operation.
 
-### [IM-6/IM-8] One-Click Short-Video Workbench (DRAFT APPROVAL PACKAGE)
-- **Status**: Documentation-only proposal awaiting separate formal review, merge and implementation authorization.
-- **Authoritative baseline**: `main@46c7804a50bf439b7046e19fd04764bb5b63ca16`
+### [IM-6/IM-8] One-Click Short-Video Workbench (ACCEPTED)
+- **Status**: PR #14 passed formal review and final-head CI, then merged to `main` as a repository milestone.
+- **Implementation baseline**: `main@d9a95f811d2874410679ac2fff27306cfbbeb605`
+- **PR**: [#14](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/14)
+- **Reviewed head**: `9563d0af76e93f25d30be60b2806392749da6358`
+- **Merge commit**: `526ddcf354571c68bf54ea4e3ea057592fdd472d`
+- **Final CI**: [Pipeline #83](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32416784651)
 - **Approval package**: `docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md`
-- **Proposed controls**:
-  - guided existing/new-project selection with owner/editor write permissions and viewer read-only behavior;
+- **Evidence**: `docs/evidence/IM6-IM8-ONE-CLICK-SHORT-VIDEO-VERIFICATION.md`
+- **Accepted controls**:
+  - governed current/new-project quick-create flow with owner/editor writes and viewer read-only behavior;
   - ordered existing-media selection plus bounded sequential uploads;
   - deterministic Canonical Timeline 1.1 layout using original or fixed clip duration;
   - explicit existing-timeline replacement confirmation and optimistic-revision conflict handling;
   - AssetVersion mapping and mandatory export-rights preflight;
+  - zero timeline saves and zero render submissions while rights are blocked;
+  - governance resume that reuses uploaded versions without duplicate upload;
   - one client-side render submission with project/request-generation isolation;
-  - handoff to canonical task, Candidate and existing explicit Adoption/MasterRevision operations.
-- **Explicit exclusions**: no AI generation, digital avatar, face/person replacement, wardrobe/background transformation, provider/plugin/model, paid call, dependency, backend API/model, migration, Worker, deployment or public access.
-- **Boundary**: Approval-package completion is not implementation. Any functional branch, review and merge require separate owner authorization.
+  - Candidate handoff while Adoption and MasterRevision remain separate explicit operations.
+- **Formal review**: The exact final head passed with no unresolved blocking findings.
+- **Boundary**: Acceptance records repository state only. It does not authorize or claim AI generation, digital avatar, face/person replacement, wardrobe/background transformation, a real provider/plugin/model, paid calls, new dependencies, backend changes, deployment, public access or commercial operation.
 
 ## Security & Upgrade Boundaries
 - **No hardcoded credentials**: Environment variables handle sidecar configurations.
