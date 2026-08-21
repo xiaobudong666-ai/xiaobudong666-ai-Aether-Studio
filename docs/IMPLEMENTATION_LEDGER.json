@@ -205,26 +205,29 @@
       "boundary": "ACCEPTED records repository milestone acceptance only. It does not authorize deployment, public access, real providers/plugins/models, paid calls, production data or commercial operation."
     },
     "IM-6/IM-8": {
-      "status": "DRAFT_FOR_OWNER_APPROVAL",
-      "baseline_commit": "46c7804a50bf439b7046e19fd04764bb5b63ca16",
+      "status": "ACCEPTED",
+      "baseline_commit": "d9a95f811d2874410679ac2fff27306cfbbeb605",
       "approval_package": "docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md",
+      "candidate_pr": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/14",
+      "code_candidate_commit": "9563d0af76e93f25d30be60b2806392749da6358",
+      "merge_commit": "526ddcf354571c68bf54ea4e3ea057592fdd472d",
+      "merged_at": "2026-08-21T04:07:06Z",
+      "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/32416784651",
       "description": "Compose accepted project, media, timeline, rights, render-task and candidate capabilities into a governed one-click short-video workbench flow.",
-      "proposed_controls": [
+      "approval": "Owner approved the bounded implementation, separately authorized formal review, and separately authorized merge of exact head 9563d0af76e93f25d30be60b2806392749da6358.",
+      "evidence": "docs/evidence/IM6-IM8-ONE-CLICK-SHORT-VIDEO-VERIFICATION.md",
+      "implemented_controls": [
         "Existing or new project selection with owner/editor writes and viewer read-only behavior",
         "Ordered existing-media selection plus bounded sequential uploads",
         "Deterministic Canonical Timeline 1.1 construction using original or fixed clip duration",
         "Explicit timeline replacement confirmation and optimistic revision conflict handling",
         "AssetVersion mapping and mandatory export-rights preflight",
+        "Zero timeline saves and zero render submissions while rights are blocked",
+        "Governance resume reuses uploaded media and AssetVersion records without duplicate upload",
         "Single client-side render submission with project and request-generation isolation",
         "Canonical task and Candidate handoff without automatic Adoption or MasterRevision creation"
       ],
-      "authorized_document_files": [
-        "docs/approvals/IM6-IM8-ONE-CLICK-SHORT-VIDEO-CODING-APPROVAL.md",
-        "docs/ROADMAP.md",
-        "docs/IMPLEMENTATION_LEDGER.json",
-        "docs/PRD_CODE_ALIGNMENT.md"
-      ],
-      "proposed_function_files": [
+      "implemented_function_files": [
         "apps/web/src/components/QuickCreatePanel.tsx",
         "apps/web/src/components/QuickCreatePanel.test.tsx",
         "apps/web/src/App.tsx",
@@ -235,13 +238,26 @@
         "e2e/workbench.spec.ts",
         "e2e/production.spec.ts"
       ],
-      "remaining_gates": [
-        "Formal review and merge of the documentation-only approval package",
-        "Separate explicit owner approval before any IM-6/IM-8 feature code",
-        "All code tests, scope audit and draft feature pull request",
-        "Separate formal review and merge authorization for the future feature pull request"
+      "verification": [
+        "Web ESLint, TypeScript, production build, twenty web tests, eleven contract tests and four editor tests passed",
+        "Playwright workbench flow passed",
+        "Docker Compose, FFmpeg, Worker, video-use, real render and persistent queue checks passed",
+        "Production browser upload-rights block-governance-resume-single render-download flow passed",
+        "Final reviewed head passed all jobs in GitHub Actions Pipeline #83"
       ],
-      "boundary": "DRAFT_FOR_OWNER_APPROVAL is planning evidence only. It does not authorize feature code, dependencies, backend APIs/models, migrations, Workers, real providers/plugins/models, paid calls, deployment, public access, production data or commercial operation."
+      "acceptance_evidence": [
+        "Formal review recorded no unresolved blocking findings against exact head 9563d0af76e93f25d30be60b2806392749da6358",
+        "Pull request #14 merged to main as 526ddcf354571c68bf54ea4e3ea057592fdd472d on 2026-08-21T04:07:06Z",
+        "The accepted diff remained limited to the nine files authorized by approval-package section 11.1"
+      ],
+      "remaining_boundaries": {
+        "ai_and_transformations": "AI generation, digital avatar, face/person replacement and wardrobe/background transformation remain unimplemented in this increment.",
+        "providers_and_plugins": "No real provider, plugin or model is integrated or authorized.",
+        "production_launch": "No deployment, public endpoint, production data or production credential is authorized.",
+        "commercial_use": "Independent security, legal/compliance and finance/tax review remain mandatory before commercial use.",
+        "future_changes": "Any subsequent functional change, new dependency, backend change, provider/plugin, deployment or merge requires its applicable approval gate."
+      },
+      "boundary": "ACCEPTED records repository milestone acceptance only. It does not authorize deployment, public access, real providers/plugins/models, paid calls, production data or commercial operation."
     }
   }
 }
