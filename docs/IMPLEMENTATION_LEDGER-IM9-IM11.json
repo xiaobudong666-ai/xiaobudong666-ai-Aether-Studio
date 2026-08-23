@@ -1,0 +1,25 @@
+{
+  "baseline": "96213f7389d4f665b5b165d4d5a98a29765b3f9f",
+  "scope": ["IM9", "IM10", "IM11"],
+  "status": "documentation-draft",
+  "implementation": "not_started",
+  "files": [
+    "docs/approvals/IM9-IM11-GOVERNED-GENERATION-APPROVAL.md",
+    "docs/ROADMAP-IM9-IM11.md",
+    "docs/IMPLEMENTATION_LEDGER-IM9-IM11.json",
+    "docs/PRD_CODE_ALIGNMENT-IM9-IM11.md",
+    "docs/evidence/IM9-IM11-VERIFICATION.md"
+  ],
+  "boundaries": {
+    "new_dependencies": false,
+    "backend_api": false,
+    "migration": false,
+    "worker": false,
+    "real_provider": false,
+    "real_plugin": false,
+    "paid_calls": false,
+    "deployment": false,
+    "public_access": false
+  },
+  "approval_note": "Documentation only. Coding and integration require separate approval."
+}
