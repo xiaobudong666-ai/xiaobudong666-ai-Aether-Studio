@@ -1,7 +1,7 @@
 {
-  "baseline": "96213f7389d4f665b5b165d4d5a98a29765b3f9f",
+  "baseline": "6bfd6f1bfae9de1681775ff6020c87cf97d30aed",
   "scope": ["IM9", "IM10", "IM11"],
-  "status": "documentation-draft",
+  "status": "documentation-accepted",
   "implementation": "not_started",
   "files": [
     "docs/approvals/IM9-IM11-GOVERNED-GENERATION-APPROVAL.md",
@@ -21,5 +21,5 @@
     "deployment": false,
     "public_access": false
   },
-  "approval_note": "Documentation only. Coding and integration require separate approval."
+  "approval_note": "Documentation gate accepted by merge. Functional coding and integration require separate owner approval."
 }
