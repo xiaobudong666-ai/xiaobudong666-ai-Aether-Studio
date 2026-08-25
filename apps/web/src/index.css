@@ -77,6 +77,79 @@ body {
   border: 1px solid rgba(209, 250, 229, 0.35);
 }
 
+.generation-entry,
+.generation-panel {
+  flex: 0 0 auto;
+  margin: 10px 12px 0;
+  padding: 12px;
+  border: 1px solid #43365f;
+  border-radius: 8px;
+  background: #17141f;
+  box-sizing: border-box;
+}
+
+.generation-panel {
+  max-height: min(62vh, 620px);
+  overflow-y: auto;
+}
+
+.generation-entry,
+.generation-heading,
+.generation-task-center article > div:first-child,
+.generation-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.generation-entry > div,
+.generation-heading > div,
+.generation-task-center article > div:first-child,
+.generation-result {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.generation-entry span,
+.generation-heading span,
+.generation-grid p,
+.generation-grid fieldset > span,
+.generation-boundary {
+  color: #a1a1aa;
+  font-size: 12px;
+}
+
+.generation-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.generation-grid fieldset {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid #3b3447;
+  border-radius: 6px;
+}
+
+.generation-grid legend { color: #c4b5fd; font-size: 12px; font-weight: 600; }
+.generation-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.generation-grid label:has(input[type="checkbox"]) { flex-direction: row; align-items: center; }
+.generation-grid textarea { min-height: 66px; resize: vertical; }
+.generation-task-center h3 { margin: 14px 0 8px; font-size: 14px; }
+.generation-task-center article { padding: 9px; border: 1px solid #34303b; border-radius: 6px; margin-top: 6px; }
+.generation-task-center article > div:first-child { flex-direction: row; align-items: center; }
+.generation-actions { display: flex; gap: 6px; margin-top: 7px; }
+.generation-result { margin-top: 8px; padding-top: 8px; border-top: 1px solid #34303b; }
+.generation-result button { align-self: flex-end; }
+.generation-boundary { margin-bottom: 0; color: #a7f3d0; }
+
 .quick-create-entry,
 .quick-create-panel {
   flex: 0 0 auto;
