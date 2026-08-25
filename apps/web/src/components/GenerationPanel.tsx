@@ -22,7 +22,15 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export function GenerationPanel({ role, tenantId, actorId, project, assetVersions }: GenerationPanelProps) {
-  const adapterRef = useRef(new DeterministicGenerationAdapter());
+  const storageKey = `aether:generation:v1:${tenantId}:${actorId}`;
+  const [adapter] = useState(() => {
+    try {
+      const value = localStorage.getItem(storageKey);
+      return DeterministicGenerationAdapter.restore(value ? JSON.parse(value) : null);
+    } catch {
+      return new DeterministicGenerationAdapter();
+    }
+  });
   const [open, setOpen] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [aspectRatio, setAspectRatio] = useState<GenerationInput["aspectRatio"]>("9:16");
@@ -32,8 +40,8 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   const [rightsSnapshotId, setRightsSnapshotId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [preflightReady, setPreflightReady] = useState(false);
-  const [tasks, setTasks] = useState<GenerationTask[]>([]);
-  const [references, setReferences] = useState<EditorReference[]>([]);
+  const [tasks, setTasks] = useState<GenerationTask[]>(() => adapter.list());
+  const [references, setReferences] = useState<EditorReference[]>(() => adapter.listEditorReferences());
   const clientRequestIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -59,7 +67,11 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     currentRevision: project?.revision,
   });
 
-  const refresh = () => setTasks(adapterRef.current.list());
+  const refresh = () => {
+    setTasks(adapter.list());
+    setReferences(adapter.listEditorReferences());
+    localStorage.setItem(storageKey, JSON.stringify(adapter.snapshot()));
+  };
 
   const preflight = () => {
     const result = preflightGeneration(input());
@@ -73,7 +85,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   const submit = () => {
     if (!preflightReady || !clientRequestIdRef.current) return;
     try {
-      const task = adapterRef.current.submit(input(), clientRequestIdRef.current, actorId);
+      const task = adapter.submit(input(), clientRequestIdRef.current, actorId);
       refresh();
       setMessage(`任务 ${task.id} 已进入本地队列；重复点击不会创建第二个任务。`);
     } catch (error) {
@@ -82,26 +94,26 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   };
 
   const run = (task: GenerationTask) => {
-    adapterRef.current.start(task.id, actorId);
-    adapterRef.current.complete(task.id, task.attempt, tenantId, project?.id || "", actorId);
+    adapter.start(task.id, actorId);
+    adapter.complete(task.id, task.attempt, tenantId, project?.id || "", actorId);
     refresh();
     setMessage("本地确定性任务完成，结果等待人工审阅。未写入最终时间线。");
   };
 
   const cancel = (taskId: string) => {
-    adapterRef.current.cancel(taskId, actorId);
+    adapter.cancel(taskId, actorId);
     refresh();
   };
 
   const retry = (taskId: string) => {
-    adapterRef.current.retry(taskId, actorId);
+    adapter.retry(taskId, actorId);
     refresh();
   };
 
   const enterEditor = (task: GenerationTask, resultId: string) => {
     try {
-      const reference = adapterRef.current.reviewResult(task.id, resultId, tenantId, project?.id || "", actorId);
-      setReferences((previous) => previous.some((item) => item.id === reference.id) ? previous : [...previous, reference]);
+      adapter.reviewResult(task.id, resultId, tenantId, project?.id || "", actorId);
+      refresh();
       setMessage("已创建受治理的素材版本引用；未自动采纳，也未写入最终时间线。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "结果审阅失败。");
