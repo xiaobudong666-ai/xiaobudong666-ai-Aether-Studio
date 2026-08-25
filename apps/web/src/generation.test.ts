@@ -198,10 +198,13 @@ describe("IM9–IM11 28 acceptance cases", () => {
     expect(() => adapter.reviewResult(task.id, done.results[0].id, base.tenantId, "project-2", "owner-1")).toThrow("SCOPE_MISMATCH");
   });
 
-  test("25 重新进入可通过任务快照恢复状态", () => {
+  test("25 关闭页面后可通过版本化本地快照恢复任务状态", () => {
     const adapter = setup();
     const task = running(adapter);
-    expect(adapter.get(task.id)).toMatchObject({ id: task.id, status: "RUNNING", attempt: 1 });
+    const persisted = JSON.parse(JSON.stringify(adapter.snapshot()));
+    const restored = DeterministicGenerationAdapter.restore(persisted);
+    expect(restored.get(task.id)).toMatchObject({ id: task.id, status: "RUNNING", attempt: 1 });
+    expect(restored.audit.map((event) => event.action)).toEqual(["SUBMIT", "START"]);
   });
 
   test("26 同一任务重复 refresh 不重复创建结果", () => {
