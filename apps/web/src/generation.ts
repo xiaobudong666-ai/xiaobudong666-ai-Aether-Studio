@@ -86,6 +86,13 @@ export interface AuditEvent {
   taskId?: string;
 }
 
+export interface GenerationAdapterSnapshot {
+  version: 1;
+  tasks: GenerationTask[];
+  editorReferences: EditorReference[];
+  audit: AuditEvent[];
+}
+
 const SUPPORTED_RATIOS = new Set(["16:9", "9:16", "1:1"]);
 const MAX_OUTPUTS = 4;
 
@@ -138,6 +145,41 @@ export class DeterministicGenerationAdapter {
 
   constructor(now: () => string = () => new Date().toISOString()) {
     this.now = now;
+  }
+
+  static restore(snapshot: unknown, now: () => string = () => new Date().toISOString()): DeterministicGenerationAdapter {
+    const adapter = new DeterministicGenerationAdapter(now);
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return adapter;
+    const candidate = snapshot as Partial<GenerationAdapterSnapshot>;
+    if (candidate.version !== 1 || !Array.isArray(candidate.tasks)
+      || !Array.isArray(candidate.editorReferences) || !Array.isArray(candidate.audit)) return adapter;
+    for (const task of candidate.tasks) {
+      if (!task || typeof task.id !== "string" || !task.request?.clientRequestId) continue;
+      const clone = JSON.parse(JSON.stringify(task)) as GenerationTask;
+      adapter.tasksById.set(clone.id, clone);
+      adapter.requestToTask.set(clone.request.clientRequestId, clone.id);
+      clone.results.forEach((result) => adapter.resultChecksums.add(result.checksum));
+      const sequence = Number(clone.request.id.split("-").at(-1));
+      if (Number.isSafeInteger(sequence)) adapter.sequence = Math.max(adapter.sequence, sequence);
+    }
+    for (const reference of candidate.editorReferences) {
+      if (reference?.resultId) adapter.editorReferences.set(reference.resultId, { ...reference });
+    }
+    adapter.audit.push(...candidate.audit.filter((event) => Boolean(event?.action && event?.actor && event?.at)));
+    return adapter;
+  }
+
+  snapshot(): GenerationAdapterSnapshot {
+    return {
+      version: 1,
+      tasks: this.list(),
+      editorReferences: this.listEditorReferences(),
+      audit: this.audit.map((event) => ({ ...event })),
+    };
+  }
+
+  listEditorReferences(): EditorReference[] {
+    return [...this.editorReferences.values()].map((reference) => ({ ...reference }));
   }
 
   submit(input: GenerationInput, clientRequestId: string, actor: string): GenerationTask {
