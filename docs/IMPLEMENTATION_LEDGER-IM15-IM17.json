@@ -13,6 +13,7 @@
       "append-only non-secret provider configuration versions",
       "operator-mode plus owner-policy dual-key activation",
       "short-lived sanitized Worker runtime attestation",
+      "retirement of legacy unauthenticated and API-direct MoneyPrinter routes",
       "fail-closed capability snapshots and owner emergency stop"
     ],
     "IM16": [

@@ -14,7 +14,7 @@
 
 IM12–IM14 established durable project generation tasks, Worker leases, trusted API intake, immutable AssetVersion creation and rights-default blocking. The remaining smallest path toward a safely activatable real Provider is not credential entry or deployment. It is a deny-by-default activation control plane that can prove API/Worker configuration agreement, constrain Adapter egress and artifact bytes, bound tenant use, trip a circuit breaker and stop new work without destroying evidence.
 
-Current source still enables capability snapshots only for `deterministic-fake`; Worker generation rejects every other mode. The current MoneyPrinter Adapter has submit/status methods but no accepted restricted artifact-stream contract. Existing quotas cover projects, storage and rendering, not generation reservations or settled generated seconds.
+Current source still enables capability snapshots only for `deterministic-fake`; Worker generation rejects every other mode. The API also retains legacy `/moneyprinter/*` routes that directly probe, submit to and query the Adapter outside the governed project task/Worker path. The current MoneyPrinter Adapter has submit/status methods but no accepted restricted artifact-stream contract. Existing quotas cover projects, storage and rendering, not generation reservations or settled generated seconds.
 
 ## Gate status
 
@@ -29,6 +29,7 @@ Current source still enables capability snapshots only for `deterministic-fake`;
 ## Invariants
 
 - Runtime mode defaults to `disabled` in source, Compose and environment templates.
+- Legacy API-direct MoneyPrinter routes are retired; browser generation uses only protected project-scoped APIs.
 - Automated tests use a deterministic fake Sidecar only and make no public Provider request.
 - Secrets remain outside repository, database, DTOs, logs and browser storage.
 - MoneyPrinterTurbo remains pinned to `v1.2.7` / `475f21147f0808f5ffe3f58af9ab794b28a4da2c`.

@@ -18,12 +18,13 @@
 
 1. `apps/api/app/generation_tasks.py` enables capability only when mode is exactly `deterministic-fake`; disabled mode returns `PROVIDER_DISABLED`.
 2. `apps/worker/app/main.py` rejects any claimed generation task whose `providerMode` is not `deterministic-fake`.
-3. API and Worker do not share a published provider configuration version or attested policy hash.
-4. The MoneyPrinter Adapter implements health, capability, submit and status behavior, but the accepted source does not implement a restricted `stream_artifact()` method even though the governed Worker path expects a stream.
-5. Adapter requests disable environment proxy inheritance with `trust_env=False`, but artifact-origin, redirect and bounded-stream evidence does not yet exist.
-6. `.env.example`, `infra/docker/.env.example` and `infra/docker/docker-compose.yml` do not expose a governed real-generation runtime mode; therefore no committed default can currently prove dual-key activation.
-7. Tenant quotas cover project count, storage, concurrent rendering and monthly render seconds; generation reservations and settled generated seconds are absent.
-8. Existing task retries and leases limit individual work, but there is no persistent Provider circuit breaker or audited owner emergency stop.
+3. `apps/api/app/main.py` still exposes legacy `/moneyprinter/health` and `/moneyprinter/capabilities` without an auth dependency, and `/moneyprinter/generate` plus `/moneyprinter/status/{task_id}` call the API-side Adapter directly. These routes bypass the governed project task, Worker lease, generation quota, circuit-breaker and artifact-intake path.
+4. API and Worker do not share a published provider configuration version or attested policy hash.
+5. The MoneyPrinter Adapter implements health, capability, submit and status behavior, but the accepted source does not implement a restricted `stream_artifact()` method even though the governed Worker path expects a stream.
+6. Adapter requests disable environment proxy inheritance with `trust_env=False`, but artifact-origin, redirect and bounded-stream evidence does not yet exist.
+7. `.env.example`, `infra/docker/.env.example` and `infra/docker/docker-compose.yml` do not expose a governed real-generation runtime mode; therefore no committed default can currently prove dual-key activation.
+8. Tenant quotas cover project count, storage, concurrent rendering and monthly render seconds; generation reservations and settled generated seconds are absent.
+9. Existing task retries and leases limit individual work, but there is no persistent Provider circuit breaker or audited owner emergency stop.
 
 ## Proposed documentation package
 
@@ -39,6 +40,7 @@
 - The proposed code scope is allowlisted; any additional functional file requires renewed owner approval.
 - The package authorizes no code by itself.
 - Runtime defaults remain disabled in source, Compose and environment templates.
+- Legacy unauthenticated and API-direct `/moneyprinter/*` routes must be retired before any real-mode path can be accepted.
 - CI and local tests must use a deterministic fake Sidecar and must not contact a public Provider.
 - No credential, paid call, dependency/lockfile change, upstream pin change, external queue/object storage, automatic rights/adoption/timeline/render/publish, deployment or public access is included.
 

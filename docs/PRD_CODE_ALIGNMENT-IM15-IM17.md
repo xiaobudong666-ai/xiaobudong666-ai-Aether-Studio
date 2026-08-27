@@ -4,6 +4,7 @@
 |---|---|---|---|
 | Governed server generation | IM12–IM14 project API, persistent tasks, Worker leases and trusted intake are accepted | Preserve as the task/data authority | Implemented / must reuse |
 | Runtime provider gate | Capability enables only for `deterministic-fake`; other modes are rejected | Non-secret config versions, operator/owner dual key and fresh Worker attestation | Not implemented |
+| Legacy Provider bypass | API still exposes unauthenticated health/capability probes and API-direct generate/status routes | Retire legacy routes so only protected project APIs and Worker Adapter can access generation | Blocking gap |
 | Configuration provenance | Task stores a capability snapshot hash | Bind real-mode claims to a published config version and policy hash | Not implemented |
 | Secret boundary | Existing environment variables and internal Sidecar network | Prove secrets never enter Aether DB, DTO, logs, events or browser | Partial |
 | MoneyPrinter contract | Pinned Adapter submits and queries | Restricted artifact stream, normalized errors, cancel capability and egress constraints | Partial |
@@ -20,7 +21,7 @@
 
 ## Alignment conclusion
 
-The repository now has the durable task, Worker, artifact, provenance and rights bridge required before a Provider can be considered. The next safe repository slice is activation readiness: configuration agreement, restricted Adapter traffic, bounded generation usage, failure containment and an auditable stop path.
+The repository now has the durable task, Worker, artifact, provenance and rights bridge required before a Provider can be considered, but the legacy API-direct MoneyPrinter routes must first be retired so they cannot bypass that bridge. The next safe repository slice is activation readiness: configuration agreement, restricted Adapter traffic, bounded generation usage, failure containment and an auditable stop path.
 
 This slice must be testable entirely against a deterministic fake Sidecar. It may make the code capable of accepting a future explicitly enabled MoneyPrinter mode, but it must leave every committed default disabled and must not supply credentials, make a real call or claim operational AI generation.
 

@@ -35,6 +35,7 @@
 - `build_capability_snapshot()` 仅在 `mode == "deterministic-fake"` 时启用；其他模式固定返回 `PROVIDER_DISABLED`。
 - Worker 的 `process_generation_task()` 只接受 claim 中的 `deterministic-fake`，否则立即失败。
 - API 与 Worker 没有可比较的已发布配置版本或运行态配置摘要；能力页面无法证明两端配置一致。
+- API 仍公开旧的 `/moneyprinter/health`、`/moneyprinter/capabilities`、`/moneyprinter/generate` 与 `/moneyprinter/status/{task_id}` 路由；其中健康/能力路由无登录门禁，生成与状态路由由 API 直接调用 Adapter，可绕过项目级任务、Worker 租约、生成配额、熔断与治理入库。
 - MoneyPrinter Adapter 当前能提交与查询，但没有已实现的受限 `stream_artifact()` 合同；取消、重定向、来源与响应去敏边界也未形成激活证据。
 - Compose 和环境模板没有真实生成运行模式、默认关闭断言、生成并发/月度用量或熔断配置。
 - 已有配额覆盖项目、存储、并发渲染和月度渲染秒数；尚无生成请求的预留、结算、并发或月度用量权威记录。
@@ -46,6 +47,7 @@
 ## 3. 权威架构选择
 
 - **默认拒绝**：代码、Compose 与两个环境模板的默认真实运行模式必须为 `disabled`。
+- **退役旧旁路**：所有浏览器生成、能力与状态读取必须经过受保护的新接口；旧 `/moneyprinter/*` 直连路由必须稳定返回 `410 GONE` 或从路由表移除，API 进程不得再提交或查询真实生成上游。
 - **双钥匙加新鲜证明**：浏览器或数据库配置不能单独启用 Provider；operator 环境模式、owner 已发布配置和 Worker 新鲜证明必须一致。
 - **秘密不入库**：配置版本只保存非秘密策略、能力范围和摘要；API Key、令牌、Cookie、Authorization 与 Sidecar 原始配置不得进入数据库、API DTO、日志、事件或前端存储。
 - **API 为任务与用量权威**：Worker 不直接连接业务数据库；预留、结算、熔断和停机均通过受令牌保护的内部 API 完成。
@@ -114,7 +116,8 @@ Worker 周期性通过内部令牌端点报告去敏证明，至少包含：
 
 ### 5.3 提交与恢复
 
-- API 创建任务仍不访问 Sidecar。
+- 旧 `/moneyprinter/health`、`/moneyprinter/capabilities`、`/moneyprinter/generate` 和 `/moneyprinter/status/{task_id}` 必须退役；不得保留未登录能力探测或 API 直连提交/查询的兼容旁路。
+- API 创建任务仍不访问 Sidecar，API 运行时也不得实例化 Adapter 执行真实生成提交、查询、取消或产物下载。
 - Worker 在保存 attempt 与租约后才提交；得到 upstream job id 后先持久化再轮询。
 - 响应丢失且不能证明未提交时进入 `UNKNOWN`，禁止自动再次 POST。
 - 已有 upstream job id 的重启任务只查询；终态、取消和过期租约规则沿用 IM13。
@@ -184,14 +187,14 @@ owner 可设置去敏原因码并立即停机。停机后：
 11. 错误 Worker token 的证明请求零状态变化。
 12. 新鲜匹配证明生成有限 capability snapshot 与稳定 hash。
 13. snapshot 到期或配置 supersede 后旧 hash 提交返回冲突且零上游调用。
-14. readiness DTO 不包含 Sidecar URL、主机、端口、密钥或原始异常。
+14. readiness DTO 不包含 Sidecar URL、主机、端口、密钥或原始异常；旧 health/capabilities 路由不得继续返回未登录的 Adapter 原始输出。
 15. API/Worker 重启后从持久配置恢复，默认状态不被错误提升为 enabled。
 16. Compose、根环境模板和生产环境模板都明确默认 `disabled`。
 
 ### IM16：Adapter 与产物流（17–32）
 
-17. API create 只排队，不直接调用 MoneyPrinter Sidecar。
-18. disabled/fake 测试模式不会实例化或调用真实 Adapter 网络路径。
+17. 所有浏览器生成与状态调用只经过受保护的项目级接口；旧 `/moneyprinter/health`、`/capabilities`、`/generate`、`/status` 直连路由稳定返回 410 或不存在。
+18. API 运行时不直接提交、查询、取消或下载 Provider 产物；disabled/fake 测试模式不会实例化或调用 Worker 的真实 Adapter 网络路径。
 19. 明确 moneyprinter 模式只在 claim 配置摘要匹配时进入 Adapter。
 20. 提交 payload 只包含审批字段，拒绝任意模型参数、URL 与身份样本。
 21. 上游 4xx 不自动重试；429/5xx/连接前失败受边界重试限制。
@@ -236,6 +239,7 @@ owner 可设置去敏原因码并立即停机。停机后：
 - `apps/api/app/main.py`
 - `apps/api/app/generation_tasks.py`
 - `apps/api/test_generation_tasks.py`
+- `apps/api/test_moneyprinter.py`
 - `apps/worker/app/main.py`
 - `apps/worker/app/generation_queue.py`
 - `apps/worker/app/moneyprinter_adapter.py`
@@ -255,6 +259,7 @@ owner 可设置去敏原因码并立即停机。停机后：
 ## 11. 明确禁止范围
 
 - 在任何已提交配置中把真实 Provider 默认设为 enabled/active/moneyprinter。
+- 保留、恢复或新增任何绕过项目任务、Worker 租约、配额、熔断和治理入库的 API 直连 Provider 路由。
 - 真实 Provider/plugin/model、API Key、Cookie、令牌、生产数据或付费调用。
 - 在 CI、开发验证或评审中访问公网 Provider；所有网络验收只允许 deterministic fake Sidecar。
 - MoneyPrinterTurbo 上游版本/commit、Dockerfile、依赖或锁文件升级。
