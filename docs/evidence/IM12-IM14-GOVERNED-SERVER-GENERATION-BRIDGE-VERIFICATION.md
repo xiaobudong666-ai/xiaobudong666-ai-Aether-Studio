@@ -77,3 +77,16 @@
 - 成功入库只新增项目 Material 和不可变 AssetVersion；provenance、checksum、Provider 产物编号与 capability snapshot hash 一并保存。
 - 新生成 AssetVersion 不自动生成 RightsSnapshot；存储状态固定为 `RIGHTS_BLOCKED`，只有现有权利判定为允许时浏览器 DTO 才派生 `SUCCEEDED`。
 - 生成链路不创建 Candidate、Adoption、MasterRevision，不写最终时间线，不触发渲染或发布。
+
+## Repository acceptance closure
+
+- Coding baseline: `main@b9852257076ccad2ac8aed8b1e04cefab5e0d901`.
+- Functional PR: [#21](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/pull/21).
+- Formally reviewed head: `3b900e4909566dcced9cd10b870d64df38724ee0`.
+- Squash merge commit: `d6c39593cf25856f4b411cbe909d8fa9b54403c0`.
+- Final-head CI: [Pipeline #114](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/33032162493) — all three jobs passed.
+- Formal review: PASS; blocking findings: 0; unresolved review threads: 0.
+- Scope audit: 13 changed files, all within approval-package section 11.
+- Repository status: **IM12–IM14 implementation accepted**.
+
+This acceptance records repository implementation only. Runtime real Provider remains disabled; no real model/plugin/API key, paid call, MoneyPrinter Adapter or pinned-upstream change, new dependency, external queue/object storage, automatic rights approval/adoption/timeline/render/publish, deployment or public access is authorized or claimed.

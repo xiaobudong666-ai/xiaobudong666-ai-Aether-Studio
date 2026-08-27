@@ -1,51 +1,74 @@
 {
-  "baseline": "a41bdf194d92158abb49f83c45189c52b1e9ebd1",
-  "scope": ["IM12", "IM13", "IM14"],
-  "status": "documentation-draft",
-  "implementation": "not_started",
-  "approval_package": "docs/approvals/IM12-IM14-GOVERNED-SERVER-GENERATION-BRIDGE-CODING-APPROVAL.md",
-  "planned_controls": {
+  "baseline": "d6c39593cf25856f4b411cbe909d8fa9b54403c0",
+  "coding_baseline": "b9852257076ccad2ac8aed8b1e04cefab5e0d901",
+  "scope": [
+    "IM12",
+    "IM13",
+    "IM14"
+  ],
+  "status": "implementation-accepted",
+  "implementation": "completed_authorized_governed_server_bridge_scope",
+  "implementation_pr": 21,
+  "reviewed_head": "3b900e4909566dcced9cd10b870d64df38724ee0",
+  "merge_commit": "d6c39593cf25856f4b411cbe909d8fa9b54403c0",
+  "files": [
+    "docs/approvals/IM12-IM14-GOVERNED-SERVER-GENERATION-BRIDGE-CODING-APPROVAL.md",
+    "docs/ROADMAP-IM12-IM14.md",
+    "docs/IMPLEMENTATION_LEDGER-IM12-IM14.json",
+    "docs/PRD_CODE_ALIGNMENT-IM12-IM14.md",
+    "docs/evidence/IM12-IM14-GOVERNED-SERVER-GENERATION-BRIDGE-VERIFICATION.md"
+  ],
+  "verification": {
+    "mandatory_acceptance": "40/40_pass",
+    "api_full": "63/63_pass",
+    "worker_generation": "8/8_pass",
+    "worker_full": "31/31_pass",
+    "web_full": "56/56_pass",
+    "contracts_editor": "15/15_pass",
+    "typescript": "pass",
+    "eslint": "pass_zero_warnings",
+    "production_build": "pass",
+    "ci_pipeline": "114_pass",
+    "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/33032162493",
+    "formal_review_blockers": 0
+  },
+  "implemented_controls": {
     "IM12": [
-      "project-scoped authenticated generation API",
-      "server-side capability and input validation",
-      "tenant-scoped idempotency",
-      "owner-editor writes and viewer read-only access"
+      "project-scoped authenticated capability, validate, create, list, detail, cancel and retry APIs",
+      "tenant/project/RBAC/CSRF checks, capability snapshots and idempotent task creation"
     ],
     "IM13": [
-      "leased Worker claim and heartbeat",
-      "bounded retry and immutable attempt history",
-      "append-only task event audit history",
-      "internal token and lease protected Worker API contracts",
-      "ambiguous response recovery without blind repost",
-      "cancel intent and late-response isolation"
+      "additive generation task, attempt and append-only event persistence",
+      "token- and lease-protected Worker claim, heartbeat and transition APIs",
+      "bounded retry, cancellation, restart recovery and ambiguous-response isolation"
     ],
     "IM14": [
-      "trusted same-origin artifact source enforcement",
-      "streamed size quota probe and SHA-256 checks",
-      "idempotent Material and immutable AssetVersion intake",
-      "mandatory RIGHTS_MISSING handoff"
+      "trusted multipart byte-stream artifact intake with quota, probe and SHA-256 checks",
+      "one Material and one immutable AssetVersion with governed provenance",
+      "rights-default blocking and server-authoritative frontend recovery"
     ]
   },
-  "required_acceptance_cases": 40,
   "boundaries": {
-    "real_provider_activation": false,
-    "provider_credentials": false,
-    "paid_calls": false,
+    "runtime_provider_default": "disabled",
+    "test_provider": "deterministic-fake-only",
     "new_dependencies": false,
-    "adapter_or_upstream_upgrade": false,
+    "lockfile_change": false,
+    "moneyprinter_adapter_change": false,
+    "upstream_pin_change": false,
+    "real_provider": false,
+    "real_plugin": false,
+    "real_model": false,
+    "api_key": false,
+    "paid_calls": false,
     "new_queue_infrastructure": false,
+    "external_object_storage": false,
+    "digital_human_or_identity_transformation": false,
+    "automatic_rights_approval": false,
     "automatic_adoption": false,
-    "unguarded_timeline_write": false,
+    "automatic_timeline_write": false,
+    "automatic_render_or_publish": false,
     "deployment": false,
     "public_access": false
   },
-  "remaining_gates": [
-    "documentation formal review approval",
-    "documentation merge approval",
-    "separate exact coding authorization",
-    "functional PR formal review approval",
-    "functional PR merge approval",
-    "separate real-provider activation approval"
-  ],
-  "note": "This ledger records a proposal only. No IM12-IM14 functional implementation or external integration is claimed."
+  "approval_note": "PR #21 merged the authorized IM12–IM14 governed server-generation bridge. Real-provider activation, credentials, paid use and deployment remain separately unauthorized."
 }
