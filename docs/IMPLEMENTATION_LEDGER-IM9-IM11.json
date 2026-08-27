@@ -1,8 +1,11 @@
 {
-  "baseline": "6bfd6f1bfae9de1681775ff6020c87cf97d30aed",
+  "baseline": "8f64a172bf740578dba0fcfe451f1464b9a54028",
   "scope": ["IM9", "IM10", "IM11"],
-  "status": "documentation-accepted",
-  "implementation": "not_started",
+  "status": "implementation-accepted",
+  "implementation": "completed_authorized_frontend_local_scope",
+  "implementation_pr": 18,
+  "reviewed_head": "29fd1154c6365edaeeaa2b9754392d61fb173dda",
+  "merge_commit": "8f64a172bf740578dba0fcfe451f1464b9a54028",
   "files": [
     "docs/approvals/IM9-IM11-GOVERNED-GENERATION-APPROVAL.md",
     "docs/ROADMAP-IM9-IM11.md",
@@ -10,16 +13,31 @@
     "docs/PRD_CODE_ALIGNMENT-IM9-IM11.md",
     "docs/evidence/IM9-IM11-VERIFICATION.md"
   ],
+  "verification": {
+    "approval_cases": "28/28_pass",
+    "web_tests": "51/51_pass",
+    "typescript": "pass",
+    "eslint": "pass_zero_warnings",
+    "production_build": "pass",
+    "ci_pipeline": "105_pass",
+    "formal_review_blockers": 0,
+    "resolved_blocker": "FR18-01"
+  },
   "boundaries": {
     "new_dependencies": false,
     "backend_api": false,
     "migration": false,
     "worker": false,
+    "queue_infrastructure": false,
     "real_provider": false,
     "real_plugin": false,
+    "real_model": false,
+    "api_key": false,
     "paid_calls": false,
+    "automatic_adoption": false,
+    "unguarded_timeline_write": false,
     "deployment": false,
     "public_access": false
   },
-  "approval_note": "Documentation gate accepted by merge. Functional coding and integration require separate owner approval."
+  "approval_note": "PR #18 merged the authorized deterministic frontend/local implementation. Real integration, infrastructure, deployment and public access remain separately unauthorized."
 }
