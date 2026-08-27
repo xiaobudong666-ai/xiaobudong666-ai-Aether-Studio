@@ -1,6 +1,7 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   DeterministicGenerationAdapter,
+  GenerationApiClient,
   GenerationInput,
   deterministicChecksum,
   paginateTasks,
@@ -229,5 +230,54 @@ describe("IM9–IM11 28 acceptance cases", () => {
     adapter.complete(task.id, task.attempt, base.tenantId, base.projectId, "owner-1");
     expect(adapter.audit.map((event) => event.action)).toEqual(["SUBMIT", "START", "COMPLETE"]);
     expect(adapter.audit.every((event) => event.actor === "owner-1" && event.at)).toBe(true);
+  });
+});
+
+describe("IM12–IM14 generation API client", () => {
+  const task = {
+    taskId: "server-task-1", projectId: "project-1", provider: "moneyprinter",
+    status: "QUEUED", storedStatus: "QUEUED", progress: 0, message: "queued",
+    attempt: 1, maxAttempts: 3, cancelRequested: false,
+    rights: { allowed: false, code: "RIGHTS_MISSING" }, results: [],
+    createdAt: "2026-08-27T00:00:00Z", updatedAt: "2026-08-27T00:00:00Z",
+  };
+
+  test("mutations carry CSRF and idempotency headers", async () => {
+    const request = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      void _input;
+      void _init;
+      return { ok: true, status: 202, json: async () => task } as Response;
+    });
+    const client = new GenerationApiClient("/api", request);
+    await client.create("project-1", {
+      videoSubject: "subject", videoAspect: "9:16", voiceName: "voice",
+      videoConcatMode: "random", videoClipDuration: 5, outputCount: 1,
+      inputAssetVersionIds: [], idempotencyKey: "00000000-0000-4000-8000-000000000001",
+      capabilitySnapshotHash: "a".repeat(64),
+      expectedProjectRevision: 1, confirmExternalGeneration: true,
+    });
+    expect(request.mock.calls[0][1]?.headers).toMatchObject({
+      "X-Aether-CSRF": "1", "Idempotency-Key": "00000000-0000-4000-8000-000000000001",
+    });
+  });
+
+  test("server list is the authoritative task source", async () => {
+    const request = vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ items: [task] }),
+    } as Response));
+    const client = new GenerationApiClient("/api", request);
+    expect((await client.list("project-1"))[0].taskId).toBe("server-task-1");
+    expect(request).toHaveBeenCalledWith(
+      "/api/projects/project-1/generation-tasks?pageSize=100", undefined,
+    );
+  });
+
+  test("API errors redact token-like details", async () => {
+    const request = vi.fn(async () => ({
+      ok: false, status: 502,
+      json: async () => ({ detail: { code: "PROVIDER_FAILED", message: "Bearer secret token leaked" } }),
+    } as Response));
+    const client = new GenerationApiClient("/api", request);
+    await expect(client.list("project-1")).rejects.toThrow("技术详情已隐藏");
   });
 });

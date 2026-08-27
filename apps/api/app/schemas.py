@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import List, Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -72,6 +73,58 @@ class MoneyPrinterGenerateRequest(BaseModel):
     voice_name: Optional[str] = "en-US-JennyNeural"
     video_concat_mode: Optional[str] = "random"
     video_clip_duration: Optional[int] = 5
+
+
+class GenerationTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    videoSubject: str = Field(..., min_length=1, max_length=500)
+    videoAspect: Literal["16:9", "9:16", "1:1"] = "9:16"
+    voiceName: str = Field(default="en-US-JennyNeural", min_length=1, max_length=120)
+    videoConcatMode: Literal["random", "sequential"] = "random"
+    videoClipDuration: int = Field(default=5, ge=1, le=10)
+    outputCount: int = Field(default=1, ge=1, le=4)
+    inputAssetVersionIds: List[str] = Field(default_factory=list, max_length=20)
+    idempotencyKey: UUID
+    capabilitySnapshotHash: str = Field(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    expectedProjectRevision: int = Field(..., ge=0)
+    confirmExternalGeneration: Literal[True]
+
+    @field_validator("videoSubject", "voiceName")
+    @classmethod
+    def reject_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("value must not be blank")
+        return stripped
+
+    @field_validator("inputAssetVersionIds")
+    @classmethod
+    def unique_asset_versions(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("input asset version identifiers must not be blank")
+        if len(set(value)) != len(value):
+            raise ValueError("input asset version identifiers must be unique")
+        return value
+
+
+class GenerationWorkerHeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class GenerationWorkerTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[
+        "SUBMITTING", "RUNNING", "INGESTING", "FAILED", "CANCELED", "UNKNOWN", "PARTIAL"
+    ]
+    progress: int = Field(..., ge=0, le=100)
+    message: str = Field(..., min_length=1, max_length=500)
+    upstreamJobId: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    providerArtifactId: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    errorCode: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    errorMessage: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    retryable: bool = False
 
 
 class LoginRequest(BaseModel):

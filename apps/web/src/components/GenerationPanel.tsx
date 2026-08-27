@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
 import { AssetVersionDTO, ProjectDTO } from "@aether/contracts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  DeterministicGenerationAdapter,
   EditorReference,
-  GenerationInput,
-  GenerationTask,
-  preflightGeneration,
+  GenerationApiClient,
+  GenerationCapabilitySnapshot,
+  ServerGenerationRequest,
+  ServerGenerationResult,
+  ServerGenerationStatus,
+  ServerGenerationTask,
 } from "../generation";
 
 interface GenerationPanelProps {
@@ -16,177 +18,223 @@ interface GenerationPanelProps {
   assetVersions: AssetVersionDTO[];
 }
 
-const STATUS_LABEL: Record<string, string> = {
-  DRAFT: "草稿", PREFLIGHT: "预检通过", BLOCKED: "已阻断", QUEUED: "排队中",
-  RUNNING: "生成中", SUCCEEDED: "已完成", FAILED: "失败", CANCELLED: "已取消", EXPIRED: "已过期",
+const STATUS_LABEL: Record<ServerGenerationStatus, string> = {
+  QUEUED: "排队中", SUBMITTING: "提交中", RUNNING: "生成中",
+  INGESTING: "产物入库中", RIGHTS_BLOCKED: "等待权利审核", SUCCEEDED: "权利已允许",
+  FAILED: "失败", CANCELED: "已取消", UNKNOWN: "状态待人工核对", PARTIAL: "部分完成",
 };
+const ACTIVE_STATUSES = new Set<ServerGenerationStatus>(["QUEUED", "SUBMITTING", "RUNNING", "INGESTING"]);
+
+function newIdempotencyKey(): string {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const suffix = Math.random().toString(16).slice(2).padEnd(12, "0").slice(0, 12);
+  return `00000000-0000-4000-8000-${suffix}`;
+}
 
 export function GenerationPanel({ role, tenantId, actorId, project, assetVersions }: GenerationPanelProps) {
-  const storageKey = `aether:generation:v1:${tenantId}:${actorId}`;
-  const [adapter] = useState(() => {
-    try {
-      const value = localStorage.getItem(storageKey);
-      return DeterministicGenerationAdapter.restore(value ? JSON.parse(value) : null);
-    } catch {
-      return new DeterministicGenerationAdapter();
-    }
-  });
+  const api = useMemo(
+    () => new GenerationApiClient("/api", (input, init) => globalThis.fetch(input, init)),
+    [],
+  );
+  const requestSequence = useRef(0);
+  const idempotencyKeyRef = useRef<string | null>(null);
   const [open, setOpen] = useState(false);
+  const [capabilities, setCapabilities] = useState<GenerationCapabilitySnapshot | null>(null);
+  const [tasks, setTasks] = useState<ServerGenerationTask[]>([]);
+  const [references, setReferences] = useState<EditorReference[]>([]);
   const [prompt, setPrompt] = useState("");
-  const [aspectRatio, setAspectRatio] = useState<GenerationInput["aspectRatio"]>("9:16");
-  const [durationSeconds, setDurationSeconds] = useState(10);
+  const [aspect, setAspect] = useState<ServerGenerationRequest["videoAspect"]>("9:16");
+  const [voiceName, setVoiceName] = useState("en-US-JennyNeural");
+  const [concatMode, setConcatMode] = useState<ServerGenerationRequest["videoConcatMode"]>("random");
+  const [clipDuration, setClipDuration] = useState(5);
   const [outputCount, setOutputCount] = useState(1);
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
-  const [rightsSnapshotId, setRightsSnapshotId] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
+  const [preflightBody, setPreflightBody] = useState<ServerGenerationRequest | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const [preflightReady, setPreflightReady] = useState(false);
-  const [tasks, setTasks] = useState<GenerationTask[]>(() => adapter.list());
-  const [references, setReferences] = useState<EditorReference[]>(() => adapter.listEditorReferences());
-  const clientRequestIdRef = useRef<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const availableAssets = useMemo(
+    () => assetVersions.filter((version) => version.projectId === project?.id),
+    [assetVersions, project?.id],
+  );
+  const invalidatePreflight = () => {
+    setPreflightBody(null);
+    idempotencyKeyRef.current = null;
+  };
+
+  const loadServerState = useCallback(async (silent = false) => {
+    const projectId = project?.id;
+    const sequence = ++requestSequence.current;
+    if (!projectId) {
+      setTasks([]);
+      setCapabilities(null);
+      return;
+    }
+    if (!silent) setBusy(true);
+    try {
+      const [nextCapabilities, nextTasks] = await Promise.all([api.capabilities(), api.list(projectId)]);
+      if (sequence !== requestSequence.current || projectId !== project?.id) return;
+      setCapabilities(nextCapabilities);
+      setTasks(nextTasks);
+      if (!silent && !nextCapabilities.enabled) setMessage("真实生成 Provider 当前保持禁用；只能查看既有服务端任务。");
+    } catch (error) {
+      if (sequence === requestSequence.current && !silent) setMessage(error instanceof Error ? error.message : "无法读取生成任务。");
+    } finally {
+      if (!silent && sequence === requestSequence.current) setBusy(false);
+    }
+  }, [api, project?.id]);
 
   useEffect(() => {
-    setPreflightReady(false);
-    setMessage(project?.id ? "项目已切换，请重新预检生成参数。" : null);
+    invalidatePreflight();
     setSelectedAssetIds([]);
-    clientRequestIdRef.current = null;
-  }, [project?.id]);
+    setReferences([]);
+    setMessage(project?.id ? "已切换项目，正在从服务端恢复任务状态。" : null);
+    void loadServerState();
+    return () => { requestSequence.current += 1; };
+  }, [loadServerState, project?.id]);
 
-  const availableAssets = useMemo(() => assetVersions.filter((version) => version.projectId === project?.id), [assetVersions, project?.id]);
-  const input = (): GenerationInput => ({
-    tenantId,
-    projectId: project?.id || "",
-    prompt,
-    inputAssetIds: selectedAssetIds,
-    aspectRatio,
-    durationMs: durationSeconds * 1000,
-    outputCount,
-    rightsSnapshotIds: rightsSnapshotId.trim() ? [rightsSnapshotId.trim()] : [],
-    role,
-    quotaAvailable: true,
-    expectedRevision: project?.revision,
-    currentRevision: project?.revision,
-  });
+  useEffect(() => {
+    if (!open || !project?.id || !tasks.some((task) => ACTIVE_STATUSES.has(task.status))) return undefined;
+    const timer = window.setInterval(() => { void loadServerState(true); }, 3000);
+    return () => window.clearInterval(timer);
+  }, [loadServerState, open, project?.id, tasks]);
 
-  const refresh = () => {
-    setTasks(adapter.list());
-    setReferences(adapter.listEditorReferences());
-    localStorage.setItem(storageKey, JSON.stringify(adapter.snapshot()));
+  const buildRequest = (): ServerGenerationRequest | null => {
+    if (!project || !capabilities || !confirmed) return null;
+    idempotencyKeyRef.current ||= newIdempotencyKey();
+    return {
+      videoSubject: prompt.trim(), videoAspect: aspect, voiceName,
+      videoConcatMode: concatMode, videoClipDuration: clipDuration, outputCount,
+      inputAssetVersionIds: selectedAssetIds,
+      idempotencyKey: idempotencyKeyRef.current,
+      capabilitySnapshotHash: capabilities.snapshotHash,
+      expectedProjectRevision: project.revision, confirmExternalGeneration: true,
+    };
   };
 
-  const preflight = () => {
-    const result = preflightGeneration(input());
-    setPreflightReady(result.allowed);
-    setMessage(result.allowed ? "预检通过：可提交本地确定性生成任务。" : `预检阻断：${result.errors.join("、")}`);
-    if (result.allowed && !clientRequestIdRef.current) {
-      clientRequestIdRef.current = `generation-${project?.id}-${Date.now()}`;
+  const preflight = async () => {
+    const body = buildRequest();
+    if (!body || !project) {
+      setMessage("请填写生成主题、确认外部生成边界，并等待能力快照载入。");
+      return;
     }
-  };
-
-  const submit = () => {
-    if (!preflightReady || !clientRequestIdRef.current) return;
+    setBusy(true);
     try {
-      const task = adapter.submit(input(), clientRequestIdRef.current, actorId);
-      refresh();
-      setMessage(`任务 ${task.id} 已进入本地队列；重复点击不会创建第二个任务。`);
+      await api.validate(project.id, body);
+      setPreflightBody(body);
+      setMessage("服务端预检通过：可创建受治理生成任务。");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "任务提交失败。");
+      invalidatePreflight();
+      setMessage(error instanceof Error ? error.message : "服务端预检失败。");
+    } finally {
+      setBusy(false);
     }
   };
 
-  const run = (task: GenerationTask) => {
-    adapter.start(task.id, actorId);
-    adapter.complete(task.id, task.attempt, tenantId, project?.id || "", actorId);
-    refresh();
-    setMessage("本地确定性任务完成，结果等待人工审阅。未写入最终时间线。");
-  };
-
-  const cancel = (taskId: string) => {
-    adapter.cancel(taskId, actorId);
-    refresh();
-  };
-
-  const retry = (taskId: string) => {
-    adapter.retry(taskId, actorId);
-    refresh();
-  };
-
-  const enterEditor = (task: GenerationTask, resultId: string) => {
+  const submit = async () => {
+    if (!project || !preflightBody || !idempotencyKeyRef.current) return;
+    setBusy(true);
     try {
-      adapter.reviewResult(task.id, resultId, tenantId, project?.id || "", actorId);
-      refresh();
-      setMessage("已创建受治理的素材版本引用；未自动采纳，也未写入最终时间线。");
+      const task = await api.create(project.id, preflightBody);
+      setTasks((previous) => [task, ...previous.filter((candidate) => candidate.taskId !== task.taskId)]);
+      setMessage(`任务 ${task.taskId} 已进入服务端队列；重复提交使用同一幂等键。`);
+      invalidatePreflight();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "结果审阅失败。");
+      setMessage(error instanceof Error ? error.message : "生成任务创建失败。");
+    } finally {
+      setBusy(false);
     }
   };
 
-  if (role === "viewer") {
-    return <section className="generation-entry"><div><strong>AI 受治理生成</strong><span>当前为只读权限，可查看任务但不能创建、取消、重试或采纳。</span></div></section>;
-  }
+  const mutateTask = async (taskId: string, action: "cancel" | "retry") => {
+    if (!project) return;
+    setBusy(true);
+    try {
+      const task = action === "cancel" ? await api.cancel(project.id, taskId) : await api.retry(project.id, taskId);
+      setTasks((previous) => previous.map((candidate) => candidate.taskId === taskId ? task : candidate));
+      setMessage(action === "cancel" ? "取消意图已由服务端持久化。" : "已追加新的重试 attempt；历史记录保持不变。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "任务操作失败。");
+    } finally {
+      setBusy(false);
+    }
+  };
 
-  if (!open) {
-    return (
-      <section className="generation-entry">
-        <div><strong>AI 受治理生成</strong><span>本阶段仅使用 deterministic fake/local adapter，不调用真实模型。</span></div>
-        <button type="button" disabled={!project} onClick={() => setOpen(true)}>打开生成任务</button>
-      </section>
-    );
-  }
+  const createEditorReference = (task: ServerGenerationTask, result: ServerGenerationResult) => {
+    if (!project || !result.rights.allowed) {
+      setMessage(`权利检查阻断：${result.rights.code}。不会写入剪辑引用或时间线。`);
+      return;
+    }
+    setReferences((previous) => previous.some((reference) => reference.resultId === result.assetVersionId) ? previous : [...previous, {
+      id: `editor-reference-${result.assetVersionId}`, projectId: project.id,
+      assetVersionId: result.assetVersionId, resultId: result.assetVersionId,
+      adopted: false, createdAt: new Date().toISOString(),
+    }]);
+    setMessage(`已为任务 ${task.taskId} 创建 adopted=false 的剪辑引用；未写入最终时间线、渲染或发布。`);
+  };
 
-  return (
-    <section className="generation-panel" aria-label="AI 受治理生成任务">
-      <div className="generation-heading">
-        <div><strong>IM9–IM11 · 生成请求、任务中心与结果审阅</strong><span>项目：{project?.name || "未选择"}</span></div>
-        <button type="button" className="secondary" onClick={() => setOpen(false)}>收起</button>
-      </div>
-      <div className="generation-grid">
-        <fieldset>
-          <legend>生成请求</legend>
-          <label>提示词<textarea aria-label="生成提示词" value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreflightReady(false); }} /></label>
-          <label>目标比例<select aria-label="目标比例" value={aspectRatio} onChange={(event) => { setAspectRatio(event.target.value as GenerationInput["aspectRatio"]); setPreflightReady(false); }}><option>9:16</option><option>16:9</option><option>1:1</option></select></label>
-          <label>时长（秒）<input aria-label="生成时长" type="number" min="1" max="60" value={durationSeconds} onChange={(event) => { setDurationSeconds(Number(event.target.value)); setPreflightReady(false); }} /></label>
-          <label>输出数量<input aria-label="输出数量" type="number" min="1" max="4" value={outputCount} onChange={(event) => { setOutputCount(Number(event.target.value)); setPreflightReady(false); }} /></label>
-          <label>权利快照编号<input aria-label="权利快照编号" value={rightsSnapshotId} onChange={(event) => { setRightsSnapshotId(event.target.value); setPreflightReady(false); }} placeholder="必填，例如 rights-123" /></label>
-        </fieldset>
-        <fieldset>
-          <legend>参考素材（可选）</legend>
-          {availableAssets.length === 0 && <span>当前项目暂无可引用素材版本。</span>}
-          {availableAssets.map((version) => (
-            <label key={version.id}><input type="checkbox" aria-label={`参考素材 ${version.id}`} checked={selectedAssetIds.includes(version.id)} onChange={(event) => { setSelectedAssetIds((previous) => event.target.checked ? [...previous, version.id] : previous.filter((id) => id !== version.id)); setPreflightReady(false); }} />版本 {version.versionNo} · {version.sha256.slice(0, 12)}</label>
-          ))}
-          <p>模型能力：本地确定性占位器</p>
-          <p>不会访问第三方 API、不会产生费用。</p>
-        </fieldset>
-        <fieldset>
-          <legend>预检与提交</legend>
-          <button type="button" onClick={preflight}>执行生成预检</button>
-          <button type="button" disabled={!preflightReady} onClick={submit}>提交生成</button>
-          <p>状态：{preflightReady ? "预检通过" : "等待预检"}</p>
-          {message && <div role="status">{message}</div>}
-        </fieldset>
-      </div>
-      <div className="generation-task-center">
-        <h3>任务中心</h3>
-        {tasks.length === 0 && <p>暂无生成任务。</p>}
-        {tasks.map((task) => (
-          <article key={task.id}>
-            <div><strong>{task.id}</strong><span>{STATUS_LABEL[task.status] || task.status} · attempt {task.attempt} · {task.progress}%</span></div>
-            <div className="generation-actions">
-              {task.status === "QUEUED" && <button type="button" onClick={() => run(task)}>运行本地任务</button>}
-              {["QUEUED", "RUNNING"].includes(task.status) && <button type="button" onClick={() => cancel(task.id)}>取消</button>}
-              {task.status === "FAILED" && !task.errorCode?.startsWith("NON_RETRYABLE_") && <button type="button" onClick={() => retry(task.id)}>重试</button>}
-            </div>
-            {task.results.map((result) => (
-              <div className="generation-result" key={result.id}>
-                <span>{result.mimeType} · {result.width}×{result.height} · {result.checksum.slice(0, 12)}</span>
-                <span>来源：{result.provenance}</span>
-                <button type="button" onClick={() => enterEditor(task, result.id)}>进入剪辑</button>
-              </div>
-            ))}
-          </article>
-        ))}
-      </div>
-      {references.length > 0 && <p className="generation-boundary">已创建 {references.length} 个受治理引用；全部 adopted=false，未写入最终时间线。</p>}
-    </section>
-  );
+  const renderTasks = (readOnly: boolean) => <div className="generation-task-center">
+    <h3>服务端任务中心</h3>
+    {tasks.length === 0 && <p>暂无生成任务。</p>}
+    {tasks.map((task) => <article key={task.taskId}>
+      <div><strong>{task.taskId}</strong><span>{STATUS_LABEL[task.status]} · attempt {task.attempt}/{task.maxAttempts} · {task.progress}%</span></div>
+      <p>{task.message}</p>
+      {!readOnly && <div className="generation-actions">
+        {ACTIVE_STATUSES.has(task.status) && <button type="button" disabled={busy} onClick={() => void mutateTask(task.taskId, "cancel")}>取消</button>}
+        {["FAILED", "PARTIAL"].includes(task.status) && !task.errorCode?.startsWith("NON_RETRYABLE_") && <button type="button" disabled={busy} onClick={() => void mutateTask(task.taskId, "retry")}>重试</button>}
+      </div>}
+      {task.errorCode && <p>错误：{task.errorCode} · {task.errorMessage}</p>}
+      {task.results.map((result) => <div className="generation-result" key={result.assetVersionId}>
+        <span>{result.contentType} · {result.checksum.slice(0, 12)} · {result.rights.code}</span>
+        <span>来源任务：{String(result.provenance.generationTaskId || task.taskId)}</span>
+        {!readOnly && <button type="button" disabled={!result.rights.allowed} onClick={() => createEditorReference(task, result)}>用于快速制作</button>}
+      </div>)}
+    </article>)}
+  </div>;
+
+  if (role === "viewer") return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
+    <div><strong>AI 受治理生成</strong><span>当前为只读权限；任务来自服务端，不提供创建、取消、重试或采纳操作。</span></div>
+    {renderTasks(true)}
+  </section>;
+
+  if (!open) return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
+    <div><strong>AI 受治理生成</strong><span>任务状态由服务端持久化；真实 Provider 默认保持禁用。</span></div>
+    <button type="button" disabled={!project} onClick={() => setOpen(true)}>打开生成任务</button>
+  </section>;
+
+  return <section className="generation-panel" aria-label="AI 受治理生成任务" data-tenant={tenantId} data-actor={actorId}>
+    <div className="generation-heading">
+      <div><strong>IM12–IM14 · 服务端受治理生成桥接</strong><span>项目：{project?.name || "未选择"}</span></div>
+      <button type="button" className="secondary" onClick={() => setOpen(false)}>收起</button>
+    </div>
+    <div className="generation-grid">
+      <fieldset disabled={busy || !capabilities?.enabled}>
+        <legend>生成请求</legend>
+        <label>生成主题<textarea aria-label="生成主题" maxLength={500} value={prompt} onChange={(event) => { setPrompt(event.target.value); invalidatePreflight(); }} /></label>
+        <label>目标比例<select aria-label="目标比例" value={aspect} onChange={(event) => { setAspect(event.target.value as ServerGenerationRequest["videoAspect"]); invalidatePreflight(); }}>{(capabilities?.videoAspects || ["9:16"]).map((value) => <option key={value}>{value}</option>)}</select></label>
+        <label>声音<select aria-label="声音" value={voiceName} onChange={(event) => { setVoiceName(event.target.value); invalidatePreflight(); }}>{(capabilities?.voices || [voiceName]).map((value) => <option key={value}>{value}</option>)}</select></label>
+        <label>拼接模式<select aria-label="拼接模式" value={concatMode} onChange={(event) => { setConcatMode(event.target.value as ServerGenerationRequest["videoConcatMode"]); invalidatePreflight(); }}><option value="random">随机</option><option value="sequential">顺序</option></select></label>
+        <label>单片段时长（秒）<input aria-label="单片段时长" type="number" min="1" max="10" value={clipDuration} onChange={(event) => { setClipDuration(Number(event.target.value)); invalidatePreflight(); }} /></label>
+        <label>输出数量<input aria-label="输出数量" type="number" min="1" max={capabilities?.maxOutputs || 1} value={outputCount} onChange={(event) => { setOutputCount(Number(event.target.value)); invalidatePreflight(); }} /></label>
+      </fieldset>
+      <fieldset disabled={busy || !capabilities?.enabled}>
+        <legend>参考素材与确认</legend>
+        {availableAssets.length === 0 && <span>当前项目暂无可选素材版本。</span>}
+        {availableAssets.map((version) => <label key={version.id}><input type="checkbox" checked={selectedAssetIds.includes(version.id)} onChange={(event) => { setSelectedAssetIds((previous) => event.target.checked ? [...previous, version.id] : previous.filter((id) => id !== version.id)); invalidatePreflight(); }} />版本 {version.versionNo} · {version.sha256.slice(0, 12)}</label>)}
+        <label><input aria-label="确认外部生成边界" type="checkbox" checked={confirmed} onChange={(event) => { setConfirmed(event.target.checked); invalidatePreflight(); }} />确认任务只进入受治理队列，结果默认受权利阻断。</label>
+        <p>Provider：{capabilities?.mode || "载入中"} · {capabilities?.sourceVersion || "未知"}</p>
+      </fieldset>
+      <fieldset>
+        <legend>预检与提交</legend>
+        <button type="button" disabled={busy || !capabilities?.enabled || !prompt.trim() || !confirmed} onClick={() => void preflight()}>执行服务端预检</button>
+        <button type="button" disabled={busy || !preflightBody} onClick={() => void submit()}>提交生成</button>
+        <button type="button" className="secondary" disabled={busy || !project} onClick={() => void loadServerState()}>刷新任务</button>
+        <p>状态：{preflightBody ? "预检通过" : "等待预检"}</p>
+        {message && <div role="status">{message}</div>}
+      </fieldset>
+    </div>
+    {renderTasks(false)}
+    {references.length > 0 && <p className="generation-boundary">已创建 {references.length} 个受治理引用；全部 adopted=false，未写入最终时间线。</p>}
+  </section>;
 }

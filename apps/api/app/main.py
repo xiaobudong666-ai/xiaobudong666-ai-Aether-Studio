@@ -52,6 +52,9 @@ from .models import (
     DBAssetVersion,
     DBCandidate,
     DBExternalTask,
+    DBGenerationAttempt,
+    DBGenerationEvent,
+    DBGenerationTask,
     DBMasterRevision,
     DBProject,
     DBRenderTask,
@@ -61,11 +64,27 @@ from .models import (
     DBUser,
 )
 from .moneyprinter_adapter import MoneyPrinterTurboAdapter
+from .generation_tasks import (
+    ACTIVE_GENERATION_STATES,
+    RETRYABLE_GENERATION_STATES,
+    TERMINAL_GENERATION_STATES,
+    WORKER_TRANSITIONS,
+    add_event as add_generation_event,
+    build_capability_snapshot,
+    capability_snapshot_valid,
+    current_attempt as current_generation_attempt,
+    request_hash as generation_request_hash,
+    safe_error_message,
+    task_response as generation_task_response,
+)
 from .schemas import (
     AdoptCandidateRequest,
     CreateProjectRequest,
     CreateRightsSnapshotRequest,
     CreateUserRequest,
+    GenerationTaskRequest,
+    GenerationWorkerHeartbeatRequest,
+    GenerationWorkerTransitionRequest,
     LoginRequest,
     MoneyPrinterGenerateRequest,
     ProjectResponse,
@@ -280,6 +299,7 @@ def create_app(
     worker_token: str | None = None,
     cookie_secure: bool | None = None,
     enforce_csrf: bool | None = None,
+    generation_provider_mode: str | None = None,
 ) -> FastAPI:
     del render_step_delay  # retained for backwards-compatible test construction
     internal_sessions = sessionmaker(autocommit=False, autoflush=False, bind=app_engine)
@@ -288,7 +308,17 @@ def create_app(
     resolved_enforce_csrf = enforce_csrf if enforce_csrf is not None else os.environ.get("AETHER_ENFORCE_CSRF", "true").lower() == "true"
     session_hours = max(1, int(os.environ.get("AETHER_SESSION_HOURS", "12")))
     lease_seconds = max(15, int(os.environ.get("AETHER_TASK_LEASE_SECONDS", "60")))
-    max_upload_bytes = int(os.environ.get("AETHER_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
+    max_upload_bytes = min(
+        2 * 1024**3,
+        int(os.environ.get("AETHER_MAX_UPLOAD_BYTES", str(2 * 1024**3))),
+    )
+    resolved_generation_provider_mode = (
+        generation_provider_mode
+        if generation_provider_mode is not None
+        else os.environ.get("AETHER_GENERATION_PROVIDER_MODE", "disabled")
+    )
+    if resolved_generation_provider_mode not in {"disabled", "deterministic-fake"}:
+        resolved_generation_provider_mode = "disabled"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -313,6 +343,10 @@ def create_app(
     created_app = FastAPI(title="Aether Studio 接口服务", version="1.1.0", lifespan=lifespan)
     created_app.state.moneyprinter = MoneyPrinterTurboAdapter()
     created_app.state.video_use = video_use_adapter or VideoUseAdapter()
+    created_app.state.generation_provider_mode = resolved_generation_provider_mode
+    created_app.state.generation_capability_snapshot = build_capability_snapshot(
+        resolved_generation_provider_mode
+    )
     created_app.state.setup_required = False
 
     origins = [
@@ -396,6 +430,90 @@ def create_app(
         return db.execute(
             query.order_by(DBRightsSnapshot.captured_at.desc()).limit(1)
         ).scalar_one_or_none()
+
+    def generation_rights(db: Session, task: DBGenerationTask) -> dict:
+        if not task.asset_version_id:
+            return {"allowed": False, "code": "RIGHTS_MISSING"}
+        return rights_decision(
+            latest_rights_snapshot(db, task.asset_version_id, "EXPORT"),
+            utc_now(),
+        )
+
+    def generation_task_for_tenant(
+        db: Session,
+        project_id: str,
+        task_id: str,
+        context: AuthContext,
+    ) -> DBGenerationTask:
+        task = db.execute(
+            select(DBGenerationTask).where(
+                DBGenerationTask.id == task_id,
+                DBGenerationTask.project_id == project_id,
+                DBGenerationTask.tenant_id == context.tenant_id,
+            )
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"},
+            )
+        return task
+
+    def current_generation_capabilities(*, refresh: bool = False) -> dict:
+        snapshot = created_app.state.generation_capability_snapshot
+        expires_at = datetime.datetime.fromisoformat(
+            str(snapshot["expiresAt"]).replace("Z", "+00:00")
+        )
+        if refresh or utc_now() >= expires_at:
+            snapshot = build_capability_snapshot(created_app.state.generation_provider_mode)
+            created_app.state.generation_capability_snapshot = snapshot
+        return snapshot
+
+    def validate_generation_request(
+        db: Session,
+        project: DBProject,
+        req: GenerationTaskRequest,
+        context: AuthContext,
+    ) -> dict:
+        if project.revision != req.expectedProjectRevision:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROJECT_REVISION_CONFLICT", "message": "项目版本已变化，请重新预检"},
+            )
+        snapshot = current_generation_capabilities()
+        valid, code = capability_snapshot_valid(
+            snapshot, req.capabilitySnapshotHash, utc_now()
+        )
+        if not valid:
+            status_code = 503 if code in {"PROVIDER_DISABLED", "PROVIDER_UNHEALTHY"} else 409
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": code, "message": "生成服务能力快照不可用，请重新预检"},
+            )
+        if req.voiceName not in snapshot["voices"]:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "VOICE_UNSUPPORTED", "message": "所选声音不在当前能力范围内"},
+            )
+        if req.outputCount > int(snapshot["maxOutputs"]):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "OUTPUT_COUNT_UNSUPPORTED", "message": "输出数量超过当前 Provider 能力"},
+            )
+        if req.inputAssetVersionIds:
+            count = db.execute(
+                select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.id.in_(req.inputAssetVersionIds),
+                    DBAssetVersion.project_id == project.id,
+                    DBAssetVersion.tenant_id == context.tenant_id,
+                )
+            ).scalar_one()
+            if count != len(req.inputAssetVersionIds):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "INPUT_ASSET_SCOPE_INVALID", "message": "参考素材版本不存在或不属于当前项目"},
+                )
+        return snapshot
 
     def refresh_quota_period(db: Session, tenant: DBTenant) -> bool:
         period = utc_now().strftime("%Y-%m")
@@ -516,6 +634,539 @@ def create_app(
         task.updated_at = utc_now()
         db.commit()
         return payload
+
+    @created_app.get("/generation/providers/moneyprinter/capabilities")
+    def generation_capabilities(
+        _context: AuthContext = Depends(context_dependency),
+    ):
+        return current_generation_capabilities()
+
+    @created_app.post("/projects/{project_id}/generation-tasks/validate")
+    def validate_generation_task(
+        project_id: str,
+        req: GenerationTaskRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        project = project_for_tenant(db, project_id, context)
+        snapshot = validate_generation_request(db, project, req, context)
+        return {
+            "allowed": True,
+            "status": "PREFLIGHT",
+            "capabilitySnapshotHash": snapshot["snapshotHash"],
+            "projectRevision": project.revision,
+        }
+
+    @created_app.post("/projects/{project_id}/generation-tasks", status_code=202)
+    def create_generation_task(
+        project_id: str,
+        req: GenerationTaskRequest,
+        idempotency_key_header: str | None = Header(default=None, alias="Idempotency-Key", min_length=8, max_length=128),
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        begin_serialized_write(db)
+        project = project_for_tenant(db, project_id, context)
+        idempotency_key = str(req.idempotencyKey)
+        if idempotency_key_header is not None and idempotency_key_header != idempotency_key:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "IDEMPOTENCY_KEY_MISMATCH", "message": "请求体与请求头的幂等键不一致"},
+            )
+        payload = req.model_dump(mode="json")
+        payload_hash = generation_request_hash(payload)
+        existing = db.execute(
+            select(DBGenerationTask).where(
+                DBGenerationTask.tenant_id == context.tenant_id,
+                DBGenerationTask.idempotency_key == idempotency_key,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if existing.project_id != project_id or existing.request_hash != payload_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "IDEMPOTENCY_KEY_REUSED", "message": "该幂等键已用于不同生成请求"},
+                )
+            return generation_task_response(
+                db, existing, rights=generation_rights(db, existing), include_history=True
+            )
+        snapshot = validate_generation_request(db, project, req, context)
+        now = utc_now()
+        task = DBGenerationTask(
+            id=str(uuid.uuid4()),
+            tenant_id=context.tenant_id,
+            project_id=project_id,
+            requested_by=context.user_id,
+            provider="moneyprinter",
+            status="QUEUED",
+            progress=0,
+            message="生成任务已进入受治理队列",
+            request_json=payload,
+            request_hash=payload_hash,
+            capability_snapshot_json=snapshot,
+            capability_snapshot_hash=snapshot["snapshotHash"],
+            idempotency_key=idempotency_key,
+            attempts=1,
+            max_attempts=3,
+            created_at=now,
+            updated_at=now,
+        )
+        attempt = DBGenerationAttempt(
+            id=str(uuid.uuid4()),
+            generation_task_id=task.id,
+            attempt_no=1,
+            status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED",
+            created_at=now,
+        )
+        db.add_all([task, attempt])
+        add_generation_event(
+            db, task, attempt=attempt, event_type="TASK_CREATED",
+            actor_type="USER", actor_id=context.user_id, to_status="QUEUED", now=now,
+        )
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            concurrent = db.execute(
+                select(DBGenerationTask).where(
+                    DBGenerationTask.tenant_id == context.tenant_id,
+                    DBGenerationTask.idempotency_key == idempotency_key,
+                )
+            ).scalar_one_or_none()
+            if concurrent is not None and concurrent.project_id == project_id and concurrent.request_hash == payload_hash:
+                return generation_task_response(
+                    db, concurrent, rights=generation_rights(db, concurrent), include_history=True
+                )
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_CREATE_CONFLICT", "message": "生成任务发生并发冲突"},
+            ) from exc
+        return generation_task_response(
+            db, task, rights=generation_rights(db, task), include_history=True
+        )
+
+    @created_app.get("/projects/{project_id}/generation-tasks")
+    def list_generation_tasks(
+        project_id: str,
+        cursor: int = Query(default=0, ge=0),
+        pageSize: int = Query(default=20, ge=1, le=100),
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        project_for_tenant(db, project_id, context)
+        rows = list(db.execute(
+            select(DBGenerationTask)
+            .where(
+                DBGenerationTask.project_id == project_id,
+                DBGenerationTask.tenant_id == context.tenant_id,
+            )
+            .order_by(DBGenerationTask.created_at.desc(), DBGenerationTask.id.desc())
+            .offset(cursor)
+            .limit(pageSize + 1)
+        ).scalars())
+        has_more = len(rows) > pageSize
+        items = rows[:pageSize]
+        return {
+            "items": [
+                generation_task_response(db, task, rights=generation_rights(db, task))
+                for task in items
+            ],
+            "nextCursor": cursor + pageSize if has_more else None,
+        }
+
+    @created_app.get("/projects/{project_id}/generation-tasks/{task_id}")
+    def get_generation_task(
+        project_id: str,
+        task_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        project_for_tenant(db, project_id, context)
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        return generation_task_response(
+            db, task, rights=generation_rights(db, task), include_history=True
+        )
+
+    @created_app.post("/projects/{project_id}/generation-tasks/{task_id}/cancel")
+    def cancel_generation_task(
+        project_id: str,
+        task_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        if task.cancel_requested_at is None and task.status not in TERMINAL_GENERATION_STATES:
+            now = utc_now()
+            previous = task.status
+            attempt = current_generation_attempt(db, task)
+            task.cancel_requested_at = now
+            task.status = "CANCELED"
+            task.message = "生成任务已取消"
+            task.completed_at = now
+            task.updated_at = now
+            task.lease_owner = None
+            task.lease_expires_at = None
+            attempt.status = "CANCELED"
+            attempt.completed_at = now
+            add_generation_event(
+                db, task, attempt=attempt, event_type="TASK_CANCELED",
+                actor_type="USER", actor_id=context.user_id,
+                from_status=previous, to_status="CANCELED", now=now,
+            )
+            db.commit()
+        return generation_task_response(
+            db, task, rights=generation_rights(db, task), include_history=True
+        )
+
+    @created_app.post("/projects/{project_id}/generation-tasks/{task_id}/retry", status_code=202)
+    def retry_generation_task(
+        project_id: str,
+        task_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        if task.status not in RETRYABLE_GENERATION_STATES or (task.error_code or "").startswith("NON_RETRYABLE_"):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_NOT_RETRYABLE", "message": "当前任务状态不可重试"},
+            )
+        if task.attempts >= task.max_attempts:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_RETRY_EXHAUSTED", "message": "生成任务已达到最大尝试次数"},
+            )
+        now = utc_now()
+        previous = task.status
+        task.attempts += 1
+        task.status = "QUEUED"
+        task.progress = 0
+        task.message = "生成任务已排队重试"
+        task.upstream_job_id = None
+        task.provider_artifact_id = None
+        task.error_code = None
+        task.error_message = None
+        task.completed_at = None
+        task.lease_owner = None
+        task.lease_expires_at = None
+        task.updated_at = now
+        attempt = DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task.id,
+            attempt_no=task.attempts, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        )
+        db.add(attempt)
+        add_generation_event(
+            db, task, attempt=attempt, event_type="TASK_RETRIED",
+            actor_type="USER", actor_id=context.user_id,
+            from_status=previous, to_status="QUEUED",
+            metadata={"attempt": task.attempts}, now=now,
+        )
+        db.commit()
+        return generation_task_response(
+            db, task, rights=generation_rights(db, task), include_history=True
+        )
+
+    @created_app.post("/internal/generation-tasks/claim")
+    def claim_generation_task(
+        response: Response,
+        x_worker_token: str | None = Header(default=None),
+        x_worker_id: str = Header(default="worker"),
+        db: Session = Depends(db_dependency),
+    ):
+        require_internal_token(x_worker_token)
+        now = utc_now()
+        begin_serialized_write(db)
+        claim_query = (
+            select(DBGenerationTask)
+            .where(
+                DBGenerationTask.status.in_(ACTIVE_GENERATION_STATES),
+                or_(DBGenerationTask.lease_expires_at.is_(None), DBGenerationTask.lease_expires_at < now),
+                DBGenerationTask.cancel_requested_at.is_(None),
+            )
+            .order_by(DBGenerationTask.created_at.asc(), DBGenerationTask.id.asc())
+            .limit(1)
+        )
+        if app_engine.dialect.name != "sqlite":
+            claim_query = claim_query.with_for_update(skip_locked=True)
+        task = db.execute(claim_query).scalar_one_or_none()
+        if task is None:
+            db.rollback()
+            response.status_code = 204
+            return response
+        previous = task.status
+        attempt = current_generation_attempt(db, task)
+        if task.status == "QUEUED" or not task.upstream_job_id:
+            task.status = "SUBMITTING"
+            task.message = "工作节点正在提交生成任务"
+            attempt.status = "SUBMITTING"
+            attempt.submission_started_at = attempt.submission_started_at or now
+        else:
+            task.message = "工作节点正在恢复生成任务"
+        task.started_at = task.started_at or now
+        task.lease_owner = x_worker_id
+        task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
+        task.updated_at = now
+        add_generation_event(
+            db, task, attempt=attempt,
+            event_type="LEASE_RECOVERED" if previous != "QUEUED" else "TASK_CLAIMED",
+            actor_type="WORKER", actor_id=x_worker_id,
+            from_status=previous, to_status=task.status,
+            metadata={"leaseSeconds": lease_seconds}, now=now,
+        )
+        db.commit()
+        return {
+            "taskId": task.id,
+            "projectId": task.project_id,
+            "attempt": task.attempts,
+            "status": task.status,
+            "request": task.request_json,
+            "upstreamJobId": task.upstream_job_id,
+            "providerArtifactId": task.provider_artifact_id,
+            "providerMode": task.capability_snapshot_json.get("mode"),
+            "leaseSeconds": lease_seconds,
+        }
+
+    @created_app.post("/internal/generation-tasks/{task_id}/heartbeat")
+    def heartbeat_generation_task(
+        task_id: str,
+        _req: GenerationWorkerHeartbeatRequest,
+        x_worker_token: str | None = Header(default=None),
+        x_worker_id: str = Header(default="worker"),
+        db: Session = Depends(db_dependency),
+    ):
+        require_internal_token(x_worker_token)
+        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+        now = utc_now()
+        if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
+            raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
+        task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
+        task.updated_at = now
+        db.commit()
+        return {"taskId": task.id, "leaseExpiresAt": iso_utc(task.lease_expires_at)}
+
+    @created_app.post("/internal/generation-tasks/{task_id}/transition")
+    def transition_generation_task(
+        task_id: str,
+        req: GenerationWorkerTransitionRequest,
+        x_worker_token: str | None = Header(default=None),
+        x_worker_id: str = Header(default="worker"),
+        db: Session = Depends(db_dependency),
+    ):
+        require_internal_token(x_worker_token)
+        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+        now = utc_now()
+        if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if task.cancel_requested_at is not None or task.status == "CANCELED":
+            raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到响应已隔离"})
+        if req.status != task.status and req.status not in WORKER_TRANSITIONS.get(task.status, set()):
+            raise HTTPException(status_code=409, detail={"code": "ILLEGAL_GENERATION_TRANSITION", "message": "生成任务状态迁移不合法"})
+        if req.upstreamJobId and task.upstream_job_id and req.upstreamJobId != task.upstream_job_id:
+            raise HTTPException(status_code=409, detail={"code": "UPSTREAM_ID_IMMUTABLE", "message": "上游任务编号不可替换"})
+        previous = task.status
+        attempt = current_generation_attempt(db, task)
+        if req.upstreamJobId:
+            task.upstream_job_id = req.upstreamJobId
+            attempt.upstream_job_id = attempt.upstream_job_id or req.upstreamJobId
+            attempt.reconciliation_state = "SUBMITTED"
+        if req.providerArtifactId:
+            task.provider_artifact_id = req.providerArtifactId
+        task.status = req.status
+        task.progress = req.progress
+        task.message = req.message
+        task.error_code = req.errorCode
+        task.error_message = safe_error_message(req.errorMessage)
+        task.updated_at = now
+        attempt.status = req.status
+        attempt.error_code = req.errorCode
+        attempt.error_message = safe_error_message(req.errorMessage)
+        if req.status == "UNKNOWN":
+            attempt.reconciliation_state = "UNKNOWN"
+        if req.status in {"FAILED", "CANCELED", "UNKNOWN", "PARTIAL"}:
+            if req.status == "FAILED" and not req.retryable and task.error_code:
+                task.error_code = f"NON_RETRYABLE_{task.error_code}"
+                attempt.error_code = task.error_code
+            task.completed_at = now
+            attempt.completed_at = now
+            task.lease_owner = None
+            task.lease_expires_at = None
+        else:
+            task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
+        add_generation_event(
+            db, task, attempt=attempt, event_type="WORKER_TRANSITION",
+            actor_type="WORKER", actor_id=x_worker_id,
+            from_status=previous, to_status=req.status,
+            metadata={"progress": req.progress}, now=now,
+        )
+        db.commit()
+        return {"taskId": task.id, "status": task.status, "progress": task.progress}
+
+    @created_app.post("/internal/generation-tasks/{task_id}/artifact-intake", status_code=201)
+    def intake_generation_artifact(
+        task_id: str,
+        providerArtifactId: str = Form(..., min_length=1, max_length=256),
+        file: UploadFile = File(...),
+        x_worker_token: str | None = Header(default=None),
+        x_worker_id: str = Header(default="worker"),
+        db: Session = Depends(db_dependency),
+    ):
+        require_internal_token(x_worker_token)
+        if any(marker in providerArtifactId for marker in ("://", "..", "\\", "/")):
+            raise HTTPException(status_code=422, detail={"code": "ARTIFACT_ID_INVALID", "message": "产物编号格式不安全"})
+        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+        if task.asset_version_id:
+            completion = db.execute(
+                select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == task.id,
+                    DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+                    DBGenerationEvent.actor_id == x_worker_id,
+                )
+            ).scalar_one_or_none()
+            if task.provider_artifact_id == providerArtifactId and completion is not None:
+                return generation_task_response(db, task, rights=generation_rights(db, task), include_history=True)
+            raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ALREADY_INGESTED", "message": "任务已绑定其他受治理产物"})
+        now = utc_now()
+        if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if task.cancel_requested_at is not None or task.status == "CANCELED":
+            raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
+        if task.status not in {"RUNNING", "INGESTING"}:
+            raise HTTPException(status_code=409, detail={"code": "ARTIFACT_INTAKE_NOT_ALLOWED", "message": "当前状态不允许接收产物"})
+        if file.content_type != "video/mp4":
+            raise HTTPException(status_code=415, detail={"code": "ARTIFACT_CONTENT_TYPE_INVALID", "message": "仅接受受信任的 MP4 字节流"})
+        file.file.seek(0, os.SEEK_END)
+        upload_size = file.file.tell()
+        file.file.seek(0)
+        if upload_size <= 0:
+            raise HTTPException(status_code=422, detail={"code": "EMPTY_UPLOAD", "message": "生成产物为空"})
+        if upload_size > max_upload_bytes:
+            raise HTTPException(status_code=413, detail={"code": "UPLOAD_TOO_LARGE", "message": "生成产物超过系统大小限制"})
+        digest = hashlib.sha256()
+        while chunk := file.file.read(1024 * 1024):
+            digest.update(chunk)
+        file.file.seek(0)
+        reservation = db.execute(
+            update(DBTenant)
+            .where(DBTenant.id == task.tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
+            .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
+        )
+        if reservation.rowcount != 1:
+            db.rollback()
+            raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
+        db.commit()
+        try:
+            uploaded = created_app.state.video_use.upload_media(
+                task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
+            )
+            metadata = uploaded.get("metadata") or {}
+            if not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
+                raise ValueError("generated artifact did not pass media probe")
+            media_id = str(uploaded.get("mediaId") or "")
+            if not media_id or uploaded.get("projectId") != task.project_id:
+                raise ValueError("generated artifact returned invalid media scope")
+            project = db.execute(select(DBProject).where(DBProject.id == task.project_id, DBProject.tenant_id == task.tenant_id)).scalar_one()
+            provenance = {
+                "provider": task.provider,
+                "providerArtifactId": providerArtifactId,
+                "generationTaskId": task.id,
+                "attempt": task.attempts,
+                "capabilitySnapshotHash": task.capability_snapshot_hash,
+            }
+            probe = {**metadata, "provenance": provenance}
+            duration_seconds = float(metadata["durationSeconds"])
+            size_bytes = int(metadata.get("sizeBytes") or upload_size)
+            material = {
+                "id": media_id,
+                "name": uploaded.get("fileName") or f"generation-{task.id}.mp4",
+                "url": f"/api/video-use/media/{task.project_id}/{media_id}",
+                "type": "video",
+                "contentType": "video/mp4",
+                "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
+                "sizeBytes": size_bytes,
+            }
+            if not any(item.get("id") == media_id for item in project.materials):
+                project.materials = [*project.materials, material]
+                project.revision += 1
+                project.updated_at = now
+            next_version = (db.execute(
+                select(func.max(DBAssetVersion.version_no)).where(
+                    DBAssetVersion.project_id == task.project_id,
+                    DBAssetVersion.media_id == media_id,
+                )
+            ).scalar_one_or_none() or 0) + 1
+            asset = DBAssetVersion(
+                id=str(uuid.uuid4()), tenant_id=task.tenant_id, project_id=task.project_id,
+                media_id=media_id, version_no=next_version, sha256=digest.hexdigest(),
+                media_type="video", content_type="video/mp4", size_bytes=size_bytes,
+                probe_json=probe, created_by=task.requested_by, created_at=now,
+            )
+            previous = task.status
+            task.status = "RIGHTS_BLOCKED"
+            task.progress = 100
+            task.message = "生成产物已入库，等待权利审核"
+            task.provider_artifact_id = providerArtifactId
+            task.media_id = media_id
+            task.asset_version_id = asset.id
+            task.completed_at = now
+            task.updated_at = now
+            task.lease_owner = None
+            task.lease_expires_at = None
+            attempt = current_generation_attempt(db, task)
+            attempt.status = "RIGHTS_BLOCKED"
+            attempt.reconciliation_state = "ARTIFACT_INGESTED"
+            attempt.completed_at = now
+            db.add(asset)
+            add_generation_event(
+                db, task, attempt=attempt, event_type="ARTIFACT_INGESTED",
+                actor_type="WORKER", actor_id=x_worker_id,
+                from_status=previous, to_status="RIGHTS_BLOCKED",
+                metadata={"assetVersionId": asset.id, "sha256": asset.sha256, "sizeBytes": size_bytes}, now=now,
+            )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
+            failed_task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one()
+            failed_attempt = current_generation_attempt(db, failed_task)
+            failed_task.status = "FAILED"
+            failed_task.error_code = "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED" if isinstance(exc, ValueError) else "ARTIFACT_INGEST_FAILED"
+            failed_task.error_message = "生成产物未通过受治理媒体校验" if isinstance(exc, ValueError) else "生成产物入库失败"
+            failed_task.completed_at = utc_now()
+            failed_task.updated_at = failed_task.completed_at
+            failed_task.lease_owner = None
+            failed_task.lease_expires_at = None
+            failed_attempt.status = "FAILED"
+            failed_attempt.error_code = failed_task.error_code
+            failed_attempt.error_message = failed_task.error_message
+            failed_attempt.completed_at = failed_task.completed_at
+            add_generation_event(
+                db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
+                actor_type="SYSTEM", actor_id="api", from_status=task.status,
+                to_status="FAILED", metadata={"compensatedQuotaBytes": upload_size}, now=failed_task.completed_at,
+            )
+            db.commit()
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=422, detail={"code": "ARTIFACT_VALIDATION_FAILED", "message": "生成产物未通过媒体校验"}) from exc
+            if isinstance(exc, VideoUseError):
+                raise HTTPException(status_code=502, detail={"code": "ARTIFACT_STORE_FAILED", "message": "生成产物存储失败"}) from exc
+            raise
+        finally:
+            file.file.close()
+        return generation_task_response(db, task, rights=generation_rights(db, task), include_history=True)
 
     @created_app.get("/video-use/health")
     def video_use_health():
