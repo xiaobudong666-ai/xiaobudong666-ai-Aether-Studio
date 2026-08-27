@@ -19,9 +19,12 @@
 - [x] IM12–IM14 each have a bounded responsibility.
 - [x] API, fields, state transitions, permissions, data model and module interactions are defined.
 - [x] Idempotency, leases, retry, cancellation, ambiguous response and restart recovery are defined.
+- [x] Internal Worker claim, heartbeat, transition and multipart artifact-intake contracts are defined.
+- [x] Worker-to-API authority is explicit; Worker direct database writes are prohibited.
+- [x] Immutable attempt records and append-only sanitized task events are defined.
 - [x] Trusted source, streaming limit, quota, probe, checksum, transaction and cleanup controls are defined.
 - [x] Rights default-deny and no-auto-adoption/timeline/render invariants are defined.
-- [x] 36 executable acceptance cases are enumerated.
+- [x] 40 executable acceptance cases are enumerated.
 - [x] Exact allowed coding files and stop conditions are enumerated.
 - [x] Real provider activation, credentials, paid calls, dependencies and deployment remain prohibited.
 
@@ -32,4 +35,3 @@ This package adds five documentation files. It does not modify code, dependencie
 ## Verification limitation
 
 No functional test passage or provider operation is claimed because implementation has not started. Formal review, merge, coding, functional review, activation and deployment remain separate gates.
-
