@@ -39,6 +39,7 @@
 - 上游 `config.example.toml` 在 `[app]` 中保存 LLM Provider、模型、素材源以及对应 API Key；Pexels/Pixabay 和选定 LLM 可能分别需要凭据。
 - 上游 `docker-compose.yml` 通过把源码目录挂载到容器来提供 `config.toml`；Aether 当前镜像没有等价的目标秘密挂载。
 - 固定版本的 `app/controllers/v1/video.py` 使用无鉴权 router；因此不能把 Sidecar 接口暴露给 API、Web、宿主公网或其他不需要访问的服务。
+- 固定版本完成任务后把产物 URL 解析到 `/tasks/...`。当前 Aether Adapter 默认只信任 `/artifacts/` 与 `/api/v1/artifacts/`；金丝雀的已发布非秘密 policy 必须精确使用 `artifactPathPrefixes=["/tasks/"]`，不得放宽为 `/`。
 - 固定版本会在普通日志中记录任务参数和主题；真实金丝雀只能使用非敏感合成提示，运行配置必须把上游日志级别限制为 `WARNING`，证据采集不得包含原始提示或原始响应。
 - 固定版本的默认跨平台自动发布为关闭；金丝雀必须继续明确关闭所有自动发布能力。
 
@@ -65,6 +66,7 @@
 - **不保存秘密摘要**：不得把秘密文件哈希、长度、键名列表、路径、mtime 或内容写入数据库、事件、DTO、浏览器和普通证据；只允许公开 `credentialState=PRESENT|ABSENT|INVALID`。
 - **双网络隔离**：Worker 与 Sidecar 共享 `provider-control` 内部网络；Sidecar 独占 `provider-egress` 外联网络；其他服务不连接这两个网络。
 - **单向业务边界**：只有 Worker Adapter 能访问 Sidecar；API 继续只做任务、租约、治理、用量和产物入库权威。
+- **固定产物合同**：上游 `endpoint` 必须为空以保持 Sidecar 同源 URL，`material_directory="task"`，已发布 Aether policy 必须精确允许 `/tasks/` 且继续执行同源、单产物、字节/类型限制；配置或 policy 任一不匹配均 fail closed。
 - **真实金丝雀只允许一次**：一次授权对应一个租户、一个项目、一个已发布配置版本、一个非敏感合成主题、一个请求、一个输出和最多十秒预算。
 - **先停机、后配置、再短时启用**：初始 kill switch 必须为 `DISABLED`；完成预检后才可恢复，结束或任一异常立即重新停机并把 operator mode 恢复为 `disabled`。
 - **上游账户硬额度独立存在**：真实执行前必须提供 Provider/素材源账户的货币硬上限或预付余额证据；Aether 不实现支付或账单系统。
@@ -103,9 +105,11 @@ override 只允许：
 - 文件可被 TOML 解析，但输出只包含允许的非秘密状态；
 - `log_level="WARNING"`；`upload_post_enabled=false`、`upload_post_auto_upload=false`；
 - `enable_redis=false`，不引入外部队列；
+- `endpoint=""`、`material_directory="task"`、`max_concurrent_tasks=1`、`hide_config=true`；
 - 仅配置审批后确定的一个 LLM Provider、一个模型、一个素材源和一个语音路径；
+- 只允许所选素材源对应的 key 列表非空，其他素材源 key 列表必须为空；`[proxy]` 必须为空；
 - 禁止 `g4f`、Pollinations 公共匿名模式、任意代理、任意 base URL、自动发布和用户自定义上传路径；
-- Aether 非秘密 policy 的 configVersionId/policyHash、租户和运行 profile 与启动参数一致；
+- Aether 非秘密 policy 的 configVersionId/policyHash、租户和运行 profile 与启动参数一致，并精确设置 `artifactPathPrefixes=["/tasks/"]`；
 - Provider 账户硬额度证据和素材许可证/来源决策存在，但脚本不读取密钥或调用上游。
 
 预检不得打印 TOML 值、键值对、文件路径、文件哈希、模型提示或任何秘密形态文本。
@@ -196,8 +200,8 @@ ONE_TASK_RUNNING -> SUCCEEDED | FAILED | UNKNOWN | CANCELED
 9. 数据库、事件、DTO、浏览器、日志和证据中不出现秘密文件哈希、路径、mtime、长度或键值。
 10. `credentialState=PRESENT` 只在结构预检通过时出现；缺失/异常为稳定去敏状态并保持 disabled。
 11. `log_level` 不是 WARNING 或更严格时拒绝；上传/自动发布任一开启时拒绝。
-12. g4f、匿名公共 Provider、代理、任意 base URL 或多个 LLM/素材源组合被拒绝。
-13. configVersionId、policyHash、tenant/profile 任一不匹配时 Worker 证明无效且零上游调用。
+12. g4f、匿名公共 Provider、代理、任意 base URL、非空 `endpoint`、非 `task` 素材目录、并发不等于 1、`hide_config=false` 或多个 LLM/素材源组合被拒绝。
+13. configVersionId、policyHash、tenant/profile 任一不匹配，或已发布 policy 未精确设置 `artifactPathPrefixes=["/tasks/"]` 时，Worker 证明无效且零上游调用；不得用 `/` 放宽。
 14. CI 只使用临时 fake TOML；测试进程不读取开发者或目标主机真实文件。
 
 ### IM19：网络与接口隔离（15–26）
@@ -224,7 +228,7 @@ ONE_TASK_RUNNING -> SUCCEEDED | FAILED | UNKNOWN | CANCELED
 31. Provider 账户硬额度/预付余额和素材许可证证据缺失时拒绝。
 32. run 只接受一个租户、项目、非敏感合成主题和唯一 idempotency key。
 33. 单次授权最多一个 create 和一个上游 POST；429/5xx 有界处理，模糊提交不得重放。
-34. 成功只创建一组治理产物和一次 SETTLED；重复完成不重复素材或用量。
+34. `/tasks/...` 同源成功产物只创建一组治理产物和一次 SETTLED；错误前缀、跨源 URL 或重复完成不得重复素材或用量。
 35. 失败/取消/未提交按既有规则 RELEASED；UNKNOWN 保留证据并立即停机。
 36. 任一成功产物仍为 rights-blocked、`adopted=false`，零自动时间线/渲染/发布。
 37. SIGINT、脚本异常、健康失败、熔断、超时或预算触发均执行 fail-closed disarm。
