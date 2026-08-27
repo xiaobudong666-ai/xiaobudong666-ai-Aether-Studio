@@ -14,6 +14,7 @@ import {
 } from "@aether/contracts";
 import { AssetLibrary } from "./components/AssetLibrary";
 import { CanvasPreview } from "./components/CanvasPreview";
+import { GenerationPanel } from "./components/GenerationPanel";
 import { PropertyInspector } from "./components/PropertyInspector";
 import {
   QuickCreatePanel,
@@ -800,6 +801,14 @@ export default function App() {
           <button type="button" aria-label="关闭提示" onClick={() => setActionMessage(null)}>关闭</button>
         </div>
       )}
+
+      <GenerationPanel
+        role={authUser.role}
+        tenantId={authUser.tenant.id}
+        actorId={authUser.id}
+        project={currentProject}
+        assetVersions={assetVersions}
+      />
 
       <QuickCreatePanel
         role={authUser.role}
