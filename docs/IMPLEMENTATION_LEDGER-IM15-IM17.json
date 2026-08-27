@@ -1,35 +1,65 @@
 {
-  "baseline": "db2a23bc95e7990f2652b5fe38c625ce232a16de",
+  "baseline": "ad7e505d6d131d12e2c18c5c255a6ae034b62fbd",
+  "coding_baseline": "16d987d4265e4fa4aea346f493277b7869585d55",
   "scope": [
     "IM15",
     "IM16",
     "IM17"
   ],
-  "status": "documentation-draft",
-  "implementation": "not_started",
+  "status": "implementation-accepted",
+  "implementation": "completed_authorized_provider_activation_readiness_scope",
   "approval_package": "docs/approvals/IM15-IM17-PROVIDER-ACTIVATION-READINESS-CODING-APPROVAL.md",
-  "planned_controls": {
+  "verification_evidence": "docs/evidence/IM15-IM17-PROVIDER-ACTIVATION-READINESS-VERIFICATION.md",
+  "documentation_pr": 23,
+  "implementation_pr": 24,
+  "reviewed_head": "54dbbd676426b08325f826a83fde26cbecd66659",
+  "merge_commit": "ad7e505d6d131d12e2c18c5c255a6ae034b62fbd",
+  "changed_files": 18,
+  "verification": {
+    "mandatory_acceptance": "48/48_pass",
+    "api_full": "99/99_pass",
+    "worker_full": "48/48_pass",
+    "web_full": "56/56_pass",
+    "contracts": "11/11_pass",
+    "editor": "4/4_pass",
+    "video_use": "3/3_pass",
+    "typescript": "pass",
+    "eslint": "pass_zero_warnings",
+    "production_build": "pass",
+    "python_compile": "pass",
+    "ci_pipeline": "126_pass",
+    "ci_run": "https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/33056228449",
+    "playwright": "pass",
+    "docker_compose": "pass",
+    "ffmpeg_video_use_real_render": "pass",
+    "persistent_queue": "pass",
+    "production_browser_upload_download": "pass",
+    "formal_review_blockers": 0,
+    "resolved_formal_review_findings": [
+      "FR24-01: preserve API-authoritative cancellation, lease-loss and emergency-stop outcomes in Worker queue rejection handling"
+    ]
+  },
+  "implemented_controls": {
     "IM15": [
-      "append-only non-secret provider configuration versions",
-      "operator-mode plus owner-policy dual-key activation",
-      "short-lived sanitized Worker runtime attestation",
-      "retirement of legacy unauthenticated and API-direct MoneyPrinter routes",
-      "fail-closed capability snapshots and owner emergency stop"
+      "append-only non-secret provider configuration versions and immutable publish chain",
+      "exact operator-mode, owner-policy and fresh Worker-attestation activation gate",
+      "configuration and policy hash binding with sanitized capability snapshots",
+      "retirement of legacy unauthenticated and API-direct MoneyPrinter routes"
     ],
     "IM16": [
-      "normalized MoneyPrinter submit, status and cancellation-capability contracts",
-      "strict same-origin artifact reference validation",
-      "no-redirect no-proxy bounded streaming and sanitized errors",
+      "normalized MoneyPrinter submit, status and unsupported-cancel contracts",
+      "strict same-origin artifact reference validation with no redirects or proxy inheritance",
+      "bounded content-type and byte-stream validation with sanitized errors",
       "ambiguous-submission and restart reconciliation without blind repost"
     ],
     "IM17": [
-      "tenant generation concurrency and monthly usage limits",
+      "tenant generation concurrency and monthly request/generated-seconds limits",
       "idempotent append-only reservation, release and settlement entries",
-      "persistent provider circuit breaker and audited recovery",
-      "server-authoritative readiness, quota and stop-state UI"
+      "persistent circuit breaker with half-open probe and audited owner emergency stop/recovery",
+      "server-authoritative readiness, quota, circuit and stop-state frontend",
+      "Worker preservation of authoritative cancellation, lease-loss and emergency-stop outcomes"
     ]
   },
-  "required_acceptance_cases": 48,
   "boundaries": {
     "runtime_provider_default": "disabled",
     "test_provider": "deterministic-fake-sidecar-only",
@@ -50,17 +80,14 @@
     "automatic_timeline_write": false,
     "automatic_render_or_publish": false,
     "deployment": false,
-    "public_access": false
+    "public_access": false,
+    "commercial_operation": false
   },
   "remaining_gates": [
-    "documentation formal review approval",
-    "documentation merge approval",
-    "separate exact-SHA coding authorization",
-    "functional PR formal review approval",
-    "functional PR merge approval",
     "separate real-provider activation approval",
     "separate credential and paid-use approval",
-    "separate deployment approval"
+    "separate target-environment and deployment approval",
+    "separate public-access and commercial-operation approval"
   ],
-  "note": "This ledger records a proposed activation-readiness coding boundary only. No IM15-IM17 functionality, real provider connectivity, paid use or deployment is claimed."
+  "approval_note": "PR #24 merged the authorized IM15–IM17 Provider activation-readiness implementation. It leaves every committed runtime default disabled and does not authorize real connectivity, credentials, paid use, deployment or public access."
 }
