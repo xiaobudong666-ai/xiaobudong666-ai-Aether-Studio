@@ -6,6 +6,8 @@
 | Provider capability gate | MoneyPrinter Adapter exposes health/capabilities | Authenticated, short-lived, sanitized server capability snapshot | Partial |
 | Project-scoped generation task | `DBExternalTask` stores tenant/requester/engine/status | Dedicated project task, immutable request snapshot and idempotency | Not implemented |
 | Durable orchestration | RenderTask already proves leased Worker pattern | Generation claim, heartbeat, recovery, cancel, bounded retry and UNKNOWN reconciliation | Not implemented |
+| Worker authority boundary | Existing render Worker uses protected internal API contracts | Claim, heartbeat, transition and multipart artifact-intake APIs; Worker never writes DB directly | Not implemented |
+| Attempt and state audit | Local adapter preserves attempts in browser snapshot | Dedicated immutable attempt rows and append-only sanitized events | Not implemented |
 | Safe generated artifact intake | Upload path already proves quota/probe/hash/AssetVersion | Trusted Sidecar source plus idempotent generated-artifact intake | Not implemented |
 | Rights handoff | RightsSnapshot and QuickCreate rights preflight exist | Server-created asset begins `RIGHTS_MISSING`; downstream rechecks current rights | Not implemented for generation |
 | Adoption/timeline protection | IM9–IM11 references are `adopted=false` | Preserve explicit Adoption and prohibit automatic timeline/render side effects | Required invariant |
@@ -20,4 +22,3 @@ IM12–IM14 intentionally reuses current repository components. It permits a fut
 ## Source-of-truth rule
 
 Until this documentation package is formally reviewed and merged, and the owner later authorizes coding against an exact `main` SHA, all IM12–IM14 rows remain `NOT_IMPLEMENTED`. Documentation completion must never be presented as provider connectivity or usable production AI generation.
-
