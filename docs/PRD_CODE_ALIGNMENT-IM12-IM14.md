@@ -1,24 +1,40 @@
 # IM12–IM14 PRD—Code Alignment
 
-| Requirement | Current repository evidence | Gap proposed for IM12–IM14 | Current status |
-|---|---|---|---|
-| Governed generation UI | IM9–IM11 `GenerationPanel` and deterministic local adapter | Replace browser-local task authority with protected project API | Local-only / accepted |
-| Provider capability gate | MoneyPrinter Adapter exposes health/capabilities | Authenticated, short-lived, sanitized server capability snapshot | Partial |
-| Project-scoped generation task | `DBExternalTask` stores tenant/requester/engine/status | Dedicated project task, immutable request snapshot and idempotency | Not implemented |
-| Durable orchestration | RenderTask already proves leased Worker pattern | Generation claim, heartbeat, recovery, cancel, bounded retry and UNKNOWN reconciliation | Not implemented |
-| Worker authority boundary | Existing render Worker uses protected internal API contracts | Claim, heartbeat, transition and multipart artifact-intake APIs; Worker never writes DB directly | Not implemented |
-| Attempt and state audit | Local adapter preserves attempts in browser snapshot | Dedicated immutable attempt rows and append-only sanitized events | Not implemented |
-| Safe generated artifact intake | Upload path already proves quota/probe/hash/AssetVersion | Trusted Sidecar source plus idempotent generated-artifact intake | Not implemented |
-| Rights handoff | RightsSnapshot and QuickCreate rights preflight exist | Server-created asset begins `RIGHTS_MISSING`; downstream rechecks current rights | Not implemented for generation |
-| Adoption/timeline protection | IM9–IM11 references are `adopted=false` | Preserve explicit Adoption and prohibit automatic timeline/render side effects | Required invariant |
-| Real provider/API key | Pinned Adapter contract exists | Activation remains outside this batch | Prohibited |
+| Requirement | Merged implementation evidence | Coding status |
+|---|---|---|
+| IM12 project-scoped capability and preflight | Protected MoneyPrinter capability snapshot plus project validate endpoint | Implemented in authorized server-bridge scope |
+| IM12 durable task API | Authenticated create/list/detail/cancel/retry routes with tenant, project, RBAC, CSRF and idempotency checks | Implemented and tested |
+| IM13 canonical persistence | Additive `DBGenerationTask`, `DBGenerationAttempt` and append-only `DBGenerationEvent` records | Implemented and tested |
+| IM13 Worker ownership | Internal claim/heartbeat/transition APIs require Worker token and current lease | Implemented and tested |
+| IM13 cancel/retry/recovery | Persisted cancel intent, bounded retry, expired-lease recovery, immutable attempt history and ambiguous-response isolation | Implemented and tested |
+| IM14 trusted artifact intake | Lease-protected multipart byte stream; URL/path/JSON references rejected; quota, probe and SHA-256 checks enforced | Implemented and tested |
+| IM14 governed materialization | Exactly one project Material and immutable AssetVersion with generation provenance and idempotent completion | Implemented and tested |
+| Rights handoff | New output stores `RIGHTS_BLOCKED`; usability is derived only from an existing allowed RightsSnapshot | Mandatory and tested |
+| Frontend server authority | `GenerationPanel` consumes server task/attempt/result state and isolates project-switch late responses | Implemented and tested |
+| Editor handoff | Rights-allowed output creates only an `adopted=false` governed reference | Implemented; no automatic final timeline |
+| Runtime Provider | Defaults to `disabled`; tests inject only `deterministic-fake` | Real activation not authorized |
+| MoneyPrinter Adapter/upstream | No Adapter or pinned-upstream change in PR #21 | Unchanged by design |
+| Automatic adoption/timeline/render/publish | Explicitly excluded from PR #21 | Not implemented by design |
+| Deployment/public access | No deployment or public-access change in PR #21 | Not authorized |
 
-## Alignment conclusion
+## Accepted implementation
 
-The next smallest functional gap is not another generation UI or a new AI provider. It is the missing durable bridge between the accepted local workflow and existing server-side project, Worker, media and rights controls.
+PR #21 implemented the approved IM12–IM14 functional slice on top of `main@b9852257076ccad2ac8aed8b1e04cefab5e0d901`. The formally reviewed head `3b900e4909566dcced9cd10b870d64df38724ee0` was squash-merged as `d6c39593cf25856f4b411cbe909d8fa9b54403c0`.
 
-IM12–IM14 intentionally reuses current repository components. It permits a future additive generation-task model/API/Worker implementation only after separate coding approval, while keeping all tests on a fake Adapter and keeping runtime provider mode disabled.
+The accepted implementation is limited to the existing repository architecture, deterministic fake Adapter tests and the governed server bridge. It does not claim real Provider connectivity, production AI generation, deployment or commercial operation.
 
-## Source-of-truth rule
+## Verification alignment
 
-Until this documentation package is formally reviewed and merged, and the owner later authorizes coding against an exact `main` SHA, all IM12–IM14 rows remain `NOT_IMPLEMENTED`. Documentation completion must never be presented as provider connectivity or usable production AI generation.
+- Mandatory IM12–IM14 acceptance cases: 40/40 passed.
+- API full regression: 63/63 passed.
+- Worker generation tests: 8/8 passed; Worker full regression: 31/31 passed.
+- Web full regression: 56/56 passed; contracts/editor: 15/15 passed.
+- TypeScript, ESLint with zero warnings, production build, Ruff checks and patch checks: passed.
+- CI Pipeline #114 passed lint/build/unit, Playwright workbench and Docker Compose integration.
+- Docker integration passed healthy-stack, same-origin, FFmpeg/Worker/video-use, real-render, persistent-queue and production-browser upload-to-download checks.
+- Formal-review blockers: 0.
+- Changed scope: 13 files, all within approval-package section 11.
+
+## Remaining activation gate
+
+Any real provider/plugin/model/API key, paid call, MoneyPrinter Adapter or upstream-pin change, new dependency, external queue/object storage, automatic rights approval/adoption/timeline/render/publish, deployment or public-access change requires separate owner authorization and new executable evidence.
