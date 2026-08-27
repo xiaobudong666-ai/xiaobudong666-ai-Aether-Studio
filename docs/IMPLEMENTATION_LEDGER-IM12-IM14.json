@@ -14,6 +14,8 @@
     "IM13": [
       "leased Worker claim and heartbeat",
       "bounded retry and immutable attempt history",
+      "append-only task event audit history",
+      "internal token and lease protected Worker API contracts",
       "ambiguous response recovery without blind repost",
       "cancel intent and late-response isolation"
     ],
@@ -24,7 +26,7 @@
       "mandatory RIGHTS_MISSING handoff"
     ]
   },
-  "required_acceptance_cases": 36,
+  "required_acceptance_cases": 40,
   "boundaries": {
     "real_provider_activation": false,
     "provider_credentials": false,
@@ -47,4 +49,3 @@
   ],
   "note": "This ledger records a proposal only. No IM12-IM14 functional implementation or external integration is claimed."
 }
-
