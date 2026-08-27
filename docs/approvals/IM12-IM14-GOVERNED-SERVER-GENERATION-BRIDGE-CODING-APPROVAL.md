@@ -63,6 +63,17 @@
 
 所有写请求沿用现有 CSRF；所有读写同时检查 session tenant 与 project。其他租户 UUID 返回 404 或等价非泄露响应。
 
+Worker 只能通过既有内部令牌访问以下服务端合同，不得直接连接或写入业务数据库：
+
+| 方法与路径 | 调用方 | 行为 |
+|---|---|---|
+| `POST /internal/generation-tasks/claim` | Worker | 原子认领一条可执行任务并返回租约、请求快照和取消意图 |
+| `POST /internal/generation-tasks/{task_id}/heartbeat` | 持有租约的 Worker | 延长租约并更新规范进度；租约不匹配返回冲突 |
+| `POST /internal/generation-tasks/{task_id}/transition` | 持有租约的 Worker | 追加状态事件并幂等保存 upstreamJobId、attempt 结果或去敏错误 |
+| `POST /internal/generation-tasks/{task_id}/artifact-intake` | 持有租约的 Worker | 接收流式 multipart 产物与 providerArtifactId；API 执行校验、入库事务和权利阻断 |
+
+内部端点必须使用现有恒时 Worker token 校验；缺失、错误或租约不匹配时零状态变化、零素材写入。`artifact-intake` 不接受 URL、宿主机路径或 JSON 中的文件位置，只接受请求体字节流和受限元数据。
+
 ### 4.2 输入与能力
 
 请求字段限于：`videoSubject`（1–500）、`videoAspect`（`9:16/16:9/1:1`）、`voiceName`（能力枚举）、`videoConcatMode`（`random/sequential`）、`videoClipDuration`（1–10）、`outputCount`（1–4）、`confirmExternalGeneration` 与 UUID `idempotencyKey`。
@@ -90,11 +101,12 @@
 7. Worker 重启后回收过期租约；重复完成回调和轮询结果必须幂等。
 8. 取消是持久意图；上游不支持取消时仍不得把取消后的迟到结果自动用于下游。
 9. attempt 历史追加保存，不覆盖旧 attempt。
-10. 日志、DTO 与错误只包含规范错误码和去敏信息。
+10. 每次提交或 retry 创建不可变 attempt；每次状态变化、取消、重试、租约回收和入库结果追加不可变 event。
+11. 日志、DTO 与错误只包含规范错误码和去敏信息。
 
 ## 6. IM14——受信任产物入库与权利交接
 
-Worker 只接受 Adapter 从已知内部 Sidecar 返回的产物标识或同源相对下载路径。拒绝浏览器提供的 URL、外部重定向、`file://`、宿主机路径、shell 参数和未配置对象存储地址。
+Worker 只接受 Adapter 从已知内部 Sidecar 返回的产物标识或同源相对下载路径。拒绝浏览器提供的 URL、外部重定向、`file://`、宿主机路径、shell 参数和未配置对象存储地址。Worker 完成来源校验与 Sidecar 流读取后，通过内部 `artifact-intake` 把字节流交给 API；API 是配额、业务记录与事务的唯一写入权威。
 
 入库必须按以下顺序：
 
@@ -112,7 +124,11 @@ Worker 只接受 Adapter 从已知内部 Sidecar 返回的产物标识或同源�
 
 `DBGenerationTask` 至少包含：`id/tenant_id/project_id/requested_by/provider/status/progress/message/request_json/request_hash/capability_snapshot_json/capability_snapshot_hash/idempotency_key/upstream_job_id/provider_artifact_id/media_id/asset_version_id/attempts/max_attempts/lease_owner/lease_expires_at/cancel_requested_at/error_code/error_message/created_at/updated_at/started_at/completed_at`。
 
-约束：`UNIQUE(tenant_id,idempotency_key)`；项目、租户、素材和版本必须一致；迁移只能加表/索引，不删除、重写或回填不相关业务数据。
+`DBGenerationAttempt` 为不可变 attempt 权威记录，至少包含：`id/generation_task_id/attempt_no/status/submission_started_at/upstream_job_id/reconciliation_state/error_code/error_message/created_at/completed_at`，并设置 `UNIQUE(generation_task_id,attempt_no)`。retry 只能追加下一编号，不得覆盖旧记录。
+
+`DBGenerationEvent` 为追加式审计记录，至少包含：`id/generation_task_id/attempt_id/event_type/from_status/to_status/actor_type/actor_id/metadata_json/created_at`。`metadata_json` 只允许受限去敏字段，不保存提示词、URL、令牌或上游原始响应。
+
+约束：`UNIQUE(tenant_id,idempotency_key)`；`UNIQUE(generation_task_id,attempt_no)`；项目、租户、素材和版本必须一致；迁移只能加表/索引，不删除、重写或回填不相关业务数据。
 
 ## 8. 前端切换边界
 
@@ -134,7 +150,7 @@ Worker 只接受 Adapter 从已知内部 Sidecar 返回的产物标识或同源�
 
 敏感输入不得出现在 URL、普通日志、分析事件、SSE、客户端存储或原始异常。内部 Worker 路由沿用现有恒时令牌比较和去敏错误边界。
 
-## 10. 36 条强制验收
+## 10. 40 条强制验收
 
 ### API 与隔离
 
@@ -183,6 +199,10 @@ Worker 只接受 Adapter 从已知内部 Sidecar 返回的产物标识或同源�
 34. 权利允许后只创建 `adopted=false` 引用，不自动写最终时间线或提交渲染。
 35. 现有 51 个 Web 测试、API、Worker、Playwright、Docker、FFmpeg、video-use、真实渲染和上传到下载回归全部通过。
 36. diff 范围审计证明无依赖、锁文件、Adapter pin、真实凭据、部署和公开访问变化。
+37. 四个内部 Worker 端点在令牌缺失、错误或租约不匹配时零状态变化、零素材写入。
+38. Worker 代码不导入数据库 Session/模型，也不直接写业务数据库；所有权威更新经内部 API 完成。
+39. 初次提交和每次 retry 分别产生唯一 attempt；重启、重复回调和迟到响应不覆盖历史 attempt/event。
+40. `artifact-intake` 只接受持有租约 Worker 的 multipart 字节流与受限元数据，拒绝 URL、路径和非流式 JSON 产物引用。
 
 ## 11. 允许的编码文件范围
 
@@ -220,6 +240,6 @@ Worker 只接受 Adapter 从已知内部 Sidecar 返回的产物标识或同源�
 2. owner 批准文档转正式评审。
 3. owner 批准文档合并。
 4. owner 对精确 `main` SHA 和第 11/12 节明确批准编码。
-5. 实现、36 条验收、全量回归与 Draft 功能 PR。
+5. 实现、40 条验收、全量回归与 Draft 功能 PR。
 6. owner 分别批准正式评审和合并。
 7. 真实上游激活、密钥、付费调用与部署仍需新的独立审批。
