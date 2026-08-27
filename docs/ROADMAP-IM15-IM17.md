@@ -1,40 +1,40 @@
 # IM15–IM17 Roadmap
 
-## Planning baseline
+## Accepted implementation baseline
 
-`main@db2a23bc95e7990f2652b5fe38c625ce232a16de`
+`main@ad7e505d6d131d12e2c18c5c255a6ae034b62fbd`
 
-## Evidence-based sequence
+## Sequence
 
-1. **IM15 — versioned provider configuration and runtime attestation**: documentation proposed; implementation not started.
-2. **IM16 — hardened MoneyPrinter Adapter and restricted artifact streaming**: documentation proposed; implementation not started.
-3. **IM17 — generation quota, usage, circuit breaker and emergency stop**: documentation proposed; implementation not started.
+1. **IM15 — versioned provider configuration and runtime attestation**: **implemented**.
+2. **IM16 — hardened MoneyPrinter Adapter and restricted artifact streaming**: **implemented**.
+3. **IM17 — generation quota, usage, circuit breaker and emergency stop**: **implemented**.
 
-## Why this is next
+## Closed gates
 
-IM12–IM14 established durable project generation tasks, Worker leases, trusted API intake, immutable AssetVersion creation and rights-default blocking. The remaining smallest path toward a safely activatable real Provider is not credential entry or deployment. It is a deny-by-default activation control plane that can prove API/Worker configuration agreement, constrain Adapter egress and artifact bytes, bound tenant use, trip a circuit breaker and stop new work without destroying evidence.
+- Documentation gate: **closed / accepted** through the IM15–IM17 approval-package workflow and squash merge of PR #23 as `16d987d4265e4fa4aea346f493277b7869585d55`.
+- Coding authorization gate: **closed** by the owner's explicit authorization against `main@16d987d4265e4fa4aea346f493277b7869585d55`, including the separately approved CI-only file-scope extension.
+- Functional implementation gate: **closed / accepted** by squash merge of PR #24.
+- Verification gate: **closed** with 48/48 mandatory acceptance cases, all full regressions and CI Pipeline #126 passing.
+- Formal-review blockers: **0** on reviewed head `54dbbd676426b08325f826a83fde26cbecd66659`; `FR24-01` was fixed before acceptance.
 
-Current source still enables capability snapshots only for `deterministic-fake`; Worker generation rejects every other mode. The API also retains legacy `/moneyprinter/*` routes that directly probe, submit to and query the Adapter outside the governed project task/Worker path. The current MoneyPrinter Adapter has submit/status methods but no accepted restricted artifact-stream contract. Existing quotas cover projects, storage and rendering, not generation reservations or settled generated seconds.
+## Current implementation status
 
-## Gate status
+**Implemented within the authorized activation-readiness scope.** Aether now retires the legacy API-direct `/moneyprinter/*` bypass; stores immutable non-secret Provider configuration versions; requires exact operator mode, published owner policy and a fresh matching Worker attestation; binds claimed tasks to configuration and policy hashes; constrains Adapter requests, redirects, proxy inheritance and artifact streams; accounts for generation reservations, releases and settlements; persists circuit-breaker state and audited emergency stop/recovery; and exposes server-authoritative readiness, quota, circuit and stop state to the frontend.
 
-- Documentation drafting: in progress in a documentation-only PR.
-- Documentation formal review: not approved.
-- Documentation merge: not approved.
-- Functional coding: not approved and not started.
-- Real-provider activation: prohibited.
-- Credentials and paid calls: prohibited.
-- Deployment/public access: prohibited.
+Worker queue rejections for cancellation, lease loss and emergency stop preserve the API's stable governance code and stop local processing without overwriting the authoritative terminal state.
 
-## Invariants
+## Open activation gate
 
-- Runtime mode defaults to `disabled` in source, Compose and environment templates.
-- Legacy API-direct MoneyPrinter routes are retired; browser generation uses only protected project-scoped APIs.
-- Automated tests use a deterministic fake Sidecar only and make no public Provider request.
-- Secrets remain outside repository, database, DTOs, logs and browser storage.
+The runtime Provider remains **disabled by default** in source, Compose and environment templates. The merged implementation makes a future explicitly governed activation technically checkable; it does not activate MoneyPrinter, provide credentials, make a paid/public Provider request or authorize production use.
+
+Real Provider/plugin/model activation, API keys or other credentials, paid usage, target-environment configuration, production security/load evidence, deployment, public access and commercial operation each remain separate owner gates.
+
+## Preserved invariants
+
+- Browser generation uses only protected project-scoped APIs; API runtime does not submit to, poll or download from the Provider.
+- Tests use deterministic fake behavior only and make no public Provider request.
+- Secrets remain outside repository, database, DTOs, logs, events and browser storage.
 - MoneyPrinterTurbo remains pinned to `v1.2.7` / `475f21147f0808f5ffe3f58af9ab794b28a4da2c`.
-- Generated output remains rights-blocked; no automatic adoption, timeline write, render or publish.
-
-## Non-goals
-
-No real provider/plugin/model, key, paid call, upstream upgrade, new dependency, external queue/object storage, digital human or identity transformation, automatic rights approval/adoption/timeline/render/publish, deployment, public access or commercial operation.
+- Generated output remains rights-blocked; there is no automatic adoption, timeline write, render or publish.
+- No dependency, lockfile, external queue, object-storage, secret-management or billing-system change was accepted.

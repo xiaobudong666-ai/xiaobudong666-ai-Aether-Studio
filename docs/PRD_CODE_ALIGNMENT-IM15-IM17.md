@@ -1,30 +1,44 @@
 # IM15–IM17 PRD—Code Alignment
 
-| Requirement | Current repository evidence | Gap proposed for IM15–IM17 | Current status |
-|---|---|---|---|
-| Governed server generation | IM12–IM14 project API, persistent tasks, Worker leases and trusted intake are accepted | Preserve as the task/data authority | Implemented / must reuse |
-| Runtime provider gate | Capability enables only for `deterministic-fake`; other modes are rejected | Non-secret config versions, operator/owner dual key and fresh Worker attestation | Not implemented |
-| Legacy Provider bypass | API still exposes unauthenticated health/capability probes and API-direct generate/status routes | Retire legacy routes so only protected project APIs and Worker Adapter can access generation | Blocking gap |
-| Configuration provenance | Task stores a capability snapshot hash | Bind real-mode claims to a published config version and policy hash | Not implemented |
-| Secret boundary | Existing environment variables and internal Sidecar network | Prove secrets never enter Aether DB, DTO, logs, events or browser | Partial |
-| MoneyPrinter contract | Pinned Adapter submits and queries | Restricted artifact stream, normalized errors, cancel capability and egress constraints | Partial |
-| Ambiguous submission | IM13 preserves UNKNOWN and prevents blind repost | Preserve the rule on the real-mode Adapter path | Implemented foundation / needs activation evidence |
-| Generation quota | Storage/render quotas exist | Generation concurrency, monthly requests/seconds, reservation and settlement | Not implemented |
-| Failure containment | Bounded task retry and cancellation exist | Persistent tenant/provider circuit breaker and half-open probe | Not implemented |
-| Emergency stop | Disabled mode prevents all real generation today | Audited owner stop/recovery that cannot override operator disable | Not implemented |
-| Frontend authority | GenerationPanel consumes server tasks and rights state | Display readiness, quotas, circuit/stop reasons without secrets | Partial |
-| Rights and adoption | Generated AssetVersion starts blocked; editor reference is `adopted=false` | Preserve unchanged | Implemented invariant |
-| M11 metering and plans | Project/storage/render quota fields exist | Add non-monetary generation usage ledger only | Partial |
-| M13 settings | Environment configuration and isolated adapters exist | Add immutable non-secret Provider ConfigVersion publish/rollback chain | Partial |
-| Real provider/API key | No authorized runtime connectivity | Remains outside this documentation and coding batch | Prohibited |
-| Production launch | Compose/runbook path exists | Target, TLS, credentials, load and launch evidence remain external | External gate |
+| Requirement | Merged implementation evidence | Repository status |
+|---|---|---|
+| Governed server generation | Existing project API, durable tasks, Worker leases and trusted intake remain the only task/data authority | Preserved and regression-tested |
+| Runtime Provider gate | Exact operator mode, published owner policy and fresh matching Worker attestation are all required | Implemented and tested; default disabled |
+| Legacy Provider bypass | `/moneyprinter/health`, `/capabilities`, `/generate` and `/status` return stable 410; API runtime has no Adapter call path | Retired and tested |
+| Configuration provenance | Immutable config versions, supersedes chain, policy hash and task claim binding | Implemented and tested |
+| Secret boundary | Policy rejects secret/address-shaped fields; readiness, DTOs, events and errors are sanitized | Implemented and tested |
+| MoneyPrinter contract | Allowlisted submit payload, normalized status/error/cancel capability, fixed Adapter/upstream identity | Implemented and tested |
+| Restricted artifact stream | Same-origin path/origin allowlist, traversal/query rejection, no redirects/proxy inheritance, bounded MP4 stream | Implemented and tested |
+| Ambiguous submission/recovery | POST ambiguity becomes `UNKNOWN`; saved upstream ID is queried without repost | Preserved and tested |
+| Generation quota | Atomic task reservation plus idempotent release/settlement for concurrency, monthly requests and generated seconds | Implemented and tested |
+| Failure containment | Persistent CLOSED/OPEN/HALF_OPEN circuit with one half-open probe and atomic transitions | Implemented and tested |
+| Emergency stop | Owner-only audited stop/recovery blocks validate/create/claim without deleting evidence | Implemented and tested |
+| Worker governance rejection | Cancellation, lease loss and emergency stop keep stable API codes and do not overwrite server state | Implemented by FR24-01 and tested |
+| Frontend authority | GenerationPanel consumes server readiness, quota, circuit, stop and rights state; late project responses are isolated | Implemented and tested |
+| Rights and adoption | Generated AssetVersion remains rights-blocked; editor reference remains `adopted=false` | Preserved invariant |
+| Runtime defaults and CI | Source, Compose and environment templates default to `disabled`; CI uses deterministic fake behavior | Implemented and tested |
+| Dependencies/upstream/infrastructure | No dependency or lockfile, MoneyPrinter pin/Dockerfile, queue or external-object-storage change | Preserved boundary |
+| Real Provider/API key/paid use | No real connectivity, credential or paid request supplied or activated | Not authorized by design |
+| Automatic timeline/render/publish | No automatic rights approval, adoption, timeline write, render or publish | Not implemented by design |
+| Production launch | No target deployment or public-access change | Separate external gate |
 
-## Alignment conclusion
+## Accepted implementation
 
-The repository now has the durable task, Worker, artifact, provenance and rights bridge required before a Provider can be considered, but the legacy API-direct MoneyPrinter routes must first be retired so they cannot bypass that bridge. The next safe repository slice is activation readiness: configuration agreement, restricted Adapter traffic, bounded generation usage, failure containment and an auditable stop path.
+PR #24 implemented the owner-approved IM15–IM17 activation-readiness slice on top of `main@16d987d4265e4fa4aea346f493277b7869585d55`. The formally reviewed head `54dbbd676426b08325f826a83fde26cbecd66659` was squash-merged as `ad7e505d6d131d12e2c18c5c255a6ae034b62fbd`.
 
-This slice must be testable entirely against a deterministic fake Sidecar. It may make the code capable of accepting a future explicitly enabled MoneyPrinter mode, but it must leave every committed default disabled and must not supply credentials, make a real call or claim operational AI generation.
+The implementation establishes a deny-by-default control plane around the existing governed generation bridge. It makes future activation auditable and bounded, but does not itself activate a Provider or claim production AI generation.
 
-## Source-of-truth rule
+## Verification alignment
 
-Until the documentation package is formally reviewed and merged, and the owner later authorizes coding against an exact `main` SHA, all IM15–IM17 rows remain `NOT_IMPLEMENTED`. Documentation acceptance is not coding acceptance; coding acceptance is not real-provider activation, paid-use or deployment approval.
+- Mandatory IM15–IM17 acceptance cases: 48/48 passed.
+- API full regression: 99/99; Worker full regression: 48/48; Web: 56/56.
+- contracts: 11/11; editor: 4/4; video-use: 3/3.
+- TypeScript, ESLint with zero warnings, production build, Python compile and patch checks: passed.
+- CI Pipeline #126 passed lint/build/unit, dependency audits, Playwright and Docker Compose integration.
+- Docker integration passed healthy-stack, same-origin, Worker/video-use, FFmpeg, fixed-upstream, real-render, persistent-queue and production-browser upload-to-download checks.
+- Formal review fixed `FR24-01`; final blockers: 0; unresolved review threads: 0.
+- Changed scope: 18 files, all within the owner-approved allowlist including the separately approved CI workflow extension.
+
+## Remaining external gates
+
+Real Provider/plugin/model activation, credentials or API keys, paid use, production configuration, security/load evidence, deployment, public access and commercial operation require separate owner authorization and target-environment evidence.
