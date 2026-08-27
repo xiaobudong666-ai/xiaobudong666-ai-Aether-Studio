@@ -3,6 +3,7 @@ import io
 import datetime
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from app.generation_queue import GenerationQueueClient, GenerationQueueError
 from app.main import WorkerComponents, process_generation_task
@@ -154,3 +155,54 @@ def test_generation_queue_requires_worker_token():
     client = GenerationQueueClient(worker_token="")
     with pytest.raises(GenerationQueueError, match="not configured"):
         client.claim()
+
+
+def test_generation_queue_preserves_governance_rejection_code(monkeypatch):
+    response = httpx.Response(
+        409,
+        json={"detail": {"code": "TASK_CANCELED", "message": "canceled"}},
+        request=httpx.Request("POST", "http://api/internal/generation-tasks/task/heartbeat"),
+    )
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    client.request.return_value = response
+    monkeypatch.setattr("app.generation_queue.httpx.Client", lambda **_kwargs: client)
+
+    with pytest.raises(GenerationQueueError) as caught:
+        GenerationQueueClient(
+            backend_url="http://api", worker_token="token", worker_id="worker",
+        ).heartbeat("task")
+
+    assert caught.value.status_code == 409
+    assert caught.value.code == "TASK_CANCELED"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_status"),
+    [
+        ("TASK_CANCELED", "CANCELED"),
+        ("LEASE_LOST", "UNKNOWN"),
+        ("PROVIDER_EMERGENCY_STOPPED", "UNKNOWN"),
+    ],
+)
+def test_worker_stops_without_overwriting_queue_governance(code, expected_status):
+    provider = MagicMock()
+    queue = queue_mock()
+    queue.heartbeat.side_effect = GenerationQueueError(
+        "governed rejection", status_code=409, code=code,
+    )
+
+    result = process_generation_task(
+        components(provider, queue),
+        claimed_task(upstreamJobId="upstream-existing"),
+        poll_interval=0,
+    )
+
+    assert result == {
+        "taskId": "generation-1",
+        "status": expected_status,
+        "errorCode": code,
+    }
+    queue.transition.assert_not_called()
+    provider.get_task_status.assert_not_called()

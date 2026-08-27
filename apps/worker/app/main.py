@@ -249,6 +249,20 @@ def process_generation_task(
         )
     request = task.get("request") or {}
     upstream_job_id = task.get("upstreamJobId")
+
+    def queue_rejection_result(exc: GenerationQueueError) -> dict:
+        code = exc.code or "GENERATION_QUEUE_UNAVAILABLE"
+        logger.warning(
+            "Governed generation task %s stopped after queue rejection: %s",
+            task_id,
+            code,
+        )
+        return {
+            "taskId": task_id,
+            "status": "CANCELED" if code == "TASK_CANCELED" else "UNKNOWN",
+            "errorCode": code,
+        }
+
     try:
         if not upstream_job_id:
             try:
@@ -357,15 +371,20 @@ def process_generation_task(
             error_code="STATUS_TIMEOUT", error_message="Generation status timed out",
             retryable=False,
         )
+    except GenerationQueueError as exc:
+        return queue_rejection_result(exc)
     except Exception:
         logger.exception("Governed generation task %s failed", task_id)
-        return queue.transition(
-            task_id, status="FAILED", progress=0,
-            message="生成 Worker 发生可恢复错误",
-            upstream_job_id=upstream_job_id,
-            error_code="WORKER_TRANSIENT_FAILURE", error_message="Worker transient failure",
-            retryable=True,
-        )
+        try:
+            return queue.transition(
+                task_id, status="FAILED", progress=0,
+                message="生成 Worker 发生可恢复错误",
+                upstream_job_id=upstream_job_id,
+                error_code="WORKER_TRANSIENT_FAILURE", error_message="Worker transient failure",
+                retryable=True,
+            )
+        except GenerationQueueError as exc:
+            return queue_rejection_result(exc)
 
 
 def attest_worker_provider(components: WorkerComponents) -> None:
