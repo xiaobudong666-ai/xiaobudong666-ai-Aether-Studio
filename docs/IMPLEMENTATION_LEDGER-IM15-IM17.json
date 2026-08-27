@@ -9,6 +9,7 @@
   "status": "implementation-accepted",
   "implementation": "completed_authorized_provider_activation_readiness_scope",
   "approval_package": "docs/approvals/IM15-IM17-PROVIDER-ACTIVATION-READINESS-CODING-APPROVAL.md",
+  "verification_evidence": "docs/evidence/IM15-IM17-PROVIDER-ACTIVATION-READINESS-VERIFICATION.md",
   "documentation_pr": 23,
   "implementation_pr": 24,
   "reviewed_head": "54dbbd676426b08325f826a83fde26cbecd66659",
