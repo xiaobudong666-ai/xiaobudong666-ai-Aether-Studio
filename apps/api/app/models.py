@@ -106,6 +106,82 @@ class DBExternalTask(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class DBGenerationTask(Base):
+    __tablename__ = "generation_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "idempotency_key",
+            name="uq_generation_task_tenant_idempotency",
+        ),
+    )
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False, index=True)
+    requested_by = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    provider = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, index=True)
+    progress = Column(Integer, default=0, nullable=False)
+    message = Column(String, nullable=False)
+    request_json = Column(JSON, nullable=False)
+    request_hash = Column(String, nullable=False)
+    capability_snapshot_json = Column(JSON, nullable=False)
+    capability_snapshot_hash = Column(String, nullable=False)
+    idempotency_key = Column(String, nullable=False)
+    upstream_job_id = Column(String, nullable=True, index=True)
+    provider_artifact_id = Column(String, nullable=True, index=True)
+    media_id = Column(String, nullable=True, index=True)
+    asset_version_id = Column(String, ForeignKey("asset_versions.id"), nullable=True, index=True)
+    attempts = Column(Integer, default=1, nullable=False)
+    max_attempts = Column(Integer, default=3, nullable=False)
+    lease_owner = Column(String, nullable=True, index=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
+    error_code = Column(String, nullable=True)
+    error_message = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DBGenerationAttempt(Base):
+    __tablename__ = "generation_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "generation_task_id", "attempt_no",
+            name="uq_generation_attempt_task_number",
+        ),
+    )
+
+    id = Column(String, primary_key=True)
+    generation_task_id = Column(String, ForeignKey("generation_tasks.id"), nullable=False, index=True)
+    attempt_no = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, index=True)
+    submission_started_at = Column(DateTime(timezone=True), nullable=True)
+    upstream_job_id = Column(String, nullable=True, index=True)
+    reconciliation_state = Column(String, nullable=False)
+    error_code = Column(String, nullable=True)
+    error_message = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DBGenerationEvent(Base):
+    __tablename__ = "generation_events"
+
+    id = Column(String, primary_key=True)
+    generation_task_id = Column(String, ForeignKey("generation_tasks.id"), nullable=False, index=True)
+    attempt_id = Column(String, ForeignKey("generation_attempts.id"), nullable=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    from_status = Column(String, nullable=True)
+    to_status = Column(String, nullable=True)
+    actor_type = Column(String, nullable=False)
+    actor_id = Column(String, nullable=False)
+    metadata_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class DBAssetVersion(Base):
     __tablename__ = "asset_versions"
     __table_args__ = (
@@ -204,5 +280,5 @@ def _reject_immutable_update(_mapper, _connection, target) -> None:
     raise ValueError(f"{target.__class__.__name__} is immutable")
 
 
-for immutable_model in (DBAssetVersion, DBRightsSnapshot, DBMasterRevision):
+for immutable_model in (DBAssetVersion, DBRightsSnapshot, DBMasterRevision, DBGenerationEvent):
     event.listen(immutable_model, "before_update", _reject_immutable_update)

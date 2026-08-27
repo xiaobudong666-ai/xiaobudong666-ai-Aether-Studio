@@ -351,3 +351,134 @@ export class DeterministicGenerationAdapter {
     return JSON.parse(JSON.stringify(task)) as GenerationTask;
   }
 }
+
+export type ServerGenerationStatus =
+  | "QUEUED" | "SUBMITTING" | "RUNNING" | "INGESTING" | "RIGHTS_BLOCKED"
+  | "SUCCEEDED" | "FAILED" | "CANCELED" | "UNKNOWN" | "PARTIAL";
+
+export interface GenerationCapabilitySnapshot {
+  provider: "moneyprinter";
+  mode: "disabled" | "deterministic-fake";
+  enabled: boolean;
+  healthy: boolean;
+  sourceVersion: string;
+  issuedAt: string;
+  expiresAt: string;
+  videoAspects: Array<"16:9" | "9:16" | "1:1">;
+  videoConcatModes: Array<"random" | "sequential">;
+  clipDurationSeconds: { min: number; max: number };
+  maxOutputs: number;
+  voices: string[];
+  snapshotHash: string;
+}
+
+export interface ServerGenerationRequest {
+  videoSubject: string;
+  videoAspect: "16:9" | "9:16" | "1:1";
+  voiceName: string;
+  videoConcatMode: "random" | "sequential";
+  videoClipDuration: number;
+  outputCount: number;
+  inputAssetVersionIds: string[];
+  idempotencyKey: string;
+  capabilitySnapshotHash: string;
+  expectedProjectRevision: number;
+  confirmExternalGeneration: true;
+}
+
+export interface ServerGenerationResult {
+  assetVersionId: string;
+  mediaId: string;
+  checksum: string;
+  contentType: string;
+  sizeBytes: number;
+  provenance: Record<string, string | number>;
+  rights: { allowed: boolean; code: string };
+}
+
+export interface ServerGenerationTask {
+  taskId: string;
+  projectId: string;
+  provider: string;
+  status: ServerGenerationStatus;
+  storedStatus: ServerGenerationStatus;
+  progress: number;
+  message: string;
+  attempt: number;
+  maxAttempts: number;
+  cancelRequested: boolean;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  rights: { allowed: boolean; code: string };
+  results: ServerGenerationResult[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+export class GenerationApiClient {
+  constructor(
+    private readonly apiBase = "/api",
+    private readonly request: FetchLike = fetch,
+  ) {}
+
+  private async json<T>(path: string, init?: RequestInit): Promise<T> {
+    const response = await this.request(`${this.apiBase}${path}`, init);
+    const payload = response.status === 204 ? null : await response.json();
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const code = typeof detail?.code === "string" ? detail.code : `HTTP_${response.status}`;
+      const message = typeof detail?.message === "string" ? detail.message : "生成服务请求失败";
+      throw new Error(`${code}: ${safeGenerationError(message)}`);
+    }
+    return payload as T;
+  }
+
+  capabilities(): Promise<GenerationCapabilitySnapshot> {
+    return this.json("/generation/providers/moneyprinter/capabilities");
+  }
+
+  validate(projectId: string, body: ServerGenerationRequest): Promise<{ allowed: true }> {
+    return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Aether-CSRF": "1" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  create(projectId: string, body: ServerGenerationRequest): Promise<ServerGenerationTask> {
+    return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Aether-CSRF": "1",
+        "Idempotency-Key": body.idempotencyKey,
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async list(projectId: string): Promise<ServerGenerationTask[]> {
+    const payload = await this.json<{ items: ServerGenerationTask[] }>(
+      `/projects/${encodeURIComponent(projectId)}/generation-tasks?pageSize=100`,
+    );
+    return payload.items;
+  }
+
+  get(projectId: string, taskId: string): Promise<ServerGenerationTask> {
+    return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks/${encodeURIComponent(taskId)}`);
+  }
+
+  cancel(projectId: string, taskId: string): Promise<ServerGenerationTask> {
+    return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks/${encodeURIComponent(taskId)}/cancel`, {
+      method: "POST", headers: { "X-Aether-CSRF": "1" },
+    });
+  }
+
+  retry(projectId: string, taskId: string): Promise<ServerGenerationTask> {
+    return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks/${encodeURIComponent(taskId)}/retry`, {
+      method: "POST", headers: { "X-Aether-CSRF": "1" },
+    });
+  }
+}

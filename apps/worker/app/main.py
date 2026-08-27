@@ -1,4 +1,5 @@
 import json
+import io
 import logging
 import os
 import threading
@@ -8,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from .ai_provider import AIProviderInterface
 from .ffmpeg_adapter import FFmpegAdapter
+from .generation_queue import GenerationQueueClient, GenerationQueueError
 from .moneyprinter_adapter import MoneyPrinterTurboAdapter
 from .recovery import TaskRecoveryManager
 from .task_queue import TaskQueueClient, TaskQueueError
@@ -70,11 +72,13 @@ class WorkerComponents:
     moneyprinter: MoneyPrinterTurboAdapter
     video_use: VideoUseAdapter
     queue: TaskQueueClient | None = None
+    generation_queue: GenerationQueueClient | None = None
 
 
 def initialize_worker() -> WorkerComponents:
     backend_url = os.environ.get("BACKEND_URL", "http://localhost:8000")
     queue = TaskQueueClient(backend_url=backend_url)
+    generation_queue = GenerationQueueClient(backend_url=backend_url)
     # Enable degradation fallback by default in background worker
     moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=True)
     return WorkerComponents(
@@ -84,6 +88,7 @@ def initialize_worker() -> WorkerComponents:
         moneyprinter=moneyprinter_adapter,
         video_use=VideoUseAdapter(),
         queue=queue,
+        generation_queue=generation_queue,
     )
 
 
@@ -168,17 +173,130 @@ def process_m1_moneyprinter_task(components: WorkerComponents, task_data: dict) 
         return {"status": "failed", "reason": str(exc)}
 
 
+def process_generation_task(
+    components: WorkerComponents,
+    task: dict,
+    poll_interval: float = 0.5,
+) -> dict:
+    queue = components.generation_queue
+    if queue is None:
+        raise GenerationQueueError("Generation queue is not configured")
+    task_id = str(task["taskId"])
+    if task.get("providerMode") != "deterministic-fake":
+        return queue.transition(
+            task_id, status="FAILED", progress=0,
+            message="运行时生成 Provider 未启用",
+            error_code="PROVIDER_DISABLED", error_message="Provider disabled",
+            retryable=False,
+        )
+    request = task.get("request") or {}
+    upstream_job_id = task.get("upstreamJobId")
+    try:
+        if not upstream_job_id:
+            try:
+                upstream_job_id = components.moneyprinter.generate_video(
+                    subject=request["videoSubject"],
+                    aspect=request["videoAspect"],
+                    voice_name=request["voiceName"],
+                    video_concat_mode=request["videoConcatMode"],
+                    video_clip_duration=request["videoClipDuration"],
+                )
+            except TimeoutError as exc:
+                return queue.transition(
+                    task_id, status="UNKNOWN", progress=0,
+                    message="上游提交结果不明确，已停止自动重投",
+                    error_code="AMBIGUOUS_SUBMISSION", error_message=str(exc),
+                    retryable=False,
+                )
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                retryable = not isinstance(status_code, int) or not 400 <= status_code < 500
+                return queue.transition(
+                    task_id, status="FAILED", progress=0,
+                    message="Provider 拒绝生成请求" if not retryable else "Provider 提交暂时失败",
+                    error_code="PROVIDER_4XX" if not retryable else "PROVIDER_SUBMIT_FAILED",
+                    error_message=str(exc), retryable=retryable,
+                )
+            queue.transition(
+                task_id, status="RUNNING", progress=5,
+                message="生成任务已提交至确定性测试 Provider",
+                upstream_job_id=upstream_job_id,
+            )
+
+        deadline = time.monotonic() + float(os.environ.get("AETHER_GENERATION_TIMEOUT_SECONDS", "3600"))
+        while time.monotonic() < deadline:
+            queue.heartbeat(task_id)
+            upstream = components.moneyprinter.get_task_status(upstream_job_id)
+            status = str(upstream.get("status", "processing")).lower()
+            progress = max(5, min(95, int(upstream.get("progress", 50))))
+            if status in {"completed", "succeeded"}:
+                provider_artifact_id = str(
+                    upstream.get("providerArtifactId") or upstream.get("artifact_id") or ""
+                )
+                if not provider_artifact_id:
+                    return queue.transition(
+                        task_id, status="FAILED", progress=progress,
+                        message="Provider 未返回受信任产物编号",
+                        upstream_job_id=upstream_job_id,
+                        error_code="ARTIFACT_ID_MISSING", error_message="Artifact identifier missing",
+                        retryable=False,
+                    )
+                queue.transition(
+                    task_id, status="INGESTING", progress=95,
+                    message="正在流式接收并校验生成产物",
+                    upstream_job_id=upstream_job_id,
+                    provider_artifact_id=provider_artifact_id,
+                )
+                artifact_stream = components.moneyprinter.stream_artifact(provider_artifact_id)
+                if isinstance(artifact_stream, bytes):
+                    artifact_stream = io.BytesIO(artifact_stream)
+                return queue.artifact_intake(task_id, provider_artifact_id, artifact_stream)
+            if status in {"failed", "error"}:
+                retryable = bool(upstream.get("retryable", False))
+                return queue.transition(
+                    task_id, status="FAILED", progress=progress,
+                    message="Provider 报告生成失败",
+                    upstream_job_id=upstream_job_id,
+                    error_code=str(upstream.get("errorCode") or "PROVIDER_FAILED"),
+                    error_message=str(upstream.get("message") or "Provider failed"),
+                    retryable=retryable,
+                )
+            if status in {"canceled", "cancelled"}:
+                return queue.transition(
+                    task_id, status="CANCELED", progress=progress,
+                    message="Provider 已取消生成任务", upstream_job_id=upstream_job_id,
+                )
+            queue.transition(
+                task_id, status="RUNNING", progress=progress,
+                message="确定性测试 Provider 正在生成",
+                upstream_job_id=upstream_job_id,
+            )
+            time.sleep(poll_interval)
+        return queue.transition(
+            task_id, status="UNKNOWN", progress=95,
+            message="生成状态查询超时，已停止自动重投",
+            upstream_job_id=upstream_job_id,
+            error_code="STATUS_TIMEOUT", error_message="Generation status timed out",
+            retryable=False,
+        )
+    except Exception as exc:
+        logger.exception("Governed generation task %s failed", task_id)
+        return queue.transition(
+            task_id, status="FAILED", progress=0,
+            message="生成 Worker 发生可恢复错误",
+            upstream_job_id=upstream_job_id,
+            error_code="WORKER_TRANSIENT_FAILURE", error_message=str(exc),
+            retryable=True,
+        )
+
+
 def run_worker(poll_interval: float = 10):
     logger.info("Initializing Aether Studio Background Worker...")
 
     components = initialize_worker()
     components.recovery.scan_and_recover_tasks()
 
-    logger.info("Probing MoneyPrinterTurbo sidecar capabilities...")
-    mpt_health = components.moneyprinter.check_health()
-    logger.info("MoneyPrinterTurbo health: %s", mpt_health)
-    mpt_caps = components.moneyprinter.get_capabilities()
-    logger.info("MoneyPrinterTurbo capabilities: %s", mpt_caps)
+    logger.info("Governed generation provider runtime mode: disabled unless claimed task is deterministic-fake")
 
     logger.info("Probing video-use sidecar capabilities...")
     video_use_health = components.video_use.check_health()
@@ -190,6 +308,14 @@ def run_worker(poll_interval: float = 10):
 
     try:
         while True:
+            generation_task = (
+                components.generation_queue.claim()
+                if components.generation_queue is not None else None
+            )
+            if generation_task is not None:
+                logger.info("Claimed governed generation task %s", generation_task["taskId"])
+                process_generation_task(components, generation_task)
+                continue
             task = components.queue.claim() if components.queue is not None else None
             if task is None:
                 time.sleep(poll_interval)
