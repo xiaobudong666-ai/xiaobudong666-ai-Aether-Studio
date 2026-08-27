@@ -12,6 +12,7 @@
     "IM18": [
       "explicit target-local read-only MoneyPrinter config override",
       "repository-external regular-file and permission preflight",
+      "pinned upstream same-origin /tasks/ artifact contract",
       "secret-free credential presence and canary-profile attestation",
       "no secret content, path, metadata or digest persistence"
     ],
