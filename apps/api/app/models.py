@@ -9,6 +9,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     event,
+    inspect as sqlalchemy_inspect,
 )
 
 from .database import Base
@@ -182,6 +183,120 @@ class DBGenerationEvent(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class DBGenerationProviderConfigVersion(Base):
+    __tablename__ = "generation_provider_config_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "provider", "version",
+            name="uq_generation_provider_config_version",
+        ),
+    )
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    provider = Column(String, nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, index=True)
+    policy_json = Column(JSON, nullable=False)
+    policy_hash = Column(String, nullable=False, index=True)
+    created_by = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    published_by = Column(String, ForeignKey("users.id"), nullable=True, index=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    supersedes_id = Column(
+        String,
+        ForeignKey("generation_provider_config_versions.id"),
+        nullable=True,
+        index=True,
+    )
+
+
+class DBGenerationProviderAttestation(Base):
+    __tablename__ = "generation_provider_attestations"
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True, index=True)
+    provider = Column(String, nullable=False, index=True)
+    worker_id = Column(String, nullable=False, index=True)
+    operator_mode = Column(String, nullable=False)
+    config_version_id = Column(
+        String,
+        ForeignKey("generation_provider_config_versions.id"),
+        nullable=True,
+        index=True,
+    )
+    policy_hash = Column(String, nullable=True, index=True)
+    adapter_version = Column(String, nullable=False)
+    upstream_pin = Column(String, nullable=False)
+    healthy = Column(Boolean, nullable=False)
+    capabilities_json = Column(JSON, nullable=False)
+    reason_code = Column(String, nullable=True)
+    checked_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class DBGenerationUsageEntry(Base):
+    __tablename__ = "generation_usage_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "reservation_key", "kind",
+            name="uq_generation_usage_reservation_kind",
+        ),
+    )
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False, index=True)
+    task_id = Column(String, ForeignKey("generation_tasks.id"), nullable=False, index=True)
+    attempt_id = Column(String, ForeignKey("generation_attempts.id"), nullable=False, index=True)
+    kind = Column(String, nullable=False, index=True)
+    request_units = Column(Integer, nullable=False)
+    generated_seconds = Column(Integer, nullable=False)
+    reservation_key = Column(String, nullable=False, index=True)
+    config_version_id = Column(
+        String,
+        ForeignKey("generation_provider_config_versions.id"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class DBGenerationCircuitState(Base):
+    __tablename__ = "generation_circuit_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "provider",
+            name="uq_generation_circuit_tenant_provider",
+        ),
+    )
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    provider = Column(String, nullable=False, index=True)
+    state = Column(String, nullable=False, index=True)
+    failure_timestamps_json = Column(JSON, nullable=False)
+    opened_at = Column(DateTime(timezone=True), nullable=True)
+    cooldown_until = Column(DateTime(timezone=True), nullable=True)
+    half_open_task_id = Column(String, ForeignKey("generation_tasks.id"), nullable=True, index=True)
+    disabled_reason_code = Column(String, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class DBGenerationProviderEvent(Base):
+    __tablename__ = "generation_provider_events"
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True, index=True)
+    provider = Column(String, nullable=False, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    actor_type = Column(String, nullable=False)
+    actor_id = Column(String, nullable=False)
+    metadata_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
 class DBAssetVersion(Base):
     __tablename__ = "asset_versions"
     __table_args__ = (
@@ -280,5 +395,43 @@ def _reject_immutable_update(_mapper, _connection, target) -> None:
     raise ValueError(f"{target.__class__.__name__} is immutable")
 
 
-for immutable_model in (DBAssetVersion, DBRightsSnapshot, DBMasterRevision, DBGenerationEvent):
+def _validate_provider_config_publish(_mapper, _connection, target) -> None:
+    state = sqlalchemy_inspect(target)
+    changed = {
+        attribute.key
+        for attribute in state.attrs
+        if attribute.history.has_changes()
+    }
+    if not changed.issubset({"status", "published_by", "published_at"}):
+        raise ValueError("DBGenerationProviderConfigVersion is immutable")
+    previous_status = state.attrs.status.history.deleted
+    old_status = previous_status[0] if previous_status else target.status
+    if (old_status, target.status) not in {
+        ("DRAFT", "PUBLISHED"),
+        ("PUBLISHED", "SUPERSEDED"),
+    }:
+        raise ValueError("DBGenerationProviderConfigVersion has an illegal lifecycle transition")
+
+
+for immutable_model in (
+    DBAssetVersion,
+    DBRightsSnapshot,
+    DBMasterRevision,
+    DBGenerationEvent,
+    DBGenerationProviderAttestation,
+    DBGenerationUsageEntry,
+    DBGenerationProviderEvent,
+):
     event.listen(immutable_model, "before_update", _reject_immutable_update)
+    event.listen(immutable_model, "before_delete", _reject_immutable_update)
+
+event.listen(
+    DBGenerationProviderConfigVersion,
+    "before_update",
+    _validate_provider_config_publish,
+)
+event.listen(
+    DBGenerationProviderConfigVersion,
+    "before_delete",
+    _reject_immutable_update,
+)

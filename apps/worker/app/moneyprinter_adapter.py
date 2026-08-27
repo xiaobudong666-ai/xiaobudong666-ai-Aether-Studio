@@ -1,191 +1,232 @@
-import os
-import time
+from __future__ import annotations
+
+import hashlib
 import logging
+import os
+import tempfile
+import time
+from pathlib import PurePosixPath
+from typing import BinaryIO
+from urllib.parse import unquote, urljoin, urlsplit
+
 import httpx
 
 logger = logging.getLogger("worker.moneyprinter_adapter")
 
+ADAPTER_VERSION = "aether-moneyprinter-v2"
+UPSTREAM_VERSION = "v1.2.7"
+UPSTREAM_PIN = "475f21147f0808f5ffe3f58af9ab794b28a4da2c"
+
+
 class MoneyPrinterError(Exception):
-    """Base exception for MoneyPrinterTurbo Adapter errors."""
-    pass
+    """Sanitized, stable Adapter error boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "PROVIDER_ERROR",
+        status_code: int | None = None,
+        retryable: bool = False,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.retryable = retryable
+
 
 class MoneyPrinterTimeoutError(MoneyPrinterError):
-    """Exception raised when requests to MoneyPrinterTurbo timeout."""
     pass
+
 
 class MoneyPrinterConnectionError(MoneyPrinterError):
-    """Exception raised on connection errors to MoneyPrinterTurbo."""
     pass
 
+
+class MoneyPrinterAmbiguousSubmissionError(MoneyPrinterError):
+    pass
+
+
 class MoneyPrinterTaskFailedError(MoneyPrinterError):
-    """Exception raised when a MoneyPrinterTurbo task fails."""
+    pass
+
+
+class MoneyPrinterArtifactError(MoneyPrinterError):
     pass
 
 
 class MoneyPrinterTurboAdapter:
-    """
-    Adapter for communicating with the MoneyPrinterTurbo Sidecar API.
-    Provides health checking, capability detection, video generation,
-    status polling, error mapping, timeouts, and exponential backoff retries.
-    """
+    """The Worker-only, deny-by-default boundary to the pinned Sidecar."""
 
     def __init__(
         self,
-        api_url: str = None,
-        timeout: float = None,
-        max_retries: int = None,
-        backoff_factor: float = None,
+        api_url: str | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+        backoff_factor: float | None = None,
         degrade_on_failure: bool = False,
+        artifact_path_prefixes: list[str] | None = None,
+        max_artifact_bytes: int | None = None,
     ):
-        self.api_url = (
-            api_url
-            or os.environ.get("MONEYPRINTER_API_URL", "http://localhost:8080")
-        ).rstrip("/")
-
-        self.timeout = float(
-            timeout
-            or os.environ.get("MONEYPRINTER_TIMEOUT", "10.0")
+        raw_url = api_url or os.environ.get(
+            "MONEYPRINTER_API_URL", "http://moneyprinter:8080"
         )
-        self.max_retries = int(
-            max_retries
-            or os.environ.get("MONEYPRINTER_MAX_RETRIES", "3")
+        parsed = urlsplit(raw_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("MoneyPrinter Sidecar origin is invalid")
+        self.api_url = raw_url.rstrip("/")
+        self._origin = (parsed.scheme, parsed.hostname, parsed.port)
+        self.timeout = float(timeout or os.environ.get("MONEYPRINTER_TIMEOUT", "10.0"))
+        self.max_retries = max(1, int(max_retries or os.environ.get("MONEYPRINTER_MAX_RETRIES", "3")))
+        self.backoff_factor = float(backoff_factor or os.environ.get("MONEYPRINTER_RETRY_BACKOFF", "2.0"))
+        self.degrade_on_failure = degrade_on_failure
+        self.artifact_path_prefixes = tuple(
+            artifact_path_prefixes or ["/artifacts/", "/api/v1/artifacts/"]
         )
-        self.backoff_factor = float(
-            backoff_factor
-            or os.environ.get("MONEYPRINTER_RETRY_BACKOFF", "2.0")
+        self.max_artifact_bytes = int(
+            max_artifact_bytes
+            or os.environ.get("AETHER_GENERATION_MAX_ARTIFACT_BYTES", str(2 * 1024**3))
         )
-        self.degrade_on_failure = degrade_on_failure or (
-            os.environ.get("MONEYPRINTER_DEGRADE_ON_FAILURE", "false").lower() == "true"
-        )
-
+        self._artifact_sources: dict[str, str] = {}
         logger.info(
-            "MoneyPrinterTurboAdapter initialized. API URL: %s, Timeout: %ss, Max Retries: %s",
-            self.api_url, self.timeout, self.max_retries
+            "MoneyPrinter Adapter initialized (version=%s, upstream_pin=%s, retries=%s)",
+            ADAPTER_VERSION,
+            UPSTREAM_PIN[:12],
+            self.max_retries,
+        )
+
+    def _client(self) -> httpx.Client:
+        return httpx.Client(
+            trust_env=False,
+            follow_redirects=False,
+            timeout=self.timeout,
         )
 
     def _request_with_retry(
         self,
         method: str,
         path: str,
-        json_data: dict = None,
-        params: dict = None,
+        json_data: dict | None = None,
+        params: dict | None = None,
     ) -> httpx.Response:
-        """
-        Executes an HTTP request with exponential backoff retries.
-        Maps generic HTTP exceptions to specific custom exceptions.
-        """
+        if not path.startswith("/") or ".." in PurePosixPath(unquote(path)).parts:
+            raise MoneyPrinterError("Provider path rejected", code="PROVIDER_PATH_INVALID")
         url = f"{self.api_url}{path}"
-        attempt = 0
-        while True:
-            attempt += 1
+        for attempt in range(1, self.max_retries + 1):
             try:
-                logger.info(
-                    "Sending %s request to %s (Attempt %s/%s)",
-                    method, url, attempt, self.max_retries
-                )
-                with httpx.Client(trust_env=False, timeout=self.timeout) as client:
-                    if method.upper() == "POST":
-                        resp = client.post(url, json=json_data, params=params)
-                    else:
-                        resp = client.get(url, params=params)
-
-                # Check status and raise if not 2xx
-                resp.raise_for_status()
-                return resp
-
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-                logger.warning(
-                    "Connection error to %s on attempt %s: %s", url, attempt, exc
-                )
-                if attempt >= self.max_retries:
-                    raise MoneyPrinterConnectionError(
-                        f"Failed to connect to MoneyPrinterTurbo at {self.api_url}: {exc}"
-                    ) from exc
-
+                with self._client() as client:
+                    response = client.request(
+                        method.upper(), url, json=json_data, params=params
+                    )
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    raise MoneyPrinterError(
+                        "Provider redirect rejected",
+                        code="PROVIDER_REDIRECT_REJECTED",
+                        status_code=response.status_code,
+                    )
+                response.raise_for_status()
+                return response
             except httpx.ReadTimeout as exc:
-                logger.warning(
-                    "Timeout reading from %s on attempt %s: %s", url, attempt, exc
-                )
+                if method.upper() == "POST":
+                    raise MoneyPrinterAmbiguousSubmissionError(
+                        "Provider submission outcome is unknown",
+                        code="AMBIGUOUS_SUBMISSION",
+                    ) from exc
                 if attempt >= self.max_retries:
                     raise MoneyPrinterTimeoutError(
-                        f"Request to MoneyPrinterTurbo timed out after {self.timeout}s: {exc}"
+                        "Provider response timed out",
+                        code="PROVIDER_READ_TIMEOUT",
+                        retryable=True,
                     ) from exc
-
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if attempt >= self.max_retries:
+                    raise MoneyPrinterConnectionError(
+                        "Provider connection failed",
+                        code="PROVIDER_CONNECTION_FAILED",
+                        retryable=True,
+                    ) from exc
             except httpx.HTTPStatusError as exc:
-                logger.error(
-                    "HTTP Error %s response from %s: %s",
-                    exc.response.status_code, url, exc.response.text
-                )
-                # Client or Server-side errors that shouldn't be retried if 4xx (except maybe 429)
                 status_code = exc.response.status_code
-                if status_code == 429 or status_code >= 500:
-                    if attempt < self.max_retries:
-                        time.sleep(self.backoff_factor ** attempt)
-                        continue
+                retryable = status_code == 429 or status_code >= 500
+                if retryable and attempt < self.max_retries:
+                    time.sleep(self.backoff_factor ** attempt)
+                    continue
                 raise MoneyPrinterError(
-                    f"MoneyPrinterTurbo API error (HTTP {status_code}): {exc.response.text}"
+                    "Provider rejected the request",
+                    code=("PROVIDER_RATE_LIMITED" if status_code == 429 else
+                          "PROVIDER_5XX" if status_code >= 500 else "PROVIDER_4XX"),
+                    status_code=status_code,
+                    retryable=retryable,
                 ) from exc
-
+            except MoneyPrinterError:
+                raise
             except Exception as exc:
-                logger.error("Unexpected error calling MoneyPrinterTurbo: %s", exc)
-                raise MoneyPrinterError(f"Unexpected error: {exc}") from exc
+                raise MoneyPrinterError(
+                    "Provider returned an invalid response",
+                    code="PROVIDER_RESPONSE_INVALID",
+                ) from exc
+            if attempt < self.max_retries:
+                time.sleep(self.backoff_factor ** attempt)
+        raise MoneyPrinterError("Provider request failed", code="PROVIDER_ERROR")
 
-            # Sleep with exponential backoff
-            sleep_time = self.backoff_factor ** attempt
-            time.sleep(sleep_time)
+    @staticmethod
+    def _json_object(response: httpx.Response) -> dict:
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise MoneyPrinterError(
+                "Provider returned invalid JSON", code="PROVIDER_JSON_INVALID"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise MoneyPrinterError(
+                "Provider returned an invalid object", code="PROVIDER_JSON_INVALID"
+            )
+        return payload
 
     def check_health(self) -> dict:
-        """
-        Probes the health of the MoneyPrinterTurbo sidecar using `/openapi.json`.
-        Only a real 2xx HTTP response is considered healthy.
-        """
         try:
-            resp = self._request_with_retry("GET", "/openapi.json")
+            self._request_with_retry("GET", "/openapi.json")
             return {
                 "status": "healthy",
                 "service": "moneyprinter-sidecar",
-                "url": self.api_url,
                 "responsive": True,
+                "adapterVersion": ADAPTER_VERSION,
+                "upstreamPin": UPSTREAM_PIN,
             }
-        except Exception as exc:
-            logger.warning("MoneyPrinterTurbo sidecar health probe failed: %s", exc)
-            if self.degrade_on_failure:
-                return self.degrade(str(exc))
-            return {
+        except Exception:
+            return self.degrade() if self.degrade_on_failure else {
                 "status": "unhealthy",
                 "service": "moneyprinter-sidecar",
-                "url": self.api_url,
                 "responsive": False,
-                "error": str(exc),
+                "reasonCode": "PROVIDER_HEALTH_FAILED",
+                "adapterVersion": ADAPTER_VERSION,
+                "upstreamPin": UPSTREAM_PIN,
             }
 
     def get_capabilities(self) -> dict:
-        """
-        Probes/declares sidecar integration capabilities.
-        Only reports actually verified and successful capabilities.
-        Since this stage integrates the decoupled Adapter/Contract without full production credentials,
-        advanced features are marked as unavailable or unknown.
-        """
-        try:
-            health = self.check_health()
-            is_active = health.get("status") == "healthy"
-            return {
-                "status": "active" if is_active else "degraded",
-                "capabilities": {
-                    "video_generation": "unknown (adapter integrated, credentials not configured)" if is_active else "unavailable",
-                    "subtitles_sync": "unavailable",
-                    "tts_voiceover": "unavailable",
-                    "supported_aspect_ratios": ["9:16", "16:9", "1:1"] if is_active else [],
-                },
-                "pinned_upstream": {
-                    "version": "v1.2.7",
-                    "commit": "475f21147f0808f5ffe3f58af9ab794b28a4da2c",
-                    "license": "MIT"
-                }
-            }
-        except Exception as exc:
-            logger.error("Failed to fetch capabilities: %s", exc)
-            return self.degrade(str(exc))
+        health = self.check_health()
+        healthy = health["status"] == "healthy"
+        return {
+            "status": "active" if healthy else "degraded",
+            "healthy": healthy,
+            "adapterVersion": ADAPTER_VERSION,
+            "upstreamPin": UPSTREAM_PIN,
+            "capabilities": {
+                "videoAspects": ["9:16", "16:9", "1:1"] if healthy else [],
+                "videoConcatModes": ["random", "sequential"] if healthy else [],
+                "maxOutputs": 1,
+                "maxClipDurationSeconds": 10,
+                "cancellationSupported": False,
+                "artifactStreaming": True,
+            },
+        }
 
     def generate_video(
         self,
@@ -195,107 +236,150 @@ class MoneyPrinterTurboAdapter:
         video_concat_mode: str = "random",
         video_clip_duration: int = 5,
     ) -> str:
-        """
-        Submits a video generation task to MoneyPrinterTurbo.
-        API Endpoint: POST /api/v1/videos
-        Upstream Response: {"status": 200, "data": {"task_id": "..."}}
-        """
+        if not subject.strip() or len(subject) > 500:
+            raise MoneyPrinterError("Generation subject rejected", code="PROVIDER_REQUEST_INVALID", status_code=422)
+        if aspect not in {"9:16", "16:9", "1:1"}:
+            raise MoneyPrinterError("Generation aspect rejected", code="PROVIDER_REQUEST_INVALID", status_code=422)
+        if video_concat_mode not in {"random", "sequential"} or not 1 <= int(video_clip_duration) <= 10:
+            raise MoneyPrinterError("Generation options rejected", code="PROVIDER_REQUEST_INVALID", status_code=422)
         payload = {
             "video_subject": subject,
             "video_aspect": aspect,
             "voice_name": voice_name,
             "video_concat_mode": video_concat_mode,
-            "video_clip_duration": video_clip_duration,
+            "video_clip_duration": int(video_clip_duration),
         }
-        try:
-            resp = self._request_with_retry("POST", "/api/v1/videos", json_data=payload)
-            response_json = resp.json()
-            data = response_json.get("data")
-            if not isinstance(data, dict):
-                raise MoneyPrinterError(f"Expected dict in response 'data', got {type(data)}: {response_json}")
-
-            task_id = data.get("task_id") or data.get("taskId")
-            if not task_id:
-                raise MoneyPrinterError(f"No task_id found in response data: {response_json}")
-            return str(task_id)
-        except Exception as exc:
-            logger.error("Failed to generate video via MoneyPrinterTurbo: %s", exc)
-            raise
+        response = self._request_with_retry("POST", "/api/v1/videos", json_data=payload)
+        data = self._json_object(response).get("data")
+        if not isinstance(data, dict) or not (data.get("task_id") or data.get("taskId")):
+            raise MoneyPrinterError("Provider omitted task identifier", code="PROVIDER_TASK_ID_MISSING")
+        return str(data.get("task_id") or data.get("taskId"))
 
     def get_task_status(self, task_id: str) -> dict:
-        """
-        Queries the status of a specific MoneyPrinterTurbo task.
-        API Endpoint: GET /api/v1/tasks/{task_id}
-        Upstream Response: {"status": 200, "data": {"state": 1, "progress": 100, "combined_videos": [...]}}
-        State mapping:
-         - -1: failed
-         - 1: completed
-         - 4: processing
-        """
+        if not task_id or any(marker in task_id for marker in ("/", "\\", "..", ":")):
+            raise MoneyPrinterError("Provider task identifier rejected", code="PROVIDER_TASK_ID_INVALID")
+        response = self._request_with_retry("GET", f"/api/v1/tasks/{task_id}")
+        data = self._json_object(response).get("data")
+        if not isinstance(data, dict):
+            raise MoneyPrinterError("Provider status object missing", code="PROVIDER_JSON_INVALID")
+        state = data.get("state")
+        status_map = {
+            -1: "failed", 0: "queued", 1: "completed", 2: "queued",
+            3: "processing", 4: "processing", 5: "canceled",
+        }
+        status = status_map.get(state, "unknown")
+        result = {
+            "task_id": task_id,
+            "status": status,
+            "progress": max(0, min(100, int(data.get("progress") or 0))),
+        }
+        if status == "failed":
+            result.update({"errorCode": "PROVIDER_FAILED", "message": "Provider reported failure", "retryable": False})
+        combined = data.get("combined_videos")
+        if status == "completed" and isinstance(combined, list) and combined:
+            source = str(combined[0])
+            self._validated_artifact_url(source)
+            artifact_id = hashlib.sha256(f"{task_id}:{source}".encode("utf-8")).hexdigest()[:40]
+            self._artifact_sources[artifact_id] = source
+            result["providerArtifactId"] = artifact_id
+        return result
+
+    def cancel_task(self, _task_id: str) -> None:
+        raise MoneyPrinterError(
+            "Provider cancellation is not supported",
+            code="PROVIDER_CANCEL_UNSUPPORTED",
+        )
+
+    def _validated_artifact_url(self, source: str) -> str:
+        if not source or "\\" in source or "\x00" in source:
+            raise MoneyPrinterArtifactError("Artifact source rejected", code="ARTIFACT_SOURCE_INVALID")
+        decoded = unquote(source)
+        parsed = urlsplit(decoded)
+        if parsed.scheme:
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or (parsed.scheme, parsed.hostname, parsed.port) != self._origin
+            ):
+                raise MoneyPrinterArtifactError("Artifact origin rejected", code="ARTIFACT_ORIGIN_REJECTED")
+            path = parsed.path
+        else:
+            if not decoded.startswith("/") or parsed.netloc:
+                raise MoneyPrinterArtifactError("Artifact path rejected", code="ARTIFACT_PATH_REJECTED")
+            path = parsed.path
+        if ".." in PurePosixPath(path).parts:
+            raise MoneyPrinterArtifactError("Artifact traversal rejected", code="ARTIFACT_PATH_REJECTED")
+        if not any(path.startswith(prefix) for prefix in self.artifact_path_prefixes):
+            raise MoneyPrinterArtifactError("Artifact prefix rejected", code="ARTIFACT_PATH_REJECTED")
+        query = parsed.query.lower()
+        if any(marker in query for marker in ("token", "secret", "key", "signature", "credential")):
+            raise MoneyPrinterArtifactError("Artifact query rejected", code="ARTIFACT_QUERY_REJECTED")
+        return urljoin(f"{self.api_url}/", decoded)
+
+    def stream_artifact(self, provider_artifact_id: str) -> BinaryIO:
+        source = self._artifact_sources.get(provider_artifact_id)
+        if source is None:
+            raise MoneyPrinterArtifactError("Artifact identifier is unknown", code="ARTIFACT_ID_UNKNOWN")
+        url = self._validated_artifact_url(source)
+        output = tempfile.SpooledTemporaryFile(max_size=min(self.max_artifact_bytes, 8 * 1024**2))
+        total = 0
         try:
-            resp = self._request_with_retry("GET", f"/api/v1/tasks/{task_id}")
-            response_json = resp.json()
-            data = response_json.get("data")
-            if not isinstance(data, dict):
-                raise MoneyPrinterError(f"Expected dict in response 'data', got {type(data)}: {response_json}")
-
-            state = data.get("state")
-            progress = data.get("progress", 0)
-
-            # Map state integer to Aether Studio status string
-            mapped_status = "processing"
-            if state == -1:
-                mapped_status = "failed"
-            elif state == 1:
-                mapped_status = "completed"
-            elif state == 4:
-                mapped_status = "processing"
-            else:
-                mapped_status = "processing"
-
-            if mapped_status == "failed":
-                raise MoneyPrinterTaskFailedError(
-                    f"MoneyPrinterTurbo task {task_id} failed with state {state}"
-                )
-
-            # Extract combined video URL if available
-            combined_videos = data.get("combined_videos", [])
-            video_url = combined_videos[0] if combined_videos else None
-
-            return {
-                "task_id": task_id,
-                "status": mapped_status,
-                "progress": progress,
-                "video_url": video_url
-            }
-        except Exception as exc:
-            logger.error("Failed to get task status for %s: %s", task_id, exc)
-            if self.degrade_on_failure:
-                return {
-                    "task_id": task_id,
-                    "status": "failed",
-                    "progress": 0,
-                    "message": f"Degraded fallback status query due to error: {exc}",
-                    "degraded": True
-                }
+            with self._client() as client:
+                with client.stream("GET", url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        raise MoneyPrinterArtifactError("Artifact redirect rejected", code="ARTIFACT_REDIRECT_REJECTED")
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if content_type != "video/mp4":
+                        raise MoneyPrinterArtifactError("Artifact media type rejected", code="ARTIFACT_CONTENT_TYPE_INVALID")
+                    raw_length = response.headers.get("content-length")
+                    if raw_length is not None:
+                        try:
+                            declared_length = int(raw_length)
+                        except ValueError as exc:
+                            raise MoneyPrinterArtifactError(
+                                "Artifact length is invalid", code="ARTIFACT_LENGTH_INVALID"
+                            ) from exc
+                        if declared_length < 0 or declared_length > self.max_artifact_bytes:
+                            raise MoneyPrinterArtifactError("Artifact exceeds byte limit", code="ARTIFACT_TOO_LARGE")
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > self.max_artifact_bytes:
+                            raise MoneyPrinterArtifactError("Artifact exceeds byte limit", code="ARTIFACT_TOO_LARGE")
+                        output.write(chunk)
+            if total == 0:
+                raise MoneyPrinterArtifactError("Artifact stream is empty", code="ARTIFACT_EMPTY")
+            output.seek(0)
+            return output
+        except MoneyPrinterArtifactError:
+            output.close()
             raise
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            output.close()
+            raise MoneyPrinterArtifactError(
+                "Artifact stream was interrupted",
+                code="ARTIFACT_STREAM_INTERRUPTED",
+                retryable=True,
+            ) from exc
 
-    def degrade(self, exception_msg: str) -> dict:
-        """
-        Graceful degradation boundary when the sidecar is unreachable or erroring out.
-        """
-        logger.warning("Triggering fallback degradation: %s", exception_msg)
+    def degrade(self) -> dict:
         return {
             "status": "degraded",
             "service": "moneyprinter-sidecar",
-            "url": self.api_url,
             "responsive": False,
             "fallback_active": True,
-            "reason": exception_msg,
+            "reasonCode": "PROVIDER_HEALTH_FAILED",
+            "adapterVersion": ADAPTER_VERSION,
+            "upstreamPin": UPSTREAM_PIN,
             "capabilities": {
-                "video_generation": "unavailable",
-                "subtitles_sync": "unavailable",
-                "tts_voiceover": "unavailable",
-                "supported_aspect_ratios": []
-            }
+                "videoAspects": [],
+                "videoConcatModes": [],
+                "maxOutputs": 1,
+                "maxClipDurationSeconds": 10,
+                "cancellationSupported": False,
+                "artifactStreaming": False,
+            },
         }

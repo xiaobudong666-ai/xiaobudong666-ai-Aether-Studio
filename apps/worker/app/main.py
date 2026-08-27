@@ -1,5 +1,6 @@
 import json
 import io
+import datetime
 import logging
 import os
 import threading
@@ -10,7 +11,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from .ai_provider import AIProviderInterface
 from .ffmpeg_adapter import FFmpegAdapter
 from .generation_queue import GenerationQueueClient, GenerationQueueError
-from .moneyprinter_adapter import MoneyPrinterTurboAdapter
+from .moneyprinter_adapter import (
+    ADAPTER_VERSION,
+    UPSTREAM_PIN,
+    MoneyPrinterAmbiguousSubmissionError,
+    MoneyPrinterError,
+    MoneyPrinterTurboAdapter,
+)
 from .recovery import TaskRecoveryManager
 from .task_queue import TaskQueueClient, TaskQueueError
 from .video_use_adapter import VideoUseAdapter
@@ -69,18 +76,33 @@ class WorkerComponents:
     ffmpeg: FFmpegAdapter
     ai: AIProviderInterface
     recovery: TaskRecoveryManager
-    moneyprinter: MoneyPrinterTurboAdapter
+    moneyprinter: object
     video_use: VideoUseAdapter
     queue: TaskQueueClient | None = None
     generation_queue: GenerationQueueClient | None = None
+
+
+class DisabledMoneyPrinterAdapter:
+    """Non-network sentinel used unless the operator explicitly selects moneyprinter."""
+
+    def __getattr__(self, _name):
+        raise RuntimeError("Generation Provider is disabled")
+
+
+def operator_generation_mode() -> str:
+    mode = os.environ.get("AETHER_GENERATION_PROVIDER_MODE", "disabled")
+    return mode if mode in {"disabled", "moneyprinter"} else "disabled"
 
 
 def initialize_worker() -> WorkerComponents:
     backend_url = os.environ.get("BACKEND_URL", "http://localhost:8000")
     queue = TaskQueueClient(backend_url=backend_url)
     generation_queue = GenerationQueueClient(backend_url=backend_url)
-    # Enable degradation fallback by default in background worker
-    moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=True)
+    moneyprinter_adapter: object
+    if operator_generation_mode() == "moneyprinter":
+        moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=False)
+    else:
+        moneyprinter_adapter = DisabledMoneyPrinterAdapter()
     return WorkerComponents(
         ffmpeg=FFmpegAdapter(),
         ai=AIProviderInterface(),
@@ -182,7 +204,43 @@ def process_generation_task(
     if queue is None:
         raise GenerationQueueError("Generation queue is not configured")
     task_id = str(task["taskId"])
-    if task.get("providerMode") != "deterministic-fake":
+    provider_mode = task.get("providerMode")
+    if provider_mode == "moneyprinter":
+        proof = task.get("workerProof") or {}
+        configured_version = os.environ.get("AETHER_GENERATION_CONFIG_VERSION_ID", "")
+        configured_hash = os.environ.get("AETHER_GENERATION_POLICY_HASH", "")
+        try:
+            proof_expires = datetime.datetime.fromisoformat(
+                str(proof.get("expiresAt") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            proof_expires = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        proof_matches = (
+            operator_generation_mode() == "moneyprinter"
+            and bool(configured_version)
+            and bool(configured_hash)
+            and configured_version == task.get("configVersionId")
+            and configured_hash == task.get("policyHash")
+            and proof.get("adapterVersion") == ADAPTER_VERSION
+            and proof.get("upstreamPin") == UPSTREAM_PIN
+            and proof_expires > datetime.datetime.now(datetime.timezone.utc)
+            and isinstance(components.moneyprinter, MoneyPrinterTurboAdapter)
+        )
+        if not proof_matches:
+            return queue.transition(
+                task_id, status="FAILED", progress=0,
+                message="Worker 运行证明与任务配置不匹配",
+                error_code="WORKER_PROOF_MISMATCH", error_message="Worker proof mismatch",
+                retryable=False,
+            )
+        provider_policy = task.get("providerPolicy") or {}
+        components.moneyprinter.artifact_path_prefixes = tuple(
+            provider_policy.get("artifactPathPrefixes") or []
+        )
+        components.moneyprinter.max_artifact_bytes = int(
+            provider_policy.get("maxArtifactBytes") or 0
+        )
+    elif provider_mode != "deterministic-fake":
         return queue.transition(
             task_id, status="FAILED", progress=0,
             message="运行时生成 Provider 未启用",
@@ -201,25 +259,27 @@ def process_generation_task(
                     video_concat_mode=request["videoConcatMode"],
                     video_clip_duration=request["videoClipDuration"],
                 )
-            except TimeoutError as exc:
+            except (TimeoutError, MoneyPrinterAmbiguousSubmissionError):
                 return queue.transition(
                     task_id, status="UNKNOWN", progress=0,
                     message="上游提交结果不明确，已停止自动重投",
-                    error_code="AMBIGUOUS_SUBMISSION", error_message=str(exc),
+                    error_code="AMBIGUOUS_SUBMISSION", error_message="Provider submission outcome unknown",
                     retryable=False,
                 )
             except Exception as exc:
                 status_code = getattr(exc, "status_code", None)
-                retryable = not isinstance(status_code, int) or not 400 <= status_code < 500
+                retryable = bool(getattr(exc, "retryable", False))
+                if not isinstance(exc, MoneyPrinterError):
+                    retryable = not isinstance(status_code, int) or not 400 <= status_code < 500
                 return queue.transition(
                     task_id, status="FAILED", progress=0,
                     message="Provider 拒绝生成请求" if not retryable else "Provider 提交暂时失败",
-                    error_code="PROVIDER_4XX" if not retryable else "PROVIDER_SUBMIT_FAILED",
-                    error_message=str(exc), retryable=retryable,
+                    error_code=str(getattr(exc, "code", None) or ("PROVIDER_4XX" if not retryable else "PROVIDER_SUBMIT_FAILED")),
+                    error_message="Provider submission failed", retryable=retryable,
                 )
             queue.transition(
                 task_id, status="RUNNING", progress=5,
-                message="生成任务已提交至确定性测试 Provider",
+                message="生成任务已提交至受治理 Provider",
                 upstream_job_id=upstream_job_id,
             )
 
@@ -247,7 +307,17 @@ def process_generation_task(
                     upstream_job_id=upstream_job_id,
                     provider_artifact_id=provider_artifact_id,
                 )
-                artifact_stream = components.moneyprinter.stream_artifact(provider_artifact_id)
+                try:
+                    artifact_stream = components.moneyprinter.stream_artifact(provider_artifact_id)
+                except Exception as exc:
+                    return queue.transition(
+                        task_id, status="FAILED", progress=95,
+                        message="Provider 产物未通过受限流校验",
+                        upstream_job_id=upstream_job_id,
+                        error_code=str(getattr(exc, "code", "ARTIFACT_STREAM_FAILED")),
+                        error_message="Artifact stream validation failed",
+                        retryable=bool(getattr(exc, "retryable", False)),
+                    )
                 if isinstance(artifact_stream, bytes):
                     artifact_stream = io.BytesIO(artifact_stream)
                 return queue.artifact_intake(task_id, provider_artifact_id, artifact_stream)
@@ -266,9 +336,17 @@ def process_generation_task(
                     task_id, status="CANCELED", progress=progress,
                     message="Provider 已取消生成任务", upstream_job_id=upstream_job_id,
                 )
+            if status == "unknown":
+                return queue.transition(
+                    task_id, status="UNKNOWN", progress=progress,
+                    message="Provider 返回未知状态，已停止自动动作",
+                    upstream_job_id=upstream_job_id,
+                    error_code="PROVIDER_STATUS_UNKNOWN",
+                    error_message="Provider status unknown", retryable=False,
+                )
             queue.transition(
                 task_id, status="RUNNING", progress=progress,
-                message="确定性测试 Provider 正在生成",
+                message="受治理 Provider 正在生成",
                 upstream_job_id=upstream_job_id,
             )
             time.sleep(poll_interval)
@@ -279,15 +357,45 @@ def process_generation_task(
             error_code="STATUS_TIMEOUT", error_message="Generation status timed out",
             retryable=False,
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("Governed generation task %s failed", task_id)
         return queue.transition(
             task_id, status="FAILED", progress=0,
             message="生成 Worker 发生可恢复错误",
             upstream_job_id=upstream_job_id,
-            error_code="WORKER_TRANSIENT_FAILURE", error_message=str(exc),
+            error_code="WORKER_TRANSIENT_FAILURE", error_message="Worker transient failure",
             retryable=True,
         )
+
+
+def attest_worker_provider(components: WorkerComponents) -> None:
+    queue = components.generation_queue
+    if queue is None:
+        return
+    mode = operator_generation_mode()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    healthy = False
+    capabilities: dict = {}
+    reason_code = "OPERATOR_DISABLED"
+    if mode == "moneyprinter" and isinstance(components.moneyprinter, MoneyPrinterTurboAdapter):
+        report = components.moneyprinter.get_capabilities()
+        healthy = bool(report.get("healthy"))
+        capabilities = dict(report.get("capabilities") or {})
+        reason_code = None if healthy else "PROVIDER_HEALTH_FAILED"
+    queue.attest({
+        "provider": "moneyprinter",
+        "operatorMode": mode,
+        "tenantId": os.environ.get("AETHER_GENERATION_TENANT_ID") or None,
+        "configVersionId": os.environ.get("AETHER_GENERATION_CONFIG_VERSION_ID") or None,
+        "policyHash": os.environ.get("AETHER_GENERATION_POLICY_HASH") or None,
+        "adapterVersion": ADAPTER_VERSION,
+        "upstreamPin": UPSTREAM_PIN,
+        "healthy": healthy,
+        "capabilities": capabilities,
+        "reasonCode": reason_code,
+        "checkedAt": now.isoformat().replace("+00:00", "Z"),
+        "expiresAt": (now + datetime.timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+    })
 
 
 def run_worker(poll_interval: float = 10):
@@ -296,7 +404,8 @@ def run_worker(poll_interval: float = 10):
     components = initialize_worker()
     components.recovery.scan_and_recover_tasks()
 
-    logger.info("Governed generation provider runtime mode: disabled unless claimed task is deterministic-fake")
+    logger.info("Governed generation provider runtime mode: %s", operator_generation_mode())
+    next_attestation_at = 0.0
 
     logger.info("Probing video-use sidecar capabilities...")
     video_use_health = components.video_use.check_health()
@@ -308,6 +417,12 @@ def run_worker(poll_interval: float = 10):
 
     try:
         while True:
+            if time.monotonic() >= next_attestation_at:
+                try:
+                    attest_worker_provider(components)
+                except GenerationQueueError:
+                    logger.warning("Worker Provider attestation was not accepted")
+                next_attestation_at = time.monotonic() + 120
             generation_task = (
                 components.generation_queue.claim()
                 if components.generation_queue is not None else None

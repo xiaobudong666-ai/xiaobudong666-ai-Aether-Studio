@@ -12,8 +12,13 @@ from sqlalchemy.orm import Session
 from .models import (
     DBAssetVersion,
     DBGenerationAttempt,
+    DBGenerationCircuitState,
     DBGenerationEvent,
+    DBGenerationProviderAttestation,
+    DBGenerationProviderConfigVersion,
+    DBGenerationProviderEvent,
     DBGenerationTask,
+    DBGenerationUsageEntry,
 )
 
 
@@ -26,6 +31,27 @@ WORKER_TRANSITIONS = {
     "SUBMITTING": {"RUNNING", "FAILED", "CANCELED", "UNKNOWN"},
     "RUNNING": {"RUNNING", "INGESTING", "FAILED", "CANCELED", "UNKNOWN", "PARTIAL"},
     "INGESTING": {"INGESTING", "RIGHTS_BLOCKED", "FAILED", "CANCELED", "PARTIAL"},
+}
+
+MONEYPRINTER_UPSTREAM_PIN = "475f21147f0808f5ffe3f58af9ab794b28a4da2c"
+MONEYPRINTER_ADAPTER_VERSION = "aether-moneyprinter-v2"
+DEFAULT_FAKE_POLICY: dict[str, Any] = {
+    "enabledIntent": True,
+    "allowedAspects": ["16:9", "9:16", "1:1"],
+    "allowedVoices": ["en-US-JennyNeural", "zh-CN-XiaoxiaoNeural"],
+    "allowedConcatModes": ["random", "sequential"],
+    "maxClipDurationSeconds": 10,
+    "maxOutputs": 1,
+    "concurrentTaskLimit": 4,
+    "monthlyRequestLimit": 10_000,
+    "monthlyGeneratedSecondsLimit": 1_000_000,
+    "failureWindow": 300,
+    "failureThreshold": 5,
+    "cooldownSeconds": 60,
+    "artifactPathPrefixes": ["/artifacts/", "/api/v1/artifacts/"],
+    "maxArtifactBytes": 2 * 1024**3,
+    "configLabel": "deterministic-fake-test-policy",
+    "description": "Local deterministic acceptance mode only.",
 }
 
 
@@ -49,32 +75,191 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def build_capability_snapshot(mode: str, now: datetime.datetime | None = None) -> dict[str, Any]:
+def build_capability_snapshot(
+    mode: str,
+    now: datetime.datetime | None = None,
+    *,
+    policy: dict[str, Any] | None = None,
+    config_version_id: str | None = None,
+    policy_hash: str | None = None,
+    healthy: bool | None = None,
+    reason_code: str | None = None,
+    attestation_expires_at: datetime.datetime | None = None,
+    quota: dict[str, Any] | None = None,
+    circuit_state: str = "CLOSED",
+) -> dict[str, Any]:
     issued_at = now or utc_now()
-    enabled = mode == "deterministic-fake"
+    effective_policy = policy or DEFAULT_FAKE_POLICY
+    enabled = mode in {"deterministic-fake", "moneyprinter"} and (healthy is not False)
+    effective_healthy = enabled if healthy is None else healthy
+    expires_at = min(
+        issued_at + datetime.timedelta(minutes=5),
+        attestation_expires_at or issued_at + datetime.timedelta(minutes=5),
+    )
     snapshot: dict[str, Any] = {
         "provider": "moneyprinter",
-        "mode": "deterministic-fake" if enabled else "disabled",
+        "mode": mode if enabled else "disabled",
         "enabled": enabled,
-        "healthy": enabled,
-        "sourceVersion": "im12-im14-deterministic-fake-v1" if enabled else "disabled",
+        "healthy": effective_healthy,
+        "sourceVersion": (
+            "im15-im17-moneyprinter-v1"
+            if mode == "moneyprinter" and enabled
+            else "im12-im14-deterministic-fake-v1" if enabled else "disabled"
+        ),
+        "configVersionId": config_version_id,
+        "policyHash": policy_hash,
         "issuedAt": iso_utc(issued_at),
         "checkedAt": iso_utc(issued_at),
-        "expiresAt": iso_utc(issued_at + datetime.timedelta(minutes=5)),
-        "reasonCode": None if enabled else "PROVIDER_DISABLED",
-        "videoAspects": ["16:9", "9:16", "1:1"],
-        "videoConcatModes": ["random", "sequential"],
-        "clipDurationSeconds": {"min": 1, "max": 10},
-        "maxOutputs": 1,
-        "voices": ["en-US-JennyNeural", "zh-CN-XiaoxiaoNeural"],
+        "expiresAt": iso_utc(expires_at),
+        "reasonCode": None if enabled else (reason_code or "PROVIDER_DISABLED"),
+        "videoAspects": effective_policy.get("allowedAspects", []),
+        "videoConcatModes": effective_policy.get("allowedConcatModes", []),
+        "clipDurationSeconds": {
+            "min": 1,
+            "max": int(effective_policy.get("maxClipDurationSeconds", 0)),
+        },
+        "maxOutputs": int(effective_policy.get("maxOutputs", 0)),
+        "voices": effective_policy.get("allowedVoices", []),
+        "quota": quota or {
+            "concurrentLimit": int(effective_policy.get("concurrentTaskLimit", 0)),
+            "concurrentRemaining": int(effective_policy.get("concurrentTaskLimit", 0)),
+            "monthlyRequestLimit": int(effective_policy.get("monthlyRequestLimit", 0)),
+            "monthlyRequestRemaining": int(effective_policy.get("monthlyRequestLimit", 0)),
+            "monthlyGeneratedSecondsLimit": int(effective_policy.get("monthlyGeneratedSecondsLimit", 0)),
+            "monthlyGeneratedSecondsRemaining": int(effective_policy.get("monthlyGeneratedSecondsLimit", 0)),
+        },
+        "providerPolicy": {
+            "failureWindow": int(effective_policy.get("failureWindow", 300)),
+            "failureThreshold": int(effective_policy.get("failureThreshold", 5)),
+            "cooldownSeconds": int(effective_policy.get("cooldownSeconds", 60)),
+            "artifactPathPrefixes": list(effective_policy.get("artifactPathPrefixes", [])),
+            "maxArtifactBytes": int(effective_policy.get("maxArtifactBytes", 0)),
+        },
+        "circuit": {"state": circuit_state},
     }
     snapshot["snapshotHash"] = sha256_json(snapshot)
     return snapshot
 
 
+def provider_config_response(config: DBGenerationProviderConfigVersion) -> dict[str, Any]:
+    return {
+        "id": config.id,
+        "provider": config.provider,
+        "version": config.version,
+        "status": config.status,
+        "policy": config.policy_json,
+        "policyHash": config.policy_hash,
+        "createdBy": config.created_by,
+        "createdAt": iso_utc(config.created_at),
+        "publishedBy": config.published_by,
+        "publishedAt": iso_utc(config.published_at),
+        "supersedesId": config.supersedes_id,
+    }
+
+
+def add_provider_event(
+    db: Session,
+    *,
+    tenant_id: str | None,
+    event_type: str,
+    actor_type: str,
+    actor_id: str,
+    metadata: dict[str, Any] | None = None,
+    now: datetime.datetime | None = None,
+) -> DBGenerationProviderEvent:
+    row = DBGenerationProviderEvent(
+        id=str(uuid.uuid4()),
+        tenant_id=tenant_id,
+        provider="moneyprinter",
+        event_type=event_type,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        metadata_json=metadata or {},
+        created_at=now or utc_now(),
+    )
+    db.add(row)
+    return row
+
+
+def month_start(now: datetime.datetime) -> datetime.datetime:
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def quota_summary(
+    db: Session,
+    tenant_id: str,
+    policy: dict[str, Any],
+    now: datetime.datetime,
+) -> dict[str, int]:
+    active = db.execute(
+        select(DBGenerationTask).where(
+            DBGenerationTask.tenant_id == tenant_id,
+            DBGenerationTask.status.in_(ACTIVE_GENERATION_STATES),
+        )
+    ).scalars().all()
+    entries = db.execute(
+        select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.tenant_id == tenant_id,
+            DBGenerationUsageEntry.created_at >= month_start(now),
+        )
+    ).scalars().all()
+    reserved_requests = sum(row.request_units for row in entries if row.kind == "RESERVED")
+    released_requests = sum(row.request_units for row in entries if row.kind == "RELEASED")
+    settled_seconds = sum(row.generated_seconds for row in entries if row.kind in {"SETTLED", "ADJUSTED"})
+    request_used = max(0, reserved_requests - released_requests)
+    concurrent_limit = int(policy["concurrentTaskLimit"])
+    request_limit = int(policy["monthlyRequestLimit"])
+    seconds_limit = int(policy["monthlyGeneratedSecondsLimit"])
+    return {
+        "concurrentLimit": concurrent_limit,
+        "concurrentRemaining": max(0, concurrent_limit - len(active)),
+        "monthlyRequestLimit": request_limit,
+        "monthlyRequestRemaining": max(0, request_limit - request_used),
+        "monthlyGeneratedSecondsLimit": seconds_limit,
+        "monthlyGeneratedSecondsRemaining": max(0, seconds_limit - settled_seconds),
+    }
+
+
+def add_usage_entry(
+    db: Session,
+    *,
+    task: DBGenerationTask,
+    attempt: DBGenerationAttempt,
+    kind: str,
+    request_units: int,
+    generated_seconds: int,
+    reservation_key: str,
+    config_version_id: str | None,
+    now: datetime.datetime,
+) -> DBGenerationUsageEntry | None:
+    existing = db.execute(
+        select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.reservation_key == reservation_key,
+            DBGenerationUsageEntry.kind == kind,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return None
+    entry = DBGenerationUsageEntry(
+        id=str(uuid.uuid4()),
+        tenant_id=task.tenant_id,
+        project_id=task.project_id,
+        task_id=task.id,
+        attempt_id=attempt.id,
+        kind=kind,
+        request_units=max(0, request_units),
+        generated_seconds=max(0, generated_seconds),
+        reservation_key=reservation_key,
+        config_version_id=config_version_id,
+        created_at=now,
+    )
+    db.add(entry)
+    return entry
+
+
 def capability_snapshot_valid(snapshot: dict[str, Any], supplied_hash: str, now: datetime.datetime) -> tuple[bool, str | None]:
     if not snapshot.get("enabled"):
-        return False, "PROVIDER_DISABLED"
+        return False, str(snapshot.get("reasonCode") or "PROVIDER_DISABLED")
     if not snapshot.get("healthy"):
         return False, "PROVIDER_UNHEALTHY"
     if supplied_hash != snapshot.get("snapshotHash"):

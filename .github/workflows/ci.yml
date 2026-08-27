@@ -72,7 +72,7 @@ jobs:
       - name: Run API tests
         env:
           PYTHONPATH: apps/api
-        run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py -v
+        run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py -v
 
   playwright:
     name: Playwright workbench flow
@@ -162,8 +162,8 @@ jobs:
           curl --fail --show-error http://127.0.0.1:8001/health
           curl --fail --show-error http://127.0.0.1/healthz
           curl --fail --show-error http://127.0.0.1/api/health
-          curl --fail --show-error http://127.0.0.1/api/moneyprinter/health
-          curl --fail --show-error http://127.0.0.1/api/moneyprinter/capabilities
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1/api/moneyprinter/health)" = "410"
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1/api/moneyprinter/capabilities)" = "410"
           curl --fail --show-error http://127.0.0.1/api/video-use/health
           curl --fail --show-error http://127.0.0.1/api/video-use/capabilities
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' --request POST http://127.0.0.1/api/internal/render-tasks/claim)" = "404"
@@ -189,9 +189,10 @@ jobs:
         run: |
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_worker.py worker:/tmp/test_worker.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_moneyprinter.py worker:/tmp/test_moneyprinter.py
+          docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_generation_tasks.py worker:/tmp/test_generation_tasks.py
           docker compose -f infra/docker/docker-compose.yml exec -T \
             -e PYTHONPATH=/app worker \
-            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py -v
+            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py -v
 
       - name: Run video-use sidecar tests in FFmpeg container
         run: |

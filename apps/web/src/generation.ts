@@ -358,7 +358,7 @@ export type ServerGenerationStatus =
 
 export interface GenerationCapabilitySnapshot {
   provider: "moneyprinter";
-  mode: "disabled" | "deterministic-fake";
+  mode: "disabled" | "deterministic-fake" | "moneyprinter";
   enabled: boolean;
   healthy: boolean;
   sourceVersion: string;
@@ -370,6 +370,29 @@ export interface GenerationCapabilitySnapshot {
   maxOutputs: number;
   voices: string[];
   snapshotHash: string;
+  reasonCode?: string | null;
+  configVersionId?: string | null;
+  policyHash?: string | null;
+  operatorMode: "disabled" | "deterministic-fake" | "moneyprinter";
+  ownerPolicy: { published: boolean; enabledIntent: boolean };
+  workerProof: {
+    present: boolean;
+    fresh: boolean;
+    checkedAt?: string | null;
+    expiresAt?: string | null;
+    adapterVersion?: string | null;
+    upstreamPin?: string | null;
+  };
+  quota: {
+    concurrentLimit: number;
+    concurrentRemaining: number;
+    monthlyRequestLimit: number;
+    monthlyRequestRemaining: number;
+    monthlyGeneratedSecondsLimit: number;
+    monthlyGeneratedSecondsRemaining: number;
+  };
+  circuit: { state: "CLOSED" | "OPEN" | "HALF_OPEN" | "DISABLED" };
+  killSwitch: { disabled: boolean; reasonCode?: string | null };
 }
 
 export interface ServerGenerationRequest {
@@ -436,7 +459,7 @@ export class GenerationApiClient {
   }
 
   capabilities(): Promise<GenerationCapabilitySnapshot> {
-    return this.json("/generation/providers/moneyprinter/capabilities");
+    return this.json("/generation/providers/moneyprinter/readiness");
   }
 
   validate(projectId: string, body: ServerGenerationRequest): Promise<{ allowed: true }> {

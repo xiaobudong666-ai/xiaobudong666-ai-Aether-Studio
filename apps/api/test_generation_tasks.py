@@ -1,7 +1,9 @@
 import datetime
+import inspect
 import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,8 +15,13 @@ from app.models import (
     DBAssetVersion,
     DBCandidate,
     DBGenerationAttempt,
+    DBGenerationCircuitState,
     DBGenerationEvent,
+    DBGenerationProviderAttestation,
+    DBGenerationProviderConfigVersion,
+    DBGenerationProviderEvent,
     DBGenerationTask,
+    DBGenerationUsageEntry,
     DBProject,
     DBTenant,
     DBUser,
@@ -88,6 +95,111 @@ def generation_context(tmp_path, monkeypatch):
         yield client, sessions, app, media_store
     Base.metadata.drop_all(bind=engine)
     engine.dispose()
+
+
+@pytest.fixture()
+def provider_control_context(tmp_path):
+    engine = build_engine(f"sqlite:///{tmp_path / 'provider-control.db'}")
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def get_db():
+        with sessions() as db:
+            yield db
+
+    app = create_app(
+        app_engine=engine,
+        db_dependency=get_db,
+        video_use_adapter=FakeGeneratedMediaStore(),
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="provider-owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False,
+        enforce_csrf=True,
+        generation_provider_mode="moneyprinter",
+    )
+    with TestClient(app) as client:
+        assert client.post(
+            "/auth/login",
+            json={"email": "provider-owner@example.com", "password": OWNER_PASSWORD},
+        ).status_code == 200
+        client.headers.update({"X-Aether-CSRF": "1"})
+        yield client, sessions, app, engine
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+
+
+def provider_policy(**overrides):
+    policy = {
+        "enabledIntent": True,
+        "allowedAspects": ["16:9", "9:16", "1:1"],
+        "allowedVoices": ["en-US-JennyNeural"],
+        "allowedConcatModes": ["random", "sequential"],
+        "maxClipDurationSeconds": 10,
+        "maxOutputs": 1,
+        "concurrentTaskLimit": 2,
+        "monthlyRequestLimit": 100,
+        "monthlyGeneratedSecondsLimit": 1000,
+        "failureWindow": 300,
+        "failureThreshold": 2,
+        "cooldownSeconds": 60,
+        "artifactPathPrefixes": ["/artifacts/"],
+        "maxArtifactBytes": 1024,
+        "configLabel": "provider-readiness-v1",
+        "description": "Governed activation policy.",
+    }
+    policy.update(overrides)
+    return policy
+
+
+def create_provider_config(client, **overrides):
+    response = client.post(
+        "/generation/providers/moneyprinter/config-versions",
+        json=provider_policy(**overrides),
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def publish_provider_config(client, config):
+    response = client.post(
+        f"/generation/providers/moneyprinter/config-versions/{config['id']}/publish"
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def attest_provider(client, sessions, config, **overrides):
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    payload = {
+        "provider": "moneyprinter",
+        "operatorMode": "moneyprinter",
+        "tenantId": tenant_id,
+        "configVersionId": config["id"],
+        "policyHash": config["policyHash"],
+        "adapterVersion": "aether-moneyprinter-v2",
+        "upstreamPin": "475f21147f0808f5ffe3f58af9ab794b28a4da2c",
+        "healthy": True,
+        "capabilities": {
+            "videoAspects": ["9:16"],
+            "voices": ["en-US-JennyNeural"],
+            "videoConcatModes": ["random"],
+            "maxOutputs": 1,
+            "maxClipDurationSeconds": 10,
+            "cancellationSupported": False,
+            "artifactStreaming": True,
+        },
+        "reasonCode": None,
+        "checkedAt": now.isoformat(),
+        "expiresAt": (now + datetime.timedelta(minutes=4)).isoformat(),
+    }
+    payload.update(overrides)
+    return client.post(
+        "/internal/generation/providers/moneyprinter/attest",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-proof"},
+        json=payload,
+    )
 
 
 def create_project(client, name="Generation project"):
@@ -648,3 +760,468 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
         assert tenant.used_storage_bytes == 0
         assert stored.status == "FAILED"
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+
+
+def test_im15_01_new_environment_is_disabled_without_provider_calls(provider_control_context):
+    client, sessions, app, _ = provider_control_context
+    readiness = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["enabled"] is False
+    assert readiness["reasonCode"] == "OWNER_CONFIG_MISSING"
+    assert not hasattr(app.state, "moneyprinter")
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == 0
+
+
+@pytest.mark.parametrize("mode", [None, "", "MONEYPRINTER", "unknown"])
+def test_im15_02_unknown_or_disguised_operator_mode_is_disabled(tmp_path, monkeypatch, mode):
+    if mode is None:
+        monkeypatch.delenv("AETHER_GENERATION_PROVIDER_MODE", raising=False)
+    else:
+        monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", mode)
+    engine = build_engine(f"sqlite:///{tmp_path / f'mode-{mode or "missing"}.db'}")
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    app = create_app(
+        app_engine=engine, db_dependency=lambda: iter(()),
+        bootstrap_admin_password=OWNER_PASSWORD,
+    )
+    assert app.state.generation_provider_mode == "disabled"
+    engine.dispose()
+
+
+def test_im15_03_editor_and_viewer_cannot_mutate_provider_control(provider_control_context):
+    client, _, _, _ = provider_control_context
+    for role in ("editor", "viewer"):
+        password = secrets.token_urlsafe(24)
+        assert client.post("/admin/users", json={
+            "email": f"{role}@example.com", "displayName": role,
+            "password": password, "role": role,
+        }).status_code == 201
+        client.post("/auth/logout")
+        client.post("/auth/login", json={"email": f"{role}@example.com", "password": password})
+        assert client.post(
+            "/generation/providers/moneyprinter/config-versions",
+            json=provider_policy(),
+        ).status_code == 403
+        assert client.post(
+            "/generation/providers/moneyprinter/kill-switch",
+            json={"disabled": True, "reasonCode": "OWNER_STOP"},
+        ).status_code == 403
+        client.post("/auth/logout")
+        client.post("/auth/login", json={"email": "provider-owner@example.com", "password": OWNER_PASSWORD})
+
+
+def test_im15_04_owner_draft_requires_csrf_and_has_no_provider_call(provider_control_context):
+    client, sessions, app, _ = provider_control_context
+    del client.headers["X-Aether-CSRF"]
+    assert client.post(
+        "/generation/providers/moneyprinter/config-versions", json=provider_policy()
+    ).status_code == 403
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationProviderConfigVersion.id))).scalar_one() == 0
+    assert not hasattr(app.state, "moneyprinter")
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        {"providerUrl": "https://evil.example"},
+        {"apiKey": "value"},
+        {"description": "authorization token"},
+    ],
+)
+def test_im15_05_unknown_url_and_secret_shaped_policy_is_rejected(provider_control_context, unsafe):
+    client, sessions, _, _ = provider_control_context
+    payload = provider_policy()
+    payload.update(unsafe)
+    assert client.post(
+        "/generation/providers/moneyprinter/config-versions", json=payload
+    ).status_code == 422
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationProviderConfigVersion.id))).scalar_one() == 0
+
+
+def test_im15_06_published_config_is_immutable_and_new_version_appends(provider_control_context):
+    client, _, _, _ = provider_control_context
+    first = publish_provider_config(client, create_provider_config(client))
+    assert client.post(
+        f"/generation/providers/moneyprinter/config-versions/{first['id']}/publish"
+    ).status_code == 409
+    second = create_provider_config(client, configLabel="provider-readiness-v2")
+    assert second["version"] == 2
+    assert second["supersedesId"] == first["id"]
+    publish_provider_config(client, second)
+    versions = client.get("/generation/providers/moneyprinter/config-versions").json()
+    assert [item["status"] for item in versions] == ["PUBLISHED", "SUPERSEDED"]
+
+
+def test_im15_07_owner_publish_cannot_override_operator_disabled(provider_control_context):
+    client, _, app, _ = provider_control_context
+    publish_provider_config(client, create_provider_config(client))
+    app.state.generation_provider_mode = "disabled"
+    readiness = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["enabled"] is False
+    assert readiness["reasonCode"] == "OPERATOR_DISABLED"
+
+
+def test_im15_08_operator_mode_without_published_config_is_disabled(provider_control_context):
+    client, _, app, _ = provider_control_context
+    assert app.state.generation_provider_mode == "moneyprinter"
+    readiness = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["enabled"] is False
+    assert readiness["ownerPolicy"]["published"] is False
+
+
+def test_im15_09_published_config_without_worker_proof_is_disabled(provider_control_context):
+    client, _, _, _ = provider_control_context
+    publish_provider_config(client, create_provider_config(client))
+    readiness = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["reasonCode"] == "WORKER_ATTESTATION_MISSING"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("policyHash", "b" * 64, "WORKER_POLICY_MISMATCH"),
+        ("upstreamPin", "wrong-pin", "WORKER_UPSTREAM_PIN_MISMATCH"),
+        ("operatorMode", "disabled", "WORKER_OPERATOR_MODE_MISMATCH"),
+    ],
+)
+def test_im15_10_mismatched_worker_proof_disables_readiness(provider_control_context, field, value, expected):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config, **{field: value}).status_code == 201
+    readiness = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["enabled"] is False
+    assert readiness["reasonCode"] == expected
+
+
+def test_im15_11_bad_worker_token_has_zero_state_change(provider_control_context):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    response = client.post(
+        "/internal/generation/providers/moneyprinter/attest",
+        headers={"X-Worker-Token": "wrong", "X-Worker-Id": "attacker"},
+        json={
+            "provider": "moneyprinter", "operatorMode": "moneyprinter",
+            "tenantId": tenant_id, "configVersionId": config["id"],
+            "policyHash": config["policyHash"], "adapterVersion": "v",
+            "upstreamPin": "wrong", "healthy": True, "capabilities": {},
+            "checkedAt": now.isoformat(),
+            "expiresAt": (now + datetime.timedelta(minutes=1)).isoformat(),
+        },
+    )
+    assert response.status_code == 401
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationProviderAttestation.id))).scalar_one() == 0
+
+
+def test_im15_12_matching_fresh_proof_produces_stable_capability_hash(provider_control_context):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    attested = attest_provider(client, sessions, config)
+    assert attested.status_code == 201, attested.text
+    first = client.get("/generation/providers/moneyprinter/readiness").json()
+    second = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert first["enabled"] is True
+    assert first["snapshotHash"] == second["snapshotHash"]
+    assert len(first["snapshotHash"]) == 64
+
+
+def test_im15_13_superseded_snapshot_hash_is_rejected_without_task(provider_control_context):
+    client, sessions, _, _ = provider_control_context
+    first = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, first).status_code == 201
+    project = create_project(client)
+    stale = generation_request(client, project)
+    second = publish_provider_config(
+        client, create_provider_config(client, configLabel="provider-readiness-v2")
+    )
+    assert second["id"] != first["id"]
+    response = client.post(f"/projects/{project['id']}/generation-tasks", json=stale)
+    assert response.status_code in {409, 503}
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == 0
+
+
+def test_im15_14_readiness_is_sanitized_and_legacy_probes_are_gone(provider_control_context):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    serialized = str(client.get("/generation/providers/moneyprinter/readiness").json()).lower()
+    for forbidden in ("http://", "https://", "api_key", "authorization", "cookie", "localhost"):
+        assert forbidden not in serialized
+    assert client.get("/moneyprinter/health").status_code == 410
+    assert client.get("/moneyprinter/capabilities").status_code == 410
+
+
+def test_im15_15_provider_control_recovers_from_persistent_state(provider_control_context):
+    client, sessions, _, engine = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+
+    def get_db():
+        with sessions() as db:
+            yield db
+
+    restarted = create_app(
+        app_engine=engine, db_dependency=get_db,
+        video_use_adapter=FakeGeneratedMediaStore(),
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="provider-owner@example.com",
+        worker_token=WORKER_TOKEN, cookie_secure=False, enforce_csrf=True,
+        generation_provider_mode="moneyprinter",
+    )
+    with TestClient(restarted) as restarted_client:
+        restarted_client.post("/auth/login", json={
+            "email": "provider-owner@example.com", "password": OWNER_PASSWORD,
+        })
+        readiness = restarted_client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["enabled"] is True
+    assert readiness["configVersionId"] == config["id"]
+
+
+def test_im15_16_compose_and_environment_templates_default_disabled():
+    root = Path(__file__).resolve().parents[2]
+    for path in (root / ".env.example", root / "infra/docker/.env.example"):
+        assert "AETHER_GENERATION_PROVIDER_MODE=disabled" in path.read_text()
+    compose = (root / "infra/docker/docker-compose.yml").read_text()
+    assert compose.count("AETHER_GENERATION_PROVIDER_MODE=${AETHER_GENERATION_PROVIDER_MODE:-disabled}") == 2
+
+
+def test_im17_33_validate_reports_quota_without_reservation(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/validate",
+        json=generation_request(client, project),
+    )
+    assert response.status_code == 200
+    assert response.json()["quota"]["concurrentRemaining"] > 0
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 0
+
+
+def test_im17_34_create_atomically_writes_one_reserved_entry(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    task = create_task(client, project)
+    with sessions() as db:
+        entries = list(db.execute(select(DBGenerationUsageEntry)).scalars())
+    assert len(entries) == 1
+    assert entries[0].kind == "RESERVED" and entries[0].task_id == task["taskId"]
+
+
+def test_im17_35_concurrent_create_never_exceeds_limit(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    responses = []
+    for index in range(5):
+        key = f"concurrency-{index}"
+        responses.append(client.post(
+            f"/projects/{project['id']}/generation-tasks",
+            headers={"Idempotency-Key": idempotency_uuid(key)},
+            json=generation_request(client, project, idempotency_key=key),
+        ))
+    assert [response.status_code for response in responses].count(202) == 4
+    assert responses[-1].json()["detail"]["code"] == "GENERATION_CONCURRENCY_QUOTA_EXCEEDED"
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == 4
+
+
+def test_im17_36_monthly_request_and_seconds_limits_reject_new_work(generation_context, monkeypatch):
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "monthlyRequestLimit", 1)
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    create_task(client, project, key="monthly-one")
+    with sessions() as db:
+        row = db.execute(select(DBGenerationTask)).scalar_one()
+        row.status = "FAILED"
+        db.commit()
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks",
+        json=generation_request(client, project, idempotency_key="monthly-two"),
+    )
+    assert response.status_code == 429
+    assert response.json()["detail"]["code"] == "GENERATION_MONTHLY_REQUEST_QUOTA_EXCEEDED"
+
+
+def test_im17_37_cancel_releases_once_without_negative_usage(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    task = create_task(client, project)
+    path = f"/projects/{project['id']}/generation-tasks/{task['taskId']}/cancel"
+    assert client.post(path).status_code == 200
+    assert client.post(path).status_code == 200
+    with sessions() as db:
+        entries = list(db.execute(select(DBGenerationUsageEntry)).scalars())
+    assert [entry.kind for entry in entries] == ["RESERVED", "RELEASED"]
+    assert sum(entry.request_units if entry.kind == "RESERVED" else -entry.request_units for entry in entries) == 0
+
+
+def test_im17_38_success_settles_probe_seconds_once(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    task = ingest_success(client, project)
+    client.post(
+        f"/internal/generation-tasks/{task['taskId']}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "artifact-1"},
+        files={"file": ("artifact.mp4", b"deterministic-video", "video/mp4")},
+    )
+    with sessions() as db:
+        settled = list(db.execute(select(DBGenerationUsageEntry).where(DBGenerationUsageEntry.kind == "SETTLED")).scalars())
+    assert len(settled) == 1 and settled[0].generated_seconds == 1
+
+
+def test_im17_39_retry_reuses_reservation_and_appends_attempt(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    task = create_task(client, project)
+    claim(client)
+    transition(client, task["taskId"], "FAILED", errorCode="TEMPORARY", retryable=True)
+    assert client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry").status_code == 202
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == 2
+
+
+def test_im17_40_multiple_worker_failures_open_circuit_once(generation_context, monkeypatch):
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "failureThreshold", 1)
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    first = create_task(client, project, key="circuit-first")
+    second = create_task(client, project, key="circuit-second")
+    assert claim(client, "worker-a").json()["taskId"] == first["taskId"]
+    assert claim(client, "worker-b").json()["taskId"] == second["taskId"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda values: transition(
+                client, values[0], "FAILED", worker_id=values[1],
+                errorCode="PROVIDER_5XX", retryable=True,
+            ).status_code,
+            [(first["taskId"], "worker-a"), (second["taskId"], "worker-b")],
+        ))
+    assert results == [200, 200]
+    with sessions() as db:
+        opened = db.execute(select(func.count(DBGenerationProviderEvent.id)).where(
+            DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_OPENED"
+        )).scalar_one()
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+    assert opened == 1 and circuit.state == "OPEN"
+
+
+def test_im17_41_open_blocks_claim_and_half_open_allows_one_probe(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    create_task(client, project, key="half-open-a")
+    create_task(client, project, key="half-open-b")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
+            state="OPEN", failure_timestamps_json=[], opened_at=now,
+            cooldown_until=now + datetime.timedelta(minutes=1), updated_at=now,
+        ))
+        db.commit()
+    assert claim(client).status_code == 204
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        circuit.cooldown_until = now - datetime.timedelta(seconds=1)
+        db.commit()
+    assert claim(client, "worker-a").status_code == 200
+    assert claim(client, "worker-b").status_code == 204
+
+
+def test_im17_42_half_open_success_closes_persistent_circuit(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key="half-open-success")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
+            state="OPEN", failure_timestamps_json=[now.isoformat()], opened_at=now,
+            cooldown_until=now - datetime.timedelta(seconds=1), updated_at=now,
+        ))
+        db.commit()
+    assert claim(client, "worker-a").status_code == 200
+    transition(client, task["taskId"], "RUNNING", upstreamJobId="upstream")
+    transition(client, task["taskId"], "INGESTING", upstreamJobId="upstream", providerArtifactId="artifact")
+    assert client.post(
+        f"/internal/generation-tasks/{task['taskId']}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "artifact"},
+        files={"file": ("artifact.mp4", b"video", "video/mp4")},
+    ).status_code == 201
+    with sessions() as db:
+        assert db.execute(select(DBGenerationCircuitState.state)).scalar_one() == "CLOSED"
+
+
+def test_im17_43_owner_emergency_stop_blocks_validate_create_and_claim(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    create_task(client, project, key="kill-existing")
+    response = client.post(
+        "/generation/providers/moneyprinter/kill-switch",
+        json={"disabled": True, "reasonCode": "OWNER_EMERGENCY"},
+    )
+    assert response.status_code == 200 and response.json()["killSwitch"]["disabled"] is True
+    request = generation_request(client, project, idempotency_key="kill-new")
+    assert client.post(f"/projects/{project['id']}/generation-tasks/validate", json=request).status_code == 503
+    assert claim(client).status_code == 204
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationProviderEvent.id)).where(
+            DBGenerationProviderEvent.event_type == "PROVIDER_EMERGENCY_STOPPED"
+        )).scalar_one() == 1
+
+
+def test_im17_44_stop_and_recovery_preserve_governance_evidence(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    task = ingest_success(client, project)
+    with sessions() as db:
+        before = {
+            "assets": db.execute(select(func.count(DBAssetVersion.id))).scalar_one(),
+            "attempts": db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one(),
+            "events": db.execute(select(func.count(DBGenerationEvent.id))).scalar_one(),
+            "usage": db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one(),
+        }
+    client.post("/generation/providers/moneyprinter/kill-switch", json={"disabled": True, "reasonCode": "OWNER_STOP"})
+    client.post("/generation/providers/moneyprinter/kill-switch", json={"disabled": False, "reasonCode": "OWNER_RECOVERY"})
+    with sessions() as db:
+        after = {
+            "assets": db.execute(select(func.count(DBAssetVersion.id))).scalar_one(),
+            "attempts": db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one(),
+            "events": db.execute(select(func.count(DBGenerationEvent.id))).scalar_one(),
+            "usage": db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one(),
+        }
+        provider_events = db.execute(select(func.count(DBGenerationProviderEvent.id))).scalar_one()
+    assert after == before
+    assert provider_events >= 2
+    assert task["storedStatus"] == "RIGHTS_BLOCKED"
+
+
+def test_im17_47_test_runtime_is_fake_only_and_real_mode_defaults_disabled():
+    source = inspect.getsource(create_app)
+    app = create_app(generation_provider_mode="unknown")
+    assert app.state.generation_provider_mode == "disabled"
+    assert "AETHER_GENERATION_PROVIDER_MODE" in source
+    assert "deterministic-fake" in source
+
+
+def test_im17_48_static_scope_has_no_dependency_pin_or_public_provider_egress():
+    root = Path(__file__).resolve().parents[2]
+    compose = (root / "infra/docker/docker-compose.yml").read_text()
+    assert "475f21147f0808f5ffe3f58af9ab794b28a4da2c" in compose
+    api_source = (root / "apps/api/app/main.py").read_text()
+    assert "MONEYPRINTER_API_URL" not in api_source
+    assert "MoneyPrinterTurboAdapter" not in api_source

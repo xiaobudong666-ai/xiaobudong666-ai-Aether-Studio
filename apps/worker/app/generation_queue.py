@@ -48,6 +48,13 @@ class GenerationQueueClient:
             raise GenerationQueueError("Generation queue returned a non-object claim")
         return payload
 
+    def attest(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/internal/generation/providers/moneyprinter/attest",
+            json=payload,
+        ).json()
+
     def heartbeat(self, task_id: str) -> dict[str, Any]:
         return self._request(
             "POST", f"/internal/generation-tasks/{task_id}/heartbeat", json={}
