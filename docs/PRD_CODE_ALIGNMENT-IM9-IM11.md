@@ -1,19 +1,34 @@
 # IM9–IM11 PRD—Code Alignment
 
-| Requirement | Current repository state | Coding status |
+| Requirement | Merged implementation evidence | Coding status |
 |---|---|---|
-| IM9 generation request/preflight | Defined in merged approval package | Not implemented |
-| IM10 task state/retry/cancel | Defined in merged approval package | Not implemented |
-| IM11 result review/provenance/intake | Defined in merged approval package | Not implemented |
-| Rights snapshot gate | Existing governance principle reused | Must remain mandatory |
-| Deterministic fake adapter | Approval requirement | To be implemented after coding approval |
-| Real provider/plugin/model | Explicitly out of scope | Not authorized |
+| IM9 generation request/preflight | `GenerationPanel.tsx` + `preflightGeneration` | Implemented in authorized frontend/local scope |
+| IM10 task state/retry/cancel | `DeterministicGenerationAdapter` with idempotency, attempts, cancel, retry and late-response isolation | Implemented in authorized frontend/local scope |
+| IM11 result review/provenance/intake | `reviewResult` creates governed editor references with rights, checksum and provenance gates | Implemented in authorized frontend/local scope |
+| Rights snapshot gate | Preflight and result review require a rights snapshot | Mandatory and tested |
+| Deterministic fake/local adapter | Versioned local snapshot, task state and deterministic results | Implemented and tested |
+| Page-close recovery | Versioned browser-local snapshot restore | Implemented by FR18-01 remediation |
+| Automatic adoption/final timeline write | Governed references remain `adopted=false` | Not implemented by design |
+| Real provider/plugin/model/API key | Explicitly excluded from PR #18 | Not authorized |
+| Backend API/migration/Worker/queue | No changes in PR #18 | Not authorized |
+| Deployment/public access | No changes in PR #18 | Not authorized |
 
-## Post-merge alignment
-The documentation gate is accepted because the approval package is merged into `main`. This does **not** convert any PRD item into implemented functionality. The repository has no functional-code evidence for IM9–IM11 yet.
+## Accepted implementation
 
-## Implementation gate
-Before coding, the owner must explicitly approve the IM9–IM11 coding scope. The first implementation pass must use deterministic local/fake adapters and existing contracts. Any new dependency, backend endpoint, migration, worker, provider/plugin/model, paid call, deployment or public-access change remains outside this authorization.
+PR #18 implemented the approved IM9–IM11 functional slice on top of `main@adf2a81f07a890d74fbb1cad80ea71e7290bfbd4`. The formally reviewed head `29fd1154c6365edaeeaa2b9754392d61fb173dda` was squash-merged as `8f64a172bf740578dba0fcfe451f1464b9a54028`.
 
-## Acceptance evidence rule
-A future implementation claim requires a code diff plus executable test evidence. Documentation, contracts, screenshots or roadmap entries alone cannot be counted as implementation completion.
+The accepted implementation is limited to the existing React frontend contracts and deterministic fake/local adapter. It does not claim production AI generation or provider connectivity.
+
+## Verification alignment
+
+- Approval-package acceptance cases: 28/28 passed.
+- Web tests: 51/51 passed.
+- TypeScript, ESLint with zero warnings and production build: passed.
+- CI Pipeline #105: passed.
+- Playwright, Docker, FFmpeg, Worker, real-render and production-browser regression paths: passed.
+- Formal-review blocker FR18-01 was resolved by versioned local snapshot recovery.
+- Changed scope: six Web frontend files only.
+
+## Remaining integration gate
+
+Any new dependency, backend endpoint, database migration, Worker or queue infrastructure, real provider/plugin/model/API key, paid call, automatic adoption, ungoverned timeline write, deployment or public-access change requires a separate owner approval and new executable evidence.
