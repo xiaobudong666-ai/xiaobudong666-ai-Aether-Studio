@@ -17,6 +17,17 @@ const capabilities = {
   videoAspects: ["16:9", "9:16", "1:1"], videoConcatModes: ["random", "sequential"],
   clipDurationSeconds: { min: 1, max: 10 }, maxOutputs: 1,
   voices: ["en-US-JennyNeural"], snapshotHash: "a".repeat(64),
+  reasonCode: null, configVersionId: null, policyHash: null,
+  operatorMode: "deterministic-fake",
+  ownerPolicy: { published: true, enabledIntent: true },
+  workerProof: { present: true, fresh: true },
+  quota: {
+    concurrentLimit: 4, concurrentRemaining: 4,
+    monthlyRequestLimit: 100, monthlyRequestRemaining: 100,
+    monthlyGeneratedSecondsLimit: 1000, monthlyGeneratedSecondsRemaining: 1000,
+  },
+  circuit: { state: "CLOSED" },
+  killSwitch: { disabled: false, reasonCode: null },
 };
 
 const queuedTask: ServerGenerationTask = {
@@ -34,7 +45,7 @@ function response(payload: unknown, status = 200): Response {
 function installFetch(list: ServerGenerationTask[] = []) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.endsWith("/generation/providers/moneyprinter/capabilities")) return response(capabilities);
+    if (url.endsWith("/generation/providers/moneyprinter/readiness")) return response(capabilities);
     if (url.includes("generation-tasks?pageSize=100")) return response({ items: list, nextCursor: null });
     if (url.endsWith("/generation-tasks/validate")) return response({ allowed: true, status: "PREFLIGHT" });
     if (url.endsWith("/generation-tasks") && init?.method === "POST") return response(queuedTask, 202);
@@ -49,7 +60,7 @@ describe("GenerationPanel server authority", () => {
   beforeEach(() => { installFetch(); });
   afterEach(() => vi.unstubAllGlobals());
 
-  test("viewer sees server tasks but no mutation controls", async () => {
+  test("IM17-46 viewer is read-only under server readiness and rights gates", async () => {
     vi.unstubAllGlobals();
     installFetch([queuedTask]);
     render(<GenerationPanel role="viewer" tenantId="tenant-1" actorId="viewer-1" project={project} assetVersions={[]} />);
@@ -62,8 +73,9 @@ describe("GenerationPanel server authority", () => {
   test("preflight and submit use server APIs without a local run action", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+    expect(screen.getByLabelText("Provider 就绪状态").children).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
-    await screen.findByText(/deterministic-fake/);
+    await screen.findByText(/服务端权威状态：可创建/);
     fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "一匹马穿过雨夜城市" } });
     fireEvent.click(screen.getByLabelText("确认外部生成边界"));
     fireEvent.click(screen.getByRole("button", { name: "执行服务端预检" }));
@@ -89,13 +101,13 @@ describe("GenerationPanel server authority", () => {
     expect(screen.getByText(/排队中/)).toBeTruthy();
   });
 
-  test("late response from a previous project is isolated", async () => {
+  test("IM17-45 late readiness and task responses cannot pollute a new project", async () => {
     let resolveOld: ((value: Response) => void) | undefined;
     const oldList = new Promise<Response>((resolve) => { resolveOld = resolve; });
     const nextProject = { ...project, id: "project-2", name: "Second" };
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("capabilities")) return response(capabilities);
+      if (url.endsWith("readiness")) return response(capabilities);
       if (url.includes("project-1/generation-tasks")) return oldList;
       if (url.includes("project-2/generation-tasks")) return response({ items: [{ ...queuedTask, taskId: "server-generation-2", projectId: "project-2" }] });
       throw new Error(url);

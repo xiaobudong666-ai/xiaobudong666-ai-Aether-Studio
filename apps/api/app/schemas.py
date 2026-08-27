@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -125,6 +125,63 @@ class GenerationWorkerTransitionRequest(BaseModel):
     errorCode: Optional[str] = Field(default=None, min_length=1, max_length=120)
     errorMessage: Optional[str] = Field(default=None, min_length=1, max_length=500)
     retryable: bool = False
+
+
+class GenerationProviderPolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabledIntent: bool = False
+    allowedAspects: List[Literal["16:9", "9:16", "1:1"]] = Field(min_length=1, max_length=3)
+    allowedVoices: List[str] = Field(min_length=1, max_length=20)
+    allowedConcatModes: List[Literal["random", "sequential"]] = Field(min_length=1, max_length=2)
+    maxClipDurationSeconds: int = Field(ge=1, le=10)
+    maxOutputs: int = Field(ge=1, le=4)
+    concurrentTaskLimit: int = Field(ge=1, le=100)
+    monthlyRequestLimit: int = Field(ge=1, le=1_000_000)
+    monthlyGeneratedSecondsLimit: int = Field(ge=1, le=100_000_000)
+    failureWindow: int = Field(ge=10, le=86_400)
+    failureThreshold: int = Field(ge=1, le=100)
+    cooldownSeconds: int = Field(ge=10, le=86_400)
+    artifactPathPrefixes: List[str] = Field(min_length=1, max_length=10)
+    maxArtifactBytes: int = Field(ge=1, le=2 * 1024**3)
+    configLabel: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("allowedVoices", "artifactPathPrefixes")
+    @classmethod
+    def reject_unsafe_policy_strings(cls, value: List[str]) -> List[str]:
+        forbidden = ("://", "token", "secret", "api_key", "api-key", "cookie", "authorization")
+        cleaned = []
+        for item in value:
+            stripped = item.strip()
+            if not stripped or any(marker in stripped.lower() for marker in forbidden):
+                raise ValueError("policy contains an unsafe or secret-shaped value")
+            cleaned.append(stripped)
+        return cleaned
+
+
+class GenerationProviderAttestationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["moneyprinter"]
+    operatorMode: Literal["disabled", "moneyprinter"]
+    tenantId: Optional[str] = Field(default=None, max_length=128)
+    configVersionId: Optional[str] = Field(default=None, max_length=128)
+    policyHash: Optional[str] = Field(default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    adapterVersion: str = Field(min_length=1, max_length=80)
+    upstreamPin: str = Field(min_length=1, max_length=80)
+    healthy: bool
+    capabilities: dict[str, Any]
+    reasonCode: Optional[str] = Field(default=None, max_length=120)
+    checkedAt: datetime
+    expiresAt: datetime
+
+
+class GenerationProviderKillSwitchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    disabled: bool
+    reasonCode: str = Field(min_length=1, max_length=120, pattern=r"^[A-Z0-9_]+$")
 
 
 class LoginRequest(BaseModel):

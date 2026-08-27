@@ -8,7 +8,16 @@ import httpx
 
 
 class GenerationQueueError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
 
 
 class GenerationQueueClient:
@@ -36,8 +45,21 @@ class GenerationQueueClient:
                 response = client.request(method, f"{self.backend_url}{path}", headers=self.headers, **kwargs)
             response.raise_for_status()
             return response
+        except httpx.HTTPStatusError as exc:
+            code = None
+            try:
+                detail = exc.response.json().get("detail")
+                if isinstance(detail, dict):
+                    code = detail.get("code")
+            except (TypeError, ValueError):
+                pass
+            raise GenerationQueueError(
+                "Generation queue rejected the request",
+                status_code=exc.response.status_code,
+                code=str(code) if code else None,
+            ) from exc
         except httpx.HTTPError as exc:
-            raise GenerationQueueError(f"Generation queue request failed: {exc}") from exc
+            raise GenerationQueueError("Generation queue request failed") from exc
 
     def claim(self) -> dict[str, Any] | None:
         response = self._request("POST", "/internal/generation-tasks/claim")
@@ -47,6 +69,13 @@ class GenerationQueueClient:
         if not isinstance(payload, dict):
             raise GenerationQueueError("Generation queue returned a non-object claim")
         return payload
+
+    def attest(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/internal/generation/providers/moneyprinter/attest",
+            json=payload,
+        ).json()
 
     def heartbeat(self, task_id: str) -> dict[str, Any]:
         return self._request(

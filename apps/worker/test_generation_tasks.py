@@ -1,10 +1,13 @@
 import inspect
 import io
+import datetime
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from app.generation_queue import GenerationQueueClient, GenerationQueueError
 from app.main import WorkerComponents, process_generation_task
+from app.moneyprinter_adapter import ADAPTER_VERSION, UPSTREAM_PIN, MoneyPrinterTurboAdapter
 
 
 def components(provider, queue):
@@ -49,7 +52,7 @@ def test_runtime_disabled_never_calls_provider():
     provider.generate_video.assert_not_called()
 
 
-def test_deterministic_fake_submits_polls_and_streams_bytes():
+def test_im16_31_deterministic_fake_stream_is_ingested_once_with_artifact_id():
     provider = MagicMock()
     provider.generate_video.return_value = "upstream-1"
     provider.get_task_status.return_value = {
@@ -64,7 +67,7 @@ def test_deterministic_fake_submits_polls_and_streams_bytes():
     queue.artifact_intake.assert_called_once()
 
 
-def test_restart_with_upstream_id_queries_without_reposting():
+def test_im16_23_restart_with_upstream_id_queries_without_reposting():
     provider = MagicMock()
     provider.get_task_status.return_value = {
         "status": "completed", "providerArtifactId": "artifact-recovered",
@@ -76,6 +79,33 @@ def test_restart_with_upstream_id_queries_without_reposting():
     )
     provider.generate_video.assert_not_called()
     provider.get_task_status.assert_called_once_with("upstream-existing")
+
+
+def test_im16_19_moneyprinter_mode_requires_matching_claim_proof(monkeypatch):
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
+    monkeypatch.setenv("AETHER_GENERATION_CONFIG_VERSION_ID", "config-1")
+    monkeypatch.setenv("AETHER_GENERATION_POLICY_HASH", "a" * 64)
+    provider = MoneyPrinterTurboAdapter(api_url="http://moneyprinter-sidecar:8080")
+    provider.generate_video = MagicMock(return_value="upstream-1")
+    provider.get_task_status = MagicMock(return_value={
+        "status": "completed", "progress": 100, "providerArtifactId": "artifact-1",
+    })
+    provider.stream_artifact = MagicMock(return_value=io.BytesIO(b"video"))
+    queue = queue_mock()
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=2)
+    task = claimed_task(
+        providerMode="moneyprinter",
+        configVersionId="config-1",
+        policyHash="a" * 64,
+        providerPolicy={"artifactPathPrefixes": ["/artifacts/"], "maxArtifactBytes": 1024},
+        workerProof={
+            "expiresAt": expires.isoformat().replace("+00:00", "Z"),
+            "adapterVersion": ADAPTER_VERSION,
+            "upstreamPin": UPSTREAM_PIN,
+        },
+    )
+    assert process_generation_task(components(provider, queue), task, poll_interval=0)["status"] == "RIGHTS_BLOCKED"
+    provider.generate_video.assert_called_once()
 
 
 def test_ambiguous_submission_becomes_unknown_without_repost():
@@ -125,3 +155,54 @@ def test_generation_queue_requires_worker_token():
     client = GenerationQueueClient(worker_token="")
     with pytest.raises(GenerationQueueError, match="not configured"):
         client.claim()
+
+
+def test_generation_queue_preserves_governance_rejection_code(monkeypatch):
+    response = httpx.Response(
+        409,
+        json={"detail": {"code": "TASK_CANCELED", "message": "canceled"}},
+        request=httpx.Request("POST", "http://api/internal/generation-tasks/task/heartbeat"),
+    )
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    client.request.return_value = response
+    monkeypatch.setattr("app.generation_queue.httpx.Client", lambda **_kwargs: client)
+
+    with pytest.raises(GenerationQueueError) as caught:
+        GenerationQueueClient(
+            backend_url="http://api", worker_token="token", worker_id="worker",
+        ).heartbeat("task")
+
+    assert caught.value.status_code == 409
+    assert caught.value.code == "TASK_CANCELED"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_status"),
+    [
+        ("TASK_CANCELED", "CANCELED"),
+        ("LEASE_LOST", "UNKNOWN"),
+        ("PROVIDER_EMERGENCY_STOPPED", "UNKNOWN"),
+    ],
+)
+def test_worker_stops_without_overwriting_queue_governance(code, expected_status):
+    provider = MagicMock()
+    queue = queue_mock()
+    queue.heartbeat.side_effect = GenerationQueueError(
+        "governed rejection", status_code=409, code=code,
+    )
+
+    result = process_generation_task(
+        components(provider, queue),
+        claimed_task(upstreamJobId="upstream-existing"),
+        poll_interval=0,
+    )
+
+    assert result == {
+        "taskId": "generation-1",
+        "status": expected_status,
+        "errorCode": code,
+    }
+    queue.transition.assert_not_called()
+    provider.get_task_status.assert_not_called()

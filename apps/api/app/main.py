@@ -51,10 +51,13 @@ from .models import (
     DBAdoption,
     DBAssetVersion,
     DBCandidate,
-    DBExternalTask,
     DBGenerationAttempt,
+    DBGenerationCircuitState,
     DBGenerationEvent,
+    DBGenerationProviderAttestation,
+    DBGenerationProviderConfigVersion,
     DBGenerationTask,
+    DBGenerationUsageEntry,
     DBMasterRevision,
     DBProject,
     DBRenderTask,
@@ -63,18 +66,25 @@ from .models import (
     DBTenant,
     DBUser,
 )
-from .moneyprinter_adapter import MoneyPrinterTurboAdapter
 from .generation_tasks import (
     ACTIVE_GENERATION_STATES,
+    DEFAULT_FAKE_POLICY,
+    MONEYPRINTER_ADAPTER_VERSION,
+    MONEYPRINTER_UPSTREAM_PIN,
     RETRYABLE_GENERATION_STATES,
     TERMINAL_GENERATION_STATES,
     WORKER_TRANSITIONS,
     add_event as add_generation_event,
+    add_provider_event,
+    add_usage_entry,
     build_capability_snapshot,
     capability_snapshot_valid,
     current_attempt as current_generation_attempt,
+    provider_config_response,
+    quota_summary,
     request_hash as generation_request_hash,
     safe_error_message,
+    sha256_json,
     task_response as generation_task_response,
 )
 from .schemas import (
@@ -83,10 +93,12 @@ from .schemas import (
     CreateRightsSnapshotRequest,
     CreateUserRequest,
     GenerationTaskRequest,
+    GenerationProviderAttestationRequest,
+    GenerationProviderKillSwitchRequest,
+    GenerationProviderPolicyRequest,
     GenerationWorkerHeartbeatRequest,
     GenerationWorkerTransitionRequest,
     LoginRequest,
-    MoneyPrinterGenerateRequest,
     ProjectResponse,
     UpdateProjectRequest,
     WorkerTaskUpdateRequest,
@@ -312,13 +324,18 @@ def create_app(
         2 * 1024**3,
         int(os.environ.get("AETHER_MAX_UPLOAD_BYTES", str(2 * 1024**3))),
     )
-    resolved_generation_provider_mode = (
-        generation_provider_mode
-        if generation_provider_mode is not None
-        else os.environ.get("AETHER_GENERATION_PROVIDER_MODE", "disabled")
-    )
-    if resolved_generation_provider_mode not in {"disabled", "deterministic-fake"}:
-        resolved_generation_provider_mode = "disabled"
+    if generation_provider_mode is None:
+        resolved_generation_provider_mode = os.environ.get(
+            "AETHER_GENERATION_PROVIDER_MODE", "disabled"
+        )
+        if resolved_generation_provider_mode not in {"disabled", "moneyprinter"}:
+            resolved_generation_provider_mode = "disabled"
+    else:
+        resolved_generation_provider_mode = generation_provider_mode
+        if resolved_generation_provider_mode not in {
+            "disabled", "deterministic-fake", "moneyprinter"
+        }:
+            resolved_generation_provider_mode = "disabled"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -341,12 +358,8 @@ def create_app(
         yield
 
     created_app = FastAPI(title="Aether Studio 接口服务", version="1.1.0", lifespan=lifespan)
-    created_app.state.moneyprinter = MoneyPrinterTurboAdapter()
     created_app.state.video_use = video_use_adapter or VideoUseAdapter()
     created_app.state.generation_provider_mode = resolved_generation_provider_mode
-    created_app.state.generation_capability_snapshot = build_capability_snapshot(
-        resolved_generation_provider_mode
-    )
     created_app.state.setup_required = False
 
     origins = [
@@ -459,14 +472,145 @@ def create_app(
             )
         return task
 
-    def current_generation_capabilities(*, refresh: bool = False) -> dict:
-        snapshot = created_app.state.generation_capability_snapshot
-        expires_at = datetime.datetime.fromisoformat(
-            str(snapshot["expiresAt"]).replace("Z", "+00:00")
+    def published_generation_config(
+        db: Session, tenant_id: str
+    ) -> DBGenerationProviderConfigVersion | None:
+        return db.execute(
+            select(DBGenerationProviderConfigVersion)
+            .where(
+                DBGenerationProviderConfigVersion.tenant_id == tenant_id,
+                DBGenerationProviderConfigVersion.provider == "moneyprinter",
+                DBGenerationProviderConfigVersion.status == "PUBLISHED",
+            )
+            .order_by(DBGenerationProviderConfigVersion.version.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+    def generation_circuit(
+        db: Session, tenant_id: str, *, create: bool = False
+    ) -> DBGenerationCircuitState | None:
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one_or_none()
+        if circuit is None and create:
+            circuit = DBGenerationCircuitState(
+                id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
+                state="CLOSED", failure_timestamps_json=[], updated_at=utc_now(),
+            )
+            db.add(circuit)
+            db.flush()
+        return circuit
+
+    def current_generation_capabilities(db: Session, tenant_id: str) -> dict:
+        now = utc_now()
+        snapshot_time = now.replace(second=0, microsecond=0)
+        mode = created_app.state.generation_provider_mode
+        config = published_generation_config(db, tenant_id)
+        circuit = generation_circuit(db, tenant_id)
+        circuit_state = circuit.state if circuit is not None else "CLOSED"
+        policy = config.policy_json if config is not None else DEFAULT_FAKE_POLICY
+        reason_code: str | None = None
+        attestation: DBGenerationProviderAttestation | None = None
+        healthy = True
+
+        if mode == "disabled":
+            reason_code = "OPERATOR_DISABLED"
+            healthy = False
+        elif mode == "moneyprinter":
+            if config is None:
+                reason_code = "OWNER_CONFIG_MISSING"
+                healthy = False
+            elif not bool(config.policy_json.get("enabledIntent")):
+                reason_code = "OWNER_POLICY_DISABLED"
+                healthy = False
+            else:
+                attestation = db.execute(
+                    select(DBGenerationProviderAttestation)
+                    .where(
+                        DBGenerationProviderAttestation.provider == "moneyprinter",
+                        DBGenerationProviderAttestation.tenant_id == tenant_id,
+                        DBGenerationProviderAttestation.config_version_id == config.id,
+                    )
+                    .order_by(DBGenerationProviderAttestation.checked_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if attestation is None:
+                    reason_code = "WORKER_ATTESTATION_MISSING"
+                    healthy = False
+                elif _as_utc(attestation.expires_at) <= now:
+                    reason_code = "WORKER_ATTESTATION_EXPIRED"
+                    healthy = False
+                elif attestation.operator_mode != "moneyprinter":
+                    reason_code = "WORKER_OPERATOR_MODE_MISMATCH"
+                    healthy = False
+                elif attestation.policy_hash != config.policy_hash:
+                    reason_code = "WORKER_POLICY_MISMATCH"
+                    healthy = False
+                elif attestation.upstream_pin != MONEYPRINTER_UPSTREAM_PIN:
+                    reason_code = "WORKER_UPSTREAM_PIN_MISMATCH"
+                    healthy = False
+                elif not attestation.healthy:
+                    reason_code = attestation.reason_code or "PROVIDER_UNHEALTHY"
+                    healthy = False
+
+        if circuit_state == "DISABLED":
+            reason_code = circuit.disabled_reason_code or "OWNER_KILL_SWITCH"
+            healthy = False
+        elif circuit_state == "OPEN":
+            cooldown_until = _as_utc(circuit.cooldown_until) if circuit else None
+            if cooldown_until is not None and now >= cooldown_until:
+                circuit.state = "HALF_OPEN"
+                circuit.half_open_task_id = None
+                circuit.updated_at = now
+                circuit_state = "HALF_OPEN"
+                add_provider_event(
+                    db, tenant_id=tenant_id, event_type="CIRCUIT_HALF_OPENED",
+                    actor_type="SYSTEM", actor_id="api", now=now,
+                )
+                db.commit()
+            else:
+                reason_code = "GENERATION_CIRCUIT_OPEN"
+                healthy = False
+
+        quota = quota_summary(db, tenant_id, policy, now)
+        snapshot = build_capability_snapshot(
+            mode if healthy else "disabled",
+            snapshot_time,
+            policy=policy,
+            config_version_id=config.id if config else None,
+            policy_hash=config.policy_hash if config else None,
+            healthy=healthy,
+            reason_code=reason_code,
+            attestation_expires_at=_as_utc(attestation.expires_at) if attestation else None,
+            quota=quota,
+            circuit_state=circuit_state,
         )
-        if refresh or utc_now() >= expires_at:
-            snapshot = build_capability_snapshot(created_app.state.generation_provider_mode)
-            created_app.state.generation_capability_snapshot = snapshot
+        snapshot.update({
+            "operatorMode": mode,
+            "ownerPolicy": {
+                "published": config is not None,
+                "enabledIntent": bool(config and config.policy_json.get("enabledIntent")),
+            },
+            "workerProof": {
+                "present": attestation is not None,
+                "fresh": bool(attestation and _as_utc(attestation.expires_at) > now),
+                "checkedAt": iso_utc(attestation.checked_at) if attestation else None,
+                "expiresAt": iso_utc(attestation.expires_at) if attestation else None,
+                "adapterVersion": attestation.adapter_version if attestation else None,
+                "upstreamPin": attestation.upstream_pin if attestation else None,
+            },
+            "killSwitch": {
+                "disabled": circuit_state == "DISABLED",
+                "reasonCode": circuit.disabled_reason_code if circuit and circuit.state == "DISABLED" else None,
+            },
+        })
+        snapshot.pop("snapshotHash", None)
+        snapshot["snapshotHash"] = sha256_json({
+            key: value for key, value in snapshot.items() if key != "quota"
+        })
         return snapshot
 
     def validate_generation_request(
@@ -480,12 +624,14 @@ def create_app(
                 status_code=409,
                 detail={"code": "PROJECT_REVISION_CONFLICT", "message": "项目版本已变化，请重新预检"},
             )
-        snapshot = current_generation_capabilities()
+        snapshot = current_generation_capabilities(db, context.tenant_id)
         valid, code = capability_snapshot_valid(
             snapshot, req.capabilitySnapshotHash, utc_now()
         )
         if not valid:
-            status_code = 503 if code in {"PROVIDER_DISABLED", "PROVIDER_UNHEALTHY"} else 409
+            status_code = 409 if code in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"
+            } else 503
             raise HTTPException(
                 status_code=status_code,
                 detail={"code": code, "message": "生成服务能力快照不可用，请重新预检"},
@@ -494,6 +640,21 @@ def create_app(
             raise HTTPException(
                 status_code=422,
                 detail={"code": "VOICE_UNSUPPORTED", "message": "所选声音不在当前能力范围内"},
+            )
+        if req.videoAspect not in snapshot["videoAspects"]:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "ASPECT_UNSUPPORTED", "message": "所选画幅不在当前能力范围内"},
+            )
+        if req.videoConcatMode not in snapshot["videoConcatModes"]:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "CONCAT_MODE_UNSUPPORTED", "message": "所选拼接模式不在当前能力范围内"},
+            )
+        if req.videoClipDuration > int(snapshot["clipDurationSeconds"]["max"]):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "CLIP_DURATION_UNSUPPORTED", "message": "片段时长超过当前能力范围"},
             )
         if req.outputCount > int(snapshot["maxOutputs"]):
             raise HTTPException(
@@ -531,6 +692,94 @@ def create_app(
     def require_internal_token(x_worker_token: str | None) -> None:
         if not resolved_worker_token or not x_worker_token or not hmac.compare_digest(resolved_worker_token, x_worker_token):
             raise HTTPException(status_code=401, detail={"code": "WORKER_AUTH_FAILED", "message": "工作节点认证失败"})
+
+    def release_generation_reservation(
+        db: Session,
+        task: DBGenerationTask,
+        attempt: DBGenerationAttempt,
+        *,
+        reason_code: str,
+        now: datetime.datetime,
+    ) -> None:
+        settled = db.execute(
+            select(DBGenerationUsageEntry.id).where(
+                DBGenerationUsageEntry.task_id == task.id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )
+        ).scalar_one_or_none()
+        if settled is not None:
+            return
+        entry = add_usage_entry(
+            db, task=task, attempt=attempt, kind="RELEASED",
+            request_units=1, generated_seconds=0,
+            reservation_key=f"generation:{task.id}",
+            config_version_id=task.capability_snapshot_json.get("configVersionId"),
+            now=now,
+        )
+        if entry is not None:
+            add_generation_event(
+                db, task, attempt=attempt, event_type="GENERATION_USAGE_RELEASED",
+                actor_type="SYSTEM", actor_id="api",
+                metadata={"reasonCode": reason_code}, now=now,
+            )
+
+    def record_generation_failure(
+        db: Session,
+        task: DBGenerationTask,
+        *,
+        now: datetime.datetime,
+    ) -> None:
+        policy = task.capability_snapshot_json.get("providerPolicy") or {}
+        window_seconds = max(10, int(policy.get("failureWindow", 300)))
+        threshold = max(1, int(policy.get("failureThreshold", 5)))
+        cooldown_seconds = max(10, int(policy.get("cooldownSeconds", 60)))
+        circuit = generation_circuit(db, task.tenant_id, create=True)
+        if circuit.state == "DISABLED":
+            return
+        cutoff = now - datetime.timedelta(seconds=window_seconds)
+        timestamps: list[datetime.datetime] = []
+        for raw in circuit.failure_timestamps_json or []:
+            try:
+                parsed = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed >= cutoff:
+                timestamps.append(parsed)
+        timestamps.append(now)
+        previous = circuit.state
+        should_open = previous == "HALF_OPEN" or len(timestamps) >= threshold
+        circuit.failure_timestamps_json = [iso_utc(item) for item in timestamps]
+        if should_open:
+            circuit.state = "OPEN"
+            circuit.opened_at = now
+            circuit.cooldown_until = now + datetime.timedelta(seconds=cooldown_seconds)
+            circuit.half_open_task_id = None
+            if previous != "OPEN":
+                add_provider_event(
+                    db, tenant_id=task.tenant_id, event_type="GENERATION_CIRCUIT_OPENED",
+                    actor_type="SYSTEM", actor_id="api",
+                    metadata={"failureCount": len(timestamps), "failureThreshold": threshold}, now=now,
+                )
+        circuit.updated_at = now
+
+    def record_generation_success(
+        db: Session, task: DBGenerationTask, *, now: datetime.datetime
+    ) -> None:
+        circuit = generation_circuit(db, task.tenant_id)
+        if circuit is None or circuit.state not in {"HALF_OPEN", "OPEN"}:
+            return
+        previous = circuit.state
+        circuit.state = "CLOSED"
+        circuit.failure_timestamps_json = []
+        circuit.opened_at = None
+        circuit.cooldown_until = None
+        circuit.half_open_task_id = None
+        circuit.updated_at = now
+        add_provider_event(
+            db, tenant_id=task.tenant_id, event_type="GENERATION_CIRCUIT_CLOSED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata={"fromState": previous, "taskId": task.id}, now=now,
+        )
 
     @created_app.get("/health")
     def health_check(db: Session = Depends(db_dependency)):
@@ -596,50 +845,239 @@ def create_app(
         db.commit()
         return {"id": user.id, "email": user.email, "displayName": user.display_name, "role": user.role, "isActive": True}
 
-    @created_app.get("/moneyprinter/health")
-    def moneyprinter_health():
-        return created_app.state.moneyprinter.check_health()
+    def legacy_moneyprinter_gone(task_id: str | None = None):
+        del task_id
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "code": "LEGACY_PROVIDER_ROUTE_RETIRED",
+                "message": "旧 Provider 直连接口已退役，请使用受治理的项目级生成接口",
+            },
+        )
 
-    @created_app.get("/moneyprinter/capabilities")
-    def moneyprinter_capabilities():
-        return created_app.state.moneyprinter.get_capabilities()
+    created_app.add_api_route(
+        "/moneyprinter/health", legacy_moneyprinter_gone, methods=["GET"]
+    )
+    created_app.add_api_route(
+        "/moneyprinter/capabilities", legacy_moneyprinter_gone, methods=["GET"]
+    )
+    created_app.add_api_route(
+        "/moneyprinter/generate", legacy_moneyprinter_gone, methods=["POST"]
+    )
+    created_app.add_api_route(
+        "/moneyprinter/status/{task_id}", legacy_moneyprinter_gone, methods=["GET"]
+    )
 
-    @created_app.post("/moneyprinter/generate")
-    def moneyprinter_generate(req: MoneyPrinterGenerateRequest, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
-        require_roles(context, "owner", "editor")
-        try:
-            task_id = created_app.state.moneyprinter.generate_video(
-                subject=req.video_subject, aspect=req.video_aspect, voice_name=req.voice_name,
-                video_concat_mode=req.video_concat_mode, video_clip_duration=req.video_clip_duration,
+    def reject_unsafe_provider_value(value: object) -> None:
+        secret_markers = (
+            "api_key", "api-key", "secret", "token", "cookie",
+            "authorization", "password", "credential",
+        )
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = str(key).lower().replace("_", "").replace("-", "")
+                if (
+                    any(marker.replace("_", "").replace("-", "") in normalized_key for marker in secret_markers)
+                    or normalized_key in {"url", "uri", "host", "port", "baseurl", "apiurl"}
+                    or normalized_key.endswith(("url", "uri", "host", "port"))
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": "PROVIDER_POLICY_UNSAFE", "message": "Provider 策略包含禁止字段"},
+                    )
+                reject_unsafe_provider_value(item)
+        elif isinstance(value, list):
+            for item in value:
+                reject_unsafe_provider_value(item)
+        elif isinstance(value, str) and (
+            "://" in value.lower()
+            or any(marker in value.lower() for marker in secret_markers)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "PROVIDER_POLICY_UNSAFE", "message": "Provider 策略包含疑似秘密或地址"},
             )
-        except Exception as exc:
-            logger.exception("MoneyPrinterTurbo task submission failed")
-            raise HTTPException(status_code=502, detail={"code": "MONEYPRINTER_API_ERROR", "message": "MoneyPrinterTurbo 任务提交失败"}) from exc
-        now = utc_now()
-        db.add(DBExternalTask(id=task_id, tenant_id=context.tenant_id, requested_by=context.user_id, engine="moneyprinter", status="submitted", created_at=now, updated_at=now))
-        db.commit()
-        return {"task_id": task_id, "status": "submitted"}
-
-    @created_app.get("/moneyprinter/status/{task_id}")
-    def moneyprinter_status(task_id: str, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
-        task = db.execute(select(DBExternalTask).where(DBExternalTask.id == task_id, DBExternalTask.tenant_id == context.tenant_id)).scalar_one_or_none()
-        if task is None:
-            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "未找到该任务"})
-        try:
-            payload = created_app.state.moneyprinter.get_task_status(task_id)
-        except Exception as exc:
-            logger.exception("MoneyPrinterTurbo status query failed")
-            raise HTTPException(status_code=502, detail={"code": "MONEYPRINTER_STATUS_ERROR", "message": "MoneyPrinterTurbo 任务状态查询失败"}) from exc
-        task.status = str(payload.get("status", task.status))
-        task.updated_at = utc_now()
-        db.commit()
-        return payload
 
     @created_app.get("/generation/providers/moneyprinter/capabilities")
     def generation_capabilities(
-        _context: AuthContext = Depends(context_dependency),
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
     ):
-        return current_generation_capabilities()
+        return current_generation_capabilities(db, context.tenant_id)
+
+    @created_app.get("/generation/providers/moneyprinter/readiness")
+    def generation_readiness(
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        return current_generation_capabilities(db, context.tenant_id)
+
+    @created_app.get("/generation/providers/moneyprinter/config-versions")
+    def list_generation_provider_configs(
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner")
+        configs = db.execute(
+            select(DBGenerationProviderConfigVersion)
+            .where(
+                DBGenerationProviderConfigVersion.tenant_id == context.tenant_id,
+                DBGenerationProviderConfigVersion.provider == "moneyprinter",
+            )
+            .order_by(DBGenerationProviderConfigVersion.version.desc())
+        ).scalars()
+        return [provider_config_response(config) for config in configs]
+
+    @created_app.post(
+        "/generation/providers/moneyprinter/config-versions", status_code=201
+    )
+    def create_generation_provider_config(
+        req: GenerationProviderPolicyRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner")
+        policy = req.model_dump(mode="json")
+        reject_unsafe_provider_value(policy)
+        begin_serialized_write(db)
+        latest = db.execute(
+            select(DBGenerationProviderConfigVersion)
+            .where(
+                DBGenerationProviderConfigVersion.tenant_id == context.tenant_id,
+                DBGenerationProviderConfigVersion.provider == "moneyprinter",
+            )
+            .order_by(DBGenerationProviderConfigVersion.version.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        now = utc_now()
+        config = DBGenerationProviderConfigVersion(
+            id=str(uuid.uuid4()), tenant_id=context.tenant_id,
+            provider="moneyprinter", version=(latest.version + 1 if latest else 1),
+            status="DRAFT", policy_json=policy, policy_hash=sha256_json(policy),
+            created_by=context.user_id, created_at=now,
+            supersedes_id=latest.id if latest else None,
+        )
+        db.add(config)
+        add_provider_event(
+            db, tenant_id=context.tenant_id, event_type="PROVIDER_CONFIG_CREATED",
+            actor_type="USER", actor_id=context.user_id,
+            metadata={"configVersionId": config.id, "version": config.version}, now=now,
+        )
+        db.commit()
+        return provider_config_response(config)
+
+    @created_app.post(
+        "/generation/providers/moneyprinter/config-versions/{config_id}/publish"
+    )
+    def publish_generation_provider_config(
+        config_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner")
+        begin_serialized_write(db)
+        config = db.execute(
+            select(DBGenerationProviderConfigVersion).where(
+                DBGenerationProviderConfigVersion.id == config_id,
+                DBGenerationProviderConfigVersion.tenant_id == context.tenant_id,
+                DBGenerationProviderConfigVersion.provider == "moneyprinter",
+            )
+        ).scalar_one_or_none()
+        if config is None:
+            raise HTTPException(status_code=404, detail={"code": "PROVIDER_CONFIG_NOT_FOUND", "message": "未找到 Provider 配置版本"})
+        if config.status != "DRAFT":
+            raise HTTPException(status_code=409, detail={"code": "PROVIDER_CONFIG_IMMUTABLE", "message": "配置版本已发布或被替代"})
+        now = utc_now()
+        previous = published_generation_config(db, context.tenant_id)
+        if previous is not None and previous.id != config.id:
+            previous.status = "SUPERSEDED"
+        config.status = "PUBLISHED"
+        config.published_by = context.user_id
+        config.published_at = now
+        add_provider_event(
+            db, tenant_id=context.tenant_id, event_type="PROVIDER_CONFIG_PUBLISHED",
+            actor_type="USER", actor_id=context.user_id,
+            metadata={"configVersionId": config.id, "version": config.version,
+                      "supersededConfigVersionId": previous.id if previous else None}, now=now,
+        )
+        db.commit()
+        return provider_config_response(config)
+
+    @created_app.post("/generation/providers/moneyprinter/kill-switch")
+    def set_generation_kill_switch(
+        req: GenerationProviderKillSwitchRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner")
+        begin_serialized_write(db)
+        now = utc_now()
+        circuit = generation_circuit(db, context.tenant_id, create=True)
+        previous = circuit.state
+        circuit.state = "DISABLED" if req.disabled else "CLOSED"
+        circuit.disabled_reason_code = req.reasonCode if req.disabled else None
+        circuit.failure_timestamps_json = [] if not req.disabled else circuit.failure_timestamps_json
+        circuit.opened_at = None if not req.disabled else circuit.opened_at
+        circuit.cooldown_until = None if not req.disabled else circuit.cooldown_until
+        circuit.half_open_task_id = None
+        circuit.updated_at = now
+        add_provider_event(
+            db, tenant_id=context.tenant_id,
+            event_type="PROVIDER_EMERGENCY_STOPPED" if req.disabled else "PROVIDER_EMERGENCY_RECOVERED",
+            actor_type="USER", actor_id=context.user_id,
+            metadata={"fromState": previous, "toState": circuit.state, "reasonCode": req.reasonCode},
+            now=now,
+        )
+        db.commit()
+        return current_generation_capabilities(db, context.tenant_id)
+
+    @created_app.post("/internal/generation/providers/moneyprinter/attest", status_code=201)
+    def attest_generation_provider(
+        req: GenerationProviderAttestationRequest,
+        x_worker_token: str | None = Header(default=None),
+        x_worker_id: str = Header(default="worker"),
+        db: Session = Depends(db_dependency),
+    ):
+        require_internal_token(x_worker_token)
+        now = utc_now()
+        checked_at = _as_utc(req.checkedAt)
+        expires_at = _as_utc(req.expiresAt)
+        if checked_at > now + datetime.timedelta(seconds=30) or expires_at <= now or expires_at > checked_at + datetime.timedelta(minutes=5):
+            raise HTTPException(status_code=422, detail={"code": "WORKER_ATTESTATION_WINDOW_INVALID", "message": "Worker 证明有效期无效"})
+        allowed_capability_keys = {
+            "videoAspects", "voices", "videoConcatModes", "maxOutputs",
+            "maxClipDurationSeconds", "cancellationSupported", "artifactStreaming",
+        }
+        if set(req.capabilities) - allowed_capability_keys:
+            raise HTTPException(status_code=422, detail={"code": "WORKER_ATTESTATION_UNSAFE", "message": "Worker 证明包含未允许字段"})
+        reject_unsafe_provider_value(req.capabilities)
+        if req.tenantId is not None and req.configVersionId is not None:
+            config = db.execute(
+                select(DBGenerationProviderConfigVersion).where(
+                    DBGenerationProviderConfigVersion.id == req.configVersionId,
+                    DBGenerationProviderConfigVersion.tenant_id == req.tenantId,
+                )
+            ).scalar_one_or_none()
+            if config is None:
+                raise HTTPException(status_code=422, detail={"code": "WORKER_CONFIG_UNKNOWN", "message": "Worker 证明引用未知配置"})
+        attestation = DBGenerationProviderAttestation(
+            id=str(uuid.uuid4()), tenant_id=req.tenantId, provider=req.provider,
+            worker_id=x_worker_id, operator_mode=req.operatorMode,
+            config_version_id=req.configVersionId, policy_hash=req.policyHash,
+            adapter_version=req.adapterVersion, upstream_pin=req.upstreamPin,
+            healthy=req.healthy, capabilities_json=req.capabilities,
+            reason_code=req.reasonCode, checked_at=checked_at,
+            expires_at=expires_at, created_at=now,
+        )
+        db.add(attestation)
+        add_provider_event(
+            db, tenant_id=req.tenantId, event_type="WORKER_ATTESTED",
+            actor_type="WORKER", actor_id=x_worker_id,
+            metadata={"configVersionId": req.configVersionId, "healthy": req.healthy,
+                      "reasonCode": req.reasonCode, "expiresAt": iso_utc(expires_at)}, now=now,
+        )
+        db.commit()
+        return {"accepted": True, "attestationId": attestation.id, "expiresAt": iso_utc(expires_at)}
 
     @created_app.post("/projects/{project_id}/generation-tasks/validate")
     def validate_generation_task(
@@ -656,6 +1094,13 @@ def create_app(
             "status": "PREFLIGHT",
             "capabilitySnapshotHash": snapshot["snapshotHash"],
             "projectRevision": project.revision,
+            "readiness": {
+                "enabled": snapshot["enabled"],
+                "reasonCode": snapshot["reasonCode"],
+                "circuit": snapshot["circuit"],
+                "killSwitch": snapshot["killSwitch"],
+            },
+            "quota": snapshot["quota"],
         }
 
     @created_app.post("/projects/{project_id}/generation-tasks", status_code=202)
@@ -693,6 +1138,30 @@ def create_app(
                 db, existing, rights=generation_rights(db, existing), include_history=True
             )
         snapshot = validate_generation_request(db, project, req, context)
+        quota = snapshot["quota"]
+        if (
+            snapshot.get("circuit", {}).get("state") == "HALF_OPEN"
+            and int(quota["concurrentRemaining"]) < int(quota["concurrentLimit"])
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "GENERATION_HALF_OPEN_PROBE_BUSY", "message": "熔断半开探测任务正在执行"},
+            )
+        if int(quota["concurrentRemaining"]) < 1:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "GENERATION_CONCURRENCY_QUOTA_EXCEEDED", "message": "并发生成任务已达到上限"},
+            )
+        if int(quota["monthlyRequestRemaining"]) < 1:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "GENERATION_MONTHLY_REQUEST_QUOTA_EXCEEDED", "message": "月度生成请求已达到上限"},
+            )
+        if int(quota["monthlyGeneratedSecondsRemaining"]) < 1:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "GENERATION_MONTHLY_SECONDS_QUOTA_EXCEEDED", "message": "月度生成时长已达到上限"},
+            )
         now = utc_now()
         task = DBGenerationTask(
             id=str(uuid.uuid4()),
@@ -722,9 +1191,16 @@ def create_app(
             created_at=now,
         )
         db.add_all([task, attempt])
+        add_usage_entry(
+            db, task=task, attempt=attempt, kind="RESERVED",
+            request_units=1, generated_seconds=0,
+            reservation_key=f"generation:{task.id}",
+            config_version_id=snapshot.get("configVersionId"), now=now,
+        )
         add_generation_event(
             db, task, attempt=attempt, event_type="TASK_CREATED",
-            actor_type="USER", actor_id=context.user_id, to_status="QUEUED", now=now,
+            actor_type="USER", actor_id=context.user_id, to_status="QUEUED",
+            metadata={"usageReserved": True, "requestUnits": 1}, now=now,
         )
         try:
             db.commit()
@@ -817,6 +1293,17 @@ def create_app(
                 actor_type="USER", actor_id=context.user_id,
                 from_status=previous, to_status="CANCELED", now=now,
             )
+            release_generation_reservation(
+                db, task, attempt, reason_code="TASK_CANCELED", now=now
+            )
+            task_circuit = generation_circuit(db, task.tenant_id)
+            if (
+                task_circuit is not None
+                and task_circuit.state == "HALF_OPEN"
+                and task_circuit.half_open_task_id == task.id
+            ):
+                task_circuit.half_open_task_id = None
+                task_circuit.updated_at = now
             db.commit()
         return generation_task_response(
             db, task, rights=generation_rights(db, task), include_history=True
@@ -840,6 +1327,25 @@ def create_app(
             raise HTTPException(
                 status_code=409,
                 detail={"code": "GENERATION_RETRY_EXHAUSTED", "message": "生成任务已达到最大尝试次数"},
+            )
+        readiness = current_generation_capabilities(db, context.tenant_id)
+        if not readiness["enabled"]:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": readiness["reasonCode"], "message": "生成服务当前不可重试"},
+            )
+        if (
+            readiness.get("configVersionId") != task.capability_snapshot_json.get("configVersionId")
+            or readiness.get("policyHash") != task.capability_snapshot_json.get("policyHash")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_CONFIG_SUPERSEDED", "message": "任务配置已被替代，请新建生成请求"},
+            )
+        if int(readiness["quota"]["concurrentRemaining"]) < 1:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "GENERATION_CONCURRENCY_QUOTA_EXCEEDED", "message": "并发生成任务已达到上限"},
             )
         now = utc_now()
         previous = task.status
@@ -890,11 +1396,69 @@ def create_app(
                 DBGenerationTask.cancel_requested_at.is_(None),
             )
             .order_by(DBGenerationTask.created_at.asc(), DBGenerationTask.id.asc())
-            .limit(1)
+            .limit(100)
         )
         if app_engine.dialect.name != "sqlite":
             claim_query = claim_query.with_for_update(skip_locked=True)
-        task = db.execute(claim_query).scalar_one_or_none()
+        candidates = list(db.execute(claim_query).scalars())
+        task: DBGenerationTask | None = None
+        claim_attestation: DBGenerationProviderAttestation | None = None
+        for candidate in candidates:
+            candidate_mode = candidate.capability_snapshot_json.get("mode")
+            if candidate_mode != created_app.state.generation_provider_mode:
+                continue
+            candidate_circuit = generation_circuit(db, candidate.tenant_id)
+            if candidate_circuit is not None:
+                if candidate_circuit.state == "DISABLED":
+                    continue
+                if candidate_circuit.state == "OPEN":
+                    cooldown_until = _as_utc(candidate_circuit.cooldown_until)
+                    if cooldown_until is None or now < cooldown_until:
+                        continue
+                    candidate_circuit.state = "HALF_OPEN"
+                    candidate_circuit.half_open_task_id = None
+                    candidate_circuit.updated_at = now
+                    add_provider_event(
+                        db, tenant_id=candidate.tenant_id,
+                        event_type="CIRCUIT_HALF_OPENED", actor_type="SYSTEM",
+                        actor_id="api", now=now,
+                    )
+                if candidate_circuit.state == "HALF_OPEN":
+                    if candidate_circuit.half_open_task_id not in {None, candidate.id}:
+                        continue
+                    candidate_circuit.half_open_task_id = candidate.id
+                    candidate_circuit.updated_at = now
+            if candidate_mode == "moneyprinter":
+                config = published_generation_config(db, candidate.tenant_id)
+                if (
+                    config is None
+                    or config.id != candidate.capability_snapshot_json.get("configVersionId")
+                    or config.policy_hash != candidate.capability_snapshot_json.get("policyHash")
+                    or not config.policy_json.get("enabledIntent")
+                ):
+                    continue
+                claim_attestation = db.execute(
+                    select(DBGenerationProviderAttestation)
+                    .where(
+                        DBGenerationProviderAttestation.tenant_id == candidate.tenant_id,
+                        DBGenerationProviderAttestation.provider == "moneyprinter",
+                        DBGenerationProviderAttestation.worker_id == x_worker_id,
+                        DBGenerationProviderAttestation.operator_mode == "moneyprinter",
+                        DBGenerationProviderAttestation.config_version_id == config.id,
+                        DBGenerationProviderAttestation.policy_hash == config.policy_hash,
+                        DBGenerationProviderAttestation.upstream_pin == MONEYPRINTER_UPSTREAM_PIN,
+                        DBGenerationProviderAttestation.healthy.is_(True),
+                        DBGenerationProviderAttestation.expires_at > now,
+                    )
+                    .order_by(DBGenerationProviderAttestation.checked_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if claim_attestation is None:
+                    continue
+            elif candidate_mode != "deterministic-fake":
+                continue
+            task = candidate
+            break
         if task is None:
             db.rollback()
             response.status_code = 204
@@ -929,6 +1493,15 @@ def create_app(
             "upstreamJobId": task.upstream_job_id,
             "providerArtifactId": task.provider_artifact_id,
             "providerMode": task.capability_snapshot_json.get("mode"),
+            "configVersionId": task.capability_snapshot_json.get("configVersionId"),
+            "policyHash": task.capability_snapshot_json.get("policyHash"),
+            "providerPolicy": task.capability_snapshot_json.get("providerPolicy"),
+            "workerProof": {
+                "attestationId": claim_attestation.id if claim_attestation else None,
+                "expiresAt": iso_utc(claim_attestation.expires_at) if claim_attestation else None,
+                "adapterVersion": claim_attestation.adapter_version if claim_attestation else MONEYPRINTER_ADAPTER_VERSION,
+                "upstreamPin": claim_attestation.upstream_pin if claim_attestation else MONEYPRINTER_UPSTREAM_PIN,
+            },
             "leaseSeconds": lease_seconds,
         }
 
@@ -941,6 +1514,7 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
+        begin_serialized_write(db)
         task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
@@ -963,6 +1537,7 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
+        begin_serialized_write(db)
         task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
@@ -1002,6 +1577,22 @@ def create_app(
             attempt.completed_at = now
             task.lease_owner = None
             task.lease_expires_at = None
+            provider_failure = bool(
+                req.errorCode
+                and (
+                    req.errorCode.startswith("PROVIDER_")
+                    or req.errorCode in {"AMBIGUOUS_SUBMISSION", "STATUS_TIMEOUT"}
+                )
+            )
+            if provider_failure:
+                record_generation_failure(db, task, now=now)
+            if req.status == "CANCELED" or (
+                req.status == "FAILED" and (not req.retryable or task.attempts >= task.max_attempts)
+            ):
+                release_generation_reservation(
+                    db, task, attempt,
+                    reason_code=req.errorCode or req.status, now=now,
+                )
         else:
             task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         add_generation_event(
@@ -1039,6 +1630,12 @@ def create_app(
             if task.provider_artifact_id == providerArtifactId and completion is not None:
                 return generation_task_response(db, task, rights=generation_rights(db, task), include_history=True)
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ALREADY_INGESTED", "message": "任务已绑定其他受治理产物"})
+        task_circuit = generation_circuit(db, task.tenant_id)
+        if task_circuit is not None and task_circuit.state == "DISABLED":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROVIDER_EMERGENCY_STOPPED", "message": "紧急停机期间迟到产物已隔离"},
+            )
         now = utc_now()
         if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
@@ -1088,6 +1685,23 @@ def create_app(
             }
             probe = {**metadata, "provenance": provenance}
             duration_seconds = float(metadata["durationSeconds"])
+            generated_seconds = max(1, int(duration_seconds + 0.999999))
+            settled_seconds = db.execute(
+                select(func.coalesce(func.sum(DBGenerationUsageEntry.generated_seconds), 0)).where(
+                    DBGenerationUsageEntry.tenant_id == task.tenant_id,
+                    DBGenerationUsageEntry.kind.in_(["SETTLED", "ADJUSTED"]),
+                    DBGenerationUsageEntry.created_at >= now.replace(
+                        day=1, hour=0, minute=0, second=0, microsecond=0
+                    ),
+                )
+            ).scalar_one()
+            seconds_limit = int(
+                (task.capability_snapshot_json.get("quota") or {}).get(
+                    "monthlyGeneratedSecondsLimit", 0
+                )
+            )
+            if seconds_limit < 1 or int(settled_seconds) + generated_seconds > seconds_limit:
+                raise ValueError("generated seconds quota exceeded")
             size_bytes = int(metadata.get("sizeBytes") or upload_size)
             material = {
                 "id": media_id,
@@ -1130,11 +1744,20 @@ def create_app(
             attempt.reconciliation_state = "ARTIFACT_INGESTED"
             attempt.completed_at = now
             db.add(asset)
+            add_usage_entry(
+                db, task=task, attempt=attempt, kind="SETTLED",
+                request_units=0, generated_seconds=generated_seconds,
+                reservation_key=f"generation:{task.id}",
+                config_version_id=task.capability_snapshot_json.get("configVersionId"),
+                now=now,
+            )
+            record_generation_success(db, task, now=now)
             add_generation_event(
                 db, task, attempt=attempt, event_type="ARTIFACT_INGESTED",
                 actor_type="WORKER", actor_id=x_worker_id,
                 from_status=previous, to_status="RIGHTS_BLOCKED",
-                metadata={"assetVersionId": asset.id, "sha256": asset.sha256, "sizeBytes": size_bytes}, now=now,
+                metadata={"assetVersionId": asset.id, "sha256": asset.sha256,
+                          "sizeBytes": size_bytes, "generatedSeconds": generated_seconds}, now=now,
             )
             db.commit()
         except Exception as exc:
@@ -1157,6 +1780,10 @@ def create_app(
                 db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
                 actor_type="SYSTEM", actor_id="api", from_status=task.status,
                 to_status="FAILED", metadata={"compensatedQuotaBytes": upload_size}, now=failed_task.completed_at,
+            )
+            release_generation_reservation(
+                db, failed_task, failed_attempt,
+                reason_code=failed_task.error_code, now=failed_task.completed_at,
             )
             db.commit()
             if isinstance(exc, ValueError):
