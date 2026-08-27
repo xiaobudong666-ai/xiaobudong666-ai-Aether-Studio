@@ -1,0 +1,50 @@
+{
+  "baseline": "a41bdf194d92158abb49f83c45189c52b1e9ebd1",
+  "scope": ["IM12", "IM13", "IM14"],
+  "status": "documentation-draft",
+  "implementation": "not_started",
+  "approval_package": "docs/approvals/IM12-IM14-GOVERNED-SERVER-GENERATION-BRIDGE-CODING-APPROVAL.md",
+  "planned_controls": {
+    "IM12": [
+      "project-scoped authenticated generation API",
+      "server-side capability and input validation",
+      "tenant-scoped idempotency",
+      "owner-editor writes and viewer read-only access"
+    ],
+    "IM13": [
+      "leased Worker claim and heartbeat",
+      "bounded retry and immutable attempt history",
+      "ambiguous response recovery without blind repost",
+      "cancel intent and late-response isolation"
+    ],
+    "IM14": [
+      "trusted same-origin artifact source enforcement",
+      "streamed size quota probe and SHA-256 checks",
+      "idempotent Material and immutable AssetVersion intake",
+      "mandatory RIGHTS_MISSING handoff"
+    ]
+  },
+  "required_acceptance_cases": 36,
+  "boundaries": {
+    "real_provider_activation": false,
+    "provider_credentials": false,
+    "paid_calls": false,
+    "new_dependencies": false,
+    "adapter_or_upstream_upgrade": false,
+    "new_queue_infrastructure": false,
+    "automatic_adoption": false,
+    "unguarded_timeline_write": false,
+    "deployment": false,
+    "public_access": false
+  },
+  "remaining_gates": [
+    "documentation formal review approval",
+    "documentation merge approval",
+    "separate exact coding authorization",
+    "functional PR formal review approval",
+    "functional PR merge approval",
+    "separate real-provider activation approval"
+  ],
+  "note": "This ledger records a proposal only. No IM12-IM14 functional implementation or external integration is claimed."
+}
+
