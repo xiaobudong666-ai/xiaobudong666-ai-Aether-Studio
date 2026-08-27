@@ -13,11 +13,12 @@
 3. The API receives only the generation operator mode; the Worker receives non-secret configVersionId/policyHash and the fixed internal Sidecar URL.
 4. `moneyprinter-sidecar`, API, Worker and video-use currently share `aether-net`; the Sidecar publishes no host port but is reachable from other containers on that network.
 5. Worker `MoneyPrinterTurboAdapter` disables proxy inheritance and redirects, validates same-origin artifacts and caps artifact bytes.
-6. Old Aether `/moneyprinter/*` endpoints return 410; API business code no longer performs direct Provider submit/status calls.
-7. Existing Provider config policy stores only non-secret fields; secrets, URLs and secret-shaped values are rejected.
-8. Existing readiness proves operator/config/policy/Adapter/pin/health agreement but does not prove target credentials or Provider account limits.
-9. Existing quota tracks requests and generated seconds, not currency; a Provider-side hard cost limit remains external.
-10. Existing rights flow blocks generated versions by default and requires explicit later governance/adoption.
+6. The Adapter defaults permit `/artifacts/` and `/api/v1/artifacts/`, while the pinned upstream completes files under `/tasks/...`; an exact published policy override is required before a canary can ingest an artifact.
+7. Old Aether `/moneyprinter/*` endpoints return 410; API business code no longer performs direct Provider submit/status calls.
+8. Existing Provider config policy stores only non-secret fields; secrets, URLs and secret-shaped values are rejected.
+9. Existing readiness proves operator/config/policy/Adapter/pin/health agreement but does not prove target credentials or Provider account limits.
+10. Existing quota tracks requests and generated seconds, not currency; a Provider-side hard cost limit remains external.
+11. Existing rights flow blocks generated versions by default and requires explicit later governance/adoption.
 
 ## Exact pinned-upstream findings
 
@@ -26,6 +27,7 @@ The following files were read at the fixed commit `475f21147f0808f5ffe3f58af9ab7
 - `app/config/config.py` loads root `config.toml` and copies `config.example.toml` when absent.
 - `config.example.toml` contains LLM Provider/model, Pexels/Pixabay and related credential settings.
 - `app/controllers/v1/video.py` creates its router without the commented token dependency and records task parameters at normal log levels.
+- `app/controllers/v1/video.py` resolves completed output URLs below `/tasks/...`; this differs from the current Adapter default artifact prefixes.
 - The upstream Compose expects the source/config directory to be mounted; Aether's custom image does not currently mount a target config.
 
 These facts justify a target-local read-only file boundary, network isolation, warning-level logging and non-sensitive canary inputs before any real request.
@@ -35,6 +37,7 @@ These facts justify a target-local read-only file boundary, network isolation, w
 - [x] Approval document defines IM18, IM19 and IM20 separately.
 - [x] Baseline and fixed upstream commit are exact.
 - [x] Secret ownership, mount, permission, logging and evidence rules are explicit.
+- [x] Pinned runtime profile and exact same-origin `/tasks/` artifact policy are explicit.
 - [x] Network topology and its limitations are explicit.
 - [x] Private-canary state sequence, one-request budget and fail-closed cleanup are explicit.
 - [x] 40 mandatory acceptance cases are numbered and executable in fake-only CI.
