@@ -73,6 +73,7 @@ describe("GenerationPanel server authority", () => {
   test("preflight and submit use server APIs without a local run action", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+    expect(screen.getByLabelText("Provider 就绪状态").children).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
     await screen.findByText(/服务端权威状态：可创建/);
     fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "一匹马穿过雨夜城市" } });

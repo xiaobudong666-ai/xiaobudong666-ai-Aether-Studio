@@ -204,23 +204,27 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     </article>)}
   </div>;
 
-  const renderReadiness = () => <div className="generation-readiness" aria-label="Provider 就绪状态">
+  const renderReadiness = (compact = false) => <div className="generation-readiness" aria-label="Provider 就绪状态">
     <strong>服务端权威状态：{generationReady ? "可创建" : "已阻断"}</strong>
-    <span>模式 {capabilities?.operatorMode || "disabled"} · 配置 {capabilities?.ownerPolicy?.published ? "已发布" : "未发布"} · Worker 证明 {capabilities?.workerProof?.fresh ? "新鲜" : "缺失或过期"}</span>
-    <span>熔断 {capabilities?.circuit?.state || "CLOSED"} · 紧急停机 {capabilities?.killSwitch?.disabled ? "已启用" : "未启用"}</span>
-    <span>并发余量 {capabilities?.quota?.concurrentRemaining ?? 0}/{capabilities?.quota?.concurrentLimit ?? 0} · 月请求余量 {capabilities?.quota?.monthlyRequestRemaining ?? 0} · 月生成秒数余量 {capabilities?.quota?.monthlyGeneratedSecondsRemaining ?? 0}</span>
-    {!generationReady && <span>阻断原因：{capabilities?.reasonCode || capabilities?.killSwitch?.reasonCode || "READINESS_PENDING"}</span>}
+    {compact ? <span>
+      模式 {capabilities?.operatorMode || "disabled"} · 配置 {capabilities?.ownerPolicy?.published ? "已发布" : "未发布"} · Worker {capabilities?.workerProof?.fresh ? "就绪" : "未就绪"} · 熔断 {capabilities?.circuit?.state || "CLOSED"} · 停机 {capabilities?.killSwitch?.disabled ? "是" : "否"} · 并发 {capabilities?.quota?.concurrentRemaining ?? 0}/{capabilities?.quota?.concurrentLimit ?? 0} · 月请求 {capabilities?.quota?.monthlyRequestRemaining ?? 0} · 月秒数 {capabilities?.quota?.monthlyGeneratedSecondsRemaining ?? 0}{!generationReady ? ` · ${capabilities?.reasonCode || capabilities?.killSwitch?.reasonCode || "READINESS_PENDING"}` : ""}
+    </span> : <>
+      <span>模式 {capabilities?.operatorMode || "disabled"} · 配置 {capabilities?.ownerPolicy?.published ? "已发布" : "未发布"} · Worker 证明 {capabilities?.workerProof?.fresh ? "新鲜" : "缺失或过期"}</span>
+      <span>熔断 {capabilities?.circuit?.state || "CLOSED"} · 紧急停机 {capabilities?.killSwitch?.disabled ? "已启用" : "未启用"}</span>
+      <span>并发余量 {capabilities?.quota?.concurrentRemaining ?? 0}/{capabilities?.quota?.concurrentLimit ?? 0} · 月请求余量 {capabilities?.quota?.monthlyRequestRemaining ?? 0} · 月生成秒数余量 {capabilities?.quota?.monthlyGeneratedSecondsRemaining ?? 0}</span>
+      {!generationReady && <span>阻断原因：{capabilities?.reasonCode || capabilities?.killSwitch?.reasonCode || "READINESS_PENDING"}</span>}
+    </>}
   </div>;
 
   if (role === "viewer") return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
     <div><strong>AI 受治理生成</strong><span>当前为只读权限；任务来自服务端，不提供创建、取消、重试或采纳操作。</span></div>
-    {renderReadiness()}
+    {renderReadiness(true)}
     {renderTasks(true)}
   </section>;
 
   if (!open) return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
     <div><strong>AI 受治理生成</strong><span>任务状态由服务端持久化；真实 Provider 默认保持禁用。</span></div>
-    {renderReadiness()}
+    {renderReadiness(true)}
     <button type="button" disabled={!project} onClick={() => setOpen(true)}>打开生成任务</button>
   </section>;
 
