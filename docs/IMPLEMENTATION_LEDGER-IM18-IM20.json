@@ -1,0 +1,65 @@
+{
+  "baseline": "221540aa2fcb64df4012aa37f8bd017da8e29a9c",
+  "scope": [
+    "IM18",
+    "IM19",
+    "IM20"
+  ],
+  "status": "documentation-draft",
+  "implementation": "not_started",
+  "approval_package": "docs/approvals/IM18-IM20-GOVERNED-PRIVATE-PROVIDER-CANARY-CODING-APPROVAL.md",
+  "planned_controls": {
+    "IM18": [
+      "explicit target-local read-only MoneyPrinter config override",
+      "repository-external regular-file and permission preflight",
+      "pinned upstream same-origin /tasks/ artifact contract",
+      "secret-free credential presence and canary-profile attestation",
+      "no secret content, path, metadata or digest persistence"
+    ],
+    "IM19": [
+      "internal Worker-to-Sidecar provider-control network",
+      "Sidecar-only provider-egress network",
+      "no Sidecar host port or API/Web/video-use connectivity",
+      "warning-level sanitized logs and preserved Adapter egress restrictions"
+    ],
+    "IM20": [
+      "preflight-first explicit canary command sequence",
+      "one request, one output and at most ten generated seconds",
+      "fail-closed kill-switch and operator-mode shutdown",
+      "secret-free evidence bundle with rights-blocked output"
+    ]
+  },
+  "required_acceptance_cases": 40,
+  "boundaries": {
+    "runtime_provider_default": "disabled",
+    "test_provider": "deterministic-fake-sidecar-only",
+    "real_provider_selected": false,
+    "real_credentials": false,
+    "real_provider_egress": false,
+    "paid_call": false,
+    "upstream_upgrade": false,
+    "new_dependencies_or_lockfiles": false,
+    "external_queue_or_object_storage": false,
+    "digital_human_or_identity_transformation": false,
+    "automatic_rights_allow": false,
+    "automatic_adoption": false,
+    "automatic_timeline_write": false,
+    "automatic_render_or_publish": false,
+    "private_canary_execution": false,
+    "deployment": false,
+    "public_access": false,
+    "commercial_operation": false
+  },
+  "remaining_gates": [
+    "documentation formal review approval",
+    "documentation merge approval",
+    "separate exact-SHA coding authorization",
+    "functional PR formal review approval",
+    "functional PR merge approval",
+    "single real Provider/model/material-source selection approval",
+    "target-local credential and paid-use approval",
+    "private one-task canary execution approval",
+    "separate deployment, public-access and commercial-operation approval"
+  ],
+  "note": "This ledger records a proposed private-canary coding boundary only. No IM18-IM20 functionality, real Provider selection, credential, paid call, target execution or deployment is claimed."
+}
