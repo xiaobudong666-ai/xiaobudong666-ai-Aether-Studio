@@ -92,6 +92,13 @@ feature PR is opened.
 | Local Docker | unavailable in the execution environment; remote CI required |
 | Local Playwright | Chromium download timed out; remote CI required |
 
+## Remote verification history
+
+| Run | Result |
+|---|---|
+| [33438948517](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/33438948517) | Failed before API execution because the first connector upload corrupted `apps/api/app/main.py` with NUL bytes; the remote file was restored from the locally verified source and its complete character count was checked before replacement. |
+| Restored-source branch run | PENDING_REMOTE_CI |
+
 ## Remaining gate
 
 Push the feature branch and require the branch CI to pass build/test/audits,
