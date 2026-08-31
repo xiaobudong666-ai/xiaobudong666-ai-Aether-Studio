@@ -50,7 +50,8 @@ services:
       args:
         MONEYPRINTER_COMMIT: 475f21147f0808f5ffe3f58af9ab794b28a4da2c
     networks:
-      - aether-net
+      - provider-control
+      - provider-egress
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -95,8 +96,6 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
     depends_on:
-      moneyprinter-sidecar:
-        condition: service_healthy
       video-use:
         condition: service_healthy
     healthcheck:
@@ -118,6 +117,7 @@ services:
       - "127.0.0.1:${AETHER_WORKER_PORT:-8001}:8001"
     networks:
       - aether-net
+      - provider-control
     environment:
       - BACKEND_URL=http://api:8000
       - WORKER_PORT=8001
@@ -130,6 +130,9 @@ services:
       - AETHER_GENERATION_CONFIG_VERSION_ID=${AETHER_GENERATION_CONFIG_VERSION_ID:-}
       - AETHER_GENERATION_POLICY_HASH=${AETHER_GENERATION_POLICY_HASH:-}
       - AETHER_GENERATION_MAX_ARTIFACT_BYTES=${AETHER_GENERATION_MAX_ARTIFACT_BYTES:-2147483648}
+      - AETHER_GENERATION_CREDENTIAL_STATE=${AETHER_GENERATION_CREDENTIAL_STATE:-ABSENT}
+      - AETHER_GENERATION_NETWORK_ISOLATION=${AETHER_GENERATION_NETWORK_ISOLATION:-NOT_ENFORCED}
+      - AETHER_GENERATION_CANARY_PROFILE=${AETHER_GENERATION_CANARY_PROFILE:-disabled}
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -188,4 +191,9 @@ volumes:
 
 networks:
   aether-net:
+    driver: bridge
+  provider-control:
+    driver: bridge
+    internal: true
+  provider-egress:
     driver: bridge
