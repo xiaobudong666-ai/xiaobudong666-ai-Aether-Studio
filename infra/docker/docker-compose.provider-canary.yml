@@ -1,0 +1,13 @@
+services:
+  moneyprinter-sidecar:
+    volumes:
+      - type: bind
+        source: ${MONEYPRINTER_CONFIG_FILE:?MONEYPRINTER_CONFIG_FILE is required}
+        target: /MoneyPrinterTurbo/config.toml
+        read_only: true
+
+  worker:
+    environment:
+      - AETHER_GENERATION_CREDENTIAL_STATE=PRESENT
+      - AETHER_GENERATION_NETWORK_ISOLATION=ENFORCED
+      - AETHER_GENERATION_CANARY_PROFILE=private-one-task-v1

@@ -69,6 +69,7 @@ def start_health_server(port: int = 8001):
 
 
 START_TIME = time.time()
+PRIVATE_CANARY_PROFILE = "private-one-task-v1"
 
 
 @dataclass
@@ -94,12 +95,42 @@ def operator_generation_mode() -> str:
     return mode if mode in {"disabled", "moneyprinter"} else "disabled"
 
 
+def canary_runtime_proof() -> tuple[str, str, str]:
+    credential_state = os.environ.get("AETHER_GENERATION_CREDENTIAL_STATE", "ABSENT")
+    network_isolation = os.environ.get(
+        "AETHER_GENERATION_NETWORK_ISOLATION", "NOT_ENFORCED"
+    )
+    canary_profile = os.environ.get("AETHER_GENERATION_CANARY_PROFILE", "disabled")
+    return credential_state, network_isolation, canary_profile
+
+
+def canary_runtime_ready() -> bool:
+    return canary_runtime_proof() == (
+        "PRESENT", "ENFORCED", PRIVATE_CANARY_PROFILE,
+    )
+
+
+def private_canary_policy_valid(policy: dict) -> bool:
+    try:
+        return (
+            bool(policy.get("enabledIntent"))
+            and int(policy.get("concurrentTaskLimit") or 0) == 1
+            and int(policy.get("monthlyRequestLimit") or 0) == 1
+            and 1 <= int(policy.get("monthlyGeneratedSecondsLimit") or 0) <= 10
+            and 1 <= int(policy.get("maxClipDurationSeconds") or 0) <= 10
+            and int(policy.get("maxOutputs") or 0) == 1
+            and policy.get("artifactPathPrefixes") == ["/tasks/"]
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def initialize_worker() -> WorkerComponents:
     backend_url = os.environ.get("BACKEND_URL", "http://localhost:8000")
     queue = TaskQueueClient(backend_url=backend_url)
     generation_queue = GenerationQueueClient(backend_url=backend_url)
     moneyprinter_adapter: object
-    if operator_generation_mode() == "moneyprinter":
+    if operator_generation_mode() == "moneyprinter" and canary_runtime_ready():
         moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=False)
     else:
         moneyprinter_adapter = DisabledMoneyPrinterAdapter()
@@ -207,6 +238,7 @@ def process_generation_task(
     provider_mode = task.get("providerMode")
     if provider_mode == "moneyprinter":
         proof = task.get("workerProof") or {}
+        provider_policy = task.get("providerPolicy") or {}
         configured_version = os.environ.get("AETHER_GENERATION_CONFIG_VERSION_ID", "")
         configured_hash = os.environ.get("AETHER_GENERATION_POLICY_HASH", "")
         try:
@@ -223,7 +255,12 @@ def process_generation_task(
             and configured_hash == task.get("policyHash")
             and proof.get("adapterVersion") == ADAPTER_VERSION
             and proof.get("upstreamPin") == UPSTREAM_PIN
+            and proof.get("credentialState") == "PRESENT"
+            and proof.get("networkIsolation") == "ENFORCED"
+            and proof.get("canaryProfile") == PRIVATE_CANARY_PROFILE
             and proof_expires > datetime.datetime.now(datetime.timezone.utc)
+            and canary_runtime_ready()
+            and private_canary_policy_valid(provider_policy)
             and isinstance(components.moneyprinter, MoneyPrinterTurboAdapter)
         )
         if not proof_matches:
@@ -233,7 +270,6 @@ def process_generation_task(
                 error_code="WORKER_PROOF_MISMATCH", error_message="Worker proof mismatch",
                 retryable=False,
             )
-        provider_policy = task.get("providerPolicy") or {}
         components.moneyprinter.artifact_path_prefixes = tuple(
             provider_policy.get("artifactPathPrefixes") or []
         )
@@ -396,7 +432,15 @@ def attest_worker_provider(components: WorkerComponents) -> None:
     healthy = False
     capabilities: dict = {}
     reason_code = "OPERATOR_DISABLED"
-    if mode == "moneyprinter" and isinstance(components.moneyprinter, MoneyPrinterTurboAdapter):
+    credential_state, network_isolation, canary_profile = canary_runtime_proof()
+    if mode == "moneyprinter" and not canary_runtime_ready():
+        if credential_state != "PRESENT":
+            reason_code = "CREDENTIAL_STATE_INVALID"
+        elif network_isolation != "ENFORCED":
+            reason_code = "NETWORK_ISOLATION_MISSING"
+        else:
+            reason_code = "CANARY_PROFILE_MISMATCH"
+    elif mode == "moneyprinter" and isinstance(components.moneyprinter, MoneyPrinterTurboAdapter):
         report = components.moneyprinter.get_capabilities()
         healthy = bool(report.get("healthy"))
         capabilities = dict(report.get("capabilities") or {})
@@ -411,6 +455,9 @@ def attest_worker_provider(components: WorkerComponents) -> None:
         "upstreamPin": UPSTREAM_PIN,
         "healthy": healthy,
         "capabilities": capabilities,
+        "credentialState": credential_state,
+        "networkIsolation": network_isolation,
+        "canaryProfile": canary_profile,
         "reasonCode": reason_code,
         "checkedAt": now.isoformat().replace("+00:00", "Z"),
         "expiresAt": (now + datetime.timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),

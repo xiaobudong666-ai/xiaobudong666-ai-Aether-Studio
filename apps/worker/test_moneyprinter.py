@@ -151,6 +151,27 @@ def test_im16_26_same_origin_relative_or_absolute_artifact_is_accepted(source):
     assert adapter._validated_artifact_url(source) == "http://moneyprinter-sidecar:8080/artifacts/final.mp4"  # noqa: SLF001
 
 
+def test_im20_34_pinned_tasks_prefix_is_exact_and_same_origin():
+    adapter = MoneyPrinterTurboAdapter(
+        api_url="http://moneyprinter-sidecar:8080",
+        artifact_path_prefixes=("/tasks/",),
+    )
+    assert adapter._validated_artifact_url("/tasks/fake/final.mp4") == (  # noqa: SLF001
+        "http://moneyprinter-sidecar:8080/tasks/fake/final.mp4"
+    )
+    with pytest.raises(MoneyPrinterArtifactError):
+        adapter._validated_artifact_url("/artifacts/final.mp4")  # noqa: SLF001
+
+
+def test_im20_34_broad_root_prefix_is_not_published_by_canary_worker():
+    adapter = MoneyPrinterTurboAdapter(
+        api_url="http://moneyprinter-sidecar:8080",
+        artifact_path_prefixes=("/tasks/",),
+    )
+    with pytest.raises(MoneyPrinterArtifactError):
+        adapter._validated_artifact_url("/outside/final.mp4")  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     "source",
     [
