@@ -28,9 +28,9 @@
 
 ## Mandatory acceptance matrix
 
-`PASS_LOCAL` is repository/unit/static evidence. `PENDING_REMOTE_CI` requires
-the existing Linux Docker or Playwright job and must become PASS before a Draft
-feature PR is opened.
+`PASS_LOCAL` is repository/unit/static evidence. `PASS_REMOTE_CI` was verified
+by the existing Linux Docker or Playwright job in CI run
+[`33440230599`](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/33440230599).
 
 | # | Evidence | Status |
 |---:|---|---|
@@ -39,27 +39,27 @@ feature PR is opened.
 | 3 | Absolute, external, regular-file, non-symlink checks | PASS_LOCAL |
 | 4 | Owner/readability and `0600` checks | PASS_LOCAL |
 | 5 | TOML errors return only stable reason codes | PASS_LOCAL |
-| 6 | Override declares fixed read-only bind; container write assertion | PENDING_REMOTE_CI |
+| 6 | Override declares fixed read-only bind; container write assertion | PASS_REMOTE_CI |
 | 7 | Override contains no secret environment, command, label, healthcheck, build arg or image change | PASS_LOCAL |
-| 8 | Compose visibility is Sidecar-only; API/Worker DTOs contain only sanitized proof | PENDING_REMOTE_CI |
+| 8 | Compose visibility is Sidecar-only; API/Worker DTOs contain only sanitized proof | PASS_REMOTE_CI |
 | 9 | Evidence scanner rejects path, metadata, digest and secret-shaped fields | PASS_LOCAL |
 | 10 | `PRESENT` requires valid structural proof; invalid states fail closed | PASS_LOCAL |
 | 11 | WARNING-or-stricter and auto-upload disabled checks | PASS_LOCAL |
 | 12 | Provider/source/proxy/base URL/endpoint/material/concurrency/hide-config rejection set | PASS_LOCAL |
 | 13 | API/Worker require exact config/policy/profile and `/tasks/` contract | PASS_LOCAL |
 | 14 | `provider-canary-smoke.py self-test` uses temporary fake inputs only | PASS_LOCAL |
-| 15 | Sidecar absent from `aether-net` and has no host port | PENDING_REMOTE_CI |
-| 16 | `provider-control` is internal and limited to Worker/Sidecar | PENDING_REMOTE_CI |
-| 17 | `provider-egress` is Sidecar-only | PENDING_REMOTE_CI |
-| 18 | API cannot resolve/connect to Sidecar | PENDING_REMOTE_CI |
-| 19 | Web and video-use cannot resolve/connect to Sidecar | PENDING_REMOTE_CI |
-| 20 | Worker reaches deterministic Sidecar contract through control network | PENDING_REMOTE_CI |
+| 15 | Sidecar absent from `aether-net` and has no host port | PASS_REMOTE_CI |
+| 16 | `provider-control` is internal and limited to Worker/Sidecar | PASS_REMOTE_CI |
+| 17 | `provider-egress` is Sidecar-only | PASS_REMOTE_CI |
+| 18 | API cannot resolve/connect to Sidecar | PASS_REMOTE_CI |
+| 19 | Web and video-use cannot resolve/connect to Sidecar | PASS_REMOTE_CI |
+| 20 | Worker reaches deterministic Sidecar contract through control network | PASS_REMOTE_CI |
 | 21 | Adapter retains `trust_env=False` and redirect refusal | PASS_LOCAL |
 | 22 | Four legacy `/moneyprinter/*` routes remain stable 410 | PASS_LOCAL |
 | 23 | No Nginx, diagnostic proxy, host port or second Provider change | PASS_LOCAL |
 | 24 | Adapter/log tests and evidence scanner reject sensitive bodies/headers/prompts | PASS_LOCAL |
 | 25 | Invalid credential/network/profile proof prevents Adapter construction/calls/claim | PASS_LOCAL |
-| 26 | Base health/render network regression | PENDING_REMOTE_CI |
+| 26 | Base health/render network regression | PASS_REMOTE_CI |
 | 27 | Controller defaults to preflight; `arm/run` require explicit command and exact SHA | PASS_LOCAL |
 | 28 | Dirty/SHA/owner/private-target/approval controls fail closed | PASS_LOCAL |
 | 29 | `arm` checks owner kill switch is disabled before recovery | PASS_LOCAL |
@@ -71,9 +71,9 @@ feature PR is opened.
 | 35 | Existing release/UNKNOWN rules preserved and fail closed | PASS_LOCAL |
 | 36 | Existing intake remains rights-blocked and does not auto-adopt/render/publish | PASS_LOCAL |
 | 37 | ERR/INT/TERM trap and timeout path invoke disarm | PASS_LOCAL |
-| 38 | Disarm sets kill switch, disables Worker, removes Sidecar container/mount | PENDING_REMOTE_CI |
+| 38 | Disarm sets kill switch, disables Worker, removes Sidecar container/mount | PASS_REMOTE_CI |
 | 39 | State/evidence allowlist scanner rejects URL, path, prompt and secret shapes | PASS_LOCAL |
-| 40 | Full API/Worker/Web/contracts/editor/video-use plus Docker/Playwright/render/browser regression | PENDING_REMOTE_CI |
+| 40 | Full API/Worker/Web/contracts/editor/video-use plus Docker/Playwright/render/browser regression | PASS_REMOTE_CI |
 
 ## Local verification
 
@@ -89,22 +89,19 @@ feature PR is opened.
 | Node lint | PASS |
 | TypeScript/Vite production build | PASS |
 | Shell syntax, Python compile, patch whitespace and secret-shape scan | PASS |
-| Local Docker | unavailable in the execution environment; remote CI required |
-| Local Playwright | Chromium download timed out; remote CI required |
+| Docker Compose integration | PASS in remote CI run `33440230599` |
+| Playwright workbench flow | PASS in remote CI run `33440230599` |
 
 ## Remote verification history
 
 | Run | Result |
 |---|---|
 | [33438948517](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/33438948517) | Failed before API execution because the first connector upload corrupted `apps/api/app/main.py` with NUL bytes; the remote file was restored from the locally verified source and its complete character count was checked before replacement. |
-| Restored-source branch run | PENDING_REMOTE_CI |
+| [33440230599](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/33440230599) | PASS: lint/build/audits/unit/fake-only, Playwright and Docker Compose integration all succeeded on Draft PR #27. |
 
 ## Remaining gate
 
-Push the feature branch and require the branch CI to pass build/test/audits,
-Playwright and Docker integration. The Docker job must prove the read-only bind,
-network membership, API/Web/video-use denial, Worker-only Sidecar access,
-FFmpeg, pinned video-use rendering, authenticated queue flow and production
-browser flow. Only after those results are recorded may a Draft feature PR be
-created. Formal review, merge, Provider/model selection, credentials, paid use,
-private canary execution and deployment remain separate owner gates.
+Draft feature PR #27 is open and its required remote verification passed. The
+next gate is separate owner approval to convert the feature PR to formal review.
+Merge, Provider/model selection, credentials, paid use, private canary execution
+and deployment remain separate owner gates.
