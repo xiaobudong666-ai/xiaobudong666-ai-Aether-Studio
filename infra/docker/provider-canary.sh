@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COMMAND="${1:-preflight}"
+shift || true
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BASE_COMPOSE="$ROOT/infra/docker/docker-compose.yml"
+CANARY_COMPOSE="$ROOT/infra/docker/docker-compose.provider-canary.yml"
+SMOKE="$ROOT/infra/docker/provider-canary-smoke.py"
+STATE_DIR="${AETHER_CANARY_STATE_DIR:-/tmp/aether-provider-canary-state}"
+STATE_FILE="$STATE_DIR/state.json"
+API_URL="${AETHER_CANARY_API_URL:-http://127.0.0.1:8000}"
+SYNTHETIC_SUBJECT="Aether synthetic canary: geometric shapes on a neutral background"
+CANARY_PROFILE="private-single-task-v1"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+emit() { printf '%s\n' "$1"; }
+block() { printf '{"status":"blocked","reasonCode":"%s"}\n' "$1" >&2; exit 2; }
+require_env() { local name="$1"; [[ -n "${!name:-}" ]] || block "${name}_REQUIRED"; }
+
+compose() {
+  docker compose -f "$BASE_COMPOSE" -f "$CANARY_COMPOSE" "$@"
+}
+
+check_git_gate() {
+  require_env AETHER_CANARY_APPROVED_SHA
+  local head
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  [[ "$head" == "$AETHER_CANARY_APPROVED_SHA" ]] || block "APPROVED_SHA_MISMATCH"
+  git -C "$ROOT" diff --quiet --ignore-submodules -- || block "WORKTREE_DIRTY"
+  git -C "$ROOT" diff --cached --quiet --ignore-submodules -- || block "WORKTREE_DIRTY"
+  [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] || block "WORKTREE_DIRTY"
+}
+
+check_public_evidence() {
+  require_env AETHER_CANARY_LIMIT_EVIDENCE_FILE
+  require_env AETHER_CANARY_LICENSE_EVIDENCE_FILE
+  [[ -f "$AETHER_CANARY_LIMIT_EVIDENCE_FILE" ]] || block "LIMIT_EVIDENCE_MISSING"
+  [[ -f "$AETHER_CANARY_LICENSE_EVIDENCE_FILE" ]] || block "LICENSE_EVIDENCE_MISSING"
+}
+
+preflight() {
+  check_git_gate
+  require_env MONEYPRINTER_CONFIG_FILE
+  require_env AETHER_CANARY_POLICY_FILE
+  require_env AETHER_GENERATION_TENANT_ID
+  require_env AETHER_GENERATION_CONFIG_VERSION_ID
+  require_env AETHER_GENERATION_POLICY_HASH
+  require_env AETHER_CANARY_PROVIDER
+  require_env AETHER_CANARY_MODEL
+  require_env AETHER_CANARY_MATERIAL_SOURCE
+  require_env AETHER_CANARY_VOICE_PATH
+  check_public_evidence
+  python "$SMOKE" preflight \
+    --config "$MONEYPRINTER_CONFIG_FILE" \
+    --repo-root "$ROOT" \
+    --policy-file "$AETHER_CANARY_POLICY_FILE" \
+    --tenant-id "$AETHER_GENERATION_TENANT_ID" \
+    --config-version-id "$AETHER_GENERATION_CONFIG_VERSION_ID" \
+    --policy-hash "$AETHER_GENERATION_POLICY_HASH" \
+    --provider "$AETHER_CANARY_PROVIDER" \
+    --model "$AETHER_CANARY_MODEL" \
+    --material-source "$AETHER_CANARY_MATERIAL_SOURCE" \
+    --voice-path "$AETHER_CANARY_VOICE_PATH" \
+    --log-level WARNING >/tmp/aether-canary-preflight-public.json
+  AETHER_GENERATION_PROVIDER_MODE=disabled \
+  AETHER_GENERATION_CREDENTIAL_STATE=PRESENT \
+  AETHER_GENERATION_NETWORK_ISOLATION=ENFORCED \
+  AETHER_GENERATION_CANARY_PROFILE="$CANARY_PROFILE" \
+  compose config --quiet
+  cat /tmp/aether-canary-preflight-public.json
+}
+
+owner_api_post() {
+  require_env AETHER_CANARY_OWNER_COOKIE_FILE
+  [[ -f "$AETHER_CANARY_OWNER_COOKIE_FILE" ]] || block "OWNER_SESSION_MISSING"
+  local path="$1" body="$2"
+  curl --fail --silent --show-error \
+    --cookie "$AETHER_CANARY_OWNER_COOKIE_FILE" \
+    -H 'Content-Type: application/json' -H 'X-Aether-CSRF: 1' \
+    -X POST "$API_URL$path" --data "$body" >/dev/null
+}
+
+verify_kill_switch_disabled() {
+  require_env AETHER_CANARY_OWNER_COOKIE_FILE
+  local body
+  body="$(curl --fail --silent --show-error --cookie "$AETHER_CANARY_OWNER_COOKIE_FILE" "$API_URL/generation/providers/moneyprinter/readiness")"
+  python - "$body" <<'PY'
+import json, sys
+obj=json.loads(sys.argv[1])
+ks=obj.get('killSwitch') or {}
+if not ks.get('disabled'):
+    raise SystemExit(2)
+PY
+}
+
+write_state() {
+  local status="$1"
+  printf '{"canaryProfile":"%s","state":"%s"}\n' "$CANARY_PROFILE" "$status" >"$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+}
+
+fail_closed_disarm() {
+  set +e
+  if [[ -n "${AETHER_CANARY_OWNER_COOKIE_FILE:-}" && -f "${AETHER_CANARY_OWNER_COOKIE_FILE:-}" ]]; then
+    owner_api_post "/generation/providers/moneyprinter/kill-switch" '{"disabled":true,"reasonCode":"CANARY_FAIL_CLOSED"}' >/dev/null 2>&1
+  fi
+  AETHER_GENERATION_PROVIDER_MODE=disabled compose down --remove-orphans >/dev/null 2>&1
+  write_state "DISARMED"
+  set -e
+}
+
+arm() {
+  [[ "${AETHER_PROVIDER_CANARY_REAL_EXECUTION_APPROVED:-}" == "YES" ]] || block "REAL_EXECUTION_NOT_APPROVED"
+  [[ "${AETHER_CANARY_OWNER_APPROVAL:-}" == "YES" ]] || block "OWNER_APPROVAL_MISSING"
+  preflight >/dev/null
+  verify_kill_switch_disabled || block "CANARY_PREARM_KILL_SWITCH_DISABLED"
+  trap 'fail_closed_disarm' ERR INT TERM
+  AETHER_GENERATION_PROVIDER_MODE=moneyprinter \
+  AETHER_GENERATION_CREDENTIAL_STATE=PRESENT \
+  AETHER_GENERATION_NETWORK_ISOLATION=ENFORCED \
+  AETHER_GENERATION_CANARY_PROFILE="$CANARY_PROFILE" \
+  compose up -d --wait --wait-timeout 180 moneyprinter-sidecar api worker
+  owner_api_post "/generation/providers/moneyprinter/kill-switch" '{"disabled":false,"reasonCode":"PRIVATE_CANARY_ARM"}'
+  write_state "ARMED"
+  emit '{"status":"armed","canaryProfile":"private-single-task-v1"}'
+}
+
+run_canary() {
+  [[ "${AETHER_PROVIDER_CANARY_REAL_EXECUTION_APPROVED:-}" == "YES" ]] || block "REAL_EXECUTION_NOT_APPROVED"
+  [[ -f "$STATE_FILE" ]] || block "CANARY_NOT_ARMED"
+  grep -q '"state":"ARMED"' "$STATE_FILE" || block "CANARY_NOT_ARMED"
+  require_env AETHER_CANARY_PROJECT_ID
+  require_env AETHER_CANARY_IDEMPOTENCY_KEY
+  require_env AETHER_CANARY_VOICE_NAME
+  require_env AETHER_CANARY_OWNER_COOKIE_FILE
+  local duration="${AETHER_CANARY_DURATION_SECONDS:-10}"
+  [[ "$duration" =~ ^[1-9]$|^10$ ]] || block "CANARY_DURATION_INVALID"
+  trap 'fail_closed_disarm' EXIT ERR INT TERM
+  python "$SMOKE" run-request \
+    --api-url "$API_URL" \
+    --cookie-file "$AETHER_CANARY_OWNER_COOKIE_FILE" \
+    --project-id "$AETHER_CANARY_PROJECT_ID" \
+    --config-version-id "$AETHER_GENERATION_CONFIG_VERSION_ID" \
+    --policy-hash "$AETHER_GENERATION_POLICY_HASH" \
+    --subject "$SYNTHETIC_SUBJECT" \
+    --idempotency-key "$AETHER_CANARY_IDEMPOTENCY_KEY" \
+    --voice-name "$AETHER_CANARY_VOICE_NAME" \
+    --duration-seconds "$duration"
+  write_state "REQUESTED"
+}
+
+disarm() {
+  fail_closed_disarm
+  emit '{"status":"disarmed","canaryProfile":"private-single-task-v1"}'
+}
+
+case "$COMMAND" in
+  preflight) preflight ;;
+  arm) arm ;;
+  run) run_canary ;;
+  disarm) disarm ;;
+  self-test) python "$SMOKE" self-test --repo-root "$ROOT" ;;
+  *) block "UNKNOWN_COMMAND" ;;
+esac
