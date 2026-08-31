@@ -1,0 +1,17 @@
+services:
+  moneyprinter-sidecar:
+    volumes:
+      - type: bind
+        source: ${MONEYPRINTER_CONFIG_FILE:?MONEYPRINTER_CONFIG_FILE must be an absolute target-local file}
+        target: /MoneyPrinterTurbo/config.toml
+        read_only: true
+    environment:
+      LOG_LEVEL: WARNING
+      LOGURU_LEVEL: WARNING
+      AETHER_PROVIDER_CANARY_PROFILE: ${AETHER_GENERATION_CANARY_PROFILE:-private-single-task-v1}
+
+  worker:
+    environment:
+      AETHER_GENERATION_CREDENTIAL_STATE: ${AETHER_GENERATION_CREDENTIAL_STATE:-ABSENT}
+      AETHER_GENERATION_NETWORK_ISOLATION: ${AETHER_GENERATION_NETWORK_ISOLATION:-NOT_ENFORCED}
+      AETHER_GENERATION_CANARY_PROFILE: ${AETHER_GENERATION_CANARY_PROFILE:-private-single-task-v1}
