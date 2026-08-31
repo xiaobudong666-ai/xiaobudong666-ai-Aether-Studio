@@ -89,6 +89,37 @@ docker compose \
   down
 ```
 
+## Private Provider canary boundary
+
+The base stack remains `AETHER_GENERATION_PROVIDER_MODE=disabled` and does not
+mount a MoneyPrinter credential file. `moneyprinter-sidecar` is isolated from
+`aether-net`: only Worker shares the internal `provider-control` network with
+it, while only the Sidecar joins `provider-egress`. API, Web and video-use must
+not be able to resolve or connect to the unauthenticated Sidecar.
+
+The repository includes `infra/docker/docker-compose.provider-canary.yml` and
+`infra/docker/provider-canary.sh` only as a gated future private-canary path.
+They do **not** authorize a real Provider, credential, paid request or target
+execution. A future separately approved target run must provide a repository-
+external regular `config.toml` with permissions no broader than `0600`, bind it
+read-only to `/MoneyPrinterTurbo/config.toml`, and pass `provider-canary.sh
+preflight` before any arm/run action.
+
+The preflight keeps secret material out of Git, Compose environment values,
+logs, databases and evidence. Its public output is limited to credential
+presence, network isolation, the fixed canary profile, the pinned upstream and
+`/tasks/` artifact policy. The first real canary, if separately approved, is
+constrained to one request, one output and 1-10 generated seconds with a
+synthetic non-sensitive subject. `arm` and `run` also require a distinct
+`AETHER_PROVIDER_CANARY_REAL_EXECUTION_APPROVED=YES` gate and an exact approved
+Git SHA. CI never sets that flag and uses fake config only.
+
+`disarm` is fail-closed: it first attempts to restore the owner kill switch,
+then tears down the override stack so the read-only secret mount disappears.
+The next ordinary start returns to the committed `disabled` default. Evidence
+must never contain Provider keys, cookies, authorization headers, the target
+config path, config metadata/hash, raw prompts or full upstream responses.
+
 ## Required operator checks before public traffic
 
 - Terminate HTTPS at a host reverse proxy or managed ingress.
