@@ -74,6 +74,9 @@ jobs:
           PYTHONPATH: apps/api
         run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py -v
 
+      - name: Run fake-only Provider canary acceptance suite
+        run: python infra/docker/provider-canary-smoke.py self-test --repo-root "$GITHUB_WORKSPACE"
+
   playwright:
     name: Playwright workbench flow
     needs: build-and-test
@@ -132,7 +135,6 @@ jobs:
     needs: build-and-test
     runs-on: ubuntu-latest
     env:
-      # Isolate disposable CI resources from local/production Compose projects.
       COMPOSE_PROJECT_NAME: aether-ci-${{ github.run_id }}-${{ github.run_attempt }}
       AETHER_COOKIE_SECURE: "false"
 
@@ -152,6 +154,55 @@ jobs:
       - name: Validate Compose configuration
         run: docker compose -f infra/docker/docker-compose.yml config --quiet
 
+      - name: Create fake-only canary fixtures and validate override
+        run: |
+          mkdir -p /tmp/aether-fake-canary
+          cat >/tmp/aether-fake-canary/config.toml <<'EOF'
+          [app]
+          llm_provider = "openai"
+          openai_api_key = "fake-ci-key"
+          openai_model_name = "fake-model"
+          openai_base_url = ""
+          video_source = "pexels"
+          pexels_api_keys = ["fake-ci-material"]
+          pixabay_api_keys = []
+          endpoint = ""
+          material_directory = "task"
+          enable_redis = false
+          max_concurrent_tasks = 1
+          hide_config = true
+          [proxy]
+          [ui]
+          upload_post_enabled = false
+          upload_post_auto_upload = false
+          [azure]
+          speech_key = ""
+          speech_region = ""
+          [siliconflow]
+          api_key = ""
+          EOF
+          chmod 600 /tmp/aether-fake-canary/config.toml
+          cat >/tmp/aether-fake-canary/policy.json <<'EOF'
+          {"tenantId":"tenant-ci","configVersionId":"config-ci","policyHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifactPathPrefixes":["/tasks/"],"concurrentTaskLimit":1,"monthlyRequestLimit":1,"monthlyGeneratedSecondsLimit":10,"maxOutputs":1}
+          EOF
+          printf '%s\n' '{"hardLimit":"fake-only"}' >/tmp/aether-fake-canary/limit.json
+          printf '%s\n' '{"license":"fake-only"}' >/tmp/aether-fake-canary/license.json
+          MONEYPRINTER_CONFIG_FILE=/tmp/aether-fake-canary/config.toml \
+          AETHER_GENERATION_CREDENTIAL_STATE=PRESENT \
+          AETHER_GENERATION_NETWORK_ISOLATION=ENFORCED \
+          AETHER_GENERATION_CANARY_PROFILE=private-single-task-v1 \
+          docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.provider-canary.yml config --quiet
+          python infra/docker/provider-canary-smoke.py preflight \
+            --config /tmp/aether-fake-canary/config.toml \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --policy-file /tmp/aether-fake-canary/policy.json \
+            --tenant-id tenant-ci --config-version-id config-ci \
+            --policy-hash aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --provider openai --model fake-model --material-source pexels --voice-path edge \
+            --log-level WARNING \
+            >/tmp/aether-fake-canary/preflight.json
+          grep -q '"credentialState": "PRESENT"' /tmp/aether-fake-canary/preflight.json
+
       - name: Build images
         run: docker compose -f infra/docker/docker-compose.yml build
 
@@ -168,17 +219,15 @@ jobs:
           curl --fail --show-error http://127.0.0.1/api/video-use/capabilities
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' --request POST http://127.0.0.1/api/internal/render-tasks/claim)" = "404"
 
-      - name: Internal same-origin networking validation
+      - name: Internal Provider networking validation
         run: |
-          # 1. Probe sidecar openapi directly from inside API container
-          docker compose -f infra/docker/docker-compose.yml exec -T api python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=5)"
-          # 2. Probe sidecar openapi directly from inside Worker container
-          docker compose -f infra/docker/docker-compose.yml exec -T worker python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=5)"
-          # 3. Assert sidecar has correct v1.2.7 API schema contracts: POST /api/v1/videos and GET /api/v1/tasks/{task_id}
-          docker compose -f infra/docker/docker-compose.yml exec -T api python -c "import urllib.request, json; \
-            data = json.loads(urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json').read().decode()); \
-            assert '/api/v1/videos' in data['paths'], 'Missing contract: POST /api/v1/videos'; \
-            assert '/api/v1/tasks/{task_id}' in data['paths'], 'Missing contract: GET /api/v1/tasks/{task_id}'"
+          echo "API cannot reach MoneyPrinter Sidecar"
+          ! docker compose -f infra/docker/docker-compose.yml exec -T api python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=3)"
+          echo "Web and video-use cannot reach MoneyPrinter Sidecar"
+          ! docker compose -f infra/docker/docker-compose.yml exec -T video-use python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=3)"
+          ! docker compose -f infra/docker/docker-compose.yml exec -T web wget -q -O - http://moneyprinter-sidecar:8080/openapi.json
+          echo "Worker reaches MoneyPrinter Sidecar through provider-control"
+          docker compose -f infra/docker/docker-compose.yml exec -T worker python -c "import urllib.request, json; data=json.loads(urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=5).read().decode()); assert '/api/v1/videos' in data['paths']; assert '/api/v1/tasks/{task_id}' in data['paths']"
 
       - name: Verify FFmpeg and ffprobe in Worker
         run: |
@@ -190,15 +239,12 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_worker.py worker:/tmp/test_worker.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_moneyprinter.py worker:/tmp/test_moneyprinter.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_generation_tasks.py worker:/tmp/test_generation_tasks.py
-          docker compose -f infra/docker/docker-compose.yml exec -T \
-            -e PYTHONPATH=/app worker \
-            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py -v
+          docker compose -f infra/docker/docker-compose.yml exec -T -e PYTHONPATH=/app worker python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py -v
 
       - name: Run video-use sidecar tests in FFmpeg container
         run: |
           docker compose -f infra/docker/docker-compose.yml cp apps/video_use/test_main.py video-use:/tmp/test_main.py
-          docker compose -f infra/docker/docker-compose.yml exec -T video-use \
-            python -m pytest /tmp/test_main.py -v
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use python -m pytest /tmp/test_main.py -v
 
       - name: Verify pinned video-use and execute a real render
         run: |
@@ -238,8 +284,7 @@ jobs:
             -f lavfi -i sine=frequency=660:sample_rate=48000 \
             -t 2 -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart \
             /tmp/browser-real.mp4
-          docker compose -f infra/docker/docker-compose.yml cp \
-            video-use:/tmp/browser-real.mp4 e2e/fixtures/browser-real.mp4
+          docker compose -f infra/docker/docker-compose.yml cp video-use:/tmp/browser-real.mp4 e2e/fixtures/browser-real.mp4
 
       - name: Run real browser upload-to-download flow
         env:
@@ -253,6 +298,12 @@ jobs:
       - name: Capture Docker logs
         if: always()
         run: docker compose -f infra/docker/docker-compose.yml logs --no-color > docker-compose.log
+
+      - name: Sanitize fake canary logs
+        if: always()
+        run: |
+          ! grep -Eiq '(api[_-]?key|authorization:|cookie:|bearer[[:space:]]+[A-Za-z0-9._-]{8,}|fake-ci-key|fake-ci-material)' docker-compose.log
+          rm -rf /tmp/aether-fake-canary
 
       - name: Upload Docker evidence
         if: always()
@@ -276,5 +327,4 @@ jobs:
 
       - name: Stop disposable CI stack and its run-scoped volumes
         if: always()
-        # --volumes is safe only because COMPOSE_PROJECT_NAME is unique to this CI run.
         run: docker compose -f infra/docker/docker-compose.yml down --volumes
