@@ -9,6 +9,7 @@
 - Fixed upstream remains MoneyPrinterTurbo `v1.2.7` at `475f21147f0808f5ffe3f58af9ab794b28a4da2c`.
 - No real Provider/model/material-source credential was read, mounted or contacted during implementation, review or CI.
 - No paid request, real `arm`/`run`, target deployment, public access or commercial operation was authorized or executed.
+- Subsequent PR #29 locked one real-canary candidate configuration and merged as `e43c71166a6e525cad23c47dfd5f30a980d04625`; its status is `CONFIGURATION_LOCKED / EXECUTION_NOT_AUTHORIZED`.
 
 ## Implemented controls
 
@@ -89,14 +90,16 @@
 - Run `33440230599`: passed the Draft feature branch verification.
 - Final reviewed-head run `33440891212`: PASS on `7d7d6ef3c10b64e76934c1dae58bb1e32c3523ac`, including lint/build/audits/unit/fake-only tests, Playwright, Docker network isolation, read-only mount, Worker-only Sidecar access, FFmpeg/render, authenticated queue and browser flow.
 
-## Accepted repository state and remaining gates
+## Accepted repository state and subsequent candidate lock
 
 PR #27 has been formally reviewed and merged as `main@0d7275836abfef26db7180076b23529b4f974f26`. IM18–IM20 repository implementation is therefore accepted.
 
-The following remain separate and are **not** authorized by this acceptance:
+PR #29 later locked one candidate runtime configuration in `docs/approvals/REAL-PROVIDER-PRIVATE-CANARY-EXECUTION-APPROVAL.md` and merged as `e43c71166a6e525cad23c47dfd5f30a980d04625`. That record explicitly remains `CONFIGURATION_LOCKED / EXECUTION_NOT_AUTHORIZED`; it does not alter the 40-case repository acceptance result and does not authorize any real execution.
 
-- selection of a real LLM Provider/model/material source/voice path;
+The following remain separate and are **not** authorized by this acceptance or the candidate lock:
+
 - target-local real credential mounting or inspection;
-- Provider-side monetary limit setup and any paid call;
+- target access or real preflight;
+- Provider-side monetary-limit verification for execution and any paid call;
 - real private-canary `arm`/`run` execution;
 - deployment, public access, expanded trial or commercial operation.
