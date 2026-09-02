@@ -53,6 +53,61 @@ its own licensed provider configuration before generation can be accepted as
 operational. `VITE_OPENREEL_URL` is also optional and is consumed only while
 building the Web image; leave it empty to omit the fallback-editor link.
 
+## Governed private Provider canary boundary
+
+The base Compose stack remains fail-closed: its committed Provider mode is
+`disabled`, it does not mount a target configuration, and the unauthenticated
+MoneyPrinter Sidecar is not attached to `aether-net`. Only the Worker shares
+the internal `provider-control` network with the Sidecar. The Sidecar alone is
+attached to `provider-egress`; API, Web and video-use have no Provider route.
+
+The optional `docker-compose.provider-canary.yml` override is not a deployment
+approval. It only defines a future, separately authorized target-local bind:
+
+- `MONEYPRINTER_CONFIG_FILE` must be an absolute, repository-external regular
+  file owned by the operator and have permissions no broader than `0600`;
+- the file is mounted only at `/MoneyPrinterTurbo/config.toml` on the Sidecar
+  and is read-only;
+- no secret value is copied into Compose environment, a command, a label, a
+  healthcheck, a build argument, an image layer or an Aether evidence record;
+- the Worker receives only `credentialState=PRESENT`,
+  `networkIsolation=ENFORCED` and `canaryProfile=private-one-task-v1` after the
+  structural preflight passes.
+
+From a clean checkout of an owner-approved exact commit, the only action that
+is safe without a separate real-execution approval is the default preflight:
+
+```bash
+MONEYPRINTER_CONFIG_FILE=/absolute/private/config.toml \
+AETHER_CANARY_ENV_FILE=/absolute/private/aether-provider-canary.env \
+AETHER_CANARY_LLM_PROVIDER=<approved-provider> \
+AETHER_CANARY_MODEL=<approved-model> \
+AETHER_CANARY_MATERIAL_SOURCE=<approved-material-source> \
+AETHER_CANARY_VOICE_PATH=edge \
+AETHER_GENERATION_TENANT_ID=<approved-tenant-id> \
+AETHER_GENERATION_CONFIG_VERSION_ID=<published-config-version-id> \
+AETHER_GENERATION_POLICY_HASH=<published-policy-hash> \
+AETHER_CANARY_PROVIDER_BUDGET_EVIDENCE=PRESENT \
+AETHER_CANARY_MATERIAL_LICENSE_EVIDENCE=PRESENT \
+infra/docker/provider-canary.sh preflight --approved-sha <approved-main-sha>
+```
+
+Preflight emits only a sanitized status. It rejects a dirty or mismatched
+checkout, unsafe target file, invalid TOML, DEBUG logging, automatic upload,
+Redis, proxy/base URL, broad artifact prefix, multiple Provider/material
+sources, or a policy other than one concurrent task, one monthly request, one
+output and at most ten generated seconds.
+
+The `arm`, `run` and `disarm` subcommands exist for a later owner-approved
+private execution. They remain locked unless the separate execution approval,
+owner UID, private-target assertion, authenticated owner session, exact SHA,
+one synthetic request and external state-file controls are all present.
+`run` persists the one-POST boundary before transmission, never automatically
+replays an ambiguous submission, and always invokes fail-closed disarm. Disarm
+sets the owner kill switch, removes the Sidecar container/read-only mount and
+recreates the Worker with Provider mode and all proof fields disabled. Do not
+invoke these subcommands during coding, CI, review or deployment approval.
+
 ## Build and start
 
 ```bash

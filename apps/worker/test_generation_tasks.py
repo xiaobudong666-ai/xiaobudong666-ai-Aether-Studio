@@ -6,7 +6,13 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 from app.generation_queue import GenerationQueueClient, GenerationQueueError
-from app.main import WorkerComponents, process_generation_task
+from app.main import (
+    DisabledMoneyPrinterAdapter,
+    WorkerComponents,
+    attest_worker_provider,
+    initialize_worker,
+    process_generation_task,
+)
 from app.moneyprinter_adapter import ADAPTER_VERSION, UPSTREAM_PIN, MoneyPrinterTurboAdapter
 
 
@@ -85,6 +91,9 @@ def test_im16_19_moneyprinter_mode_requires_matching_claim_proof(monkeypatch):
     monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
     monkeypatch.setenv("AETHER_GENERATION_CONFIG_VERSION_ID", "config-1")
     monkeypatch.setenv("AETHER_GENERATION_POLICY_HASH", "a" * 64)
+    monkeypatch.setenv("AETHER_GENERATION_CREDENTIAL_STATE", "PRESENT")
+    monkeypatch.setenv("AETHER_GENERATION_NETWORK_ISOLATION", "ENFORCED")
+    monkeypatch.setenv("AETHER_GENERATION_CANARY_PROFILE", "private-one-task-v1")
     provider = MoneyPrinterTurboAdapter(api_url="http://moneyprinter-sidecar:8080")
     provider.generate_video = MagicMock(return_value="upstream-1")
     provider.get_task_status = MagicMock(return_value={
@@ -97,15 +106,92 @@ def test_im16_19_moneyprinter_mode_requires_matching_claim_proof(monkeypatch):
         providerMode="moneyprinter",
         configVersionId="config-1",
         policyHash="a" * 64,
-        providerPolicy={"artifactPathPrefixes": ["/artifacts/"], "maxArtifactBytes": 1024},
+        providerPolicy={
+            "enabledIntent": True,
+            "concurrentTaskLimit": 1,
+            "monthlyRequestLimit": 1,
+            "monthlyGeneratedSecondsLimit": 10,
+            "maxClipDurationSeconds": 10,
+            "maxOutputs": 1,
+            "artifactPathPrefixes": ["/tasks/"],
+            "maxArtifactBytes": 1024,
+        },
         workerProof={
             "expiresAt": expires.isoformat().replace("+00:00", "Z"),
             "adapterVersion": ADAPTER_VERSION,
             "upstreamPin": UPSTREAM_PIN,
+            "credentialState": "PRESENT",
+            "networkIsolation": "ENFORCED",
+            "canaryProfile": "private-one-task-v1",
         },
     )
     assert process_generation_task(components(provider, queue), task, poll_interval=0)["status"] == "RIGHTS_BLOCKED"
     provider.generate_video.assert_called_once()
+
+
+def test_im18_10_moneyprinter_mode_without_sanitized_preflight_proof_is_non_network(monkeypatch):
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
+    monkeypatch.setenv("AETHER_GENERATION_CREDENTIAL_STATE", "ABSENT")
+    monkeypatch.setenv("AETHER_GENERATION_NETWORK_ISOLATION", "NOT_ENFORCED")
+    monkeypatch.setenv("AETHER_GENERATION_CANARY_PROFILE", "disabled")
+    initialized = initialize_worker()
+    assert isinstance(initialized.moneyprinter, DisabledMoneyPrinterAdapter)
+
+
+def test_im19_25_invalid_runtime_proof_attests_unhealthy_without_sidecar_call(monkeypatch):
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
+    monkeypatch.setenv("AETHER_GENERATION_CREDENTIAL_STATE", "INVALID")
+    monkeypatch.setenv("AETHER_GENERATION_NETWORK_ISOLATION", "ENFORCED")
+    monkeypatch.setenv("AETHER_GENERATION_CANARY_PROFILE", "private-one-task-v1")
+    provider = MagicMock()
+    queue = queue_mock()
+    current = components(provider, queue)
+    attest_worker_provider(current)
+    provider.get_capabilities.assert_not_called()
+    payload = queue.attest.call_args.args[0]
+    assert payload["healthy"] is False
+    assert payload["reasonCode"] == "CREDENTIAL_STATE_INVALID"
+    assert payload["credentialState"] == "INVALID"
+    assert payload["networkIsolation"] == "ENFORCED"
+    assert payload["canaryProfile"] == "private-one-task-v1"
+
+
+def test_im20_30_broad_runtime_policy_fails_before_provider_post(monkeypatch):
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
+    monkeypatch.setenv("AETHER_GENERATION_CONFIG_VERSION_ID", "config-1")
+    monkeypatch.setenv("AETHER_GENERATION_POLICY_HASH", "a" * 64)
+    monkeypatch.setenv("AETHER_GENERATION_CREDENTIAL_STATE", "PRESENT")
+    monkeypatch.setenv("AETHER_GENERATION_NETWORK_ISOLATION", "ENFORCED")
+    monkeypatch.setenv("AETHER_GENERATION_CANARY_PROFILE", "private-one-task-v1")
+    provider = MoneyPrinterTurboAdapter(api_url="http://moneyprinter-sidecar:8080")
+    provider.generate_video = MagicMock()
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=2)
+    task = claimed_task(
+        providerMode="moneyprinter",
+        configVersionId="config-1",
+        policyHash="a" * 64,
+        providerPolicy={
+            "enabledIntent": True,
+            "concurrentTaskLimit": 1,
+            "monthlyRequestLimit": 2,
+            "monthlyGeneratedSecondsLimit": 10,
+            "maxClipDurationSeconds": 10,
+            "maxOutputs": 1,
+            "artifactPathPrefixes": ["/tasks/"],
+            "maxArtifactBytes": 1024,
+        },
+        workerProof={
+            "expiresAt": expires.isoformat().replace("+00:00", "Z"),
+            "adapterVersion": ADAPTER_VERSION,
+            "upstreamPin": UPSTREAM_PIN,
+            "credentialState": "PRESENT",
+            "networkIsolation": "ENFORCED",
+            "canaryProfile": "private-one-task-v1",
+        },
+    )
+    result = process_generation_task(components(provider, queue_mock()), task, poll_interval=0)
+    assert result["error_code"] == "WORKER_PROOF_MISMATCH"
+    provider.generate_video.assert_not_called()
 
 
 def test_ambiguous_submission_becomes_unknown_without_repost():

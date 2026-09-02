@@ -172,6 +172,9 @@ class GenerationProviderAttestationRequest(BaseModel):
     upstreamPin: str = Field(min_length=1, max_length=80)
     healthy: bool
     capabilities: dict[str, Any]
+    credentialState: Literal["ABSENT", "PRESENT", "INVALID"]
+    networkIsolation: Literal["ENFORCED", "NOT_ENFORCED"]
+    canaryProfile: Literal["private-one-task-v1", "disabled"]
     reasonCode: Optional[str] = Field(default=None, max_length=120)
     checkedAt: datetime
     expiresAt: datetime

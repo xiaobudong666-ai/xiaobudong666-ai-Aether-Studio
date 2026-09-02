@@ -1,5 +1,6 @@
 import datetime
 import inspect
+import json
 import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -136,13 +137,13 @@ def provider_policy(**overrides):
         "allowedConcatModes": ["random", "sequential"],
         "maxClipDurationSeconds": 10,
         "maxOutputs": 1,
-        "concurrentTaskLimit": 2,
-        "monthlyRequestLimit": 100,
-        "monthlyGeneratedSecondsLimit": 1000,
+        "concurrentTaskLimit": 1,
+        "monthlyRequestLimit": 1,
+        "monthlyGeneratedSecondsLimit": 10,
         "failureWindow": 300,
         "failureThreshold": 2,
         "cooldownSeconds": 60,
-        "artifactPathPrefixes": ["/artifacts/"],
+        "artifactPathPrefixes": ["/tasks/"],
         "maxArtifactBytes": 1024,
         "configLabel": "provider-readiness-v1",
         "description": "Governed activation policy.",
@@ -181,6 +182,9 @@ def attest_provider(client, sessions, config, **overrides):
         "adapterVersion": "aether-moneyprinter-v2",
         "upstreamPin": "475f21147f0808f5ffe3f58af9ab794b28a4da2c",
         "healthy": True,
+        "credentialState": "PRESENT",
+        "networkIsolation": "ENFORCED",
+        "canaryProfile": "private-one-task-v1",
         "capabilities": {
             "videoAspects": ["9:16"],
             "voices": ["en-US-JennyNeural"],
@@ -909,6 +913,8 @@ def test_im15_11_bad_worker_token_has_zero_state_change(provider_control_context
             "tenantId": tenant_id, "configVersionId": config["id"],
             "policyHash": config["policyHash"], "adapterVersion": "v",
             "upstreamPin": "wrong", "healthy": True, "capabilities": {},
+            "credentialState": "PRESENT", "networkIsolation": "ENFORCED",
+            "canaryProfile": "private-one-task-v1",
             "checkedAt": now.isoformat(),
             "expiresAt": (now + datetime.timedelta(minutes=1)).isoformat(),
         },
@@ -989,6 +995,83 @@ def test_im15_16_compose_and_environment_templates_default_disabled():
         assert "AETHER_GENERATION_PROVIDER_MODE=disabled" in path.read_text()
     compose = (root / "infra/docker/docker-compose.yml").read_text()
     assert compose.count("AETHER_GENERATION_PROVIDER_MODE=${AETHER_GENERATION_PROVIDER_MODE:-disabled}") == 2
+
+
+def test_im18_10_readiness_exposes_only_sanitized_canary_proof(provider_control_context):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    readiness = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["enabled"] is True
+    assert readiness["credentialState"] == "PRESENT"
+    assert readiness["networkIsolation"] == "ENFORCED"
+    assert readiness["canaryProfile"] == "private-one-task-v1"
+    serialized = json.dumps(readiness).lower()
+    for forbidden in ("configpath", "mtime", "configsha256", "api_key", "cookie"):
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("credentialState", "INVALID"),
+        ("networkIsolation", "NOT_ENFORCED"),
+        ("canaryProfile", "disabled"),
+    ],
+)
+def test_im18_13_healthy_attestation_rejects_incomplete_canary_proof(
+    provider_control_context, field, value
+):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    response = attest_provider(client, sessions, config, **{field: value})
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "WORKER_CANARY_PROOF_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"artifactPathPrefixes": ["/artifacts/"]}, "CANARY_POLICY_MISMATCH"),
+        ({"concurrentTaskLimit": 2}, "CANARY_POLICY_MISMATCH"),
+        ({"monthlyRequestLimit": 2}, "CANARY_POLICY_MISMATCH"),
+        ({"monthlyGeneratedSecondsLimit": 11}, "CANARY_POLICY_MISMATCH"),
+        ({"maxOutputs": 2}, "CANARY_POLICY_MISMATCH"),
+    ],
+)
+def test_im20_30_non_canary_owner_policy_fails_closed(
+    provider_control_context, overrides, expected
+):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client, **overrides))
+    assert attest_provider(client, sessions, config).status_code == 201
+    readiness = client.get("/generation/providers/moneyprinter/readiness").json()
+    assert readiness["enabled"] is False
+    assert readiness["reasonCode"] == expected
+
+
+def test_im20_33_canary_policy_allows_only_one_reserved_request(provider_control_context):
+    client, sessions, _, _ = provider_control_context
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    project = create_project(client, "Private canary")
+    first_key = "private-canary-first"
+    first = client.post(
+        f"/projects/{project['id']}/generation-tasks",
+        headers={"Idempotency-Key": idempotency_uuid(first_key)},
+        json=generation_request(client, project, idempotency_key=first_key),
+    )
+    assert first.status_code == 202
+    second_key = "private-canary-second"
+    second = client.post(
+        f"/projects/{project['id']}/generation-tasks",
+        headers={"Idempotency-Key": idempotency_uuid(second_key)},
+        json=generation_request(client, project, idempotency_key=second_key),
+    )
+    assert second.status_code == 429
+    assert second.json()["detail"]["code"] == "GENERATION_CONCURRENCY_QUOTA_EXCEEDED"
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 1
 
 
 def test_im17_33_validate_reports_quota_without_reservation(generation_context):

@@ -116,6 +116,38 @@ logger = logging.getLogger("api.main")
 
 DatabaseDependency = Callable[[], Generator[Session, None, None]]
 ACTIVE_TASK_STATES = database_status_values("QUEUED", "RUNNING")
+PRIVATE_CANARY_PROFILE = "private-one-task-v1"
+
+
+def private_canary_policy_valid(policy: dict) -> bool:
+    """Return true only for the bounded, pinned one-task canary policy."""
+    try:
+        return (
+            bool(policy.get("enabledIntent"))
+            and int(policy.get("concurrentTaskLimit") or 0) == 1
+            and int(policy.get("monthlyRequestLimit") or 0) == 1
+            and 1 <= int(policy.get("monthlyGeneratedSecondsLimit") or 0) <= 10
+            and 1 <= int(policy.get("maxClipDurationSeconds") or 0) <= 10
+            and int(policy.get("maxOutputs") or 0) == 1
+            and policy.get("artifactPathPrefixes") == ["/tasks/"]
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def attestation_canary_proof(
+    attestation: DBGenerationProviderAttestation | None,
+) -> tuple[str, str, str]:
+    capabilities = (
+        attestation.capabilities_json
+        if attestation is not None and isinstance(attestation.capabilities_json, dict)
+        else {}
+    )
+    return (
+        str(capabilities.get("credentialState") or "ABSENT"),
+        str(capabilities.get("networkIsolation") or "NOT_ENFORCED"),
+        str(capabilities.get("canaryProfile") or "disabled"),
+    )
 
 
 def utc_now() -> datetime.datetime:
@@ -552,6 +584,18 @@ def create_app(
                 elif attestation.upstream_pin != MONEYPRINTER_UPSTREAM_PIN:
                     reason_code = "WORKER_UPSTREAM_PIN_MISMATCH"
                     healthy = False
+                elif attestation_canary_proof(attestation)[0] != "PRESENT":
+                    reason_code = "WORKER_CREDENTIAL_STATE_INVALID"
+                    healthy = False
+                elif attestation_canary_proof(attestation)[1] != "ENFORCED":
+                    reason_code = "WORKER_NETWORK_ISOLATION_MISSING"
+                    healthy = False
+                elif attestation_canary_proof(attestation)[2] != PRIVATE_CANARY_PROFILE:
+                    reason_code = "WORKER_CANARY_PROFILE_MISMATCH"
+                    healthy = False
+                elif not private_canary_policy_valid(config.policy_json):
+                    reason_code = "CANARY_POLICY_MISMATCH"
+                    healthy = False
                 elif not attestation.healthy:
                     reason_code = attestation.reason_code or "PROVIDER_UNHEALTHY"
                     healthy = False
@@ -588,8 +632,14 @@ def create_app(
             quota=quota,
             circuit_state=circuit_state,
         )
+        credential_state, network_isolation, canary_profile = attestation_canary_proof(
+            attestation
+        )
         snapshot.update({
             "operatorMode": mode,
+            "credentialState": credential_state,
+            "networkIsolation": network_isolation,
+            "canaryProfile": canary_profile,
             "ownerPolicy": {
                 "published": config is not None,
                 "enabledIntent": bool(config and config.policy_json.get("enabledIntent")),
@@ -1051,6 +1101,24 @@ def create_app(
         if set(req.capabilities) - allowed_capability_keys:
             raise HTTPException(status_code=422, detail={"code": "WORKER_ATTESTATION_UNSAFE", "message": "Worker 证明包含未允许字段"})
         reject_unsafe_provider_value(req.capabilities)
+        if req.healthy and (
+            req.credentialState != "PRESENT"
+            or req.networkIsolation != "ENFORCED"
+            or req.canaryProfile != PRIVATE_CANARY_PROFILE
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "WORKER_CANARY_PROOF_INVALID",
+                    "message": "Worker 私有金丝雀证明不完整",
+                },
+            )
+        safe_capabilities = dict(req.capabilities)
+        safe_capabilities.update({
+            "credentialState": req.credentialState,
+            "networkIsolation": req.networkIsolation,
+            "canaryProfile": req.canaryProfile,
+        })
         if req.tenantId is not None and req.configVersionId is not None:
             config = db.execute(
                 select(DBGenerationProviderConfigVersion).where(
@@ -1065,7 +1133,7 @@ def create_app(
             worker_id=x_worker_id, operator_mode=req.operatorMode,
             config_version_id=req.configVersionId, policy_hash=req.policyHash,
             adapter_version=req.adapterVersion, upstream_pin=req.upstreamPin,
-            healthy=req.healthy, capabilities_json=req.capabilities,
+            healthy=req.healthy, capabilities_json=safe_capabilities,
             reason_code=req.reasonCode, checked_at=checked_at,
             expires_at=expires_at, created_at=now,
         )
@@ -1455,6 +1523,17 @@ def create_app(
                 ).scalar_one_or_none()
                 if claim_attestation is None:
                     continue
+                credential_state, network_isolation, canary_profile = (
+                    attestation_canary_proof(claim_attestation)
+                )
+                if (
+                    credential_state != "PRESENT"
+                    or network_isolation != "ENFORCED"
+                    or canary_profile != PRIVATE_CANARY_PROFILE
+                    or not private_canary_policy_valid(config.policy_json)
+                ):
+                    claim_attestation = None
+                    continue
             elif candidate_mode != "deterministic-fake":
                 continue
             task = candidate
@@ -1501,6 +1580,9 @@ def create_app(
                 "expiresAt": iso_utc(claim_attestation.expires_at) if claim_attestation else None,
                 "adapterVersion": claim_attestation.adapter_version if claim_attestation else MONEYPRINTER_ADAPTER_VERSION,
                 "upstreamPin": claim_attestation.upstream_pin if claim_attestation else MONEYPRINTER_UPSTREAM_PIN,
+                "credentialState": attestation_canary_proof(claim_attestation)[0],
+                "networkIsolation": attestation_canary_proof(claim_attestation)[1],
+                "canaryProfile": attestation_canary_proof(claim_attestation)[2],
             },
             "leaseSeconds": lease_seconds,
         }

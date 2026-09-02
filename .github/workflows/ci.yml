@@ -74,6 +74,11 @@ jobs:
           PYTHONPATH: apps/api
         run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py -v
 
+      - name: Run fake-only private-canary preflight tests
+        run: |
+          bash -n infra/docker/provider-canary.sh
+          python infra/docker/provider-canary-smoke.py self-test
+
   playwright:
     name: Playwright workbench flow
     needs: build-and-test
@@ -150,10 +155,123 @@ jobs:
           echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
 
       - name: Validate Compose configuration
-        run: docker compose -f infra/docker/docker-compose.yml config --quiet
+        run: |
+          docker compose -f infra/docker/docker-compose.yml config --quiet
+          docker compose -f infra/docker/docker-compose.yml config --format json > "$RUNNER_TEMP/base-compose.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path(os.environ["RUNNER_TEMP"], "base-compose.json").read_text())
+          services = payload["services"]
+          networks = payload["networks"]
+          assert services["moneyprinter-sidecar"]["networks"] == {
+              "provider-control": None, "provider-egress": None,
+          }
+          assert services["worker"]["networks"] == {
+              "aether-net": None, "provider-control": None,
+          }
+          assert set(services["api"]["networks"]) == {"aether-net"}
+          assert set(services["web"]["networks"]) == {"aether-net"}
+          assert set(services["video-use"]["networks"]) == {"aether-net"}
+          assert networks["provider-control"]["internal"] is True
+          assert not services["moneyprinter-sidecar"].get("ports")
+          PY
+
+      - name: Validate fake-only canary override and sanitized preflight
+        env:
+          AETHER_CANARY_LLM_PROVIDER: openai
+          AETHER_CANARY_MODEL: fake-ci-model
+          AETHER_CANARY_MATERIAL_SOURCE: pexels
+          AETHER_CANARY_VOICE_PATH: edge
+          AETHER_GENERATION_TENANT_ID: fake-ci-tenant
+          AETHER_GENERATION_CONFIG_VERSION_ID: fake-ci-config
+          AETHER_GENERATION_POLICY_HASH: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          AETHER_CANARY_PROVIDER_BUDGET_EVIDENCE: PRESENT
+          AETHER_CANARY_MATERIAL_LICENSE_EVIDENCE: PRESENT
+        run: |
+          config_file="$RUNNER_TEMP/aether-fake-provider-canary.toml"
+          env_file="$RUNNER_TEMP/aether-fake-provider-canary.env"
+          printf '%s\n' \
+            'log_level = "WARNING"' \
+            '[app]' \
+            'video_source = "pexels"' \
+            'hide_config = true' \
+            'pexels_api_keys = ["fake-ci-material-key"]' \
+            'pixabay_api_keys = []' \
+            'llm_provider = "openai"' \
+            'openai_api_key = "fake-ci-llm-key"' \
+            'openai_model_name = "fake-ci-model"' \
+            'moonshot_api_key = ""' \
+            'moonshot_model_name = ""' \
+            'qwen_api_key = ""' \
+            'qwen_model_name = ""' \
+            'deepseek_api_key = ""' \
+            'deepseek_model_name = ""' \
+            'gemini_api_key = ""' \
+            'gemini_model_name = ""' \
+            'minimax_api_key = ""' \
+            'minimax_model_name = ""' \
+            'modelscope_api_key = ""' \
+            'modelscope_model_name = ""' \
+            'pollinations_api_key = ""' \
+            'upload_post_api_key = ""' \
+            'subtitle_provider = "edge"' \
+            'endpoint = ""' \
+            'material_directory = "task"' \
+            'enable_redis = false' \
+            'max_concurrent_tasks = 1' \
+            'upload_post_enabled = false' \
+            'upload_post_auto_upload = false' \
+            '[proxy]' \
+            '[azure]' \
+            '[siliconflow]' > "$config_file"
+          printf '%s\n' \
+            'AETHER_GENERATION_PROVIDER_MODE=disabled' \
+            'AETHER_GENERATION_CREDENTIAL_STATE=ABSENT' \
+            'AETHER_GENERATION_NETWORK_ISOLATION=NOT_ENFORCED' \
+            'AETHER_GENERATION_CANARY_PROFILE=disabled' > "$env_file"
+          chmod 600 "$config_file" "$env_file"
+          MONEYPRINTER_CONFIG_FILE="$config_file" \
+          AETHER_CANARY_ENV_FILE="$env_file" \
+          infra/docker/provider-canary.sh preflight --approved-sha "$(git rev-parse HEAD)" \
+            > "$RUNNER_TEMP/provider-canary-preflight.json"
+          python infra/docker/provider-canary-smoke.py scan-evidence \
+            --evidence-file "$RUNNER_TEMP/provider-canary-preflight.json"
+          MONEYPRINTER_CONFIG_FILE="$config_file" docker compose \
+            --env-file "$env_file" \
+            -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.provider-canary.yml \
+            config --format json > "$RUNNER_TEMP/canary-compose.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path(os.environ["RUNNER_TEMP"], "canary-compose.json").read_text())
+          sidecar = payload["services"]["moneyprinter-sidecar"]
+          worker = payload["services"]["worker"]
+          mount = next(item for item in sidecar["volumes"] if item["target"] == "/MoneyPrinterTurbo/config.toml")
+          assert mount["type"] == "bind" and mount["read_only"] is True
+          assert not sidecar.get("ports")
+          assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "PRESENT"
+          assert worker["environment"]["AETHER_GENERATION_NETWORK_ISOLATION"] == "ENFORCED"
+          assert worker["environment"]["AETHER_GENERATION_CANARY_PROFILE"] == "private-one-task-v1"
+          serialized = json.dumps(payload).lower()
+          assert "fake-ci-llm-key" not in serialized
+          assert "fake-ci-material-key" not in serialized
+          PY
 
       - name: Build images
         run: docker compose -f infra/docker/docker-compose.yml build
+
+      - name: Prove target config bind is read-only without Provider egress
+        run: |
+          docker run --rm --network none \
+            --mount "type=bind,source=$RUNNER_TEMP/aether-fake-provider-canary.toml,target=/MoneyPrinterTurbo/config.toml,readonly" \
+            --entrypoint python moneyprinterturbo:v1.2.7-475f21147f0808 \
+            -c $'from pathlib import Path\np=Path("/MoneyPrinterTurbo/config.toml")\nassert p.is_file()\ntry:\n    p.open("a").write("x")\nexcept OSError:\n    pass\nelse:\n    raise SystemExit("read-only bind accepted a write")'
 
       - name: Start healthy stack
         run: |
@@ -170,12 +288,14 @@ jobs:
 
       - name: Internal same-origin networking validation
         run: |
-          # 1. Probe sidecar openapi directly from inside API container
-          docker compose -f infra/docker/docker-compose.yml exec -T api python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=5)"
-          # 2. Probe sidecar openapi directly from inside Worker container
+          # 1. API, Web and video-use cannot resolve/connect to the unauthenticated Sidecar.
+          docker compose -f infra/docker/docker-compose.yml exec -T api python -c $'import urllib.request\ntry:\n    urllib.request.urlopen("http://moneyprinter-sidecar:8080/openapi.json", timeout=2)\nexcept Exception:\n    pass\nelse:\n    raise SystemExit("API reached Provider Sidecar")'
+          docker compose -f infra/docker/docker-compose.yml exec -T video-use python -c $'import urllib.request\ntry:\n    urllib.request.urlopen("http://moneyprinter-sidecar:8080/openapi.json", timeout=2)\nexcept Exception:\n    pass\nelse:\n    raise SystemExit("video-use reached Provider Sidecar")'
+          docker compose -f infra/docker/docker-compose.yml exec -T web sh -c "if wget -q -T 2 -O /dev/null http://moneyprinter-sidecar:8080/openapi.json; then exit 1; fi"
+          # 2. Worker alone can probe the Sidecar through provider-control.
           docker compose -f infra/docker/docker-compose.yml exec -T worker python -c "import urllib.request; urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json', timeout=5)"
-          # 3. Assert sidecar has correct v1.2.7 API schema contracts: POST /api/v1/videos and GET /api/v1/tasks/{task_id}
-          docker compose -f infra/docker/docker-compose.yml exec -T api python -c "import urllib.request, json; \
+          # 3. Assert the pinned v1.2.7 API schema from Worker only.
+          docker compose -f infra/docker/docker-compose.yml exec -T worker python -c "import urllib.request, json; \
             data = json.loads(urllib.request.urlopen('http://moneyprinter-sidecar:8080/openapi.json').read().decode()); \
             assert '/api/v1/videos' in data['paths'], 'Missing contract: POST /api/v1/videos'; \
             assert '/api/v1/tasks/{task_id}' in data['paths'], 'Missing contract: GET /api/v1/tasks/{task_id}'"

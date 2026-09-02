@@ -21,6 +21,13 @@ env/
 !.env.example
 !**/.env.example
 
+# Target-local Provider canary inputs and sanitized run evidence never belong
+# in the worktree. The committed override contains no credentials.
+*provider-canary*.toml
+*provider-canary*.env
+*provider-canary*.json
+*provider-canary*.evidence
+
 # Build outputs
 dist/
 build/
