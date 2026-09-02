@@ -8,12 +8,14 @@
 - Accepted merge commit: `0d7275836abfef26db7180076b23529b4f974f26`
 - Final reviewed-head CI: `33440891212`
 - Mandatory acceptance: `40/40 PASS`
+- Subsequent candidate-lock PR: #29, merged as `e43c71166a6e525cad23c47dfd5f30a980d04625`
 
 ## Evidence-based sequence
 
 1. **IM18 — target-local secret configuration boundary**: implemented and accepted.
 2. **IM19 — Provider network and interface isolation**: implemented and accepted.
 3. **IM20 — private one-task canary controls and deterministic shutdown**: repository controls implemented and accepted; real private-canary execution remains separately unauthorized.
+4. **Real-canary candidate lock**: one candidate runtime profile is recorded by PR #29 as `CONFIGURATION_LOCKED / EXECUTION_NOT_AUTHORIZED`.
 
 ## Accepted repository state
 
@@ -34,9 +36,11 @@ IM18–IM20 now provides the bounded repository path required before any real Pr
 - IM18–IM20 approval package: accepted.
 - IM18–IM20 repository implementation: accepted via PR #27.
 - IM18–IM20 40-case acceptance and full regression: passed.
-- Real Provider/model/material-source/voice-path selection: **not approved**.
+- Real-canary candidate Provider/model/material-source/voice-path: **locked via PR #29**.
+- Candidate lock status: **configuration only; execution not authorized**.
 - Real target-local credentials or credential inspection: **not approved**.
-- Provider-side paid use or real Provider egress: **not approved**.
+- Provider-side hard monetary-limit evidence and any paid use: **not approved for execution**.
+- Target access or real `preflight`: **not approved**.
 - Real private-canary `arm`/`run`: **not approved**.
 - Deployment, public access, expanded trial and commercial operation: **not approved**.
 
@@ -47,9 +51,9 @@ IM18–IM20 now provides the bounded repository path required before any real Pr
 - API, Web and video-use cannot connect to the unauthenticated MoneyPrinter Sidecar.
 - CI uses disposable fake configuration only and performs no real Provider request.
 - MoneyPrinterTurbo remains pinned to `v1.2.7` / `475f21147f0808f5ffe3f58af9ab794b28a4da2c`.
-- A future real canary requires a new owner authorization tied to an exact accepted `main` SHA, private target, exact runtime profile, monetary hard cap and rollback window.
+- A future real canary requires a new owner authorization tied to an exact accepted `main` SHA, the locked runtime profile, external evidence completion, monetary hard cap and rollback window.
 - Generated output remains rights-blocked; no automatic adoption, timeline write, render or publish.
 
 ## Next gate
 
-The repository is technically prepared for a separately governed private canary, but this closure does not authorize one. The next decision is external to repository implementation: select one exact real Provider/model/material-source/voice path and private target, establish license and hard monetary-limit evidence, then request a new explicit authorization for target-local credential mounting and one real canary execution.
+The repository implementation is accepted and PR #29 has locked a single candidate configuration, but neither fact authorizes a real canary. The next decision is to complete the external execution evidence required by `docs/approvals/REAL-PROVIDER-PRIVATE-CANARY-EXECUTION-APPROVAL.md`, then request a new explicit authorization for target access, target-local credential mounting, paid-use allowance, one `preflight`, one `arm`, one `run` and mandatory `disarm`. Deployment and expanded use remain later gates.
