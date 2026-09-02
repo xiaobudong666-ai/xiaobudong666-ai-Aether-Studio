@@ -15,6 +15,12 @@
   "verification_evidence": "docs/evidence/IM18-IM20-GOVERNED-PRIVATE-PROVIDER-CANARY-VERIFICATION.md",
   "required_acceptance_cases": 40,
   "acceptance_result": "40/40 PASS",
+  "subsequent_candidate_lock": {
+    "pr": 29,
+    "merge_commit": "e43c71166a6e525cad23c47dfd5f30a980d04625",
+    "record": "docs/approvals/REAL-PROVIDER-PRIVATE-CANARY-EXECUTION-APPROVAL.md",
+    "status": "CONFIGURATION_LOCKED / EXECUTION_NOT_AUTHORIZED"
+  },
   "implemented_controls": {
     "IM18": [
       "explicit target-local read-only MoneyPrinter config override",
@@ -50,7 +56,8 @@
   "boundaries": {
     "runtime_provider_default": "disabled",
     "test_provider": "deterministic-fake-only",
-    "real_provider_selected": false,
+    "real_provider_candidate_locked": true,
+    "real_execution_authorized": false,
     "real_credentials": false,
     "real_provider_egress": false,
     "paid_call": false,
@@ -68,12 +75,12 @@
     "commercial_operation": false
   },
   "remaining_gates": [
-    "single real Provider/model/material-source/voice-path selection approval",
-    "private target and license evidence approval",
-    "Provider-side hard monetary limit approval",
+    "external execution evidence completion for the locked candidate profile",
+    "Provider-side hard monetary limit verification",
     "target-local credential mounting and paid-use approval",
     "exact-SHA private one-task canary execution approval",
+    "separate evidence review after any authorized canary",
     "separate deployment, public-access, expanded-trial and commercial-operation approval"
   ],
-  "note": "IM18-IM20 repository controls are accepted through PR #27. This acceptance does not authorize real Provider selection, credentials, paid use, target execution, deployment or public access."
+  "note": "IM18-IM20 repository controls are accepted through PR #27. PR #29 subsequently locked one candidate runtime profile, but explicitly did not authorize credential handling, Provider access, paid use, preflight/arm/run, deployment or public access."
 }
