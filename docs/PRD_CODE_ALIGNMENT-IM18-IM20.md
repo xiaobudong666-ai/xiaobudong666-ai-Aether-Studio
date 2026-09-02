@@ -1,28 +1,37 @@
 # IM18–IM20 PRD—Code Alignment
 
-| Requirement | Current repository evidence | Gap proposed for IM18–IM20 | Current status |
-|---|---|---|---|
-| Governed generation authority | Project APIs, durable tasks, Worker lease/token, trusted intake and rights blocking are accepted | Preserve unchanged | Implemented / must reuse |
-| Activation control plane | Operator mode, published owner policy, matching fresh Worker proof, quota, circuit and kill switch | Preserve as mandatory precondition | Implemented / must reuse |
-| Sidecar secret input | Pinned upstream reads `/MoneyPrinterTurbo/config.toml`; Aether has no target secret mount | Explicit target-local read-only override with repository-external file checks | Not implemented |
-| Secret exposure boundary | Aether policy rejects secret-shaped values and DTOs are sanitized | Prove target config is visible only to Sidecar and absent from inspect/log/evidence/database | Partial |
-| Pinned artifact contract | Fixed upstream returns completed files under `/tasks/...`; current Adapter defaults allow only `/artifacts/` and `/api/v1/artifacts/` | Require empty upstream `endpoint` and exact published `artifactPathPrefixes=["/tasks/"]`; reject broad `/`, cross-origin and config/policy mismatch | Blocking gap |
-| Sidecar API exposure | No host port, but pinned unauthenticated API shares `aether-net` with API/Worker/video-use | Separate internal control and Sidecar-only egress networks | Blocking gap |
-| Provider selection | MoneyPrinter is fixed as the outer Adapter; inner LLM/material/TTS path remains unspecified | Require exactly one separately approved runtime profile before real execution | External decision gate |
-| Cost containment | Aether limits concurrency, request count and generated seconds | Add one-request canary profile; require Provider-side monetary hard cap separately | Partial + external gate |
-| Canary orchestration | Owner kill switch and provider mode exist | Preflight/arm/run/disarm order with fail-closed cleanup | Not implemented |
-| Evidence | Task/attempt/event/usage/provenance/rights records exist | Produce allowlisted secret-free private-canary evidence | Partial |
-| Upstream version | MoneyPrinterTurbo `v1.2.7` / `475f211...` fixed | No upgrade or patch in this slice | Preserved boundary |
-| Real credentials/calls | None authorized or supplied | Remain outside coding and CI; require separate target approval | Prohibited |
-| Rights/adoption | Generated AssetVersion defaults blocked; editor reference is `adopted=false` | Preserve unchanged | Implemented invariant |
-| Deployment/public access | Production-shaped Compose/runbook exists | No target/public launch in this slice | External gate |
+| Requirement | Accepted repository evidence | Current status |
+|---|---|---|
+| Governed generation authority | Project APIs, durable tasks, Worker lease/token, trusted intake and rights blocking remain authoritative | Accepted / reused |
+| Activation control plane | Operator mode, published owner policy, matching fresh Worker proof, quota, circuit and kill switch remain mandatory | Accepted / reused |
+| Sidecar secret input | Explicit private-canary Compose override binds repository-external `/MoneyPrinterTurbo/config.toml` read-only after preflight | Implemented / accepted |
+| Secret exposure boundary | Preflight rejects unsafe files/configuration; API/Worker expose sanitized proof only; CI scans fake evidence and never injects real credentials | Implemented / accepted |
+| Pinned artifact contract | Fixed upstream stays on `v1.2.7` / `475f211...`; canary policy requires exact same-origin `/tasks/` handling and rejects broader prefixes | Implemented / accepted |
+| Sidecar API exposure | MoneyPrinter Sidecar is removed from `aether-net`; Worker uses internal `provider-control`; Sidecar alone has `provider-egress`; no host port | Implemented / accepted |
+| Provider selection | MoneyPrinter remains the outer Adapter; inner real LLM/model/material/voice profile is intentionally not selected | External decision gate |
+| Cost containment | Repository canary profile enforces one task, one output, request limit 1 and generated-seconds limit 1–10 | Implemented; Provider monetary hard cap remains external gate |
+| Canary orchestration | Preflight-first explicit arm/run/disarm controls, exact-SHA/owner/private-target gates and fail-closed cleanup are implemented | Implemented / accepted |
+| Evidence | 40-case fake-only verification, sanitized evidence allowlist and full regression evidence are committed | Implemented / accepted |
+| Upstream version | MoneyPrinterTurbo `v1.2.7` / `475f21147f0808f5ffe3f58af9ab794b28a4da2c` unchanged | Preserved boundary |
+| Real credentials/calls | No real credential, Provider egress, paid call or real arm/run occurred in coding/review/CI | Prohibited / not executed |
+| Rights/adoption | Generated AssetVersion remains rights-blocked; no automatic adoption/timeline/render/publish path was added | Preserved invariant |
+| Deployment/public access | Production-shaped Compose/runbook exists, but no target deployment or public launch occurred | External gate |
+
+## Accepted implementation anchors
+
+- Coding baseline: `main@f046fab83fafd79efad5e4f49801e7514527c032`
+- Functional PR: #27
+- Reviewed head: `7d7d6ef3c10b64e76934c1dae58bb1e32c3523ac`
+- Merge commit: `0d7275836abfef26db7180076b23529b4f974f26`
+- Final reviewed-head CI: `33440891212`
+- Mandatory acceptance: `40/40 PASS`
 
 ## Alignment conclusion
 
-The repository has the task, governance, artifact, quota and emergency controls required around a Provider, but it does not yet have a safe way to supply the pinned Sidecar with target-local credentials, prevent other application containers from reaching that unauthenticated Sidecar, or bind the pinned upstream `/tasks/...` output contract to the Adapter's allowlist. Turning on `moneyprinter` now would therefore be incomplete and would not constitute a controlled activation.
+IM18–IM20 closed the repository-level blockers that previously prevented a controlled private-canary path: target-local read-only configuration, unauthenticated Sidecar network isolation, exact pinned `/tasks/` artifact policy, sanitized credential/network/profile proof, one-task budget and deterministic shutdown now exist and are verified in fake-only CI.
 
-IM18–IM20 is the smallest repository slice that closes those operational gaps without selecting a real model, reading a key or making a paid request. Its tests must use a deterministic fake Sidecar and temporary fake TOML only. A future real canary remains a separate owner decision with one explicit runtime profile, monetary hard cap, private target and immediate rollback.
+This does **not** mean a real Provider is activated. The repository still contains no approved real Provider/model/material-source/voice-path selection, no real target credential, no Provider-side monetary hard-limit evidence and no authorization to execute `arm` or `run`. Those remain external owner gates.
 
 ## Source-of-truth rule
 
-Until this documentation package is formally reviewed and merged, and the owner later authorizes coding against an exact new `main` SHA, every IM18–IM20 row remains `NOT_IMPLEMENTED`. Documentation acceptance is not coding approval; coding acceptance is not Provider/model selection; selection is not credential, paid-use, private-canary, deployment or commercial approval.
+As of `main@0d7275836abfef26db7180076b23529b4f974f26`, IM18–IM20 repository implementation is `ACCEPTED`. Repository acceptance is not Provider selection; Provider selection is not credential or paid-use approval; credential approval is not private-canary execution approval; private-canary success would still not constitute deployment, public-access or commercial-operation approval.
