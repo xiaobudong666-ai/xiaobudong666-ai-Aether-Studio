@@ -171,10 +171,10 @@ jobs:
           enable_redis = false
           max_concurrent_tasks = 1
           hide_config = true
-          [proxy]
-          [ui]
           upload_post_enabled = false
           upload_post_auto_upload = false
+          [proxy]
+          [ui]
           [azure]
           speech_key = ""
           speech_region = ""
