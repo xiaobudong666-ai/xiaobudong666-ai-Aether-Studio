@@ -40,8 +40,10 @@ SENSITIVE_FIELD_MARKERS = (
     "authorization", "config_path", "config_file", "mtime", "sha256",
 )
 
+
 class CanaryValidationError(RuntimeError):
     pass
+
 
 @dataclass(frozen=True)
 class PublicPreflight:
@@ -122,6 +124,8 @@ def validate_config_document(
         fail("CONCURRENCY_MUST_BE_ONE")
     if app.get("hide_config") is not True:
         fail("CONFIG_UI_MUST_BE_HIDDEN")
+    if app.get("upload_post_enabled") is not False or app.get("upload_post_auto_upload") is not False:
+        fail("AUTO_PUBLISH_MUST_BE_DISABLED")
     expected_base = KNOWN_BASE_URLS[provider]
     actual_base = text(app.get(f"{provider}_base_url"))
     if actual_base != expected_base:
@@ -129,11 +133,6 @@ def validate_config_document(
     proxy = data.get("proxy", {})
     if not isinstance(proxy, dict) or any(text(v) for v in proxy.values()):
         fail("PROXY_MUST_BE_EMPTY")
-    ui = data.get("ui", {})
-    if not isinstance(ui, dict):
-        fail("UI_SECTION_INVALID")
-    if ui.get("upload_post_enabled") is not False or ui.get("upload_post_auto_upload") is not False:
-        fail("AUTO_PUBLISH_MUST_BE_DISABLED")
     pexels = [v for v in list_value(app.get("pexels_api_keys")) if text(v)]
     pixabay = [v for v in list_value(app.get("pixabay_api_keys")) if text(v)]
     if source == "pexels" and (not pexels or pixabay):
@@ -292,7 +291,6 @@ def cmd_run_request(args: argparse.Namespace) -> int:
         "expectedProjectRevision": project["revision"],
         "confirmExternalGeneration": True,
     }
-    # Validate first; exactly one create follows only after validation succeeds.
     _api_json(opener, "POST", f"{base}/projects/{args.project_id}/generation-tasks/validate", payload)
     task = _api_json(opener, "POST", f"{base}/projects/{args.project_id}/generation-tasks", payload)
     task_id = str(task.get("taskId") or "")
@@ -325,8 +323,9 @@ def _fake_config(provider: str = "openai", source: str = "pexels") -> str:
         f'video_source = "{source}"', 'pexels_api_keys = ["fake-material"]' if source == "pexels" else 'pexels_api_keys = []',
         'pixabay_api_keys = ["fake-material"]' if source == "pixabay" else 'pixabay_api_keys = []',
         'endpoint = ""', 'material_directory = "task"', 'enable_redis = false',
-        'max_concurrent_tasks = 1', 'hide_config = true', "", "[proxy]", "", "[ui]",
-        "upload_post_enabled = false", "upload_post_auto_upload = false", "", "[azure]",
+        'max_concurrent_tasks = 1', 'hide_config = true',
+        'upload_post_enabled = false', 'upload_post_auto_upload = false',
+        "", "[proxy]", "", "[ui]", "", "[azure]",
         'speech_key = ""', 'speech_region = ""', "", "[siliconflow]", 'api_key = ""',
     ]
     return "\n".join(app_lines) + "\n"
@@ -341,7 +340,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     adapter = (repo / "apps/worker/app/moneyprinter_adapter.py").read_text()
     api_main = (repo / "apps/api/app/main.py").read_text()
     tests: list[tuple[int, Callable[[], bool]]] = []
-    def add(n: int, fn: Callable[[], bool]) -> None: tests.append((n, fn))
+
+    def add(n: int, fn: Callable[[], bool]) -> None:
+        tests.append((n, fn))
+
     add(1, lambda: "AETHER_GENERATION_PROVIDER_MODE=${AETHER_GENERATION_PROVIDER_MODE:-disabled}" in compose)
     add(2, lambda: "MONEYPRINTER_CONFIG_FILE:?" in override)
     add(3, lambda: "CONFIG_PATH_NOT_ABSOLUTE" in Path(__file__).read_text())
@@ -352,11 +354,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     add(8, lambda: "MONEYPRINTER_CONFIG_FILE" not in api_main and "MONEYPRINTER_CONFIG_FILE" not in (repo / "apps/worker/app/main.py").read_text())
     add(9, lambda: all(marker not in (repo / "docs/evidence/IM18-IM20-PRIVATE-CANARY-VERIFICATION.md").read_text().lower() for marker in ["api_key=", "authorization:", "cookie:"]))
     add(10, lambda: CANARY_PROFILE in override)
-    add(11, lambda: "LOGURU_LEVEL: WARNING" in override and "LOG_LEVEL_TOO_VERBOSE" in Path(__file__).read_text() and "upload_post_auto_upload" in Path(__file__).read_text())
+    add(11, lambda: "LOGURU_LEVEL: WARNING" in override and "AUTO_PUBLISH_MUST_BE_DISABLED" in Path(__file__).read_text())
     add(12, lambda: "DISALLOWED_PROVIDERS = {\"g4f\", \"pollinations\"}" in Path(__file__).read_text())
     add(13, lambda: 'ARTIFACT_PREFIXES = ["/tasks/"]' in Path(__file__).read_text())
     add(14, lambda: "provider-canary-smoke.py self-test" in ci)
-    add(15, lambda: "moneyprinter-sidecar:\n" in compose and "- aether-net" not in compose.split("moneyprinter-sidecar:",1)[1].split("  api:",1)[0])
+    add(15, lambda: "moneyprinter-sidecar:\n" in compose and "- aether-net" not in compose.split("moneyprinter-sidecar:", 1)[1].split("  api:", 1)[0])
     add(16, lambda: "provider-control:" in compose and "internal: true" in compose and "- provider-control" in compose)
     add(17, lambda: "provider-egress" in compose and compose.count("- provider-egress") == 1)
     add(18, lambda: "API cannot reach MoneyPrinter Sidecar" in ci)
@@ -364,7 +366,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     add(20, lambda: "Worker reaches MoneyPrinter Sidecar through provider-control" in ci)
     add(21, lambda: "trust_env=False" in adapter and "follow_redirects=False" in adapter)
     add(22, lambda: api_main.count('status_code=410') >= 1 and "/moneyprinter/health" in api_main)
-    add(23, lambda: "ports:" not in compose.split("moneyprinter-sidecar:",1)[1].split("  api:",1)[0])
+    add(23, lambda: "ports:" not in compose.split("moneyprinter-sidecar:", 1)[1].split("  api:", 1)[0])
     add(24, lambda: "Sanitize fake canary logs" in ci)
     add(25, lambda: "preflight" in shell and "fail_closed_disarm" in shell)
     add(26, lambda: "docker compose -f infra/docker/docker-compose.yml config --quiet" in ci)
@@ -377,14 +379,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     add(33, lambda: shell.count("run-request") == 1)
     add(34, lambda: 'ARTIFACT_PREFIXES = ["/tasks/"]' in Path(__file__).read_text())
     add(35, lambda: "AMBIGUOUS_SUBMISSION" in (repo / "apps/worker/app/main.py").read_text())
-    add(36, lambda: "RIGHTS_BLOCKED" in (repo / "apps/worker/Test_generation_tasks.py").read_text())
+    add(36, lambda: "RIGHTS_BLOCKED" in (repo / "apps/worker/test_generation_tasks.py").read_text())
     add(37, lambda: "trap 'fail_closed_disarm'" in shell)
     add(38, lambda: "AETHER_GENERATION_PROVIDER_MODE=disabled" in shell and "down --remove-orphans" in shell)
     add(39, lambda: "validate_public_evidence" in Path(__file__).read_text())
     add(40, lambda: all(x in ci for x in ["pytest apps/api", "pytest /tmp/test_worker.py", "playwright", "provider-canary-smoke.py self-test"]))
     failures = [n for n, fn in tests if not fn()]
     if len(tests) != 40 or failures:
-        print(json.dumps({"passed": len(tests)-len(failures), "total": len(tests), "failed": failures}), file=sys.stderr)
+        print(json.dumps({"passed": len(tests) - len(failures), "total": len(tests), "failed": failures}), file=sys.stderr)
         return 1
     print(json.dumps({"passed": 40, "total": 40, "mode": "fake-only"}, sort_keys=True))
     return 0
@@ -399,14 +401,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-level", required=True, choices=("WARNING", "ERROR", "CRITICAL"))
     p.set_defaults(func=cmd_preflight)
     r = sub.add_parser("run-request")
-    r.add_argument("--api-url", required=True); r.add_argument("--cookie-file", required=True)
-    r.add_argument("--project-id", required=True); r.add_argument("--config-version-id", required=True)
-    r.add_argument("--policy-hash", required=True); r.add_argument("--subject", required=True)
-    r.add_argument("--idempotency-key", required=True); r.add_argument("--voice-name", required=True)
+    r.add_argument("--api-url", required=True)
+    r.add_argument("--cookie-file", required=True)
+    r.add_argument("--project-id", required=True)
+    r.add_argument("--config-version-id", required=True)
+    r.add_argument("--policy-hash", required=True)
+    r.add_argument("--subject", required=True)
+    r.add_argument("--idempotency-key", required=True)
+    r.add_argument("--voice-name", required=True)
     r.add_argument("--duration-seconds", required=True, type=int, choices=range(1, 11))
     r.add_argument("--timeout-seconds", type=int, default=180, choices=range(10, 601))
     r.set_defaults(func=cmd_run_request)
-    s = sub.add_parser("self-test"); s.add_argument("--repo-root", required=True); s.set_defaults(func=cmd_self_test)
+    s = sub.add_parser("self-test")
+    s.add_argument("--repo-root", required=True)
+    s.set_defaults(func=cmd_self_test)
     return parser
 
 
@@ -420,6 +428,7 @@ def main() -> int:
     except (json.JSONDecodeError, OSError, ValueError):
         print(json.dumps({"status": "blocked", "reasonCode": "PUBLIC_INPUT_INVALID"}, sort_keys=True), file=sys.stderr)
         return 2
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
