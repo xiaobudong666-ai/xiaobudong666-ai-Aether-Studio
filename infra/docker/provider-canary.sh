@@ -9,9 +9,11 @@ CANARY_COMPOSE="$ROOT/infra/docker/docker-compose.provider-canary.yml"
 SMOKE="$ROOT/infra/docker/provider-canary-smoke.py"
 STATE_DIR="${AETHER_CANARY_STATE_DIR:-/tmp/aether-provider-canary-state}"
 STATE_FILE="$STATE_DIR/state.json"
+PREFLIGHT_FILE="$STATE_DIR/preflight-public.json"
 API_URL="${AETHER_CANARY_API_URL:-http://127.0.0.1:8000}"
 SYNTHETIC_SUBJECT="Aether synthetic canary: geometric shapes on a neutral background"
 CANARY_PROFILE="private-single-task-v1"
+READINESS_WAIT_SECONDS="${AETHER_CANARY_READINESS_WAIT_SECONDS:-120}"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
@@ -37,8 +39,8 @@ check_git_gate() {
 check_public_evidence() {
   require_env AETHER_CANARY_LIMIT_EVIDENCE_FILE
   require_env AETHER_CANARY_LICENSE_EVIDENCE_FILE
-  [[ -f "$AETHER_CANARY_LIMIT_EVIDENCE_FILE" ]] || block "LIMIT_EVIDENCE_MISSING"
-  [[ -f "$AETHER_CANARY_LICENSE_EVIDENCE_FILE" ]] || block "LICENSE_EVIDENCE_MISSING"
+  [[ -f "$AETHER_CANARY_LIMIT_EVIDENCE_FILE" && ! -L "$AETHER_CANARY_LIMIT_EVIDENCE_FILE" ]] || block "LIMIT_EVIDENCE_MISSING"
+  [[ -f "$AETHER_CANARY_LICENSE_EVIDENCE_FILE" && ! -L "$AETHER_CANARY_LICENSE_EVIDENCE_FILE" ]] || block "LICENSE_EVIDENCE_MISSING"
 }
 
 preflight() {
@@ -64,18 +66,19 @@ preflight() {
     --model "$AETHER_CANARY_MODEL" \
     --material-source "$AETHER_CANARY_MATERIAL_SOURCE" \
     --voice-path "$AETHER_CANARY_VOICE_PATH" \
-    --log-level WARNING >/tmp/aether-canary-preflight-public.json
+    --log-level WARNING >"$PREFLIGHT_FILE"
+  chmod 600 "$PREFLIGHT_FILE"
   AETHER_GENERATION_PROVIDER_MODE=disabled \
   AETHER_GENERATION_CREDENTIAL_STATE=PRESENT \
   AETHER_GENERATION_NETWORK_ISOLATION=ENFORCED \
   AETHER_GENERATION_CANARY_PROFILE="$CANARY_PROFILE" \
   compose config --quiet
-  cat /tmp/aether-canary-preflight-public.json
+  cat "$PREFLIGHT_FILE"
 }
 
 owner_api_post() {
   require_env AETHER_CANARY_OWNER_COOKIE_FILE
-  [[ -f "$AETHER_CANARY_OWNER_COOKIE_FILE" ]] || block "OWNER_SESSION_MISSING"
+  [[ -f "$AETHER_CANARY_OWNER_COOKIE_FILE" && ! -L "$AETHER_CANARY_OWNER_COOKIE_FILE" ]] || block "OWNER_SESSION_MISSING"
   local path="$1" body="$2"
   curl --fail --silent --show-error \
     --cookie "$AETHER_CANARY_OWNER_COOKIE_FILE" \
@@ -83,10 +86,17 @@ owner_api_post() {
     -X POST "$API_URL$path" --data "$body" >/dev/null
 }
 
-verify_kill_switch_disabled() {
+readiness_json() {
   require_env AETHER_CANARY_OWNER_COOKIE_FILE
+  [[ -f "$AETHER_CANARY_OWNER_COOKIE_FILE" && ! -L "$AETHER_CANARY_OWNER_COOKIE_FILE" ]] || block "OWNER_SESSION_MISSING"
+  curl --fail --silent --show-error \
+    --cookie "$AETHER_CANARY_OWNER_COOKIE_FILE" \
+    "$API_URL/generation/providers/moneyprinter/readiness"
+}
+
+verify_kill_switch_disabled() {
   local body
-  body="$(curl --fail --silent --show-error --cookie "$AETHER_CANARY_OWNER_COOKIE_FILE" "$API_URL/generation/providers/moneyprinter/readiness")"
+  body="$(readiness_json)"
   python - "$body" <<'PY'
 import json, sys
 obj=json.loads(sys.argv[1])
@@ -94,6 +104,69 @@ ks=obj.get('killSwitch') or {}
 if not ks.get('disabled'):
     raise SystemExit(2)
 PY
+}
+
+wait_for_worker_proof() {
+  local deadline body
+  deadline=$((SECONDS + READINESS_WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if body="$(readiness_json 2>/dev/null)" && \
+      AETHER_EXPECTED_CONFIG_VERSION_ID="$AETHER_GENERATION_CONFIG_VERSION_ID" \
+      AETHER_EXPECTED_POLICY_HASH="$AETHER_GENERATION_POLICY_HASH" \
+      python - "$body" <<'PY'
+import json, os, sys
+obj=json.loads(sys.argv[1])
+proof=obj.get('workerProof') or {}
+ks=obj.get('killSwitch') or {}
+ok=(
+    obj.get('operatorMode') == 'moneyprinter'
+    and obj.get('configVersionId') == os.environ['AETHER_EXPECTED_CONFIG_VERSION_ID']
+    and obj.get('policyHash') == os.environ['AETHER_EXPECTED_POLICY_HASH']
+    and ks.get('disabled') is True
+    and proof.get('present') is True
+    and proof.get('fresh') is True
+    and proof.get('adapterVersion') == 'aether-moneyprinter-v2'
+    and proof.get('upstreamPin') == '475f21147f0808f5ffe3f58af9ab794b28a4da2c'
+)
+raise SystemExit(0 if ok else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+wait_for_enabled_readiness() {
+  local deadline body
+  deadline=$((SECONDS + READINESS_WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if body="$(readiness_json 2>/dev/null)" && \
+      AETHER_EXPECTED_CONFIG_VERSION_ID="$AETHER_GENERATION_CONFIG_VERSION_ID" \
+      AETHER_EXPECTED_POLICY_HASH="$AETHER_GENERATION_POLICY_HASH" \
+      python - "$body" <<'PY'
+import json, os, sys
+obj=json.loads(sys.argv[1])
+proof=obj.get('workerProof') or {}
+ks=obj.get('killSwitch') or {}
+ok=(
+    obj.get('enabled') is True
+    and obj.get('operatorMode') == 'moneyprinter'
+    and obj.get('configVersionId') == os.environ['AETHER_EXPECTED_CONFIG_VERSION_ID']
+    and obj.get('policyHash') == os.environ['AETHER_EXPECTED_POLICY_HASH']
+    and ks.get('disabled') is False
+    and proof.get('present') is True
+    and proof.get('fresh') is True
+)
+raise SystemExit(0 if ok else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
 }
 
 write_state() {
@@ -108,6 +181,7 @@ fail_closed_disarm() {
     owner_api_post "/generation/providers/moneyprinter/kill-switch" '{"disabled":true,"reasonCode":"CANARY_FAIL_CLOSED"}' >/dev/null 2>&1
   fi
   AETHER_GENERATION_PROVIDER_MODE=disabled compose down --remove-orphans >/dev/null 2>&1
+  rm -f "$PREFLIGHT_FILE"
   write_state "DISARMED"
   set -e
 }
@@ -117,14 +191,17 @@ arm() {
   [[ "${AETHER_CANARY_OWNER_APPROVAL:-}" == "YES" ]] || block "OWNER_APPROVAL_MISSING"
   preflight >/dev/null
   verify_kill_switch_disabled || block "CANARY_PREARM_KILL_SWITCH_DISABLED"
-  trap 'fail_closed_disarm' ERR INT TERM
+  trap 'fail_closed_disarm' EXIT ERR INT TERM
   AETHER_GENERATION_PROVIDER_MODE=moneyprinter \
   AETHER_GENERATION_CREDENTIAL_STATE=PRESENT \
   AETHER_GENERATION_NETWORK_ISOLATION=ENFORCED \
   AETHER_GENERATION_CANARY_PROFILE="$CANARY_PROFILE" \
   compose up -d --wait --wait-timeout 180 moneyprinter-sidecar api worker
+  wait_for_worker_proof || block "WORKER_PROOF_NOT_READY"
   owner_api_post "/generation/providers/moneyprinter/kill-switch" '{"disabled":false,"reasonCode":"PRIVATE_CANARY_ARM"}'
+  wait_for_enabled_readiness || block "READINESS_NOT_ENABLED_AFTER_ARM"
   write_state "ARMED"
+  trap - EXIT ERR INT TERM
   emit '{"status":"armed","canaryProfile":"private-single-task-v1"}'
 }
 
