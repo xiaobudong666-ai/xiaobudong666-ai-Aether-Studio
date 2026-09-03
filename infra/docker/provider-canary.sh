@@ -10,6 +10,7 @@ SMOKE="$ROOT/infra/docker/provider-canary-smoke.py"
 STATE_DIR="${AETHER_CANARY_STATE_DIR:-/tmp/aether-provider-canary-state}"
 STATE_FILE="$STATE_DIR/state.json"
 PREFLIGHT_FILE="$STATE_DIR/preflight-public.json"
+EVIDENCE_FILE="$STATE_DIR/evidence.jsonl"
 API_URL="${AETHER_CANARY_API_URL:-http://127.0.0.1:8000}"
 SYNTHETIC_SUBJECT="Aether synthetic canary: geometric shapes on a neutral background"
 CANARY_PROFILE="private-single-task-v1"
@@ -34,6 +35,14 @@ check_git_gate() {
   git -C "$ROOT" diff --quiet --ignore-submodules -- || block "WORKTREE_DIRTY"
   git -C "$ROOT" diff --cached --quiet --ignore-submodules -- || block "WORKTREE_DIRTY"
   [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] || block "WORKTREE_DIRTY"
+}
+
+check_execution_gate() {
+  [[ "${AETHER_PROVIDER_CANARY_REAL_EXECUTION_APPROVED:-}" == "YES" ]] || block "REAL_EXECUTION_NOT_APPROVED"
+  [[ "${AETHER_CANARY_OWNER_APPROVAL:-}" == "YES" ]] || block "OWNER_APPROVAL_MISSING"
+  [[ "${AETHER_CANARY_TARGET_CLASS:-}" == "private" ]] || block "PRIVATE_TARGET_REQUIRED"
+  require_env AETHER_CANARY_APPROVAL_ID
+  check_git_gate
 }
 
 check_public_evidence() {
@@ -171,8 +180,71 @@ PY
 
 write_state() {
   local status="$1"
-  printf '{"canaryProfile":"%s","state":"%s"}\n' "$CANARY_PROFILE" "$status" >"$STATE_FILE"
+  AETHER_STATE_STATUS="$status" \
+  AETHER_STATE_PROFILE="$CANARY_PROFILE" \
+  python - "$STATE_FILE" <<'PY'
+import json, os, sys
+payload={
+    "state": os.environ["AETHER_STATE_STATUS"],
+    "canaryProfile": os.environ["AETHER_STATE_PROFILE"],
+    "approvedSha": os.environ.get("AETHER_CANARY_APPROVED_SHA"),
+    "approvalId": os.environ.get("AETHER_CANARY_APPROVAL_ID"),
+    "tenantId": os.environ.get("AETHER_GENERATION_TENANT_ID"),
+    "configVersionId": os.environ.get("AETHER_GENERATION_CONFIG_VERSION_ID"),
+    "policyHash": os.environ.get("AETHER_GENERATION_POLICY_HASH"),
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+PY
   chmod 600 "$STATE_FILE"
+}
+
+verify_armed_state() {
+  [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || block "CANARY_NOT_ARMED"
+  AETHER_EXPECTED_PROFILE="$CANARY_PROFILE" python - "$STATE_FILE" <<'PY'
+import json, os, sys
+obj=json.load(open(sys.argv[1], encoding="utf-8"))
+checks={
+    "state":"ARMED",
+    "canaryProfile":os.environ["AETHER_EXPECTED_PROFILE"],
+    "approvedSha":os.environ.get("AETHER_CANARY_APPROVED_SHA"),
+    "approvalId":os.environ.get("AETHER_CANARY_APPROVAL_ID"),
+    "tenantId":os.environ.get("AETHER_GENERATION_TENANT_ID"),
+    "configVersionId":os.environ.get("AETHER_GENERATION_CONFIG_VERSION_ID"),
+    "policyHash":os.environ.get("AETHER_GENERATION_POLICY_HASH"),
+}
+if any(obj.get(k) != v for k, v in checks.items()):
+    raise SystemExit(2)
+PY
+}
+
+record_public_evidence() {
+  local event="$1" payload="${2:-{}}"
+  AETHER_EVIDENCE_EVENT="$event" \
+  AETHER_EVIDENCE_PAYLOAD="$payload" \
+  AETHER_EVIDENCE_PROFILE="$CANARY_PROFILE" \
+  python - "$EVIDENCE_FILE" <<'PY'
+import datetime, json, os, re, sys
+payload=json.loads(os.environ["AETHER_EVIDENCE_PAYLOAD"])
+record={
+    "event":os.environ["AETHER_EVIDENCE_EVENT"],
+    "timestamp":datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"),
+    "mainSha":os.environ.get("AETHER_CANARY_APPROVED_SHA"),
+    "approvalId":os.environ.get("AETHER_CANARY_APPROVAL_ID"),
+    "canaryProfile":os.environ["AETHER_EVIDENCE_PROFILE"],
+    "payload":payload,
+}
+serialized=json.dumps(record, ensure_ascii=False, sort_keys=True).lower()
+for marker in ("api_key","apikey","token","secret","password","cookie","authorization","config_path","config_file","mtime"):
+    if marker in serialized:
+        raise SystemExit(2)
+if re.search(r"\b(bearer\s+[a-z0-9._-]{8,}|sk-[a-z0-9_-]{8,})\b", serialized):
+    raise SystemExit(2)
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+  chmod 600 "$EVIDENCE_FILE"
 }
 
 fail_closed_disarm() {
@@ -183,15 +255,18 @@ fail_closed_disarm() {
   AETHER_GENERATION_PROVIDER_MODE=disabled compose down --remove-orphans >/dev/null 2>&1
   rm -f "$PREFLIGHT_FILE"
   write_state "DISARMED"
+  if [[ -n "${AETHER_CANARY_APPROVAL_ID:-}" ]]; then
+    record_public_evidence "DISARMED" '{"killSwitch":"requested-disabled","operatorMode":"disabled","mountState":"removed"}' >/dev/null 2>&1
+  fi
   set -e
 }
 
 arm() {
-  [[ "${AETHER_PROVIDER_CANARY_REAL_EXECUTION_APPROVED:-}" == "YES" ]] || block "REAL_EXECUTION_NOT_APPROVED"
-  [[ "${AETHER_CANARY_OWNER_APPROVAL:-}" == "YES" ]] || block "OWNER_APPROVAL_MISSING"
+  check_execution_gate
   preflight >/dev/null
   verify_kill_switch_disabled || block "CANARY_PREARM_KILL_SWITCH_DISABLED"
   trap 'fail_closed_disarm' EXIT ERR INT TERM
+  record_public_evidence "PREFLIGHTED" "$(cat "$PREFLIGHT_FILE")"
   AETHER_GENERATION_PROVIDER_MODE=moneyprinter \
   AETHER_GENERATION_CREDENTIAL_STATE=PRESENT \
   AETHER_GENERATION_NETWORK_ISOLATION=ENFORCED \
@@ -201,22 +276,22 @@ arm() {
   owner_api_post "/generation/providers/moneyprinter/kill-switch" '{"disabled":false,"reasonCode":"PRIVATE_CANARY_ARM"}'
   wait_for_enabled_readiness || block "READINESS_NOT_ENABLED_AFTER_ARM"
   write_state "ARMED"
+  record_public_evidence "ARMED" "$(readiness_json)"
   trap - EXIT ERR INT TERM
   emit '{"status":"armed","canaryProfile":"private-single-task-v1"}'
 }
 
 run_canary() {
-  [[ "${AETHER_PROVIDER_CANARY_REAL_EXECUTION_APPROVED:-}" == "YES" ]] || block "REAL_EXECUTION_NOT_APPROVED"
-  [[ -f "$STATE_FILE" ]] || block "CANARY_NOT_ARMED"
-  grep -q '"state":"ARMED"' "$STATE_FILE" || block "CANARY_NOT_ARMED"
+  check_execution_gate
+  verify_armed_state || block "CANARY_STATE_MISMATCH"
   require_env AETHER_CANARY_PROJECT_ID
   require_env AETHER_CANARY_IDEMPOTENCY_KEY
   require_env AETHER_CANARY_VOICE_NAME
   require_env AETHER_CANARY_OWNER_COOKIE_FILE
-  local duration="${AETHER_CANARY_DURATION_SECONDS:-10}"
+  local duration="${AETHER_CANARY_DURATION_SECONDS:-10}" result
   [[ "$duration" =~ ^[1-9]$|^10$ ]] || block "CANARY_DURATION_INVALID"
   trap 'fail_closed_disarm' EXIT ERR INT TERM
-  python "$SMOKE" run-request \
+  result="$(python "$SMOKE" run-request \
     --api-url "$API_URL" \
     --cookie-file "$AETHER_CANARY_OWNER_COOKIE_FILE" \
     --project-id "$AETHER_CANARY_PROJECT_ID" \
@@ -225,7 +300,9 @@ run_canary() {
     --subject "$SYNTHETIC_SUBJECT" \
     --idempotency-key "$AETHER_CANARY_IDEMPOTENCY_KEY" \
     --voice-name "$AETHER_CANARY_VOICE_NAME" \
-    --duration-seconds "$duration"
+    --duration-seconds "$duration")"
+  emit "$result"
+  record_public_evidence "CANARY_TASK_TERMINAL" "$result"
   write_state "REQUESTED"
 }
 
