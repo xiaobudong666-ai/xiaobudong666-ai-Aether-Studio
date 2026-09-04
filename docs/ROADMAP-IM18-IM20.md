@@ -1,41 +1,59 @@
 # IM18–IM20 Roadmap
 
-## Planning baseline
+## Accepted implementation anchors
 
-`main@221540aa2fcb64df4012aa37f8bd017da8e29a9c`
+- Coding baseline: `main@f046fab83fafd79efad5e4f49801e7514527c032`
+- Functional PR: #27
+- Formally reviewed head: `7d7d6ef3c10b64e76934c1dae58bb1e32c3523ac`
+- Accepted merge commit: `0d7275836abfef26db7180076b23529b4f974f26`
+- Final reviewed-head CI: `33440891212`
+- Mandatory acceptance: `40/40 PASS`
+- Subsequent candidate-lock PR: #29, merged as `e43c71166a6e525cad23c47dfd5f30a980d04625`
 
 ## Evidence-based sequence
 
-1. **IM18 — target-local secret configuration boundary**: documentation proposed; implementation not started.
-2. **IM19 — Provider network and interface isolation**: documentation proposed; implementation not started.
-3. **IM20 — private one-task canary and deterministic shutdown**: documentation proposed; implementation not started.
+1. **IM18 — target-local secret configuration boundary**: implemented and accepted.
+2. **IM19 — Provider network and interface isolation**: implemented and accepted.
+3. **IM20 — private one-task canary controls and deterministic shutdown**: repository controls implemented and accepted; real private-canary execution remains separately unauthorized.
+4. **Real-canary candidate lock**: one candidate runtime profile is recorded by PR #29 as `CONFIGURATION_LOCKED / EXECUTION_NOT_AUTHORIZED`.
 
-## Why this is next
+## Accepted repository state
 
-IM15–IM17 established the deny-by-default activation control plane, restricted Worker Adapter, quota ledger, circuit breaker and emergency stop. The exact pinned MoneyPrinterTurbo upstream still requires a root `config.toml` for LLM/material credentials, while Aether currently provides no target-local read-only mount. The pinned upstream API is unauthenticated and currently shares the general application network. Those are operational blockers before any real Provider credential or paid request can be considered.
+IM18–IM20 now provides the bounded repository path required before any real Provider credential can be considered:
 
-The smallest safe next slice is therefore not real activation. It is an independently testable private-canary path: keep the base stack disabled, mount a target-local secret file only through an explicit override, isolate the Sidecar network, constrain a future authorized canary to one request/one output/at most ten generated seconds, and guarantee fail-closed shutdown with sanitized evidence.
+- committed/base runtime remains `disabled`;
+- target-local Provider configuration is accepted only through an explicit read-only Sidecar mount;
+- secret-safe preflight rejects unsafe files/configuration and emits only sanitized proof;
+- MoneyPrinter Sidecar is removed from `aether-net`, Worker alone shares `provider-control`, and Sidecar alone has `provider-egress`;
+- API/Worker readiness requires sanitized credential/network/profile proof in addition to the existing operator/owner/attestation/quota/circuit/kill-switch gates;
+- the future canary profile is constrained to one task, one output and 1–10 generated seconds with exact `/tasks/` artifact handling;
+- failure/interrupt/disarm is fail-closed and preserves rights-blocked output with no automatic adoption, timeline write, render or publish;
+- CI remains fake-only and performs zero real Provider credential or paid call.
 
 ## Gate status
 
 - IM15–IM17 repository implementation and documentation: accepted.
-- IM18–IM20 documentation drafting: in progress in a documentation-only PR.
-- IM18–IM20 documentation formal review: not approved.
-- IM18–IM20 coding: not approved and not started.
-- Real Provider/model/material-source selection: not approved.
-- Credentials, paid call and private target execution: prohibited.
-- Deployment, public access and commercial operation: prohibited.
+- IM18–IM20 approval package: accepted.
+- IM18–IM20 repository implementation: accepted via PR #27.
+- IM18–IM20 40-case acceptance and full regression: passed.
+- Real-canary candidate Provider/model/material-source/voice-path: **locked via PR #29**.
+- Candidate lock status: **configuration only; execution not authorized**.
+- Real target-local credentials or credential inspection: **not approved**.
+- Provider-side hard monetary-limit evidence and any paid use: **not approved for execution**.
+- Target access or real `preflight`: **not approved**.
+- Real private-canary `arm`/`run`: **not approved**.
+- Deployment, public access, expanded trial and commercial operation: **not approved**.
 
 ## Invariants
 
 - Source, base Compose, environment templates and CI default to `disabled`.
 - Real configuration remains outside the Git worktree and is read-only to the Sidecar only.
 - API, Web and video-use cannot connect to the unauthenticated MoneyPrinter Sidecar.
-- CI uses deterministic fake config/Sidecar only and has zero public Provider egress.
+- CI uses disposable fake configuration only and performs no real Provider request.
 - MoneyPrinterTurbo remains pinned to `v1.2.7` / `475f21147f0808f5ffe3f58af9ab794b28a4da2c`.
-- A future real canary is one task, one output and at most ten generated seconds, then returns to disabled.
+- A future real canary requires a new owner authorization tied to an exact accepted `main` SHA, the locked runtime profile, external evidence completion, monetary hard cap and rollback window.
 - Generated output remains rights-blocked; no automatic adoption, timeline write, render or publish.
 
-## Non-goals
+## Next gate
 
-No real Provider/plugin/model choice, real config or key, paid call, upstream upgrade, new dependency, external queue/object storage, public Sidecar endpoint, digital human, voice clone, face/person replacement, wardrobe/background transformation, automatic rights approval/adoption/timeline/render/publish, deployment, public access or commercial operation.
+The repository implementation is accepted and PR #29 has locked a single candidate configuration, but neither fact authorizes a real canary. The next decision is to complete the external execution evidence required by `docs/approvals/REAL-PROVIDER-PRIVATE-CANARY-EXECUTION-APPROVAL.md`, then request a new explicit authorization for target access, target-local credential mounting, paid-use allowance, one `preflight`, one `arm`, one `run` and mandatory `disarm`. Deployment and expanded use remain later gates.
