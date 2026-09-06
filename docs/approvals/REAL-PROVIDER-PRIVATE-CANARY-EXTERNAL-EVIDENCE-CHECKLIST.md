@@ -4,6 +4,10 @@
 
 编制基线：`main@e43c71166a6e525cad23c47dfd5f30a980d04625`
 
+执行代码基线：`main@0d7275836abfef26db7180076b23529b4f974f26`
+
+本次文档对齐基线：`main@845ab5d56757b20396099f6d6dea03ef11d833fa`
+
 关联门禁：`docs/approvals/REAL-PROVIDER-PRIVATE-CANARY-EXECUTION-APPROVAL.md`
 
 > 本清单只定义未来由获授权执行人采集和核验外部证据的方法。本文件的编制、评审或合并不授权访问目标、读取或验证凭据、调用 Provider、产生费用、运行 `preflight`、执行 `arm/run`、部署或公开访问。
@@ -66,7 +70,8 @@ Reviewer result: ACCEPTED | REJECTED | NOT_REVIEWED
 ## 5. 汇总结论模板
 
 ```text
-Baseline: main@e43c71166a6e525cad23c47dfd5f30a980d04625
+Execution code baseline: main@0d7275836abfef26db7180076b23529b4f974f26
+Governance document baseline: main@845ab5d56757b20396099f6d6dea03ef11d833fa
 Evidence present: 0/18
 Evidence absent/invalid/not checked: 18/18
 Execution approval: ABSENT

@@ -4,6 +4,10 @@
 
 编制基线：`main@e43c71166a6e525cad23c47dfd5f30a980d04625`
 
+执行代码基线：`main@0d7275836abfef26db7180076b23529b4f974f26`
+
+本次文档对齐基线：`main@845ab5d56757b20396099f6d6dea03ef11d833fa`
+
 > 本手册描述未来在取得独立授权后如何执行去敏、只读预检。当前不得运行本文命令，不得连接 `TARGET-PRIVATE-01`，不得读取或验证真实凭据，也不得调用 Provider。本文不包含 `arm`、`run`、部署或公开访问步骤。
 
 ## 1. 适用条件
@@ -64,7 +68,7 @@ export AETHER_CANARY_OUTPUT_LIMIT='1'
 export AETHER_CANARY_ARTIFACT_PATH_PREFIX='/tasks/'
 
 ./infra/docker/provider-canary.sh preflight \
-  --approved-sha e43c71166a6e525cad23c47dfd5f30a980d04625
+  --approved-sha 0d7275836abfef26db7180076b23529b4f974f26
 ```
 
 必须保持以下变量不存在或为 `false`：

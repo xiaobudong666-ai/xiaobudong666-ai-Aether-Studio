@@ -2,7 +2,9 @@
 
 状态：`CONFIGURATION_LOCKED / EXECUTION_NOT_AUTHORIZED`
 
-基线：`main@0d7275836abfef26db7180076b23529b4f974f26`
+执行代码基线：`main@0d7275836abfef26db7180076b23529b4f974f26`
+
+本次文档对齐基线：`main@845ab5d56757b20396099f6d6dea03ef11d833fa`
 
 关联实现：`docs/approvals/IM18-IM20-GOVERNED-PRIVATE-PROVIDER-CANARY-CODING-APPROVAL.md`
 
@@ -109,5 +111,7 @@ Pexels 素材仅允许自然、建筑、物品或抽象场景。首次金丝雀�
 ## 9. 本次审批记录
 
 owner 已批准第 1 节候选配置，确认 `TARGET-PRIVATE-01` 为私有目标，并仅授权配置锁定及本文编制。owner 明确未批准凭据操作、真实调用、付费、`arm/run`、部署或公开访问。
+
+执行代码基线固定为 `0d7275836abfef26db7180076b23529b4f974f26`。从该提交到本次文档对齐基线 `845ab5d56757b20396099f6d6dea03ef11d833fa`，`.env.example`、`.github/workflows/ci.yml`、`.gitignore`、`apps/` 与 `infra/` 无差异；其间提交仅增加本组治理文档。后续预检必须使用执行代码基线，文档提交 SHA 仅用于标识治理材料版本，二者不得混用。
 
 本文没有记录任何真实凭据、目标地址、账户、余额、Cookie、Token 或秘密文件内容。

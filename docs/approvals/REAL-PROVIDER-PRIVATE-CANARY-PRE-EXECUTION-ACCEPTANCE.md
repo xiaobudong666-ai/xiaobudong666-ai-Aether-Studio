@@ -4,13 +4,17 @@
 
 编制基线：`main@e43c71166a6e525cad23c47dfd5f30a980d04625`
 
+执行代码基线：`main@0d7275836abfef26db7180076b23529b4f974f26`
+
+本次文档对齐基线：`main@845ab5d56757b20396099f6d6dea03ef11d833fa`
+
 > 本表用于未来汇总已经独立采集和复核的去敏证据。当前所有运行相关项均为未验收；填写或合并本表不构成凭据、预检、Provider 调用、付费、`arm/run`、部署或公开访问授权。
 
 ## 1. 固定候选配置
 
 | 项目 | 唯一允许值 | 当前结论 |
 |---|---|---|
-| 精确代码基线 | `main@e43c71166a6e525cad23c47dfd5f30a980d04625` | `LOCKED` |
+| 精确代码基线 | `main@0d7275836abfef26db7180076b23529b4f974f26` | `LOCKED` |
 | 目标别名 | `TARGET-PRIVATE-01` | `LOCKED`；不记录实际地址 |
 | LLM | DeepSeek 官方 `deepseek-v4-flash` | `LOCKED` |
 | 素材 | Pexels；仅非人物、非品牌、非私人场所 | `LOCKED` |
@@ -58,7 +62,8 @@
 
 ```text
 Acceptance ID: <NON_SECRET_ID>
-Baseline: main@e43c71166a6e525cad23c47dfd5f30a980d04625
+Execution code baseline: main@0d7275836abfef26db7180076b23529b4f974f26
+Governance document baseline: main@845ab5d56757b20396099f6d6dea03ef11d833fa
 Target alias: TARGET-PRIVATE-01
 Evidence checklist version: <COMMIT_SHA>
 Preflight result: ACCEPTED | REJECTED | NOT_AUTHORIZED

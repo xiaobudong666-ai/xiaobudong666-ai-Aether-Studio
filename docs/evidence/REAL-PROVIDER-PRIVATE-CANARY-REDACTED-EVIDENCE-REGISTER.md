@@ -2,15 +2,21 @@
 
 状态：`STAGED_COLLECTION_RECORDED / INDEPENDENT_REVIEW_PENDING / NO-GO`
 
-唯一基线：`main@7087d99298b27c3b133467caa101aa0a19d44e88`
+证据采集基线：`main@7087d99298b27c3b133467caa101aa0a19d44e88`
+
+执行代码基线：`main@0d7275836abfef26db7180076b23529b4f974f26`
+
+本次文档对齐基线：`main@845ab5d56757b20396099f6d6dea03ef11d833fa`
 
 登记时间：`2026-09-03T05:43:30Z`
+
+基线对齐时间：`2026-09-04T05:50:13Z`
 
 ## EV-01 至 EV-17 登记
 
 | Evidence ID | Status | Reason code | Recorded at UTC | Non-secret reference |
 |---|---|---|---|---|
-| EV-01 | `PRESENT` | `BASELINE_EXACT_AND_CLEAN` | `2026-09-03T05:43:30Z` | `REF-BASELINE-7087D992` |
+| EV-01 | `PRESENT` | `EXECUTION_BASELINE_EXACT_AND_TREE_STABLE` | `2026-09-04T05:50:13Z` | `REF-EXECUTION-BASELINE-0D727583` |
 | EV-02 | `NOT_CHECKED` | `HUMAN_TARGET_VERIFICATION_REQUIRED` | `2026-09-03T05:43:30Z` | `TARGET-PRIVATE-01` |
 | EV-03 | `NOT_CHECKED` | `HUMAN_PROVIDER_CONTROL_PLANE_REQUIRED` | `2026-09-03T05:43:30Z` | `NONE` |
 | EV-04 | `NOT_CHECKED` | `HUMAN_PROVIDER_CONTROL_PLANE_REQUIRED` | `2026-09-03T05:43:30Z` | `NONE` |
@@ -32,14 +38,16 @@
 
 | Reference | Non-secret subject |
 |---|---|
-| `REF-BASELINE-7087D992` | 精确基线与干净工作树的只读 Git 记录 |
+| `REF-EXECUTION-BASELINE-0D727583` | 精确执行代码基线及其到文档对齐基线之间实现树无差异的只读 Git 记录 |
 | `REF-REPO-CANARY-CONTRACT` | 唯一候选组合、单任务预算、`/tasks/` 产物边界、rights-blocked 与 `adopted=false` 的基线内治理合同 |
 | `TARGET-PRIVATE-01` | owner 已批准使用的非秘密目标别名；不包含实际地址或访问参数 |
 
 ## 汇总
 
 ```text
-Baseline: main@7087d99298b27c3b133467caa101aa0a19d44e88
+Execution code baseline: main@0d7275836abfef26db7180076b23529b4f974f26
+Evidence collection baseline: main@7087d99298b27c3b133467caa101aa0a19d44e88
+Governance document baseline: main@845ab5d56757b20396099f6d6dea03ef11d833fa
 Evidence present: 5/17
 Evidence absent: 3/17
 Evidence invalid: 0/17
