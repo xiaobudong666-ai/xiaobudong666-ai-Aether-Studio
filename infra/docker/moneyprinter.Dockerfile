@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm@sha256:528eea564b69ef8aa4a4b9c75f154d0b8c4f46b24c6f7443a7a8997cbe734b8a
+FROM python:3.11.14-slim-bookworm
 
 ARG MONEYPRINTER_COMMIT=475f21147f0808f5ffe3f58af9ab794b28a4da2c
 
