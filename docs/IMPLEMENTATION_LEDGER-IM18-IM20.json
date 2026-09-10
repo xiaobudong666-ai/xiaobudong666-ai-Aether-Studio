@@ -1,5 +1,5 @@
 {
-  "baseline": "9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441",
+  "baseline": "624e26e14dc3d5bd7f51e83f98248abb3b9e366b",
   "coding_baseline": "f046fab83fafd79efad5e4f49801e7514527c032",
   "scope": [
     "IM18",
@@ -53,6 +53,12 @@
       "post_merge_ci_run": 34512370814,
       "post_merge_ci_result": "3/3 PASS",
       "result": "OPC_ROLE_DRAFT_AND_PHASE_BC_READONLY_CHECKLIST_MERGED / ROLES_NOT_APPOINTED / EVIDENCE_UNCHANGED / NO-GO"
+    },
+    {
+      "pr": 35,
+      "reviewed_head": "ebb87cf797774fd5edfc532de6fc4c2c6bfa6792",
+      "merge_commit": "624e26e14dc3d5bd7f51e83f98248abb3b9e366b",
+      "result": "JACKIE_AUTHORIZED_OPERATOR_APPOINTED / JACKIE_EMERGENCY_STOP_OWNER_APPOINTED / REVIEWER-01_INDEPENDENT_REVIEWER_APPOINTED_NOT_REVIEWED / EVIDENCE_UNCHANGED / NO-GO"
     }
   ],
   "current_evidence": {
@@ -134,5 +140,5 @@
     "separate evidence review after any authorized canary",
     "separate deployment, public-access, expanded-trial and commercial-operation approval"
   ],
-  "note": "IM18-IM20 repository controls are accepted. PRs #29-#34 added configuration locking, evidence governance, a fake-only Docker reproducibility fix, and a one-person OPC proposed-role/Stage B-C read-only checklist, but did not formally appoint roles, elevate evidence, or authorize credential handling, target or Provider access, paid use, real preflight, arm/run, deployment or public access. Current decision remains NO-GO."
+  "note": "IM18-IM20 repository controls are accepted. PRs #29-#35 added configuration locking, evidence governance, a fake-only Docker reproducibility fix, a one-person OPC proposed-role/Stage B-C read-only checklist, and formal role appointments. Jackie is APPOINTED as AUTHORIZED_OPERATOR and EMERGENCY_STOP_OWNER; REVIEWER-01 is APPOINTED as INDEPENDENT_REVIEWER but remains NOT_REVIEWED. No evidence status was elevated, and credential handling, target or Provider access, paid use, real preflight, arm/run, deployment and public access remain unauthorized. Current decision remains NO-GO."
 }
