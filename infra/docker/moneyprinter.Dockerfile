@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bullseye
+FROM python:3.11.14-slim-bookworm
 
 ARG MONEYPRINTER_COMMIT=475f21147f0808f5ffe3f58af9ab794b28a4da2c
 
