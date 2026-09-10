@@ -2,7 +2,7 @@
 
 ## Scope and accepted baselines
 
-- Current source-of-truth baseline: `main@9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`.
+- Current source-of-truth baseline: `main@624e26e14dc3d5bd7f51e83f98248abb3b9e366b`.
 - Coding baseline: `main@f046fab83fafd79efad5e4f49801e7514527c032`.
 - Functional PR: #27.
 - Formally reviewed head: `7d7d6ef3c10b64e76934c1dae58bb1e32c3523ac`.
@@ -95,8 +95,9 @@
 | PR #32 | Governance baselines aligned and remaining-evidence remediation guide merged as `6baae165d069d64f1c9489c40b411b83f27cbbb7`; evidence unchanged |
 | PR #33 | Phase A EV-14–EV-16 records prepared but kept `ABSENT`; MoneyPrinter Docker base pinned to `python:3.11.14-slim-bookworm` without changing the fixed upstream commit; merged as `dd6fc186adc84388c9a0d1aa0dd592ad2521fc2d` |
 | PR #33 post-merge Run [`34508384975`](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/34508384975) | 3/3 jobs passed: lint/build/unit/fake-only checks, Playwright and Docker Compose integration |
-| PR #34 | One-person OPC proposed-role and Stage B/C read-only human-evidence checklist merged as `9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`; roles not appointed; evidence unchanged; `NO-GO` |
-| Latest post-merge Run [`34512370814`](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/34512370814) | At `main@9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`, 3/3 jobs passed: lint/build/unit/fake-only checks, Playwright and Docker Compose integration |
+| PR #34 | One-person OPC proposed-role and Stage B/C read-only human-evidence checklist merged as `9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`; roles not appointed at that stage; evidence unchanged; `NO-GO` |
+| PR #35 | Jackie appointed as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`; `REVIEWER-01` appointed as `INDEPENDENT_REVIEWER / NOT_REVIEWED`; merged as `624e26e14dc3d5bd7f51e83f98248abb3b9e366b`; evidence unchanged; `NO-GO` |
+| PR #34 post-merge Run [`34512370814`](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/34512370814) | At `main@9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`, 3/3 jobs passed: lint/build/unit/fake-only checks, Playwright and Docker Compose integration |
 
 ## Current redacted evidence state
 
@@ -111,6 +112,6 @@ Independent review is `NOT_REVIEWED`. Read-only preflight is `NOT_AUTHORIZED / N
 
 ## Current conclusion and remaining gates
 
-The IM18–IM20 repository controls remain accepted on the current baseline, and latest post-merge fake-only CI Run `34512370814` is green. PR #34 records only proposed roles and a Stage B/C read-only checklist; it does not appoint roles or elevate evidence. The Docker base-image pin does not constitute target, credential, Provider, monetary-limit or real-request validation. The real private canary therefore remains `NO-GO`.
+The IM18–IM20 repository controls remain accepted on the current baseline. PR #34 recorded proposed roles and a Stage B/C read-only checklist; PR #35 subsequently appointed Jackie as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`, and appointed `REVIEWER-01` as `INDEPENDENT_REVIEWER / NOT_REVIEWED`. The appointments did not perform independent review or elevate evidence. The Docker base-image pin does not constitute target, credential, Provider, monetary-limit or real-request validation. The real private canary therefore remains `NO-GO`.
 
-The next step is independent review of this refreshed closure and the redacted evidence register. Jackie remains proposed—not appointed—as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`, while `INDEPENDENT_REVIEWER` remains `UNASSIGNED`. Any unresolved evidence must be collected by authorized humans in controlled environments under the existing redaction rules. Real target access, Provider-console access, credential handling, read-only `preflight`, paid use, `arm/run`, deployment and public access remain separate, unapproved gates.
+The next step is independent review of this refreshed closure and the redacted evidence register. Jackie is appointed as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`, and `REVIEWER-01` is appointed as `INDEPENDENT_REVIEWER / NOT_REVIEWED`; appointment does not mean review has been performed or accepted. Any unresolved evidence must be collected only after separate authorization by the appointed humans in controlled environments under the existing redaction rules. Real target access, Provider-console access, credential handling, read-only `preflight`, paid use, `arm/run`, deployment and public access remain separate, unapproved gates.
