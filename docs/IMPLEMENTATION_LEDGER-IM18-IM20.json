@@ -1,5 +1,5 @@
 {
-  "baseline": "624e26e14dc3d5bd7f51e83f98248abb3b9e366b",
+  "baseline": "7916dbdb65d89c576d7f5d04e1355c966a697266",
   "coding_baseline": "f046fab83fafd79efad5e4f49801e7514527c032",
   "scope": [
     "IM18",
@@ -59,6 +59,12 @@
       "reviewed_head": "ebb87cf797774fd5edfc532de6fc4c2c6bfa6792",
       "merge_commit": "624e26e14dc3d5bd7f51e83f98248abb3b9e366b",
       "result": "JACKIE_AUTHORIZED_OPERATOR_APPOINTED / JACKIE_EMERGENCY_STOP_OWNER_APPOINTED / REVIEWER-01_INDEPENDENT_REVIEWER_APPOINTED_NOT_REVIEWED / EVIDENCE_UNCHANGED / NO-GO"
+    },
+    {
+      "pr": 36,
+      "reviewed_head": "262bc582b3adc46b5bc5d8a11b85102a8174d60e",
+      "merge_commit": "7916dbdb65d89c576d7f5d04e1355c966a697266",
+      "result": "EV16_REDACTED_INDEPENDENT_REVIEW_HANDOFF_PREPARED / MATERIAL_NOT_DELIVERED / REVIEWER-01_NOT_REVIEWED / ACCEPTED_REJECTED_NOT_RECORDED / EVIDENCE_UNCHANGED / NO-GO"
     }
   ],
   "current_evidence": {
@@ -132,7 +138,7 @@
     "commercial_operation": false
   },
   "remaining_gates": [
-    "independent review of this documentation refresh and the redacted evidence register",
+    "owner-controlled delivery of the redacted EV-16 handoff to REVIEWER-01 and receipt of that human reviewer's redacted ACCEPTED or REJECTED result",
     "authorized-human completion of remaining ABSENT and NOT_CHECKED evidence",
     "separate exact-baseline read-only preflight approval",
     "separate target-local credential and paid-use approval",
@@ -140,5 +146,5 @@
     "separate evidence review after any authorized canary",
     "separate deployment, public-access, expanded-trial and commercial-operation approval"
   ],
-  "note": "IM18-IM20 repository controls are accepted. PRs #29-#35 added configuration locking, evidence governance, a fake-only Docker reproducibility fix, a one-person OPC proposed-role/Stage B-C read-only checklist, and formal role appointments. Jackie is APPOINTED as AUTHORIZED_OPERATOR and EMERGENCY_STOP_OWNER; REVIEWER-01 is APPOINTED as INDEPENDENT_REVIEWER but remains NOT_REVIEWED. No evidence status was elevated, and credential handling, target or Provider access, paid use, real preflight, arm/run, deployment and public access remain unauthorized. Current decision remains NO-GO."
+  "note": "IM18-IM20 repository controls are accepted. PRs #29-#36 added configuration locking, evidence governance, a fake-only Docker reproducibility fix, a one-person OPC proposed-role/Stage B-C read-only checklist, formal role appointments, and an EV-16 redacted independent-review handoff. Jackie is APPOINTED as AUTHORIZED_OPERATOR and EMERGENCY_STOP_OWNER; REVIEWER-01 is APPOINTED as INDEPENDENT_REVIEWER but remains NOT_REVIEWED. The PR #36 handoff is PREPARED only: it has not been delivered and no ACCEPTED or REJECTED reviewer result has been recorded. No evidence status was elevated, and credential handling, target or Provider access, paid use, real preflight, arm/run, deployment and public access remain unauthorized. Current decision remains NO-GO."
 }

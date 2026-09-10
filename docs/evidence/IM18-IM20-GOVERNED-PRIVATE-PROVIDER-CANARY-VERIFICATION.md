@@ -2,7 +2,7 @@
 
 ## Scope and accepted baselines
 
-- Current source-of-truth baseline: `main@624e26e14dc3d5bd7f51e83f98248abb3b9e366b`.
+- Current source-of-truth baseline: `main@7916dbdb65d89c576d7f5d04e1355c966a697266`.
 - Coding baseline: `main@f046fab83fafd79efad5e4f49801e7514527c032`.
 - Functional PR: #27.
 - Formally reviewed head: `7d7d6ef3c10b64e76934c1dae58bb1e32c3523ac`.
@@ -97,6 +97,7 @@
 | PR #33 post-merge Run [`34508384975`](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/34508384975) | 3/3 jobs passed: lint/build/unit/fake-only checks, Playwright and Docker Compose integration |
 | PR #34 | One-person OPC proposed-role and Stage B/C read-only human-evidence checklist merged as `9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`; roles not appointed at that stage; evidence unchanged; `NO-GO` |
 | PR #35 | Jackie appointed as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`; `REVIEWER-01` appointed as `INDEPENDENT_REVIEWER / NOT_REVIEWED`; merged as `624e26e14dc3d5bd7f51e83f98248abb3b9e366b`; evidence unchanged; `NO-GO` |
+| PR #36 | EV-16 redacted independent-review handoff prepared but not delivered; `REVIEWER-01` returned neither `ACCEPTED` nor `REJECTED`; merged as `7916dbdb65d89c576d7f5d04e1355c966a697266`; evidence unchanged; `NO-GO` |
 | PR #34 post-merge Run [`34512370814`](https://github.com/xiaobudong666-ai/xiaobudong666-ai-Aether-Studio/actions/runs/34512370814) | At `main@9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`, 3/3 jobs passed: lint/build/unit/fake-only checks, Playwright and Docker Compose integration |
 
 ## Current redacted evidence state
@@ -112,6 +113,6 @@ Independent review is `NOT_REVIEWED`. Read-only preflight is `NOT_AUTHORIZED / N
 
 ## Current conclusion and remaining gates
 
-The IM18–IM20 repository controls remain accepted on the current baseline. PR #34 recorded proposed roles and a Stage B/C read-only checklist; PR #35 subsequently appointed Jackie as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`, and appointed `REVIEWER-01` as `INDEPENDENT_REVIEWER / NOT_REVIEWED`. The appointments did not perform independent review or elevate evidence. The Docker base-image pin does not constitute target, credential, Provider, monetary-limit or real-request validation. The real private canary therefore remains `NO-GO`.
+The IM18–IM20 repository controls remain accepted on the current baseline. PR #34 recorded proposed roles and a Stage B/C read-only checklist; PR #35 subsequently appointed Jackie as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`, and appointed `REVIEWER-01` as `INDEPENDENT_REVIEWER / NOT_REVIEWED`. PR #36 prepared a redacted EV-16 independent-review handoff, but did not deliver it or record an `ACCEPTED/REJECTED` human result. These governance steps did not perform independent review or elevate evidence. The Docker base-image pin does not constitute target, credential, Provider, monetary-limit or real-request validation. The real private canary therefore remains `NO-GO`.
 
-The next step is independent review of this refreshed closure and the redacted evidence register. Jackie is appointed as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`, and `REVIEWER-01` is appointed as `INDEPENDENT_REVIEWER / NOT_REVIEWED`; appointment does not mean review has been performed or accepted. Any unresolved evidence must be collected only after separate authorization by the appointed humans in controlled environments under the existing redaction rules. Real target access, Provider-console access, credential handling, read-only `preflight`, paid use, `arm/run`, deployment and public access remain separate, unapproved gates.
+The next step is separately authorized, owner-controlled delivery of the prepared PR #36 EV-16 handoff to `REVIEWER-01` and receipt of that human reviewer's redacted `ACCEPTED` or `REJECTED` result. Jackie is appointed as `AUTHORIZED_OPERATOR` and `EMERGENCY_STOP_OWNER`, and `REVIEWER-01` is appointed as `INDEPENDENT_REVIEWER / NOT_REVIEWED`; appointment and handoff preparation do not mean review has been performed or accepted. Even a later `ACCEPTED` result would not automatically elevate EV-16, and any evidence update requires separate exact authorization. Any unresolved evidence must be collected only after separate authorization by the appointed humans in controlled environments under the existing redaction rules. Real target access, Provider-console access, credential handling, read-only `preflight`, paid use, `arm/run`, deployment and public access remain separate, unapproved gates.
