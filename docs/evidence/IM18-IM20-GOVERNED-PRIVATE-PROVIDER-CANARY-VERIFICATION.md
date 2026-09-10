@@ -8,7 +8,7 @@
 - Formally reviewed head: `7d7d6ef3c10b64e76934c1dae58bb1e32c3523ac`.
 - Accepted implementation merge: `0d7275836abfef26db7180076b23529b4f974f26`.
 - Fixed upstream remains MoneyPrinterTurbo `v1.2.7` at `475f21147f0808f5ffe3f58af9ab794b28a4da2c`.
-- Documentation closure PR #28 remains Draft and requires independent review.
+- Documentation closure PR #28 is open for formal review; this does not constitute independent evidence review.
 - Current real-canary decision: `NO-GO`.
 
 ## Implemented controls
