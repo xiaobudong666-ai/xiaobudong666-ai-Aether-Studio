@@ -3,7 +3,7 @@
 ## Current baseline and decision
 
 - Source-of-truth baseline: `main@9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441`
-- Documentation closure: Draft PR #28, independent review pending
+- Documentation closure: PR #28 is open for formal review; this does not constitute independent evidence review
 - Real private-canary decision: `NO-GO`
 
 ## Accepted implementation anchors
