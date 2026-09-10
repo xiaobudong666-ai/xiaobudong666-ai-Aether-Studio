@@ -1,39 +1,125 @@
 {
-  "baseline": "221540aa2fcb64df4012aa37f8bd017da8e29a9c",
+  "baseline": "7916dbdb65d89c576d7f5d04e1355c966a697266",
+  "coding_baseline": "f046fab83fafd79efad5e4f49801e7514527c032",
   "scope": [
     "IM18",
     "IM19",
     "IM20"
   ],
-  "status": "documentation-draft",
-  "implementation": "not_started",
+  "status": "implementation-accepted / documentation-refresh-pending-review / no-go",
+  "implementation": "accepted",
   "approval_package": "docs/approvals/IM18-IM20-GOVERNED-PRIVATE-PROVIDER-CANARY-CODING-APPROVAL.md",
-  "planned_controls": {
+  "functional_pr": 27,
+  "reviewed_head": "7d7d6ef3c10b64e76934c1dae58bb1e32c3523ac",
+  "implementation_merge_commit": "0d7275836abfef26db7180076b23529b4f974f26",
+  "final_implementation_ci_run": 33440891212,
+  "documentation_closure_pr": 28,
+  "verification_evidence": "docs/evidence/IM18-IM20-GOVERNED-PRIVATE-PROVIDER-CANARY-VERIFICATION.md",
+  "required_acceptance_cases": 40,
+  "acceptance_result": "40/40 PASS",
+  "governance_chain": [
+    {
+      "pr": 29,
+      "merge_commit": "e43c71166a6e525cad23c47dfd5f30a980d04625",
+      "result": "CONFIGURATION_LOCKED / EXECUTION_NOT_AUTHORIZED"
+    },
+    {
+      "pr": 30,
+      "merge_commit": "7087d99298b27c3b133467caa101aa0a19d44e88",
+      "result": "PREFLIGHT_EVIDENCE_PACK_MERGED / PREFLIGHT_NOT_AUTHORIZED / NO-GO"
+    },
+    {
+      "pr": 31,
+      "merge_commit": "845ab5d56757b20396099f6d6dea03ef11d833fa",
+      "result": "REDACTED_EVIDENCE_REGISTERED / INDEPENDENT_REVIEW_PENDING / NO-GO"
+    },
+    {
+      "pr": 32,
+      "merge_commit": "6baae165d069d64f1c9489c40b411b83f27cbbb7",
+      "result": "GOVERNANCE_BASELINES_ALIGNED / EVIDENCE_UNCHANGED / NO-GO"
+    },
+    {
+      "pr": 33,
+      "reviewed_head": "85a873d3a7c9f007399ffdf821972e94e1a550f1",
+      "merge_commit": "dd6fc186adc84388c9a0d1aa0dd592ad2521fc2d",
+      "post_merge_ci_run": 34508384975,
+      "post_merge_ci_result": "3/3 PASS",
+      "result": "PHASE_A_PREPARED / EVIDENCE_INSUFFICIENT / NO-GO"
+    },
+    {
+      "pr": 34,
+      "reviewed_head": "2c124c0969f160c261ab478c52232a5ba5b895ec",
+      "merge_commit": "9cc0f7e18ab10a4e7f31fd5a94b97aaf4633e441",
+      "post_merge_ci_run": 34512370814,
+      "post_merge_ci_result": "3/3 PASS",
+      "result": "OPC_ROLE_DRAFT_AND_PHASE_BC_READONLY_CHECKLIST_MERGED / ROLES_NOT_APPOINTED / EVIDENCE_UNCHANGED / NO-GO"
+    },
+    {
+      "pr": 35,
+      "reviewed_head": "ebb87cf797774fd5edfc532de6fc4c2c6bfa6792",
+      "merge_commit": "624e26e14dc3d5bd7f51e83f98248abb3b9e366b",
+      "result": "JACKIE_AUTHORIZED_OPERATOR_APPOINTED / JACKIE_EMERGENCY_STOP_OWNER_APPOINTED / REVIEWER-01_INDEPENDENT_REVIEWER_APPOINTED_NOT_REVIEWED / EVIDENCE_UNCHANGED / NO-GO"
+    },
+    {
+      "pr": 36,
+      "reviewed_head": "262bc582b3adc46b5bc5d8a11b85102a8174d60e",
+      "merge_commit": "7916dbdb65d89c576d7f5d04e1355c966a697266",
+      "result": "EV16_REDACTED_INDEPENDENT_REVIEW_HANDOFF_PREPARED / MATERIAL_NOT_DELIVERED / REVIEWER-01_NOT_REVIEWED / ACCEPTED_REJECTED_NOT_RECORDED / EVIDENCE_UNCHANGED / NO-GO"
+    }
+  ],
+  "current_evidence": {
+    "present": 5,
+    "absent": 3,
+    "invalid": 0,
+    "not_checked": 9,
+    "independent_review": "NOT_REVIEWED",
+    "read_only_preflight": "NOT_AUTHORIZED / NOT_EXECUTED",
+    "decision": "NO-GO"
+  },
+  "baseline_change": {
+    "moneyprinter_base_image": "python:3.11.14-slim-bookworm",
+    "reason": "deterministic fake-only Docker Compose CI",
+    "fixed_upstream_commit": "475f21147f0808f5ffe3f58af9ab794b28a4da2c",
+    "fixed_upstream_changed": false,
+    "real_execution_validated": false
+  },
+  "implemented_controls": {
     "IM18": [
       "explicit target-local read-only MoneyPrinter config override",
       "repository-external regular-file and permission preflight",
-      "pinned upstream same-origin /tasks/ artifact contract",
-      "secret-free credential presence and canary-profile attestation",
+      "exact pinned /tasks/ artifact contract",
+      "sanitized credential/network/canary-profile proof",
       "no secret content, path, metadata or digest persistence"
     ],
     "IM19": [
       "internal Worker-to-Sidecar provider-control network",
       "Sidecar-only provider-egress network",
       "no Sidecar host port or API/Web/video-use connectivity",
-      "warning-level sanitized logs and preserved Adapter egress restrictions"
+      "preserved Adapter no-proxy/no-redirect/same-origin restrictions"
     ],
     "IM20": [
       "preflight-first explicit canary command sequence",
       "one request, one output and at most ten generated seconds",
-      "fail-closed kill-switch and operator-mode shutdown",
-      "secret-free evidence bundle with rights-blocked output"
+      "one-POST and ambiguous-submit no-replay boundary",
+      "fail-closed kill-switch/operator shutdown and sanitized evidence"
     ]
   },
-  "required_acceptance_cases": 40,
+  "regression": {
+    "api": "109 passed",
+    "worker": "53 passed",
+    "video_use": "3 passed",
+    "contracts": "11 passed",
+    "editor": "4 passed",
+    "web": "56 passed",
+    "playwright": "PASS",
+    "docker_compose": "PASS",
+    "ffmpeg_render_browser_flow": "PASS"
+  },
   "boundaries": {
     "runtime_provider_default": "disabled",
-    "test_provider": "deterministic-fake-sidecar-only",
-    "real_provider_selected": false,
+    "test_provider": "deterministic-fake-only",
+    "real_provider_candidate_locked": true,
+    "real_execution_authorized": false,
     "real_credentials": false,
     "real_provider_egress": false,
     "paid_call": false,
@@ -45,21 +131,20 @@
     "automatic_adoption": false,
     "automatic_timeline_write": false,
     "automatic_render_or_publish": false,
+    "read_only_preflight": false,
     "private_canary_execution": false,
     "deployment": false,
     "public_access": false,
     "commercial_operation": false
   },
   "remaining_gates": [
-    "documentation formal review approval",
-    "documentation merge approval",
-    "separate exact-SHA coding authorization",
-    "functional PR formal review approval",
-    "functional PR merge approval",
-    "single real Provider/model/material-source selection approval",
-    "target-local credential and paid-use approval",
-    "private one-task canary execution approval",
-    "separate deployment, public-access and commercial-operation approval"
+    "owner-controlled delivery of the redacted EV-16 handoff to REVIEWER-01 and receipt of that human reviewer's redacted ACCEPTED or REJECTED result",
+    "authorized-human completion of remaining ABSENT and NOT_CHECKED evidence",
+    "separate exact-baseline read-only preflight approval",
+    "separate target-local credential and paid-use approval",
+    "separate exact-SHA private one-task canary execution approval",
+    "separate evidence review after any authorized canary",
+    "separate deployment, public-access, expanded-trial and commercial-operation approval"
   ],
-  "note": "This ledger records a proposed private-canary coding boundary only. No IM18-IM20 functionality, real Provider selection, credential, paid call, target execution or deployment is claimed."
+  "note": "IM18-IM20 repository controls are accepted. PRs #29-#36 added configuration locking, evidence governance, a fake-only Docker reproducibility fix, a one-person OPC proposed-role/Stage B-C read-only checklist, formal role appointments, and an EV-16 redacted independent-review handoff. Jackie is APPOINTED as AUTHORIZED_OPERATOR and EMERGENCY_STOP_OWNER; REVIEWER-01 is APPOINTED as INDEPENDENT_REVIEWER but remains NOT_REVIEWED. The PR #36 handoff is PREPARED only: it has not been delivered and no ACCEPTED or REJECTED reviewer result has been recorded. No evidence status was elevated, and credential handling, target or Provider access, paid use, real preflight, arm/run, deployment and public access remain unauthorized. Current decision remains NO-GO."
 }
