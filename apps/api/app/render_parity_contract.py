@@ -11,6 +11,10 @@ class ParityResult:
     code: str
 
 
+def _binding_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def evaluate_render_parity(
     preview: Mapping[str, Any], final: Mapping[str, Any], *, approved_threshold_version: str
 ) -> ParityResult:
@@ -22,7 +26,11 @@ def evaluate_render_parity(
         "audio_digest",
     )
     for key in required_equal:
-        if preview.get(key) != final.get(key):
+        preview_value = preview.get(key)
+        final_value = final.get(key)
+        if _binding_missing(preview_value) or _binding_missing(final_value):
+            return ParityResult(False, "RENDER_PARITY_EVIDENCE_MISSING")
+        if preview_value != final_value:
             return ParityResult(False, "RENDER_PREVIEW_FINAL_MISMATCH")
     if final.get("threshold_set_version") != approved_threshold_version:
         return ParityResult(False, "RENDER_PARITY_POLICY_CHANGED")
