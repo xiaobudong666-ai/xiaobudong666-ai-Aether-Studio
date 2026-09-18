@@ -31,9 +31,17 @@ export const TrackSchema = z.object({
   clips: z.array(ClipSchema),
 });
 
+// Canonical Timeline v1.1 optional output contract. Omitted output preserves legacy 1920x1080 rendering.
+export const TimelineOutputSchema = z.object({
+  aspect: z.enum(["16:9", "9:16", "1:1"]).optional(),
+  width: z.number().int().positive().max(7680),
+  height: z.number().int().positive().max(7680),
+});
+
 // Canonical Timeline v1.1 Schema
 export const TimelineSchema = z.object({
   version: z.literal("1.1"),
+  output: TimelineOutputSchema.optional(),
   tracks: z.array(TrackSchema),
 });
 
@@ -190,6 +198,7 @@ export const MasterRevisionSchema = z.object({
 export type RationalTimeDTO = z.infer<typeof RationalTimeSchema>;
 export type ClipDTO = z.infer<typeof ClipSchema>;
 export type TrackDTO = z.infer<typeof TrackSchema>;
+export type TimelineOutputDTO = z.infer<typeof TimelineOutputSchema>;
 export type TimelineDTO = z.infer<typeof TimelineSchema>;
 export type MaterialDTO = z.infer<typeof MaterialSchema>;
 export type ProjectDTO = z.infer<typeof ProjectSchema>;
