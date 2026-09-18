@@ -33,8 +33,14 @@ class TrackSchema(BaseModel):
     type: Literal["video", "audio", "subtitle"]
     clips: List[ClipSchema]
 
+class TimelineOutputSchema(BaseModel):
+    aspect: Optional[Literal["16:9", "9:16", "1:1"]] = None
+    width: int = Field(..., gt=0, le=7680)
+    height: int = Field(..., gt=0, le=7680)
+
 class TimelineSchema(BaseModel):
     version: Literal["1.1"] = "1.1"
+    output: Optional[TimelineOutputSchema] = None
     tracks: List[TrackSchema]
 
 class MaterialSchema(BaseModel):
