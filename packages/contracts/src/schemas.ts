@@ -38,10 +38,11 @@ export const TimelineOutputSchema = z.object({
   height: z.number().int().positive().max(7680),
 });
 
-// Canonical Timeline v1.1 Schema
+// Canonical Timeline v1.1 Schema. Legacy API responses may serialize an omitted output as null;
+// normalize that boundary value back to undefined so callers keep the optional contract.
 export const TimelineSchema = z.object({
   version: z.literal("1.1"),
-  output: TimelineOutputSchema.optional(),
+  output: TimelineOutputSchema.nullish().transform((value) => value ?? undefined),
   tracks: z.array(TrackSchema),
 });
 
