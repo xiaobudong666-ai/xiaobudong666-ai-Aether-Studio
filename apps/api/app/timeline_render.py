@@ -75,14 +75,18 @@ def build_render_payload(project) -> tuple[dict[str, Any], int]:
         "value": duration.numerator,
         "timescale": duration.denominator,
     }
+    timeline_output = project.timeline.get("output") or {}
+    output_width = timeline_output.get("width", 1920)
+    output_height = timeline_output.get("height", 1080)
+
     payload = {
         "projectId": project.id,
         "canonicalTimeline": {
             "version": "1.1",
             "duration": duration_rational,
             "output": {
-                "width": 1920,
-                "height": 1080,
+                "width": output_width,
+                "height": output_height,
                 "fps": {"value": 24, "timescale": 1},
                 "backgroundColor": "black",
             },
