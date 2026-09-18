@@ -53,6 +53,6 @@ def evaluate_rule_pack(
     if content.get("ai_generated_or_synthetic") and content.get("public_distribution"):
         if pack.get("jurisdiction_ai_label_required") and not content.get("explicit_label_planned"):
             return RuleEvaluation(False, True, "POLICY_AI_LABEL_REQUIRED")
-    if pack.get("platform_overlay_status") in {"missing", "unresolved", "stale"}:
+    if pack.get("platform_overlay_status") != "verified":
         return RuleEvaluation(False, True, "POLICY_PLATFORM_OVERLAY_REVIEW_REQUIRED")
     return RuleEvaluation(True, False, "POLICY_RULES_SATISFIED")
