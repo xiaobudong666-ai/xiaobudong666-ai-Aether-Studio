@@ -237,6 +237,13 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     <div className="generation-grid">
       <fieldset disabled={busy || !generationReady}>
         <legend>生成请求</legend>
+        <button type="button" className="secondary" onClick={() => {
+          setAspect("9:16");
+          setConcatMode("sequential");
+          setOutputCount(1);
+          invalidatePreflight();
+          setMessage("已应用口播 P0 预设：9:16、顺序编排、单输出；仍需服务端预检后才能提交。");
+        }}>口播视频预设</button>
         <label>生成主题<textarea aria-label="生成主题" maxLength={500} value={prompt} onChange={(event) => { setPrompt(event.target.value); invalidatePreflight(); }} /></label>
         <label>目标比例<select aria-label="目标比例" value={aspect} onChange={(event) => { setAspect(event.target.value as ServerGenerationRequest["videoAspect"]); invalidatePreflight(); }}>{(capabilities?.videoAspects || ["9:16"]).map((value) => <option key={value}>{value}</option>)}</select></label>
         <label>声音<select aria-label="声音" value={voiceName} onChange={(event) => { setVoiceName(event.target.value); invalidatePreflight(); }}>{(capabilities?.voices || [voiceName]).map((value) => <option key={value}>{value}</option>)}</select></label>
