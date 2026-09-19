@@ -7,6 +7,13 @@ from typing import Any
 from fastapi import HTTPException
 
 
+CANONICAL_OUTPUTS = {
+    "16:9": (1920, 1080),
+    "9:16": (1080, 1920),
+    "1:1": (1080, 1080),
+}
+
+
 def fraction(value: dict[str, int]) -> Fraction:
     return Fraction(value["value"], value["timescale"])
 
@@ -17,6 +24,41 @@ def timeline_duration(timeline: dict[str, Any]) -> Fraction:
         for clip in track.get("clips", []):
             maximum = max(maximum, fraction(clip["start"]) + fraction(clip["duration"]))
     return maximum
+
+
+def canonical_output(timeline: dict[str, Any]) -> tuple[int, int]:
+    timeline_output = timeline.get("output") or {}
+    if not timeline_output:
+        return CANONICAL_OUTPUTS["16:9"]
+
+    output_width = timeline_output.get("width")
+    output_height = timeline_output.get("height")
+    expected_aspect = timeline_output.get("aspect")
+    matched_aspect = next(
+        (
+            aspect
+            for aspect, dimensions in CANONICAL_OUTPUTS.items()
+            if dimensions == (output_width, output_height)
+        ),
+        None,
+    )
+    if matched_aspect is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "UNSUPPORTED_OUTPUT_DIMENSIONS",
+                "message": "输出尺寸必须使用受支持的 16:9、9:16 或 1:1 P0 画布",
+            },
+        )
+    if expected_aspect is not None and expected_aspect != matched_aspect:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "OUTPUT_ASPECT_MISMATCH",
+                "message": "输出比例与画布尺寸不一致",
+            },
+        )
+    return output_width, output_height
 
 
 def build_render_payload(project) -> tuple[dict[str, Any], int]:
@@ -75,9 +117,7 @@ def build_render_payload(project) -> tuple[dict[str, Any], int]:
         "value": duration.numerator,
         "timescale": duration.denominator,
     }
-    timeline_output = project.timeline.get("output") or {}
-    output_width = timeline_output.get("width", 1920)
-    output_height = timeline_output.get("height", 1080)
+    output_width, output_height = canonical_output(project.timeline)
 
     payload = {
         "projectId": project.id,
