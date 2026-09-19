@@ -16,6 +16,7 @@ interface GenerationPanelProps {
   actorId: string;
   project: ProjectDTO | null;
   assetVersions: AssetVersionDTO[];
+  onProjectUpdated?: (project: ProjectDTO) => void;
 }
 
 const STATUS_LABEL: Record<ServerGenerationStatus, string> = {
@@ -31,7 +32,7 @@ function newIdempotencyKey(): string {
   return `00000000-0000-4000-8000-${suffix}`;
 }
 
-export function GenerationPanel({ role, tenantId, actorId, project, assetVersions }: GenerationPanelProps) {
+export function GenerationPanel({ role, tenantId, actorId, project, assetVersions, onProjectUpdated }: GenerationPanelProps) {
   const api = useMemo(
     () => new GenerationApiClient("/api", (input, init) => globalThis.fetch(input, init)),
     [],
@@ -172,6 +173,27 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     }
   };
 
+  const applyTalkingHeadDraft = async (task: ServerGenerationTask, result: ServerGenerationResult) => {
+    if (!project || !result.rights.allowed) {
+      setMessage(`权利检查阻断：${result.rights.code}。不会写入口播草稿。`);
+      return;
+    }
+    setBusy(true);
+    try {
+      const updated = await api.applyTalkingHeadDraft(project.id, task.taskId, {
+        expectedRevision: project.revision,
+        aspect,
+        subtitles: [],
+      });
+      onProjectUpdated?.(updated);
+      setMessage("口播草稿已显式写入 Canonical Timeline；未自动渲染、未发布。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "口播草稿应用失败。");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const createEditorReference = (task: ServerGenerationTask, result: ServerGenerationResult) => {
     if (!project || !result.rights.allowed) {
       setMessage(`权利检查阻断：${result.rights.code}。不会写入剪辑引用或时间线。`);
@@ -199,7 +221,10 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
       {task.results.map((result) => <div className="generation-result" key={result.assetVersionId}>
         <span>{result.contentType} · {result.checksum.slice(0, 12)} · {result.rights.code}</span>
         <span>来源任务：{String(result.provenance.generationTaskId || task.taskId)}</span>
-        {!readOnly && <button type="button" disabled={!result.rights.allowed} onClick={() => createEditorReference(task, result)}>用于快速制作</button>}
+        {!readOnly && <>
+          <button type="button" disabled={!result.rights.allowed} onClick={() => createEditorReference(task, result)}>用于快速制作</button>
+          <button type="button" disabled={busy || !result.rights.allowed} onClick={() => void applyTalkingHeadDraft(task, result)}>应用到口播草稿</button>
+        </>}
       </div>)}
     </article>)}
   </div>;
