@@ -419,6 +419,13 @@ export interface ServerGenerationResult {
   rights: { allowed: boolean; code: string };
 }
 
+export interface ApplyTalkingHeadDraftRequest {
+  expectedRevision: number;
+  aspect: "16:9" | "9:16" | "1:1";
+  audioAssetVersionId?: string;
+  subtitles: Array<{ text: string; startMs: number; durationMs: number }>;
+}
+
 export interface ServerGenerationTask {
   taskId: string;
   projectId: string;
@@ -434,6 +441,7 @@ export interface ServerGenerationTask {
   errorMessage?: string | null;
   rights: { allowed: boolean; code: string };
   results: ServerGenerationResult[];
+  requestSummary?: { videoAspect?: "16:9" | "9:16" | "1:1"; videoClipDuration?: number; outputCount?: number; inputAssetVersionIds?: string[]; promptLength?: number };
   createdAt: string;
   updatedAt: string;
 }
@@ -491,6 +499,18 @@ export class GenerationApiClient {
 
   get(projectId: string, taskId: string): Promise<ServerGenerationTask> {
     return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks/${encodeURIComponent(taskId)}`);
+  }
+
+  applyTalkingHeadDraft(
+    projectId: string,
+    taskId: string,
+    body: ApplyTalkingHeadDraftRequest,
+  ): Promise<import("@aether/contracts").ProjectDTO> {
+    return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks/${encodeURIComponent(taskId)}/apply-talking-head-draft`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Aether-CSRF": "1" },
+      body: JSON.stringify(body),
+    });
   }
 
   cancel(projectId: string, taskId: string): Promise<ServerGenerationTask> {

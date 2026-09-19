@@ -33,8 +33,14 @@ class TrackSchema(BaseModel):
     type: Literal["video", "audio", "subtitle"]
     clips: List[ClipSchema]
 
+class TimelineOutputSchema(BaseModel):
+    aspect: Optional[Literal["16:9", "9:16", "1:1"]] = None
+    width: int = Field(..., gt=0, le=7680)
+    height: int = Field(..., gt=0, le=7680)
+
 class TimelineSchema(BaseModel):
     version: Literal["1.1"] = "1.1"
+    output: Optional[TimelineOutputSchema] = None
     tracks: List[TrackSchema]
 
 class MaterialSchema(BaseModel):
@@ -106,6 +112,23 @@ class GenerationTaskRequest(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("input asset version identifiers must be unique")
         return value
+
+
+class TalkingHeadSubtitleCueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=2_000)
+    startMs: int = Field(..., ge=0)
+    durationMs: int = Field(..., gt=0)
+
+
+class ApplyTalkingHeadDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expectedRevision: int = Field(..., ge=0)
+    aspect: Literal["16:9", "9:16", "1:1"] = "9:16"
+    audioAssetVersionId: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    subtitles: List[TalkingHeadSubtitleCueRequest] = Field(default_factory=list, max_length=500)
 
 
 class GenerationWorkerHeartbeatRequest(BaseModel):

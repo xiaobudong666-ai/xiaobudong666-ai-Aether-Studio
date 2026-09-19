@@ -1308,3 +1308,70 @@ def test_im17_48_static_scope_has_no_dependency_pin_or_public_provider_egress():
     api_source = (root / "apps/api/app/main.py").read_text()
     assert "MONEYPRINTER_API_URL" not in api_source
     assert "MoneyPrinterTurboAdapter" not in api_source
+
+
+def test_p0_runtime_bridge_requires_rights_and_explicit_action(generation_context):
+    client, _, _, _ = generation_context
+    project = create_project(client, "P0 bridge rights")
+    task = ingest_success(client, project, key="p0-bridge-rights")
+    current = client.get(f"/projects/{project['id']}").json()
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task['taskId']}/apply-talking-head-draft",
+        json={"expectedRevision": current["revision"], "aspect": "9:16", "subtitles": []},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "RIGHTS_MISSING"
+    unchanged = client.get(f"/projects/{project['id']}").json()
+    assert unchanged["revision"] == current["revision"]
+    assert unchanged["timeline"]["tracks"] == []
+
+
+def test_p0_runtime_bridge_explicitly_writes_vertical_draft_without_render(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "P0 bridge apply")
+    task = ingest_success(client, project, key="p0-bridge-apply")
+    result = task["results"][0]
+    rights = client.post(
+        f"/projects/{project['id']}/asset-versions/{result['assetVersionId']}/rights-snapshots",
+        json={
+            "status": "ALLOWED",
+            "purpose": "EXPORT",
+            "territory": "GLOBAL",
+            "evidenceRef": "evidence://p0-runtime-bridge",
+        },
+    )
+    assert rights.status_code == 201
+    current = client.get(f"/projects/{project['id']}").json()
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task['taskId']}/apply-talking-head-draft",
+        json={
+            "expectedRevision": current["revision"],
+            "aspect": "9:16",
+            "subtitles": [{"text": "口播测试", "startMs": 0, "durationMs": 1000}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["revision"] == current["revision"] + 1
+    assert saved["timeline"]["output"] == {"aspect": "9:16", "width": 1080, "height": 1920}
+    assert [track["type"] for track in saved["timeline"]["tracks"]] == ["video", "subtitle"]
+    with sessions() as db:
+        assert db.execute(select(func.count(DBCandidate.id))).scalar_one() == 0
+
+
+def test_p0_runtime_bridge_revision_conflict_is_fail_closed(generation_context):
+    client, _, _, _ = generation_context
+    project = create_project(client, "P0 bridge revision")
+    task = ingest_success(client, project, key="p0-bridge-revision")
+    result = task["results"][0]
+    assert client.post(
+        f"/projects/{project['id']}/asset-versions/{result['assetVersionId']}/rights-snapshots",
+        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL"},
+    ).status_code == 201
+    current = client.get(f"/projects/{project['id']}").json()
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task['taskId']}/apply-talking-head-draft",
+        json={"expectedRevision": current["revision"] - 1, "aspect": "9:16", "subtitles": []},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
