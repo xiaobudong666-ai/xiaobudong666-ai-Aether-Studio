@@ -60,6 +60,9 @@ def build_talking_head_timeline(
             "start": _rt(0),
             "duration": duration,
             "sourceIn": _rt(0),
+            # When an explicit narration track exists it is authoritative. Mute any
+            # embedded source audio to prevent double-mix/echo in Canonical Render.
+            "volume": 0.0 if audio_material_id is not None else 1.0,
             "x": 0,
             "y": 0,
             "width": width,
