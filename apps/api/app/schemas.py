@@ -114,6 +114,23 @@ class GenerationTaskRequest(BaseModel):
         return value
 
 
+class TalkingHeadSubtitleCueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=2_000)
+    startMs: int = Field(..., ge=0)
+    durationMs: int = Field(..., gt=0)
+
+
+class ApplyTalkingHeadDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expectedRevision: int = Field(..., ge=0)
+    aspect: Literal["16:9", "9:16", "1:1"] = "9:16"
+    audioAssetVersionId: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    subtitles: List[TalkingHeadSubtitleCueRequest] = Field(default_factory=list, max_length=500)
+
+
 class GenerationWorkerHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
