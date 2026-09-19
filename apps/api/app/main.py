@@ -89,6 +89,7 @@ from .generation_tasks import (
 )
 from .schemas import (
     AdoptCandidateRequest,
+    ApplyTalkingHeadDraftRequest,
     CreateProjectRequest,
     CreateRightsSnapshotRequest,
     CreateUserRequest,
@@ -108,6 +109,7 @@ from .task_status import (
     database_status_values,
     legacy_task_status,
 )
+from .talking_head_planner import SubtitleCue, build_talking_head_timeline
 from .timeline_render import build_render_payload
 from .video_use_adapter import VideoUseAdapter, VideoUseError
 
@@ -1333,6 +1335,108 @@ def create_app(
         return generation_task_response(
             db, task, rights=generation_rights(db, task), include_history=True
         )
+
+
+    @created_app.post(
+        "/projects/{project_id}/generation-tasks/{task_id}/apply-talking-head-draft",
+        response_model=ProjectResponse,
+    )
+    def apply_talking_head_draft(
+        project_id: str,
+        task_id: str,
+        req: ApplyTalkingHeadDraftRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        """Explicitly apply one rights-cleared generation result to the project draft timeline."""
+        require_roles(context, "owner", "editor")
+        project = project_for_tenant(db, project_id, context)
+        if project.revision != req.expectedRevision:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "CONCURRENCY_CONFLICT", "message": "项目版本冲突，请重新载入后再应用口播草稿"},
+            )
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        task_rights = generation_rights(db, task)
+        if not task_rights.get("allowed"):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": task_rights.get("code", "RIGHTS_MISSING"), "message": "生成结果权利检查未通过"},
+            )
+        if not task.asset_version_id:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_RESULT_MISSING", "message": "生成任务尚无可应用结果"},
+            )
+        video_asset = db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.id == task.asset_version_id,
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == context.tenant_id,
+            )
+        ).scalar_one_or_none()
+        if video_asset is None or video_asset.media_type != "video":
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "TALKING_HEAD_VIDEO_REQUIRED", "message": "口播草稿需要视频生成结果"},
+            )
+        probe = video_asset.probe_json or {}
+        duration_seconds = float(probe.get("durationSeconds") or 0)
+        if duration_seconds <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "TALKING_HEAD_DURATION_REQUIRED", "message": "生成结果缺少有效时长"},
+            )
+
+        audio_media_id = None
+        if req.audioAssetVersionId:
+            audio_asset = db.execute(
+                select(DBAssetVersion).where(
+                    DBAssetVersion.id == req.audioAssetVersionId,
+                    DBAssetVersion.project_id == project_id,
+                    DBAssetVersion.tenant_id == context.tenant_id,
+                )
+            ).scalar_one_or_none()
+            if audio_asset is None or audio_asset.media_type != "audio":
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "TALKING_HEAD_AUDIO_INVALID", "message": "独立旁白素材无效"},
+                )
+            audio_rights = rights_decision(
+                latest_rights_snapshot(db, audio_asset.id, "EXPORT"),
+                utc_now(),
+            )
+            if not audio_rights.get("allowed"):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": audio_rights.get("code", "RIGHTS_MISSING"), "message": "独立旁白权利检查未通过"},
+                )
+            audio_media_id = audio_asset.media_id
+
+        request_json = task.request_json or {}
+        requested_aspect = str(request_json.get("videoAspect") or req.aspect)
+        if requested_aspect != req.aspect:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "TALKING_HEAD_ASPECT_MISMATCH", "message": "口播草稿比例与生成请求不一致"},
+            )
+        timeline = build_talking_head_timeline(
+            video_material_id=video_asset.media_id,
+            audio_material_id=audio_media_id,
+            duration_ms=max(1, round(duration_seconds * 1000)),
+            aspect=req.aspect,
+            subtitles=tuple(
+                SubtitleCue(cue.text, cue.startMs, cue.durationMs)
+                for cue in req.subtitles
+            ),
+        )
+        updated = apply_project_update(
+            db,
+            project_id,
+            UpdateProjectRequest(timeline=timeline, expectedRevision=req.expectedRevision),
+            tenant_id=context.tenant_id,
+        )
+        return project_response(updated)
 
     @created_app.post("/projects/{project_id}/generation-tasks/{task_id}/cancel")
     def cancel_generation_task(
