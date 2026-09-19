@@ -808,6 +808,10 @@ export default function App() {
         actorId={authUser.id}
         project={currentProject}
         assetVersions={assetVersions}
+        onProjectUpdated={(project) => {
+          setCurrentProject(project);
+          setProjects((previous) => previous.map((candidate) => candidate.id === project.id ? project : candidate));
+        }}
       />
 
       <QuickCreatePanel
