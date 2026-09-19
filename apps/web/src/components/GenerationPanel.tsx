@@ -182,7 +182,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     try {
       const updated = await api.applyTalkingHeadDraft(project.id, task.taskId, {
         expectedRevision: project.revision,
-        aspect,
+        aspect: task.requestSummary?.videoAspect || aspect,
         subtitles: [],
       });
       onProjectUpdated?.(updated);
