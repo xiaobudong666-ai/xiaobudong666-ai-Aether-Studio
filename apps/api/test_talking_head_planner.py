@@ -9,6 +9,18 @@ def test_p0_talking_head_defaults_to_vertical_output():
     )
     assert timeline["output"] == {"aspect": "9:16", "width": 1080, "height": 1920}
     assert [track["type"] for track in timeline["tracks"]] == ["video", "audio"]
+    assert timeline["tracks"][0]["clips"][0]["volume"] == 0.0
+    assert timeline["tracks"][1]["clips"][0]["volume"] == 1.0
+
+
+def test_p0_talking_head_preserves_embedded_audio_without_separate_narration():
+    timeline = build_talking_head_timeline(
+        video_material_id="video-1",
+        audio_material_id=None,
+        duration_ms=5_000,
+    )
+    assert [track["type"] for track in timeline["tracks"]] == ["video"]
+    assert timeline["tracks"][0]["clips"][0]["volume"] == 1.0
 
 
 def test_p0_talking_head_adds_subtitle_track_without_material_dependency():
