@@ -40,6 +40,12 @@ HEYGEN_API_KEY_ENV_VAR = "HEYGEN_API_KEY"
 HEYGEN_API_ORIGIN = ("https", "api.heygen.com", None)
 HEYGEN_AVATAR_VIDEO_PATH = "/v3/videos"
 
+# Artifact/media origin is intentionally decoupled from the API control-plane
+# origin.  HeyGen's completed-job ``video_url`` points at its media CDN, so the
+# downloadable artifact origin must be independently pinned and fail-closed.
+HEYGEN_MEDIA_ORIGIN = ("https", "cdn.heygen.com", None)
+HEYGEN_ARTIFACT_ORIGINS = (HEYGEN_MEDIA_ORIGIN,)
+
 # Official heygen-stack API reference (Avatar Video direct-control path).
 HEYGEN_COST_PER_SECOND_USD = 0.10
 HEYGEN_DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -208,6 +214,7 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
         cost_ceiling_usd: float = 1.00,
         cost_per_second_usd: float = HEYGEN_COST_PER_SECOND_USD,
         max_artifact_bytes: int | None = None,
+        artifact_origins: tuple[tuple[str, str, int | None], ...] | None = None,
     ):
         self.enabled = enabled
         self.timeout = float(
@@ -220,6 +227,26 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
         self.max_artifact_bytes = int(
             max_artifact_bytes if max_artifact_bytes is not None else HEYGEN_MAX_ARTIFACT_BYTES
         )
+
+        raw_artifact_origins = (
+            tuple(artifact_origins)
+            if artifact_origins is not None
+            else HEYGEN_ARTIFACT_ORIGINS
+        )
+        if not raw_artifact_origins:
+            raise ValueError("artifact origins must not be empty")
+        normalized_artifact_origins: list[tuple[str, str, int | None]] = []
+        for artifact_origin in raw_artifact_origins:
+            try:
+                scheme, hostname, port = artifact_origin
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "artifact origin must be a (scheme, host, port) tuple"
+                ) from exc
+            if scheme not in {"http", "https"} or not hostname:
+                raise ValueError("artifact origin is invalid")
+            normalized_artifact_origins.append((scheme, hostname.lower(), port))
+        self._artifact_origins = tuple(normalized_artifact_origins)
 
         parsed = urlsplit(api_url)
         if (
@@ -484,7 +511,6 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
                 "Artifact identifier is unknown", code="ARTIFACT_ID_UNKNOWN"
             )
         url = self._validated_artifact_url(source)
-        self._assert_identity(url)
         output = tempfile.SpooledTemporaryFile(
             max_size=min(self.max_artifact_bytes, 8 * 1024 * 1024)
         )
@@ -563,7 +589,7 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
             parsed.scheme not in {"http", "https"}
             or parsed.username is not None
             or parsed.password is not None
-            or (parsed.scheme, parsed.hostname, parsed.port) != HEYGEN_API_ORIGIN
+            or (parsed.scheme, parsed.hostname, parsed.port) not in self._artifact_origins
         ):
             raise TalkingHeadArtifactError(
                 "Artifact origin rejected", code="ARTIFACT_ORIGIN_REJECTED"

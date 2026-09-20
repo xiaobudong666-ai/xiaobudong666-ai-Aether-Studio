@@ -18,6 +18,8 @@ from app.talking_head_provider_adapter import (
     ADAPTER_VERSION,
     HEYGEN_API_KEY_ENV_VAR,
     HEYGEN_API_ORIGIN,
+    HEYGEN_ARTIFACT_ORIGINS,
+    HEYGEN_MEDIA_ORIGIN,
     HeyGenTalkingHeadAdapter,
     TalkingHeadAmbiguousSubmissionError,
     TalkingHeadArtifactError,
@@ -51,7 +53,7 @@ def valid_spec(**overrides):
     return TalkingHeadJobSpec(**values)
 
 
-def completed_payload(video_id="video-1", video_url="https://api.heygen.com/v3/videos/video-1/download"):
+def completed_payload(video_id="video-1", video_url="https://cdn.heygen.com/videos/video-1.mp4"):
     return {"data": {"video_id": video_id, "status": "completed", "video_url": video_url, "duration": 10}}
 
 
@@ -154,7 +156,7 @@ def test_status_completed_yields_single_artifact_reference():
     assert status["job_id"] == "video-1"
     assert status["status"] == "completed"
     assert status["providerArtifactId"] == "video-1"
-    assert adapter._artifact_urls["video-1"] == "https://api.heygen.com/v3/videos/video-1/download"  # noqa: SLF001
+    assert adapter._artifact_urls["video-1"] == "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
 
 
 def test_status_unknown_stays_unknown_and_failed_is_not_retryable():
@@ -183,7 +185,7 @@ def test_artifact_returns_binary_stream_not_publishable_url():
         )
 
     adapter = adapter_with(handler)
-    adapter._artifact_urls["video-1"] = "https://api.heygen.com/v3/videos/video-1/download"  # noqa: SLF001
+    adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
     stream = adapter.artifact("video-1")
     assert not isinstance(stream, str)
     assert stream.read() == b"\x00\x00\x00\x18ftypmp42fake-mp4-bytes"
@@ -198,7 +200,7 @@ def test_artifact_rejects_non_mp4_and_wrong_origin():
             request=request,
         )
     )
-    adapter._artifact_urls["video-1"] = "https://api.heygen.com/v3/videos/video-1/download"  # noqa: SLF001
+    adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
     with pytest.raises(TalkingHeadArtifactError) as err:
         adapter.artifact("video-1")
     assert err.value.code == "ARTIFACT_CONTENT_TYPE_INVALID"
@@ -206,7 +208,54 @@ def test_artifact_rejects_non_mp4_and_wrong_origin():
     with pytest.raises(TalkingHeadArtifactError):
         adapter._validated_artifact_url("https://evil.example/video.mp4")  # noqa: SLF001
     with pytest.raises(TalkingHeadArtifactError):
-        adapter._validated_artifact_url("https://api.heygen.com/video.mp4?token=secret")  # noqa: SLF001
+        adapter._validated_artifact_url("https://cdn.heygen.com/video.mp4?token=secret")  # noqa: SLF001
+
+
+def test_artifact_accepts_approved_media_origin():
+    # Control-plane and media origins are intentionally decoupled.
+    assert HEYGEN_API_ORIGIN != HEYGEN_MEDIA_ORIGIN
+    assert HEYGEN_MEDIA_ORIGIN == ("https", "cdn.heygen.com", None)
+    assert HEYGEN_ARTIFACT_ORIGINS == (HEYGEN_MEDIA_ORIGIN,)
+
+    adapter = adapter_with(lambda request: httpx.Response(200, request=request))
+    approved = "https://cdn.heygen.com/videos/video-1.mp4"
+    assert adapter._validated_artifact_url(approved) == approved  # noqa: SLF001
+
+    def handler(request):
+        assert str(request.url) == approved
+        return httpx.Response(
+            200,
+            content=b"\x00\x00\x00\x18ftypmp42fake-mp4-bytes",
+            headers={"content-type": "video/mp4", "content-length": "28"},
+            request=request,
+        )
+
+    adapter = adapter_with(handler)
+    adapter._artifact_urls["video-1"] = approved  # noqa: SLF001
+    assert adapter.artifact("video-1").read() == b"\x00\x00\x00\x18ftypmp42fake-mp4-bytes"
+
+
+def test_artifact_rejects_unknown_origin():
+    adapter = adapter_with(lambda request: httpx.Response(200, request=request))
+    with pytest.raises(TalkingHeadArtifactError) as err:
+        adapter._validated_artifact_url("https://evil.example/video.mp4")  # noqa: SLF001
+    assert err.value.code == "ARTIFACT_ORIGIN_REJECTED"
+    with pytest.raises(TalkingHeadArtifactError) as err:
+        adapter._validated_artifact_url("https://api.heygen.com/videos/video-1.mp4")  # noqa: SLF001
+    assert err.value.code == "ARTIFACT_ORIGIN_REJECTED"
+
+
+def test_artifact_rejects_redirect_from_approved_media_origin():
+    def handler(request):
+        return httpx.Response(
+            302, headers={"location": "https://cdn.heygen.com/other.mp4"}, request=request
+        )
+
+    adapter = adapter_with(handler)
+    adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
+    with pytest.raises(TalkingHeadArtifactError) as err:
+        adapter.artifact("video-1")
+    assert err.value.code == "ARTIFACT_REDIRECT_REJECTED"
 
 
 def test_artifact_rejects_redirect_and_missing_source():
@@ -215,7 +264,7 @@ def test_artifact_rejects_redirect_and_missing_source():
             302, headers={"location": "https://evil.example/a.mp4"}, request=request
         )
     )
-    adapter._artifact_urls["video-1"] = "https://api.heygen.com/v3/videos/video-1/download"  # noqa: SLF001
+    adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
     with pytest.raises(TalkingHeadArtifactError) as err:
         adapter.artifact("video-1")
     assert err.value.code == "ARTIFACT_REDIRECT_REJECTED"
