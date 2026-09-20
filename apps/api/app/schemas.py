@@ -135,6 +135,23 @@ class ApplyTalkingHeadDraftRequest(BaseModel):
     )
 
 
+class DetectionEvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    timelineVersion: int = Field(..., ge=0)
+    previewEvidenceRef: str = Field(..., min_length=1, max_length=512)
+    finalEvidenceRef: str = Field(..., min_length=1, max_length=512)
+    mediaProbe: dict
+    talkingHeadMetrics: dict = Field(default_factory=dict)
+    mediaIds: List[str] = Field(default_factory=list, max_length=128)
+    rightsEvidence: List[dict] = Field(default_factory=list, max_length=128)
+    rulePack: dict
+    ruleContent: dict = Field(default_factory=dict)
+    sourceDigest: str = Field(..., min_length=1, max_length=256)
+    captionDigest: str = Field(..., min_length=1, max_length=256)
+    audioDigest: str = Field(..., min_length=1, max_length=256)
+
+
 class GenerationWorkerHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
