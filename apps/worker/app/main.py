@@ -20,6 +20,13 @@ from .moneyprinter_adapter import (
     MoneyPrinterTurboAdapter,
 )
 from .recovery import TaskRecoveryManager
+from .talking_head_provider_adapter import (
+    HeyGenTalkingHeadAdapter,
+    TalkingHeadAmbiguousSubmissionError,
+    TalkingHeadJobSpec,
+    TalkingHeadProviderAdapter,
+    TalkingHeadProviderError,
+)
 from .task_queue import TaskQueueClient, TaskQueueError
 from .video_use_adapter import VideoUseAdapter
 
@@ -82,6 +89,7 @@ class WorkerComponents:
     video_use: VideoUseAdapter
     queue: TaskQueueClient | None = None
     generation_queue: GenerationQueueClient | None = None
+    talking_head: object | None = None
 
 
 class DisabledMoneyPrinterAdapter:
@@ -140,6 +148,10 @@ def initialize_worker() -> WorkerComponents:
         moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=False)
     else:
         moneyprinter_adapter = DisabledMoneyPrinterAdapter()
+    # Talking-head Provider is wired but stays default-off.  It performs no
+    # network I/O and never reads HEYGEN_API_KEY; enabling is a future canary
+    # gate and is intentionally not reachable through this initialization path.
+    talking_head_adapter: object = HeyGenTalkingHeadAdapter()
     return WorkerComponents(
         ffmpeg=FFmpegAdapter(),
         ai=AIProviderInterface(),
@@ -148,6 +160,7 @@ def initialize_worker() -> WorkerComponents:
         video_use=VideoUseAdapter(),
         queue=queue,
         generation_queue=generation_queue,
+        talking_head=talking_head_adapter,
     )
 
 
@@ -242,6 +255,8 @@ def process_generation_task(
         raise GenerationQueueError("Generation queue is not configured")
     task_id = str(task["taskId"])
     provider_mode = task.get("providerMode")
+    if provider_mode == "talking-head":
+        return _process_talking_head_generation_task(components, task, poll_interval)
     if provider_mode == "moneyprinter":
         proof = task.get("workerProof") or {}
         provider_policy = task.get("providerPolicy") or {}
@@ -424,6 +439,213 @@ def process_generation_task(
                 upstream_job_id=upstream_job_id,
                 error_code="WORKER_TRANSIENT_FAILURE", error_message="Worker transient failure",
                 retryable=True,
+            )
+        except GenerationQueueError as exc:
+            return queue_rejection_result(exc)
+
+
+def _build_talking_head_job_spec(request: dict) -> TalkingHeadJobSpec:
+    """Map a talking-head generation request dict to the vendor-neutral job spec.
+
+    Field names follow the existing generation-request camelCase convention so
+    this wiring stays forward-compatible with a future API contract.  The spec
+    itself enforces 9:16 / <=10s / single visual source / voice-vs-audio.
+    """
+    try:
+        spec = TalkingHeadJobSpec(
+            text=str(request.get("text") or ""),
+            duration_seconds=int(request.get("durationSeconds") or 0),
+            aspect_ratio=str(request.get("aspectRatio") or "9:16"),
+            resolution=str(request.get("resolution") or "1080p"),
+            voice_id=request.get("voiceId"),
+            image_url=request.get("imageUrl"),
+            image_asset_id=request.get("imageAssetId"),
+            avatar_id=request.get("avatarId"),
+            audio_url=request.get("audioUrl"),
+            audio_asset_id=request.get("audioAssetId"),
+            expressiveness=request.get("expressiveness"),
+            remove_background=bool(request.get("removeBackground", False)),
+            background=request.get("background"),
+            voice_settings=request.get("voiceSettings"),
+            motion_prompt=request.get("motionPrompt"),
+        )
+    except (ValueError, TypeError) as exc:
+        raise TalkingHeadProviderError(
+            "Talking-head job spec is invalid", code="JOB_SPEC_INVALID"
+        ) from exc
+    spec.validate()
+    return spec
+
+
+def _process_talking_head_generation_task(
+    components: WorkerComponents,
+    task: dict,
+    poll_interval: float = 0.5,
+) -> dict:
+    """Governed talking-head path: 1 submission / 1 attempt / 0 retry / 0 fallback.
+
+    A completed artifact is streamed back through ``artifact_intake`` so it
+    re-enters Aether Asset / Rights / Timeline / Render / Detection governance
+    and never becomes a publishable asset by itself.
+    """
+    queue = components.generation_queue
+    if queue is None:
+        raise GenerationQueueError("Generation queue is not configured")
+    task_id = str(task["taskId"])
+    upstream_job_id = task.get("upstreamJobId")
+    adapter = components.talking_head
+    if not isinstance(adapter, TalkingHeadProviderAdapter) or not getattr(adapter, "enabled", False):
+        return queue.transition(
+            task_id, status="FAILED", progress=0,
+            message="口播生成 Provider 未启用",
+            error_code="PROVIDER_DISABLED", error_message="Talking-head Provider disabled",
+            retryable=False,
+        )
+
+    def queue_rejection_result(exc: GenerationQueueError) -> dict:
+        code = exc.code or "GENERATION_QUEUE_UNAVAILABLE"
+        logger.warning(
+            "Governed talking-head task %s stopped after queue rejection: %s",
+            task_id,
+            code,
+        )
+        return {
+            "taskId": task_id,
+            "status": "CANCELED" if code == "TASK_CANCELED" else "UNKNOWN",
+            "errorCode": code,
+        }
+
+    try:
+        request = task.get("request") or {}
+        try:
+            job_spec = _build_talking_head_job_spec(request)
+        except TalkingHeadProviderError as exc:
+            return queue.transition(
+                task_id, status="FAILED", progress=0,
+                message="口播任务参数无效",
+                error_code=exc.code or "JOB_SPEC_INVALID",
+                error_message="Talking-head job spec invalid",
+                retryable=False,
+            )
+
+        if not upstream_job_id:
+            try:
+                upstream_job_id = adapter.submit(job_spec)
+            except TalkingHeadAmbiguousSubmissionError:
+                return queue.transition(
+                    task_id, status="UNKNOWN", progress=0,
+                    message="口播提交结果不明确，已停止自动重投",
+                    error_code="AMBIGUOUS_SUBMISSION",
+                    error_message="Talking-head submission outcome unknown",
+                    retryable=False,
+                )
+            except TalkingHeadProviderError as exc:
+                return queue.transition(
+                    task_id, status="FAILED", progress=0,
+                    message="口播 Provider 拒绝生成请求",
+                    error_code=exc.code or "PROVIDER_SUBMIT_FAILED",
+                    error_message="Talking-head submission failed",
+                    retryable=False,
+                )
+            queue.transition(
+                task_id, status="RUNNING", progress=5,
+                message="口播生成任务已提交至受治理 Provider",
+                upstream_job_id=upstream_job_id,
+            )
+
+        deadline = time.monotonic() + float(
+            os.environ.get("AETHER_TALKING_HEAD_TIMEOUT_SECONDS", "3600")
+        )
+        while time.monotonic() < deadline:
+            queue.heartbeat(task_id)
+            try:
+                upstream = adapter.status(upstream_job_id)
+            except TalkingHeadProviderError as exc:
+                return queue.transition(
+                    task_id, status="FAILED", progress=95,
+                    message="口播状态查询失败，已停止自动重试",
+                    upstream_job_id=upstream_job_id,
+                    error_code=exc.code or "PROVIDER_STATUS_FAILED",
+                    error_message="Talking-head status query failed",
+                    retryable=False,
+                )
+            status = str(upstream.get("status", "unknown")).lower()
+            progress = max(5, min(95, int(upstream.get("progress", 50))))
+            if status == "completed":
+                provider_artifact_id = str(upstream.get("providerArtifactId") or "")
+                if not provider_artifact_id:
+                    return queue.transition(
+                        task_id, status="FAILED", progress=progress,
+                        message="Provider 未返回受信任产物编号",
+                        upstream_job_id=upstream_job_id,
+                        error_code="ARTIFACT_ID_MISSING",
+                        error_message="Artifact identifier missing",
+                        retryable=False,
+                    )
+                queue.transition(
+                    task_id, status="INGESTING", progress=95,
+                    message="正在流式接收并校验口播产物",
+                    upstream_job_id=upstream_job_id,
+                    provider_artifact_id=provider_artifact_id,
+                )
+                try:
+                    artifact_stream = adapter.artifact(upstream_job_id)
+                except TalkingHeadProviderError as exc:
+                    return queue.transition(
+                        task_id, status="FAILED", progress=95,
+                        message="Provider 产物未通过受限流校验",
+                        upstream_job_id=upstream_job_id,
+                        error_code=exc.code or "ARTIFACT_STREAM_FAILED",
+                        error_message="Artifact stream validation failed",
+                        retryable=False,
+                    )
+                if isinstance(artifact_stream, bytes):
+                    artifact_stream = io.BytesIO(artifact_stream)
+                return queue.artifact_intake(task_id, provider_artifact_id, artifact_stream)
+            if status == "failed":
+                return queue.transition(
+                    task_id, status="FAILED", progress=progress,
+                    message="口播 Provider 报告生成失败",
+                    upstream_job_id=upstream_job_id,
+                    error_code=str(upstream.get("errorCode") or "PROVIDER_FAILED"),
+                    error_message=str(upstream.get("message") or "Talking-head Provider failed"),
+                    retryable=False,
+                )
+            if status == "unknown":
+                return queue.transition(
+                    task_id, status="UNKNOWN", progress=progress,
+                    message="口播 Provider 返回未知状态，已停止自动动作",
+                    upstream_job_id=upstream_job_id,
+                    error_code="PROVIDER_STATUS_UNKNOWN",
+                    error_message="Talking-head Provider status unknown",
+                    retryable=False,
+                )
+            queue.transition(
+                task_id, status="RUNNING", progress=progress,
+                message="受治理口播 Provider 正在生成",
+                upstream_job_id=upstream_job_id,
+            )
+            time.sleep(poll_interval)
+        return queue.transition(
+            task_id, status="UNKNOWN", progress=95,
+            message="口播状态查询超时，已停止自动重投",
+            upstream_job_id=upstream_job_id,
+            error_code="STATUS_TIMEOUT",
+            error_message="Talking-head generation status timed out",
+            retryable=False,
+        )
+    except GenerationQueueError as exc:
+        return queue_rejection_result(exc)
+    except Exception:
+        logger.exception("Governed talking-head generation task %s failed", task_id)
+        try:
+            return queue.transition(
+                task_id, status="FAILED", progress=0,
+                message="口播 Worker 发生可恢复错误",
+                upstream_job_id=upstream_job_id,
+                error_code="WORKER_TRANSIENT_FAILURE",
+                error_message="Talking-head Worker transient failure",
+                retryable=False,
             )
         except GenerationQueueError as exc:
             return queue_rejection_result(exc)
