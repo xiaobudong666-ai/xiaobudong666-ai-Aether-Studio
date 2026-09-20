@@ -103,6 +103,40 @@ def normalize_rights_evidence(*, media_ids: Sequence[str], rights: Sequence[Mapp
     }
 
 
+def _normalize_render_parity_final(
+    parity_base: Mapping[str, Any],
+    final_evidence_ref: str,
+    render_parity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Normalize caller-supplied parity evidence only.
+
+    Missing evidence must never look like PASS. Only an explicit, caller-provided
+    detector/validator result (structural_match=True plus a passing perceptual
+    result) may produce PASS-shaped parity evidence.
+    """
+    final: dict[str, Any] = {
+        **parity_base,
+        "evidence_ref": final_evidence_ref,
+        "threshold_set_version": PARITY_POLICY_VERSION,
+    }
+    structural = render_parity.get("structural_match") if render_parity else None
+    perceptual = render_parity.get("perceptual_result") if render_parity else None
+
+    if structural is True and perceptual in ("pass", "encoding_only_variance"):
+        final["structural_match"] = True
+        final["perceptual_result"] = perceptual
+        return final
+
+    # Fail-closed: missing, ambiguous, or failing evidence is never PASS-shaped.
+    final["structural_match"] = True if structural is True else None
+    final["perceptual_result"] = (
+        perceptual
+        if perceptual not in (None, "pass", "encoding_only_variance")
+        else "review_required"
+    )
+    return final
+
+
 def build_release_evidence(
     *,
     timeline_version: int,
@@ -117,8 +151,13 @@ def build_release_evidence(
     source_digest: str,
     caption_digest: str,
     audio_digest: str,
+    render_parity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build machine evidence only. Human releaseDecision is intentionally absent."""
+    """Build machine evidence only. Human releaseDecision is intentionally absent.
+
+    Preview/Final parity evidence is never invented here: only caller-supplied
+    detector/validator parity evidence is normalized into the final parity shape.
+    """
     timeline_digest = _digest(timeline)
     quality = media_quality_findings(media_probe) + talking_head_quality_findings(talking_head_metrics)
     parity_base = {
@@ -131,13 +170,9 @@ def build_release_evidence(
     return {
         "qualityFindings": quality,
         "renderParityPreview": {**parity_base, "evidence_ref": preview_evidence_ref},
-        "renderParityFinal": {
-            **parity_base,
-            "evidence_ref": final_evidence_ref,
-            "threshold_set_version": PARITY_POLICY_VERSION,
-            "structural_match": True,
-            "perceptual_result": "pass" if all(item["state"] == "PASS" for item in quality) else "review_required",
-        },
+        "renderParityFinal": _normalize_render_parity_final(
+            parity_base, final_evidence_ref, render_parity
+        ),
         "renderParityPolicyVersion": PARITY_POLICY_VERSION,
         "rulePack": dict(rule_pack),
         "ruleContent": dict(rule_content),

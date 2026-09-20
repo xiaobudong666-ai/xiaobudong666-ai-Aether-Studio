@@ -1380,6 +1380,7 @@ def create_app(
             source_digest=req.sourceDigest,
             caption_digest=req.captionDigest,
             audio_digest=req.audioDigest,
+            render_parity=req.renderParity,
         )
 
     @created_app.post(

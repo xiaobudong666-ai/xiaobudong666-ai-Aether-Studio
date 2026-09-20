@@ -150,6 +150,10 @@ class DetectionEvidenceRequest(BaseModel):
     sourceDigest: str = Field(..., min_length=1, max_length=256)
     captionDigest: str = Field(..., min_length=1, max_length=256)
     audioDigest: str = Field(..., min_length=1, max_length=256)
+    renderParity: Optional[dict] = Field(
+        default=None,
+        description="Caller-supplied detector/validator parity result (structural_match + perceptual_result)",
+    )
 
 
 class GenerationWorkerHeartbeatRequest(BaseModel):

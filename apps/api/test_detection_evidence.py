@@ -2,11 +2,13 @@ from test_runtime_gates import governed_generation_context
 from test_generation_tasks import create_project as create_generation_project
 
 from app.detection_evidence import (
+    PARITY_POLICY_VERSION,
     build_release_evidence,
     media_quality_findings,
     normalize_rights_evidence,
     talking_head_quality_findings,
 )
+from app.render_parity_contract import evaluate_render_parity
 
 
 def _probe(**overrides):
@@ -17,6 +19,36 @@ def _probe(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def _build(**overrides):
+    kwargs = dict(
+        timeline_version=4,
+        timeline={"version": "1.1", "tracks": []},
+        preview_evidence_ref="preview://1",
+        final_evidence_ref="final://1",
+        media_probe=_probe(),
+        talking_head_metrics={
+            "faceStable": True, "lipSyncPass": True, "deformationPass": True,
+            "motionStable": True, "avDurationAligned": True,
+        },
+        rights_evidence={"mediaIds": ["m1"], "purpose": "EXPORT", "status": "ALLOWED"},
+        rule_pack={"verification_status": "verified"},
+        rule_content={"ai_generated_or_synthetic": True},
+        source_digest="source",
+        caption_digest="caption",
+        audio_digest="audio",
+    )
+    kwargs.update(overrides)
+    return build_release_evidence(**kwargs)
+
+
+def _parity_is_pass(evidence):
+    return evaluate_render_parity(
+        evidence["renderParityPreview"],
+        evidence["renderParityFinal"],
+        approved_threshold_version=PARITY_POLICY_VERSION,
+    ).valid
 
 
 def test_media_quality_passes_bounded_vertical_artifact():
@@ -51,42 +83,34 @@ def test_rights_evidence_requires_complete_allowed_export_evidence():
     assert blocked["status"] == "BLOCKED"
 
 
-def test_release_evidence_never_auto_approves_human_release():
-    evidence = build_release_evidence(
-        timeline_version=4,
-        timeline={"version": "1.1", "tracks": []},
-        preview_evidence_ref="preview://1",
-        final_evidence_ref="final://1",
-        media_probe=_probe(),
-        talking_head_metrics={
-            "faceStable": True, "lipSyncPass": True, "deformationPass": True,
-            "motionStable": True, "avDurationAligned": True,
-        },
-        rights_evidence={"mediaIds": ["m1"], "purpose": "EXPORT", "status": "ALLOWED"},
-        rule_pack={"verification_status": "verified"},
-        rule_content={"ai_generated_or_synthetic": True},
-        source_digest="source",
-        caption_digest="caption",
-        audio_digest="audio",
-    )
-    assert evidence["releaseDecision"] is None
-    assert evidence["renderParityFinal"]["perceptual_result"] == "pass"
-    assert evidence["rightsEvidenceDigest"]
-    assert evidence["timelineDigest"]
+def test_missing_parity_evidence_never_passes():
+    evidence = _build()
+    final = evidence["renderParityFinal"]
+    assert final["structural_match"] is not True
+    assert final["perceptual_result"] != "pass"
+    assert _parity_is_pass(evidence) is False
 
 
-def test_review_required_quality_prevents_machine_parity_pass():
-    evidence = build_release_evidence(
-        timeline_version=1, timeline={"tracks": []},
-        preview_evidence_ref="preview://1", final_evidence_ref="final://1",
-        media_probe=_probe(subtitleCueCount=0),
-        talking_head_metrics={},
-        rights_evidence={"mediaIds": [], "purpose": "EXPORT", "status": "BLOCKED"},
-        rule_pack={}, rule_content={},
-        source_digest="s", caption_digest="c", audio_digest="a",
-    )
-    assert evidence["renderParityFinal"]["perceptual_result"] == "review_required"
+def test_explicit_failing_parity_fails_closed():
+    evidence = _build(render_parity={"structural_match": False, "perceptual_result": "fail"})
+    final = evidence["renderParityFinal"]
+    assert final["structural_match"] is not True
+    assert final["perceptual_result"] != "pass"
+    assert _parity_is_pass(evidence) is False
+
+
+def test_explicit_valid_parity_enters_pass_evidence():
+    evidence = _build(render_parity={"structural_match": True, "perceptual_result": "pass"})
+    final = evidence["renderParityFinal"]
+    assert final["structural_match"] is True
+    assert final["perceptual_result"] == "pass"
+    assert _parity_is_pass(evidence) is True
+
+
+def test_human_release_decision_never_machine_generated():
+    evidence = _build()
     assert evidence["releaseDecision"] is None
+    assert "releaseDecision" in evidence
 
 
 def test_detection_endpoint_requires_current_revision_and_never_approves(governed_generation_context):
@@ -112,6 +136,10 @@ def test_detection_endpoint_requires_current_revision_and_never_approves(governe
     evidence = response.json()
     assert evidence["releaseDecision"] is None
     assert any(item["state"] == "REVIEW_REQUIRED" for item in evidence["qualityFindings"])
+    # Missing caller-supplied parity evidence must not be reported as PASS.
+    assert evidence["renderParityFinal"]["structural_match"] is not True
+    assert evidence["renderParityFinal"]["perceptual_result"] != "pass"
+
     payload["timelineVersion"] = project["revision"] + 1
     stale = client.post(endpoint, json=payload)
     assert stale.status_code == 409
