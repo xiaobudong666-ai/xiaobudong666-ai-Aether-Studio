@@ -72,7 +72,7 @@ jobs:
       - name: Run API tests
         env:
           PYTHONPATH: apps/api
-        run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py apps/api/test_runtime_gates.py -v
+        run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py apps/api/test_runtime_gates.py apps/api/test_detection_evidence.py -v
 
       - name: Run fake-only private-canary preflight tests
         run: |
