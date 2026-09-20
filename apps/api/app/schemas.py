@@ -129,6 +129,10 @@ class ApplyTalkingHeadDraftRequest(BaseModel):
     aspect: Literal["16:9", "9:16", "1:1"] = "9:16"
     audioAssetVersionId: Optional[str] = Field(default=None, min_length=1, max_length=128)
     subtitles: List[TalkingHeadSubtitleCueRequest] = Field(default_factory=list, max_length=500)
+    timelineReceipt: Optional[dict] = Field(
+        default=None,
+        description="M1-C1 timeline receipt binding the apply to the prior project revision",
+    )
 
 
 class GenerationWorkerHeartbeatRequest(BaseModel):
@@ -258,3 +262,25 @@ class CreateRightsSnapshotRequest(BaseModel):
 class AdoptCandidateRequest(BaseModel):
     reason: str = Field(..., min_length=1, max_length=2_000)
     supersedesId: Optional[str] = Field(default=None, max_length=128)
+    releaseDecision: Optional[dict] = Field(
+        default=None, description="Human release decision with evidence digests"
+    )
+    qualityFindings: Optional[List[dict]] = Field(
+        default=None, description="M1-C1 quality release findings"
+    )
+    renderParityPreview: Optional[dict] = Field(
+        default=None, description="Preview render parity evidence"
+    )
+    renderParityFinal: Optional[dict] = Field(
+        default=None, description="Final render parity evidence"
+    )
+    renderParityPolicyVersion: Optional[str] = Field(
+        default=None, min_length=1, max_length=128,
+        description="Approved render parity threshold set version"
+    )
+    rulePack: Optional[dict] = Field(
+        default=None, description="Verified platform rule pack"
+    )
+    ruleContent: Optional[dict] = Field(
+        default=None, description="Content provenance context for rule evaluation"
+    )

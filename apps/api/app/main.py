@@ -110,6 +110,7 @@ from .task_status import (
     legacy_task_status,
 )
 from .talking_head_planner import SubtitleCue, build_talking_head_timeline
+from .runtime_gates import enforce_release_gates, enforce_timeline_receipt
 from .timeline_render import build_render_payload
 from .video_use_adapter import VideoUseAdapter, VideoUseError
 
@@ -346,6 +347,7 @@ def create_app(
     cookie_secure: bool | None = None,
     enforce_csrf: bool | None = None,
     generation_provider_mode: str | None = None,
+    governance_gates: bool | None = None,
 ) -> FastAPI:
     del render_step_delay  # retained for backwards-compatible test construction
     internal_sessions = sessionmaker(autocommit=False, autoflush=False, bind=app_engine)
@@ -370,6 +372,11 @@ def create_app(
             "disabled", "deterministic-fake", "moneyprinter"
         }:
             resolved_generation_provider_mode = "disabled"
+    resolved_governance_gates = (
+        os.environ.get("AETHER_GOVERNANCE_GATES", "false").lower() == "true"
+        if governance_gates is None
+        else governance_gates
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -394,6 +401,7 @@ def create_app(
     created_app = FastAPI(title="Aether Studio 接口服务", version="1.1.0", lifespan=lifespan)
     created_app.state.video_use = video_use_adapter or VideoUseAdapter()
     created_app.state.generation_provider_mode = resolved_generation_provider_mode
+    created_app.state.governance_gates = resolved_governance_gates
     created_app.state.setup_required = False
 
     origins = [
@@ -1430,6 +1438,11 @@ def create_app(
                 for cue in req.subtitles
             ),
         )
+        if created_app.state.governance_gates:
+            enforce_timeline_receipt(
+                req.timelineReceipt,
+                current_version=project.revision,
+            )
         updated = apply_project_update(
             db,
             project_id,
@@ -2446,7 +2459,7 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_roles(context, "owner", "editor")
-        project_for_tenant(db, project_id, context)
+        project = project_for_tenant(db, project_id, context)
         if idempotency_key is None or not 8 <= len(idempotency_key) <= 128:
             raise HTTPException(
                 status_code=422,
@@ -2551,6 +2564,30 @@ def create_app(
                     "message": "候选采用前的资产权利检查未通过",
                     "failures": rights_failures,
                 },
+            )
+
+        if created_app.state.governance_gates:
+            timeline_digest = sha256_json(project.timeline or {})
+            rights_evidence_digest = sha256_json(
+                {
+                    "mediaIds": sorted(media_ids),
+                    "purpose": "EXPORT",
+                    "status": "ALLOWED",
+                }
+            )
+            enforce_release_gates(
+                release_decision=req.releaseDecision,
+                quality_findings=req.qualityFindings,
+                parity_preview=req.renderParityPreview,
+                parity_final=req.renderParityFinal,
+                parity_policy_version=req.renderParityPolicyVersion,
+                rule_pack=req.rulePack,
+                rule_content=req.ruleContent,
+                timeline_version=project.revision,
+                timeline_digest=timeline_digest,
+                preview_evidence_ref=candidate.artifact_ref,
+                rights_evidence_digest=rights_evidence_digest,
+                evaluation_time=utc_now(),
             )
 
         now = utc_now()
