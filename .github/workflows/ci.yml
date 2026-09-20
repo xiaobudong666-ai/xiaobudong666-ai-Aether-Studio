@@ -72,7 +72,7 @@ jobs:
       - name: Run API tests
         env:
           PYTHONPATH: apps/api
-        run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py -v
+        run: python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py apps/api/test_runtime_gates.py -v
 
       - name: Run fake-only private-canary preflight tests
         run: |
@@ -310,9 +310,10 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_worker.py worker:/tmp/test_worker.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_moneyprinter.py worker:/tmp/test_moneyprinter.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_generation_tasks.py worker:/tmp/test_generation_tasks.py
+          docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_deterministic_fake_adapter.py worker:/tmp/test_deterministic_fake_adapter.py
           docker compose -f infra/docker/docker-compose.yml exec -T \
             -e PYTHONPATH=/app worker \
-            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py -v
+            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py /tmp/test_deterministic_fake_adapter.py -v
 
       - name: Run video-use sidecar tests in FFmpeg container
         run: |
