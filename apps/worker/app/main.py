@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from .ai_provider import AIProviderInterface
 from .ffmpeg_adapter import FFmpegAdapter
 from .generation_queue import GenerationQueueClient, GenerationQueueError
+from .deterministic_fake_adapter import DeterministicFakeAdapter
 from .moneyprinter_adapter import (
     ADAPTER_VERSION,
     UPSTREAM_PIN,
@@ -92,7 +93,9 @@ class DisabledMoneyPrinterAdapter:
 
 def operator_generation_mode() -> str:
     mode = os.environ.get("AETHER_GENERATION_PROVIDER_MODE", "disabled")
-    return mode if mode in {"disabled", "moneyprinter"} else "disabled"
+    if mode in {"disabled", "moneyprinter", "deterministic-fake"}:
+        return mode
+    return "disabled"
 
 
 def canary_runtime_proof() -> tuple[str, str, str]:
@@ -130,7 +133,10 @@ def initialize_worker() -> WorkerComponents:
     queue = TaskQueueClient(backend_url=backend_url)
     generation_queue = GenerationQueueClient(backend_url=backend_url)
     moneyprinter_adapter: object
-    if operator_generation_mode() == "moneyprinter" and canary_runtime_ready():
+    generation_mode = operator_generation_mode()
+    if generation_mode == "deterministic-fake":
+        moneyprinter_adapter = DeterministicFakeAdapter()
+    elif generation_mode == "moneyprinter" and canary_runtime_ready():
         moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=False)
     else:
         moneyprinter_adapter = DisabledMoneyPrinterAdapter()
@@ -428,6 +434,11 @@ def attest_worker_provider(components: WorkerComponents) -> None:
     if queue is None:
         return
     mode = operator_generation_mode()
+    if mode == "deterministic-fake":
+        # Local fake generation is not a Provider and has no attestation
+        # contract; the API's deterministic-fake claim path does not consume
+        # provider attestations, so nothing is published here.
+        return
     now = datetime.datetime.now(datetime.timezone.utc)
     healthy = False
     capabilities: dict = {}
