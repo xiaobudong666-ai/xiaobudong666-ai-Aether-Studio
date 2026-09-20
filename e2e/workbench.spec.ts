@@ -13,15 +13,16 @@ async function signIn(page: import("@playwright/test").Page) {
 test("中文登录、项目创建和兼容文件导出均可操作", async ({ page }, testInfo) => {
   await page.goto("/");
 
-  await expect(page).toHaveTitle(/AI 漫剧视频工作台/);
+  await expect(page).toHaveTitle(/闪电智能新媒体/);
   await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
-  await expect(page.getByRole("heading", { name: "Aether Studio" })).toBeVisible();
-  await expect(page.getByText("登录你的安全漫剧工作区")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "闪电智能新媒体" })).toBeVisible();
+  await expect(page.getByText("登录你的智能新媒体工作区")).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("01-login-desktop.png"), fullPage: true });
 
   await signIn(page);
-  await expect(page.getByText("画面监看 · 480p 代理目标")).toBeVisible();
+  await expect(page.getByText("9:16 竖屏预览 · 480p 代理")).toBeVisible();
   await expect(page.getByText("属性与任务")).toBeVisible();
+  await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByText(/时间线轨道（标准格式 v1\.1）/)).toBeVisible();
   await expect(page.getByText("一键短视频制作", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "快速制作短视频" })).toBeVisible();
@@ -45,7 +46,6 @@ test("中文登录、项目创建和兼容文件导出均可操作", async ({ pa
   await expect(page.getByText("Choose File")).toHaveCount(0);
   await expect(page.getByText("No file chosen")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "提交渲染任务" })).toBeDisabled();
-  await expect(page.getByText("OpenCut 内核 0.2.10")).toBeVisible();
 
   const [openCutDownload] = await Promise.all([
     page.waitForEvent("download"),
@@ -65,7 +65,7 @@ test("中文登录、项目创建和兼容文件导出均可操作", async ({ pa
 test("错误提示、窄屏布局和退出登录可用", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
-  await expect(page.getByText("登录你的安全漫剧工作区")).toBeVisible();
+  await expect(page.getByText("登录你的智能新媒体工作区")).toBeVisible();
 
   await page.getByLabel("邮箱").fill("admin@aether.local");
   await page.getByLabel("密码").fill("wrong-password");
@@ -79,13 +79,13 @@ test("错误提示、窄屏布局和退出登录可用", async ({ page }, testIn
   await expect(page.getByPlaceholder("输入新项目名称")).toBeVisible();
 
   const libraryBox = await page.getByText("素材库", { exact: true }).boundingBox();
-  const canvasBox = await page.getByText("画面监看 · 480p 代理目标", { exact: true }).boundingBox();
   const inspectorBox = await page.getByText("属性与任务", { exact: true }).boundingBox();
-  const timelineBox = await page.getByText("时间线轨道（标准格式 v1.1）", { exact: false }).boundingBox();
-  expect(libraryBox && canvasBox && inspectorBox && timelineBox).toBeTruthy();
-  expect(libraryBox!.y).toBeLessThan(canvasBox!.y);
-  expect(canvasBox!.y).toBeLessThan(inspectorBox!.y);
-  expect(inspectorBox!.y).toBeLessThan(timelineBox!.y);
+  const canvasBox = await page.getByText("9:16 竖屏预览 · 480p 代理", { exact: true }).boundingBox();
+  const advancedBox = await page.getByText("高级编辑", { exact: false }).boundingBox();
+  expect(libraryBox && canvasBox && inspectorBox && advancedBox).toBeTruthy();
+  expect(libraryBox!.y).toBeLessThan(inspectorBox!.y);
+  expect(inspectorBox!.y).toBeLessThan(canvasBox!.y);
+  expect(canvasBox!.y).toBeLessThan(advancedBox!.y);
 
   const hasHorizontalOverflow = await page.evaluate(() => (
     document.documentElement.scrollWidth > document.documentElement.clientWidth
@@ -94,7 +94,7 @@ test("错误提示、窄屏布局和退出登录可用", async ({ page }, testIn
   await page.screenshot({ path: testInfo.outputPath("04-workbench-mobile.png"), fullPage: true });
 
   await page.getByRole("button", { name: "退出登录" }).click();
-  await expect(page.getByText("登录你的安全漫剧工作区")).toBeVisible();
+  await expect(page.getByText("登录你的智能新媒体工作区")).toBeVisible();
   await page.reload();
   await expect(page.getByRole("button", { name: "登录" })).toBeVisible();
 });

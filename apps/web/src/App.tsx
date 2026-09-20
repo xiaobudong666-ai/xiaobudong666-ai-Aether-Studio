@@ -703,15 +703,15 @@ export default function App() {
   ) || currentProject?.materials.find((material) => material.type === "video") || null;
 
   if (authLoading) {
-    return <div className="auth-screen"><div className="auth-card">正在加载 Aether Studio…</div></div>;
+    return <div className="auth-screen"><div className="auth-card">正在加载闪电智能新媒体…</div></div>;
   }
 
   if (!authUser) {
     return (
       <div className="auth-screen">
         <form className="auth-card" onSubmit={handleLogin}>
-          <h1>Aether Studio</h1>
-          <p>登录你的安全漫剧工作区</p>
+          <h1>闪电智能新媒体</h1>
+          <p>登录你的智能新媒体工作区</p>
           <label>邮箱<input aria-label="邮箱" type="email" value={loginEmail} onChange={(event) => setLoginEmail(event.target.value)} required /></label>
           <label>密码<input aria-label="密码" type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} required /></label>
           {loginError && <div className="auth-error" role="alert">{loginError}</div>}
@@ -728,10 +728,8 @@ export default function App() {
       {/* Header */}
       <header className="editor-header">
         <div className="editor-logo">
-          Aether Studio · AI 漫剧工作台
-          <span style={{ fontSize: "12px", color: "#a1a1aa", marginLeft: "8px" }}>
-            OpenCut 内核 0.2.10
-          </span>
+          闪电智能新媒体
+          <span className="editor-logo-subtitle">AI 内容操作系统</span>
         </div>
         <div className="project-select-container">
           <span className="tenant-badge" title={`${roleLabel(authUser.role)} · ${authUser.email}`}>
@@ -795,6 +793,46 @@ export default function App() {
         </div>
       </header>
 
+      <nav className="main-flow-strip" aria-label="主流程">
+        <ol className="main-flow-steps">
+          <li className="main-flow-step">
+            <span className="main-flow-step-index">1</span>
+            <div className="main-flow-step-copy">
+              <strong>输入内容</strong>
+              <span>文案、素材或链接</span>
+            </div>
+          </li>
+          <li className="main-flow-step">
+            <span className="main-flow-step-index">2</span>
+            <div className="main-flow-step-copy">
+              <strong>选择人物和声音</strong>
+              <span>数字人形象与旁白音色</span>
+            </div>
+          </li>
+          <li className="main-flow-step">
+            <span className="main-flow-step-index">3</span>
+            <div className="main-flow-step-copy">
+              <strong>生成视频</strong>
+              <span>9:16 竖屏成片</span>
+            </div>
+          </li>
+        </ol>
+        <div className="main-flow-reserved">
+          <span className="main-flow-reserved-label">即将推出</span>
+          <button type="button" disabled>视频提取</button>
+          <button type="button" disabled>图片提取</button>
+          <button type="button" disabled>链接提取</button>
+          <button type="button" disabled>AI 二创</button>
+          <button type="button" disabled>爆款潜力评分</button>
+        </div>
+      </nav>
+
+      <section className="persona-voice-bar" aria-label="选择人物和声音">
+        <label>人物<select aria-label="选择人物" disabled><option>数字人口播 · 即将接入</option></select></label>
+        <label>声音<select aria-label="选择声音" disabled><option>自然旁白 · 即将接入</option></select></label>
+        <span className="persona-voice-note">真实数字人与声音 Provider 尚未启用，此步骤为 UI 预留。</span>
+      </section>
+
       {actionMessage && (
         <div className="status-banner" role="status" aria-live="polite">
           {actionMessage}
@@ -857,13 +895,6 @@ export default function App() {
           />
         </div>
 
-        <CanvasPreview
-          currentTime={currentTime}
-          onTimeChange={setCurrentTime}
-          timelineDuration={timelineDuration}
-          previewMaterial={previewMaterial}
-        />
-
         <div id="property-inspector-region">
           <PropertyInspector
             selectedClip={selectedClip}
@@ -877,15 +908,27 @@ export default function App() {
             onSessionExpired={expireSession}
           />
         </div>
+
+        <div id="canvas-preview-region">
+          <CanvasPreview
+            currentTime={currentTime}
+            onTimeChange={setCurrentTime}
+            timelineDuration={timelineDuration}
+            previewMaterial={previewMaterial}
+          />
+        </div>
       </main>
 
-      {/* Timeline panel */}
-      <Timeline
-        timeline={currentProject?.timeline || { version: "1.1", tracks: [] }}
-        selectedClipId={selectedClip?.id || null}
-        onSelectClip={setSelectedClip}
-        currentTime={currentTime}
-      />
+      {/* Advanced editing: complex timeline */}
+      <details className="advanced-editing">
+        <summary>高级编辑 · 复杂时间线</summary>
+        <Timeline
+          timeline={currentProject?.timeline || { version: "1.1", tracks: [] }}
+          selectedClipId={selectedClip?.id || null}
+          onSelectClip={setSelectedClip}
+          currentTime={currentTime}
+        />
+      </details>
     </div>
   );
 }

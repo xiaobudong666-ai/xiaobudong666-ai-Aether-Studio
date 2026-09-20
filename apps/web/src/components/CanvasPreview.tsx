@@ -65,9 +65,9 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
 
   return (
     <div className="panel" style={{ flex: 1, height: "100%", background: "#0c0c0e", borderRight: "none" }}>
-      <div className="panel-header">画面监看 · 480p 代理目标</div>
+      <div className="panel-header">9:16 竖屏预览 · 480p 代理</div>
       <div className="canvas-panel" style={{ height: "100%", justifyContent: "space-between" }}>
-        <div className="canvas-viewport" style={{ flex: 1, width: "100%" }}>
+        <div className="canvas-viewport" style={{ flex: "0 0 auto" }}>
           <div className="proxy-badge">
             {PROXY_480P.width}×{PROXY_480P.height} · {PROXY_480P.fps} 帧/秒 · {PROXY_480P.codec.toUpperCase()}
           </div>
