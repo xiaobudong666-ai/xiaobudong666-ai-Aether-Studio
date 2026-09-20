@@ -51,8 +51,8 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await expect.poll(async () => video.evaluate((element) => (element as HTMLVideoElement).currentTime)).toBeLessThan(0.05);
   await page.screenshot({ path: testInfo.outputPath("05-real-media-preview.png"), fullPage: true });
 
-  await page.getByText("高级编辑", { exact: false }).click();
   await page.getByRole("button", { name: "+ 添加到时间线" }).click();
+  await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByRole("button", { name: /选择片段，时长/ })).toBeVisible();
   await page.getByRole("button", { name: /选择片段，时长/ }).click();
   await expect(page.getByText("已选片段")).toBeVisible();
