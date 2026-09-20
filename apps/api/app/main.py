@@ -91,6 +91,7 @@ from .schemas import (
     AdoptCandidateRequest,
     ApplyTalkingHeadDraftRequest,
     CreateProjectRequest,
+    DetectionEvidenceRequest,
     CreateRightsSnapshotRequest,
     CreateUserRequest,
     GenerationTaskRequest,
@@ -110,6 +111,7 @@ from .task_status import (
     legacy_task_status,
 )
 from .talking_head_planner import SubtitleCue, build_talking_head_timeline
+from .detection_evidence import build_release_evidence, normalize_rights_evidence
 from .runtime_gates import enforce_release_gates, enforce_timeline_receipt
 from .timeline_render import build_render_payload
 from .video_use_adapter import VideoUseAdapter, VideoUseError
@@ -1344,6 +1346,42 @@ def create_app(
             db, task, rights=generation_rights(db, task), include_history=True
         )
 
+
+
+    @created_app.post("/projects/{project_id}/detection-evidence")
+    def produce_detection_evidence(
+        project_id: str,
+        req: DetectionEvidenceRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        """Produce machine evidence for human review; never creates an approval."""
+        require_roles(context, "owner", "editor")
+        project = project_for_tenant(db, project_id, context)
+        if project.revision != req.timelineVersion:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "CONCURRENCY_CONFLICT", "message": "检测证据必须绑定当前项目版本"},
+            )
+        rights = normalize_rights_evidence(
+            media_ids=req.mediaIds,
+            rights=req.rightsEvidence,
+        )
+        return build_release_evidence(
+            timeline_version=project.revision,
+            timeline=project.timeline,
+            preview_evidence_ref=req.previewEvidenceRef,
+            final_evidence_ref=req.finalEvidenceRef,
+            media_probe=req.mediaProbe,
+            talking_head_metrics=req.talkingHeadMetrics,
+            rights_evidence=rights,
+            rule_pack=req.rulePack,
+            rule_content=req.ruleContent,
+            source_digest=req.sourceDigest,
+            caption_digest=req.captionDigest,
+            audio_digest=req.audioDigest,
+            render_parity=req.renderParity,
+        )
 
     @created_app.post(
         "/projects/{project_id}/generation-tasks/{task_id}/apply-talking-head-draft",
