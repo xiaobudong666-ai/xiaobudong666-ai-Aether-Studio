@@ -1,3 +1,6 @@
+from test_runtime_gates import governed_generation_context
+from test_generation_tasks import create_project as create_generation_project
+
 from app.detection_evidence import (
     build_release_evidence,
     media_quality_findings,
@@ -84,3 +87,32 @@ def test_review_required_quality_prevents_machine_parity_pass():
     )
     assert evidence["renderParityFinal"]["perceptual_result"] == "review_required"
     assert evidence["releaseDecision"] is None
+
+
+def test_detection_endpoint_requires_current_revision_and_never_approves(governed_generation_context):
+    client, _ = governed_generation_context
+    project = create_generation_project(client, "D1 evidence")
+    endpoint = f"/projects/{project['id']}/detection-evidence"
+    payload = {
+        "timelineVersion": project["revision"],
+        "previewEvidenceRef": "preview://d1",
+        "finalEvidenceRef": "final://d1",
+        "mediaProbe": _probe(),
+        "talkingHeadMetrics": {},
+        "mediaIds": [],
+        "rightsEvidence": [],
+        "rulePack": {"verification_status": "verified"},
+        "ruleContent": {"ai_generated_or_synthetic": True},
+        "sourceDigest": "source",
+        "captionDigest": "caption",
+        "audioDigest": "audio",
+    }
+    response = client.post(endpoint, json=payload)
+    assert response.status_code == 200, response.text
+    evidence = response.json()
+    assert evidence["releaseDecision"] is None
+    assert any(item["state"] == "REVIEW_REQUIRED" for item in evidence["qualityFindings"])
+    payload["timelineVersion"] = project["revision"] + 1
+    stale = client.post(endpoint, json=payload)
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
