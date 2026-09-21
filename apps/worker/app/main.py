@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from .ai_provider import AIProviderInterface
@@ -90,6 +90,7 @@ class WorkerComponents:
     queue: TaskQueueClient | None = None
     generation_queue: GenerationQueueClient | None = None
     talking_head: object | None = None
+    talking_head_submissions: set[str] = field(default_factory=set)
 
 
 class DisabledMoneyPrinterAdapter:
@@ -477,6 +478,49 @@ def _build_talking_head_job_spec(request: dict) -> TalkingHeadJobSpec:
     return spec
 
 
+def _talking_head_submission_persistence_fail_closed(
+    queue: GenerationQueueClient,
+    task_id: str,
+    upstream_job_id: str,
+) -> dict:
+    """Fail closed after a submission whose RUNNING state could not be persisted.
+
+    The Provider may already have accepted the job, so this Worker must never
+    resubmit.  It makes one more attempt to record a terminal ``UNKNOWN`` state
+    that also carries the upstream id (future claims would reuse it instead of
+    submitting).  If even that write is rejected, it returns a local UNKNOWN
+    marker and relies on the process-local submission ledger to block a second
+    submit.
+    """
+    logger.error(
+        "Talking-head task %s submitted upstream job %s but RUNNING could not be "
+        "persisted; failing closed to prevent re-submission",
+        task_id,
+        upstream_job_id,
+    )
+    try:
+        return queue.transition(
+            task_id, status="UNKNOWN", progress=0,
+            message="口播已提交但运行状态持久化失败，已停止自动动作",
+            upstream_job_id=upstream_job_id,
+            error_code="SUBMISSION_PERSISTENCE_FAILED",
+            error_message="Talking-head submission persistence failed",
+            retryable=False,
+        )
+    except GenerationQueueError as exc:
+        code = exc.code or "GENERATION_QUEUE_UNAVAILABLE"
+        logger.warning(
+            "Talking-head task %s could not record fail-closed terminal state: %s",
+            task_id,
+            code,
+        )
+        return {
+            "taskId": task_id,
+            "status": "UNKNOWN",
+            "errorCode": code,
+        }
+
+
 def _process_talking_head_generation_task(
     components: WorkerComponents,
     task: dict,
@@ -529,6 +573,21 @@ def _process_talking_head_generation_task(
             )
 
         if not upstream_job_id:
+            submission_ledger = components.talking_head_submissions
+            if task_id in submission_ledger:
+                # A previous pass already reached the submit stage for this
+                # logical task but the upstream id could not be persisted.
+                # Fail closed: never submit a second time.
+                return queue.transition(
+                    task_id, status="UNKNOWN", progress=0,
+                    message="口播提交结果未持久化，已停止自动重投",
+                    error_code="SUBMISSION_PERSISTENCE_FAILED",
+                    error_message="Talking-head submission persistence failed",
+                    retryable=False,
+                )
+            # Mark before submit so an ambiguous outcome is also blocked from
+            # any later re-submission within this Worker process.
+            submission_ledger.add(task_id)
             try:
                 upstream_job_id = adapter.submit(job_spec)
             except TalkingHeadAmbiguousSubmissionError:
@@ -547,11 +606,16 @@ def _process_talking_head_generation_task(
                     error_message="Talking-head submission failed",
                     retryable=False,
                 )
-            queue.transition(
-                task_id, status="RUNNING", progress=5,
-                message="口播生成任务已提交至受治理 Provider",
-                upstream_job_id=upstream_job_id,
-            )
+            try:
+                queue.transition(
+                    task_id, status="RUNNING", progress=5,
+                    message="口播生成任务已提交至受治理 Provider",
+                    upstream_job_id=upstream_job_id,
+                )
+            except GenerationQueueError:
+                return _talking_head_submission_persistence_fail_closed(
+                    queue, task_id, upstream_job_id
+                )
 
         deadline = time.monotonic() + float(
             os.environ.get("AETHER_TALKING_HEAD_TIMEOUT_SECONDS", "3600")

@@ -16,10 +16,12 @@ ever issued.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
 
+from app.generation_queue import GenerationQueueError
 from app.main import (
     WorkerComponents,
     initialize_worker,
@@ -88,6 +90,26 @@ class RecordingQueue:
         data = stream.read() if hasattr(stream, "read") else bytes(stream)
         self.intakes.append((task_id, provider_artifact_id, data))
         return {"taskId": task_id, "status": "RIGHTS_BLOCKED"}
+
+
+def _submits(calls):
+    return [c for c in calls if c.method == "POST"]
+
+
+class PersistenceFailQueue(RecordingQueue):
+    """Fails the first RUNNING transition to simulate a post-submit write loss."""
+
+    def __init__(self):
+        super().__init__()
+        self._fail_run = True
+
+    def transition(self, task_id, **values):
+        if self._fail_run and values.get("status") == "RUNNING":
+            self._fail_run = False
+            raise GenerationQueueError(
+                "Generation queue unavailable", code="GENERATION_QUEUE_UNAVAILABLE"
+            )
+        return super().transition(task_id, **values)
 
 
 def components(talking_head, queue):
@@ -259,7 +281,10 @@ def test_cost_ceiling_fail_closed_without_any_request():
 
 
 def test_status_unknown_stops_without_retry():
+    calls = []
+
     def handler(request):
+        calls.append(request)
         if request.method == "POST":
             return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
         return httpx.Response(
@@ -276,10 +301,14 @@ def test_status_unknown_stops_without_retry():
     assert result["status"] == "UNKNOWN"
     assert result["error_code"] == "PROVIDER_STATUS_UNKNOWN"
     assert result["retryable"] is False
+    assert len(_submits(calls)) == 1
 
 
 def test_status_failed_is_non_retryable():
+    calls = []
+
     def handler(request):
+        calls.append(request)
         if request.method == "POST":
             return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
         return httpx.Response(
@@ -298,6 +327,7 @@ def test_status_failed_is_non_retryable():
     assert result["status"] == "FAILED"
     assert result["error_code"] == "PROVIDER_FAILED"
     assert result["retryable"] is False
+    assert len(_submits(calls)) == 1
 
 
 def test_invalid_job_spec_fails_closed_before_submit():
@@ -313,3 +343,185 @@ def test_invalid_job_spec_fails_closed_before_submit():
     assert result["error_code"] == "JOB_SPEC_INVALID"
     assert [t[1]["status"] for t in queue.transitions] == ["FAILED"]
     assert queue.intakes == []
+
+
+# ---------------------------------------------- at-most-once submission proofs
+def test_talking_head_golden_chain_submits_exactly_once():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        url = str(request.url)
+        if url == "https://api.heygen.com/v3/videos" and request.method == "POST":
+            return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
+        if url == "https://api.heygen.com/v3/videos/video-1" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "video_id": "video-1",
+                        "status": "completed",
+                        "video_url": "https://cdn.heygen.com/videos/video-1.mp4",
+                    }
+                },
+                request=request,
+            )
+        if url == "https://cdn.heygen.com/videos/video-1.mp4":
+            return httpx.Response(
+                200,
+                content=b"\x00\x00\x00\x18ftypmp42fake-mp4-bytes",
+                headers={"content-type": "video/mp4", "content-length": "28"},
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    adapter = HeyGenTalkingHeadAdapter(
+        enabled=True, transport=httpx.MockTransport(handler)
+    )
+    queue = RecordingQueue()
+    result = process_generation_task(
+        components(adapter, queue), claimed_talking_head_task(), poll_interval=0
+    )
+    assert result["status"] == "RIGHTS_BLOCKED"
+    assert len(_submits(calls)) == 1
+    assert len(queue.intakes) == 1
+
+
+def test_ambiguous_submission_submits_exactly_once():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("lost response", request=request)
+
+    adapter = HeyGenTalkingHeadAdapter(
+        enabled=True, transport=httpx.MockTransport(handler)
+    )
+    queue = RecordingQueue()
+    result = process_generation_task(
+        components(adapter, queue), claimed_talking_head_task(), poll_interval=0
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["error_code"] == "AMBIGUOUS_SUBMISSION"
+    assert len(_submits(calls)) == 1
+
+
+def test_running_persistence_failure_fails_closed():
+    adapter = enabled_adapter()
+    queue = PersistenceFailQueue()
+    result = process_generation_task(
+        components(adapter, queue), claimed_talking_head_task(), poll_interval=0
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["error_code"] == "SUBMISSION_PERSISTENCE_FAILED"
+    # Terminal UNKNOWN still records the upstream id so a future claim can
+    # resume status polling instead of re-submitting.
+    assert any(
+        t[1].get("status") == "UNKNOWN" and t[1].get("upstream_job_id") == "video-1"
+        for t in queue.transitions
+    )
+
+
+def test_persistence_failure_never_resubmits_same_task():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "video_id": "video-1",
+                    "status": "completed",
+                    "video_url": "https://cdn.heygen.com/videos/video-1.mp4",
+                }
+            },
+            request=request,
+        )
+
+    adapter = HeyGenTalkingHeadAdapter(
+        enabled=True, transport=httpx.MockTransport(handler)
+    )
+    queue = PersistenceFailQueue()
+    comps = components(adapter, queue)
+    task = claimed_talking_head_task()
+
+    first = process_generation_task(comps, task, poll_interval=0)
+    assert first["status"] == "UNKNOWN"
+
+    # Re-processing the same logical task (upstream id still unpersisted in the
+    # claimed task dict) must never reach submit a second time.
+    second = process_generation_task(comps, task, poll_interval=0)
+    assert second["status"] == "UNKNOWN"
+    assert second["error_code"] == "SUBMISSION_PERSISTENCE_FAILED"
+    assert len(_submits(calls)) == 1
+
+
+def test_existing_upstream_job_id_skips_submit():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        url = str(request.url)
+        if url == "https://api.heygen.com/v3/videos/video-1" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "video_id": "video-1",
+                        "status": "completed",
+                        "video_url": "https://cdn.heygen.com/videos/video-1.mp4",
+                    }
+                },
+                request=request,
+            )
+        if url == "https://cdn.heygen.com/videos/video-1.mp4":
+            return httpx.Response(
+                200,
+                content=b"\x00\x00\x00\x18ftypmp42fake-mp4-bytes",
+                headers={"content-type": "video/mp4", "content-length": "28"},
+                request=request,
+            )
+        return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
+
+    adapter = HeyGenTalkingHeadAdapter(
+        enabled=True, transport=httpx.MockTransport(handler)
+    )
+    queue = RecordingQueue()
+    task = claimed_talking_head_task(upstreamJobId="video-1")
+    result = process_generation_task(
+        components(adapter, queue), task, poll_interval=0
+    )
+    assert result["status"] == "RIGHTS_BLOCKED"
+    assert _submits(calls) == []
+    assert len(queue.intakes) == 1
+
+
+def test_status_timeout_does_not_retry(monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
+        return httpx.Response(
+            200,
+            json={"data": {"video_id": "video-1", "status": "processing", "progress": 10}},
+            request=request,
+        )
+
+    adapter = HeyGenTalkingHeadAdapter(
+        enabled=True, transport=httpx.MockTransport(handler)
+    )
+    queue = RecordingQueue()
+    monkeypatch.setenv("AETHER_TALKING_HEAD_TIMEOUT_SECONDS", "2")
+    clock = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+    result = process_generation_task(
+        components(adapter, queue), claimed_talking_head_task(), poll_interval=0
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["error_code"] == "STATUS_TIMEOUT"
+    assert len(_submits(calls)) == 1
