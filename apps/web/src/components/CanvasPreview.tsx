@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { MaterialDTO, RationalTime, PROXY_480P } from "@aether/contracts";
+import { MaterialDTO, RationalTime } from "@aether/contracts";
 
 interface CanvasPreviewProps {
   currentTime: RationalTime;
@@ -65,13 +65,9 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
 
   return (
     <div className="panel" style={{ flex: 1, height: "100%", background: "#0c0c0e", borderRight: "none" }}>
-      <div className="panel-header">9:16 竖屏预览 · 480p 代理</div>
+      <div className="panel-header">视频预览</div>
       <div className="canvas-panel" style={{ height: "100%", justifyContent: "space-between" }}>
         <div className="canvas-viewport" style={{ flex: "0 0 auto" }}>
-          <div className="proxy-badge">
-            {PROXY_480P.width}×{PROXY_480P.height} · {PROXY_480P.fps} 帧/秒 · {PROXY_480P.codec.toUpperCase()}
-          </div>
-
           {previewMaterial?.type === "video" ? (
             <video
               key={previewMaterial.id}

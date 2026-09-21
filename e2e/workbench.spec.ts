@@ -7,7 +7,7 @@ async function signIn(page: import("@playwright/test").Page) {
   await page.getByLabel("邮箱").fill("admin@aether.local");
   await page.getByLabel("密码").fill(testPassword!);
   await page.getByRole("button", { name: "登录" }).click();
-  await expect(page.getByText("素材库", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
 }
 
 test("中文登录、项目创建和兼容文件导出均可操作", async ({ page }, testInfo) => {
@@ -20,9 +20,10 @@ test("中文登录、项目创建和兼容文件导出均可操作", async ({ pa
   await page.screenshot({ path: testInfo.outputPath("01-login-desktop.png"), fullPage: true });
 
   await signIn(page);
-  await expect(page.getByText("9:16 竖屏预览 · 480p 代理")).toBeVisible();
-  await expect(page.getByText("属性与任务")).toBeVisible();
+  await expect(page.getByText("视频预览", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "生成口播视频" })).toBeVisible();
   await page.getByText("高级编辑", { exact: false }).click();
+  await expect(page.getByText("属性与任务", { exact: true })).toBeVisible();
   await expect(page.getByText(/时间线轨道（标准格式 v1\.1）/)).toBeVisible();
   await expect(page.getByText("一键短视频制作", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "快速制作短视频" })).toBeVisible();
@@ -75,17 +76,22 @@ test("错误提示、窄屏布局和退出登录可用", async ({ page }, testIn
 
   await page.getByLabel("密码").fill(testPassword);
   await page.getByRole("button", { name: "登录" }).click();
-  await expect(page.getByText("素材库", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
+  await expect(page.getByText("视频预览", { exact: true })).toBeVisible();
   await expect(page.getByPlaceholder("输入新项目名称")).toBeVisible();
+
+  await page.getByText("高级编辑", { exact: false }).click();
+  await expect(page.getByText("素材库", { exact: true })).toBeVisible();
+  await expect(page.getByText("属性与任务", { exact: true })).toBeVisible();
 
   const libraryBox = await page.getByText("素材库", { exact: true }).boundingBox();
   const inspectorBox = await page.getByText("属性与任务", { exact: true }).boundingBox();
-  const canvasBox = await page.getByText("9:16 竖屏预览 · 480p 代理", { exact: true }).boundingBox();
+  const canvasBox = await page.getByText("视频预览", { exact: true }).boundingBox();
   const advancedBox = await page.getByText("高级编辑", { exact: false }).boundingBox();
   expect(libraryBox && canvasBox && inspectorBox && advancedBox).toBeTruthy();
+  expect(advancedBox!.y).toBeLessThan(libraryBox!.y);
   expect(libraryBox!.y).toBeLessThan(inspectorBox!.y);
   expect(inspectorBox!.y).toBeLessThan(canvasBox!.y);
-  expect(canvasBox!.y).toBeLessThan(advancedBox!.y);
 
   const hasHorizontalOverflow = await page.evaluate(() => (
     document.documentElement.scrollWidth > document.documentElement.clientWidth
@@ -121,8 +127,9 @@ test("只读成员在界面和接口两层都不能修改项目", async ({ page 
   await page.getByRole("button", { name: "登录" }).click();
 
   await expect(page.getByText(/只读成员/).first()).toBeVisible();
-  await expect(page.getByText("当前为只读权限，不能修改项目。")).toBeVisible();
   await expect(page.getByRole("button", { name: "创建项目" })).toBeDisabled();
+  await page.getByText("高级编辑", { exact: false }).click();
+  await expect(page.getByText("当前为只读权限，不能修改项目。")).toBeVisible();
   await expect(page.getByLabel("媒体文件输入")).toBeDisabled();
   await expect(page.getByText(/当前为只读权限，仅可查看/)).toBeVisible();
   await expect(page.getByRole("button", { name: "快速制作短视频" })).toHaveCount(0);

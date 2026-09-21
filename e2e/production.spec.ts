@@ -15,6 +15,8 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("密码").fill(password);
   await page.getByRole("button", { name: "登录" }).click();
+  await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
+  await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByText("素材库", { exact: true })).toBeVisible();
 
   const projectName = `真实成片验收-${Date.now()}`;
@@ -52,7 +54,6 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   await page.screenshot({ path: testInfo.outputPath("05-real-media-preview.png"), fullPage: true });
 
   await page.getByRole("button", { name: "+ 添加到时间线" }).click();
-  await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByRole("button", { name: /选择片段，时长/ })).toBeVisible();
   await page.getByRole("button", { name: /选择片段，时长/ }).click();
   await expect(page.getByText("已选片段")).toBeVisible();
@@ -87,6 +88,8 @@ test("浏览器真实完成上传、预览、入轨、渲染、刷新恢复与�
   expect((await stat(masterDownloadPath!)).size).toBeGreaterThan(1_000);
 
   await page.reload();
+  await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
+  await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByText("素材库", { exact: true })).toBeVisible();
   await page.getByLabel("选择项目").selectOption({ label: `${projectName}（版本 3）` });
   await expect(page.getByText("已完成", { exact: true })).toBeVisible({ timeout: 30_000 });
@@ -113,6 +116,8 @@ test("缺失导出权利时服务端阻断候选采纳并展示逐素材原因",
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("密码").fill(password);
   await page.getByRole("button", { name: "登录" }).click();
+  await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
+  await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByText("素材库", { exact: true })).toBeVisible();
 
   const projectName = `权利阻断验收-${Date.now()}`;
@@ -145,6 +150,8 @@ test("一键短视频在权利缺失时零渲染，治理后复用上传并仅�
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("密码").fill(password);
   await page.getByRole("button", { name: "登录" }).click();
+  await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
+  await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByText("素材库", { exact: true })).toBeVisible();
 
   const projectName = `一键短视频验收-${Date.now()}`;

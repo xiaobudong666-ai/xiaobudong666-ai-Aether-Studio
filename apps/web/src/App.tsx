@@ -101,6 +101,9 @@ export default function App() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [isSavingProject, setIsSavingProject] = useState(false);
+  const [scriptText, setScriptText] = useState("");
+  const [selectedAvatar, setSelectedAvatar] = useState<string | null>(null);
+  const [selectedVoice, setSelectedVoice] = useState<string | null>(null);
   const savingProjectRef = useRef(false);
   const selectedProjectIdRef = useRef<string | null>(null);
   const projectDetailRequestIdRef = useRef(0);
@@ -725,12 +728,8 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      {/* Header */}
       <header className="editor-header">
-        <div className="editor-logo">
-          闪电智能新媒体
-          <span className="editor-logo-subtitle">AI 内容操作系统</span>
-        </div>
+        <div className="editor-logo">闪电智能新媒体</div>
         <div className="project-select-container">
           <span className="tenant-badge" title={`${roleLabel(authUser.role)} · ${authUser.email}`}>
             {authUser.tenant.name} · {roleLabel(authUser.role)}
@@ -738,8 +737,8 @@ export default function App() {
           <span className="quota-badge" title="当前团队资源使用情况">
             项目 {projects.length}/{authUser.quotas.projects} · 存储 {formatBytes(authUser.quotas.storageBytesUsed)}/{formatBytes(authUser.quotas.storageBytes)} · 本月渲染 {authUser.quotas.monthlyRenderSecondsUsed}/{authUser.quotas.monthlyRenderSeconds} 秒
           </span>
-          {apiError && <span style={{ fontSize: "12px", color: "#f59e0b" }}>{apiError}</span>}
-          <form onSubmit={handleCreateProject} style={{ display: "flex", gap: "6px" }}>
+          {apiError && <span className="api-error-inline">{apiError}</span>}
+          <form className="project-create-form" onSubmit={handleCreateProject}>
             <input
               type="text"
               aria-label="新项目名称"
@@ -793,142 +792,186 @@ export default function App() {
         </div>
       </header>
 
-      <nav className="main-flow-strip" aria-label="主流程">
-        <ol className="main-flow-steps">
-          <li className="main-flow-step">
-            <span className="main-flow-step-index">1</span>
-            <div className="main-flow-step-copy">
-              <strong>输入内容</strong>
-              <span>文案、素材或链接</span>
+      <div className="app-body">
+        <main className="oral-broadcast-main">
+          <section className="flow-step" aria-label="输入内容">
+            <div className="flow-step-head">
+              <span className="flow-step-index">1</span>
+              <h2>输入内容</h2>
             </div>
-          </li>
-          <li className="main-flow-step">
-            <span className="main-flow-step-index">2</span>
-            <div className="main-flow-step-copy">
-              <strong>选择人物和声音</strong>
-              <span>数字人形象与旁白音色</span>
+            <textarea
+              className="script-input"
+              aria-label="口播文案"
+              placeholder="输入你想让人物说的内容……"
+              value={scriptText}
+              onChange={(event) => setScriptText(event.target.value)}
+            />
+            <div className="flow-extract">
+              <span className="flow-extract-label">或从素材提取</span>
+              <button type="button" disabled>视频提取<span className="coming-soon">即将开放</span></button>
+              <button type="button" disabled>图片提取<span className="coming-soon">即将开放</span></button>
+              <button type="button" disabled>链接提取<span className="coming-soon">即将开放</span></button>
             </div>
-          </li>
-          <li className="main-flow-step">
-            <span className="main-flow-step-index">3</span>
-            <div className="main-flow-step-copy">
-              <strong>生成视频</strong>
-              <span>9:16 竖屏成片</span>
+            <div className="flow-reserved" aria-label="后续能力">
+              <span>AI 二创</span>
+              <span>爆款潜力评分</span>
+              <span className="coming-soon">即将开放</span>
             </div>
-          </li>
-        </ol>
-        <div className="main-flow-reserved">
-          <span className="main-flow-reserved-label">即将推出</span>
-          <button type="button" disabled>视频提取</button>
-          <button type="button" disabled>图片提取</button>
-          <button type="button" disabled>链接提取</button>
-          <button type="button" disabled>AI 二创</button>
-          <button type="button" disabled>爆款潜力评分</button>
-        </div>
-      </nav>
+          </section>
 
-      <section className="persona-voice-bar" aria-label="选择人物和声音">
-        <label>人物<select aria-label="选择人物" disabled><option>数字人口播 · 即将接入</option></select></label>
-        <label>声音<select aria-label="选择声音" disabled><option>自然旁白 · 即将接入</option></select></label>
-        <span className="persona-voice-note">真实数字人与声音 Provider 尚未启用，此步骤为 UI 预留。</span>
-      </section>
+          <section className="flow-step" aria-label="选择人物和声音">
+            <div className="flow-step-head">
+              <span className="flow-step-index">2</span>
+              <h2>选择人物和声音</h2>
+            </div>
+            <div className="choice-block">
+              <h3>人物</h3>
+              <div className="choice-cards">
+                <button
+                  type="button"
+                  className={selectedAvatar === "upload" ? "choice-card selected" : "choice-card"}
+                  onClick={() => setSelectedAvatar("upload")}
+                >
+                  上传人物照片
+                </button>
+                <button type="button" className="choice-card" disabled>
+                  我的数字人<span className="coming-soon">即将开放</span>
+                </button>
+              </div>
+            </div>
+            <div className="choice-block">
+              <h3>声音</h3>
+              <div className="choice-cards">
+                <button
+                  type="button"
+                  className={selectedVoice === "female" ? "choice-card selected" : "choice-card"}
+                  onClick={() => setSelectedVoice("female")}
+                >
+                  自然女声
+                </button>
+                <button
+                  type="button"
+                  className={selectedVoice === "male" ? "choice-card selected" : "choice-card"}
+                  onClick={() => setSelectedVoice("male")}
+                >
+                  自然男声
+                </button>
+                <button type="button" className="choice-card" disabled>
+                  我的声音<span className="coming-soon">即将开放</span>
+                </button>
+              </div>
+            </div>
+          </section>
 
-      {actionMessage && (
-        <div className="status-banner" role="status" aria-live="polite">
-          {actionMessage}
-          <button type="button" aria-label="关闭提示" onClick={() => setActionMessage(null)}>关闭</button>
-        </div>
-      )}
+          <section className="flow-step flow-step-generate" aria-label="生成视频">
+            <div className="flow-step-head">
+              <span className="flow-step-index">3</span>
+              <h2>生成视频</h2>
+            </div>
+            <button
+              type="button"
+              className="primary-cta"
+              onClick={() => setActionMessage("口播视频生成即将开放，当前可先使用高级编辑完成视频制作。")}
+            >
+              生成口播视频
+            </button>
+            <p className="generate-hint">9:16 · 高清竖屏 · 生成后先预览，不会自动发布</p>
+          </section>
 
-      <GenerationPanel
-        role={authUser.role}
-        tenantId={authUser.tenant.id}
-        actorId={authUser.id}
-        project={currentProject}
-        assetVersions={assetVersions}
-        onProjectUpdated={(project) => {
-          setCurrentProject(project);
-          setProjects((previous) => previous.map((candidate) => candidate.id === project.id ? project : candidate));
-        }}
-      />
+          {actionMessage && (
+            <div className="status-banner" role="status" aria-live="polite">
+              {actionMessage}
+              <button type="button" aria-label="关闭提示" onClick={() => setActionMessage(null)}>关闭</button>
+            </div>
+          )}
 
-      <QuickCreatePanel
-        role={authUser.role}
-        currentProject={currentProject}
-        assetVersions={assetVersions}
-        busy={isCreatingProject || isSavingProject}
-        createProject={quickCreateProject}
-        reloadProject={quickReloadProject}
-        uploadMedia={quickUploadMedia}
-        checkRights={quickCheckRights}
-        saveTimeline={quickSaveTimeline}
-        submitRender={quickSubmitRender}
-        refreshRenderTasks={quickRefreshRenderTasks}
-        isProjectActive={(projectId) => selectedProjectIdRef.current === projectId}
-        onOpenGovernance={() => {
-          const governance = document.querySelector<HTMLDetailsElement>(
-            "#asset-library-region details.governance-section",
-          );
-          if (governance) {
-            governance.open = true;
-            governance.scrollIntoView({ behavior: "smooth", block: "center" });
-            governance.querySelector<HTMLElement>("summary")?.focus();
-          }
-        }}
-        onViewTask={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
-        onViewFinished={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
-      />
+          <details className="advanced-editing">
+            <summary>高级编辑</summary>
+            <div className="advanced-editing-body">
+              <QuickCreatePanel
+                role={authUser.role}
+                currentProject={currentProject}
+                assetVersions={assetVersions}
+                busy={isCreatingProject || isSavingProject}
+                createProject={quickCreateProject}
+                reloadProject={quickReloadProject}
+                uploadMedia={quickUploadMedia}
+                checkRights={quickCheckRights}
+                saveTimeline={quickSaveTimeline}
+                submitRender={quickSubmitRender}
+                refreshRenderTasks={quickRefreshRenderTasks}
+                isProjectActive={(projectId) => selectedProjectIdRef.current === projectId}
+                onOpenGovernance={() => {
+                  const governance = document.querySelector<HTMLDetailsElement>(
+                    "#asset-library-region details.governance-section",
+                  );
+                  if (governance) {
+                    governance.open = true;
+                    governance.scrollIntoView({ behavior: "smooth", block: "center" });
+                    governance.querySelector<HTMLElement>("summary")?.focus();
+                  }
+                }}
+                onViewTask={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
+                onViewFinished={() => document.getElementById("property-inspector-region")?.scrollIntoView({ behavior: "smooth" })}
+              />
+              <GenerationPanel
+                role={authUser.role}
+                tenantId={authUser.tenant.id}
+                actorId={authUser.id}
+                project={currentProject}
+                assetVersions={assetVersions}
+                onProjectUpdated={(project) => {
+                  setCurrentProject(project);
+                  setProjects((previous) => previous.map((candidate) => candidate.id === project.id ? project : candidate));
+                }}
+              />
+              <div className="workbench-container">
+                <div id="asset-library-region">
+                  <AssetLibrary
+                    materials={currentProject?.materials || []}
+                    onUploadMaterial={handleUploadMaterial}
+                    onAddClipToTimeline={handleAddClipToTimeline}
+                    canEdit={canEdit && !isSavingProject}
+                    hasProject={Boolean(currentProject)}
+                    projectId={currentProject?.id || null}
+                    assetVersions={assetVersions}
+                    apiBase={API_BASE}
+                    onSessionExpired={expireSession}
+                  />
+                </div>
+                <div id="property-inspector-region">
+                  <PropertyInspector
+                    selectedClip={selectedClip}
+                    projectId={currentProject?.id || null}
+                    onTriggerRender={handleTriggerRender}
+                    apiBase={API_BASE}
+                    canEdit={canEdit && !isSavingProject}
+                    canRender={canEdit && !isSavingProject && Boolean(currentProject?.timeline.tracks.some(
+                      (track) => track.type === "video" && track.clips.length > 0,
+                    ))}
+                    onSessionExpired={expireSession}
+                  />
+                </div>
+              </div>
+              <Timeline
+                timeline={currentProject?.timeline || { version: "1.1", tracks: [] }}
+                selectedClipId={selectedClip?.id || null}
+                onSelectClip={setSelectedClip}
+                currentTime={currentTime}
+              />
+            </div>
+          </details>
+        </main>
 
-      {/* Main workbench */}
-      <main className="workbench-container">
-        <div id="asset-library-region">
-          <AssetLibrary
-            materials={currentProject?.materials || []}
-            onUploadMaterial={handleUploadMaterial}
-            onAddClipToTimeline={handleAddClipToTimeline}
-            canEdit={canEdit && !isSavingProject}
-            hasProject={Boolean(currentProject)}
-            projectId={currentProject?.id || null}
-            assetVersions={assetVersions}
-            apiBase={API_BASE}
-            onSessionExpired={expireSession}
-          />
-        </div>
-
-        <div id="property-inspector-region">
-          <PropertyInspector
-            selectedClip={selectedClip}
-            projectId={currentProject?.id || null}
-            onTriggerRender={handleTriggerRender}
-            apiBase={API_BASE}
-            canEdit={canEdit && !isSavingProject}
-            canRender={canEdit && !isSavingProject && Boolean(currentProject?.timeline.tracks.some(
-              (track) => track.type === "video" && track.clips.length > 0,
-            ))}
-            onSessionExpired={expireSession}
-          />
-        </div>
-
-        <div id="canvas-preview-region">
+        <aside className="preview-column">
           <CanvasPreview
             currentTime={currentTime}
             onTimeChange={setCurrentTime}
             timelineDuration={timelineDuration}
             previewMaterial={previewMaterial}
           />
-        </div>
-      </main>
-
-      {/* Advanced editing: complex timeline */}
-      <details className="advanced-editing">
-        <summary>高级编辑 · 复杂时间线</summary>
-        <Timeline
-          timeline={currentProject?.timeline || { version: "1.1", tracks: [] }}
-          selectedClipId={selectedClip?.id || null}
-          onSelectClip={setSelectedClip}
-          currentTime={currentTime}
-        />
-      </details>
+        </aside>
+      </div>
     </div>
   );
 }
