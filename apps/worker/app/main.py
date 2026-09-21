@@ -90,7 +90,6 @@ class WorkerComponents:
     queue: TaskQueueClient | None = None
     generation_queue: GenerationQueueClient | None = None
     talking_head: object | None = None
-    talking_head_submissions: set[str] = field(default_factory=set)
 
 
 class DisabledMoneyPrinterAdapter:
@@ -489,8 +488,9 @@ def _talking_head_submission_persistence_fail_closed(
     resubmit.  It makes one more attempt to record a terminal ``UNKNOWN`` state
     that also carries the upstream id (future claims would reuse it instead of
     submitting).  If even that write is rejected, it returns a local UNKNOWN
-    marker and relies on the process-local submission ledger to block a second
-    submit.
+    marker.  A future claim of the same logical task derives
+    ``submissionConsumed`` from the persisted attempt state, so a new Worker
+    still cannot submit again.
     """
     logger.error(
         "Talking-head task %s submitted upstream job %s but RUNNING could not be "
@@ -573,11 +573,11 @@ def _process_talking_head_generation_task(
             )
 
         if not upstream_job_id:
-            submission_ledger = components.talking_head_submissions
-            if task_id in submission_ledger:
-                # A previous pass already reached the submit stage for this
-                # logical task but the upstream id could not be persisted.
-                # Fail closed: never submit a second time.
+            if bool(task.get("submissionConsumed")):
+                # The claim response derived this flag from the persisted
+                # attempt state (submission_started_at already set with no
+                # upstream id).  Submission rights are already consumed, so a
+                # second submit would violate at-most-once.  Fail closed.
                 return queue.transition(
                     task_id, status="UNKNOWN", progress=0,
                     message="口播提交结果未持久化，已停止自动重投",
@@ -585,9 +585,6 @@ def _process_talking_head_generation_task(
                     error_message="Talking-head submission persistence failed",
                     retryable=False,
                 )
-            # Mark before submit so an ambiguous outcome is also blocked from
-            # any later re-submission within this Worker process.
-            submission_ledger.add(task_id)
             try:
                 upstream_job_id = adapter.submit(job_spec)
             except TalkingHeadAmbiguousSubmissionError:

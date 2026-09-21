@@ -112,6 +112,26 @@ class PersistenceFailQueue(RecordingQueue):
         return super().transition(task_id, **values)
 
 
+class TotalPersistenceFailQueue(RecordingQueue):
+    """Fails both the RUNNING write and the follow-up fail-closed UNKNOWN write."""
+
+    def __init__(self):
+        super().__init__()
+        self._fail_run = True
+
+    def transition(self, task_id, **values):
+        if self._fail_run and values.get("status") == "RUNNING":
+            self._fail_run = False
+            raise GenerationQueueError(
+                "Generation queue unavailable", code="GENERATION_QUEUE_UNAVAILABLE"
+            )
+        if values.get("status") == "UNKNOWN":
+            raise GenerationQueueError(
+                "Generation queue unavailable", code="GENERATION_QUEUE_UNAVAILABLE"
+            )
+        return super().transition(task_id, **values)
+
+
 def components(talking_head, queue):
     return WorkerComponents(
         ffmpeg=None, ai=None, recovery=None,
@@ -127,6 +147,7 @@ def claimed_talking_head_task(**overrides):
         "attempt": 1,
         "providerMode": "talking-head",
         "upstreamJobId": None,
+        "submissionConsumed": False,
         "request": {
             "text": "大家好，这是一条十秒口播测试。",
             "durationSeconds": 10,
@@ -422,7 +443,15 @@ def test_running_persistence_failure_fails_closed():
     )
 
 
-def test_persistence_failure_never_resubmits_same_task():
+def test_worker_restart_never_resubmits_consumed_attempt():
+    """Cross-restart at-most-once proof.
+
+    Worker A consumes the single submission right and then loses both the
+    RUNNING write and the fail-closed UNKNOWN write.  Worker B is a brand-new
+    ``WorkerComponents`` instance (no shared Python memory) and receives a
+    claim whose persisted state derives ``submissionConsumed=True``.  It must
+    fail closed with 0 additional submits, so the total stays exactly 1.
+    """
     calls = []
 
     def handler(request):
@@ -444,19 +473,52 @@ def test_persistence_failure_never_resubmits_same_task():
     adapter = HeyGenTalkingHeadAdapter(
         enabled=True, transport=httpx.MockTransport(handler)
     )
-    queue = PersistenceFailQueue()
-    comps = components(adapter, queue)
-    task = claimed_talking_head_task()
 
-    first = process_generation_task(comps, task, poll_interval=0)
+    # Worker A: fresh claim, submit succeeds, then every persistence write fails.
+    worker_a = components(adapter, TotalPersistenceFailQueue())
+    first = process_generation_task(
+        worker_a, claimed_talking_head_task(), poll_interval=0
+    )
     assert first["status"] == "UNKNOWN"
+    assert first["errorCode"] == "GENERATION_QUEUE_UNAVAILABLE"
+    assert len(_submits(calls)) == 1
 
-    # Re-processing the same logical task (upstream id still unpersisted in the
-    # claimed task dict) must never reach submit a second time.
-    second = process_generation_task(comps, task, poll_interval=0)
+    # Worker A is destroyed; Worker B is a fresh instance with the same
+    # logical task/attempt and a claim carrying the persisted consumed state.
+    worker_b = components(adapter, RecordingQueue())
+    second = process_generation_task(
+        worker_b,
+        claimed_talking_head_task(submissionConsumed=True),
+        poll_interval=0,
+    )
     assert second["status"] == "UNKNOWN"
     assert second["error_code"] == "SUBMISSION_PERSISTENCE_FAILED"
+    # No second submission ever reaches the Provider.
     assert len(_submits(calls)) == 1
+
+
+def test_consumed_claim_fails_closed_without_any_submit():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
+
+    adapter = HeyGenTalkingHeadAdapter(
+        enabled=True, transport=httpx.MockTransport(handler)
+    )
+    queue = RecordingQueue()
+    result = process_generation_task(
+        components(adapter, queue),
+        claimed_talking_head_task(submissionConsumed=True),
+        poll_interval=0,
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["error_code"] == "SUBMISSION_PERSISTENCE_FAILED"
+    assert result["retryable"] is False
+    assert calls == []
+    assert [t[1]["status"] for t in queue.transitions] == ["UNKNOWN"]
+    assert queue.intakes == []
 
 
 def test_existing_upstream_job_id_skips_submit():
