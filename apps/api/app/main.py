@@ -1699,11 +1699,19 @@ def create_app(
             return response
         previous = task.status
         attempt = current_generation_attempt(db, task)
-        if task.status == "QUEUED" or not task.upstream_job_id:
+        submission_consumed = (
+            task.status != "QUEUED"
+            and not task.upstream_job_id
+            and attempt.submission_started_at is not None
+        )
+        if task.status == "QUEUED" and not task.upstream_job_id:
             task.status = "SUBMITTING"
             task.message = "工作节点正在提交生成任务"
             attempt.status = "SUBMITTING"
             attempt.submission_started_at = attempt.submission_started_at or now
+            submission_consumed = False
+        elif submission_consumed:
+            task.message = "当前尝试的提交权利已被消费，禁止再次提交"
         else:
             task.message = "工作节点正在恢复生成任务"
         task.started_at = task.started_at or now
@@ -1725,6 +1733,7 @@ def create_app(
             "status": task.status,
             "request": task.request_json,
             "upstreamJobId": task.upstream_job_id,
+            "submissionConsumed": submission_consumed,
             "providerArtifactId": task.provider_artifact_id,
             "providerMode": task.capability_snapshot_json.get("mode"),
             "configVersionId": task.capability_snapshot_json.get("configVersionId"),
