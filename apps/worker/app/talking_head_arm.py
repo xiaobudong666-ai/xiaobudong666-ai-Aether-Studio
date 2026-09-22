@@ -7,9 +7,11 @@ canary and performs **zero** Provider network I/O by itself.
 Design rules (all fail-closed):
 
 * The secret is referenced **by variable name / file path only** and resolved
-  lazily into the signed transport immediately before a request is issued.  Its
-  value is never stored on a Python object, never repr'd/logged, and never
-  appears in exception text or evidence.
+  lazily into the signed transport immediately before a request is issued.
+  Its value materializes **only** on the outbound request headers at the HTTP
+  signing boundary, and is scrubbed immediately after the delegate call; it is
+  never persisted, cached, logged, returned, or written into evidence,
+  business objects, or exception text.
 * Default mode is ``disabled``: no secret resolution, no transport, no request.
 * ``preflight`` mode only permits the read-only identity preflight
   (``GET /v3/users/me``); generation (submit/status/artifact) stays blocked.
@@ -29,7 +31,9 @@ import httpx
 
 from .talking_head_provider_adapter import (
     HEYGEN_API_KEY_ENV_VAR,
+    HEYGEN_AVATAR_VIDEO_PATH,
     HeyGenTalkingHeadAdapter,
+    TalkingHeadAmbiguousSubmissionError,
     TalkingHeadProviderError,
 )
 
@@ -62,8 +66,10 @@ class TalkingHeadArmMode(str, Enum):
 class SecretRef:
     """Credential reference resolved by variable name / file path only.
 
-    ``resolve()`` returns the transient secret value and is the only place the
-    value is ever materialized.  ``repr``/``str`` never leak it.
+    ``resolve()`` returns the transient secret value.  Callers must only use it
+    at the outbound HTTP signing boundary (see ``SignedApiKeyTransport``); it
+    must never be persisted, cached, logged, returned, or written into
+    evidence/business objects.  ``repr``/``str`` never leak it.
     """
 
     env_var: str = HEYGEN_API_KEY_ENV_VAR
@@ -135,8 +141,12 @@ class SecretRef:
 class SignedApiKeyTransport(httpx.BaseTransport):
     """Injects ``X-Api-Key`` from a ``SecretRef`` for each outbound request.
 
-    The value lives only on the request headers for the duration of the
-    underlying transport call and is never retained or exposed by this object.
+    The secret materializes only on the outbound request headers for the
+    duration of the delegate call and is scrubbed from the original request in
+    a ``finally`` block regardless of success or failure.  Delegate exceptions
+    are converted to a fixed, sanitized ``TalkingHeadProviderError`` so the
+    secret never escapes through message, repr, ``__dict__``, or the chained
+    exception surface (``__cause__`` / ``__context__``).
     """
 
     def __init__(self, secret: SecretRef, delegate: httpx.BaseTransport):
@@ -145,7 +155,55 @@ class SignedApiKeyTransport(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         request.headers["X-Api-Key"] = self._secret.resolve()
-        return self._delegate.handle_request(request)
+        response: httpx.Response | None = None
+        error: TalkingHeadProviderError | None = None
+        try:
+            response = self._delegate.handle_request(request)
+        except TalkingHeadProviderError as exc:
+            # Already a sanitized boundary error; re-raise it unchanged.
+            error = exc
+        except httpx.TimeoutException:
+            error = self._read_boundary_error(request)
+        except httpx.ReadError:
+            error = self._read_boundary_error(request)
+        except httpx.ConnectError:
+            error = TalkingHeadProviderError(
+                "Signed HeyGen connection failed", code="PROVIDER_CONNECTION_FAILED"
+            )
+        except Exception:
+            error = TalkingHeadProviderError(
+                "Signed HeyGen request failed", code="SIGNED_REQUEST_FAILED"
+            )
+        finally:
+            # Scrub the credential from the caller's request object whether the
+            # delegate returned or raised, so no request/header reference kept
+            # by the response or by an exception can expose the key.
+            request.headers.pop("X-Api-Key", None)
+        if error is not None:
+            # Raised outside the ``except`` block so the delegate exception is
+            # never implicitly chained onto this sanitized error.
+            raise error
+        assert response is not None  # pragma: no cover - delegate returned
+        return response
+
+    @staticmethod
+    def _read_boundary_error(request: httpx.Request) -> TalkingHeadProviderError:
+        """Map a delegate read/timeout failure to the correct fail-closed error.
+
+        A read failure on the single-submission ``POST /v3/videos`` path is an
+        ambiguous outcome: the Provider may already have accepted the job, so
+        the adapter must treat it as UNKNOWN and never auto-replay it.  Every
+        other path (identity preflight, status polling, artifact fetch) maps to
+        a generic read timeout that is reported but never retried automatically.
+        """
+        if (
+            request.method.upper() == "POST"
+            and request.url.path == HEYGEN_AVATAR_VIDEO_PATH
+        ):
+            return TalkingHeadAmbiguousSubmissionError()
+        return TalkingHeadProviderError(
+            "Signed HeyGen request timed out", code="PROVIDER_READ_TIMEOUT"
+        )
 
     def close(self) -> None:
         self._delegate.close()

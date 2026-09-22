@@ -169,6 +169,70 @@ def test_signed_transport_does_not_leak_secret_on_error(monkeypatch):
     assert len(calls) == 1
 
 
+def test_signed_transport_scrubs_header_after_success(monkeypatch):
+    clear_secret_env(monkeypatch)
+    monkeypatch.setenv(HEYGEN_API_KEY_ENV_VAR, FAKE_SECRET)
+    captured = []
+
+    def handler(request):
+        captured.append(request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    transport = SignedApiKeyTransport(SecretRef(), httpx.MockTransport(handler))
+    client = httpx.Client(transport=transport, trust_env=False, follow_redirects=False)
+    client.get("https://api.heygen.com/v3/users/me")
+    assert len(captured) == 1
+    # The credential is scrubbed from the caller-owned request after success.
+    assert "x-api-key" not in captured[0].headers
+    assert "X-Api-Key" not in captured[0].headers
+    assert FAKE_SECRET not in repr(transport)
+
+
+def test_signed_transport_scrubs_header_after_delegate_exception(monkeypatch):
+    clear_secret_env(monkeypatch)
+    monkeypatch.setenv(HEYGEN_API_KEY_ENV_VAR, FAKE_SECRET)
+    captured = []
+
+    def handler(request):
+        captured.append(request)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    transport = SignedApiKeyTransport(SecretRef(), httpx.MockTransport(handler))
+    client = httpx.Client(transport=transport, trust_env=False, follow_redirects=False)
+    with pytest.raises(TalkingHeadProviderError) as err:
+        client.get("https://api.heygen.com/v3/users/me")
+    assert err.value.code == "PROVIDER_CONNECTION_FAILED"
+    assert len(captured) == 1
+    # The credential is scrubbed from the caller-owned request even on failure.
+    assert "x-api-key" not in captured[0].headers
+    assert "X-Api-Key" not in captured[0].headers
+
+
+def test_signed_transport_redacts_secret_from_delegate_exception(monkeypatch):
+    clear_secret_env(monkeypatch)
+    monkeypatch.setenv(HEYGEN_API_KEY_ENV_VAR, FAKE_SECRET)
+
+    class LeakyTransport(httpx.BaseTransport):
+        def handle_request(self, request):
+            # Deliberately embed the fake key and raw headers into the raised
+            # exception to prove the boundary redacts them completely.
+            raise RuntimeError(f"boom key={FAKE_SECRET} headers={dict(request.headers)}")
+
+    transport = SignedApiKeyTransport(SecretRef(), LeakyTransport())
+    client = httpx.Client(transport=transport, trust_env=False, follow_redirects=False)
+    with pytest.raises(TalkingHeadProviderError) as err:
+        client.get("https://api.heygen.com/v3/users/me")
+
+    error = err.value
+    assert error.code == "SIGNED_REQUEST_FAILED"
+    assert FAKE_SECRET not in str(error)
+    assert FAKE_SECRET not in repr(error)
+    assert FAKE_SECRET not in str(error.__dict__)
+    # No implicit/context chaining onto the leaky delegate exception.
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 # ---------------------------------------------------------- preflight isolation
 def test_preflight_success_does_not_authorize_generation(monkeypatch):
     clear_secret_env(monkeypatch)

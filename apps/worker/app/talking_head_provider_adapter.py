@@ -14,8 +14,13 @@ and is a preparation-only artifact for the A1 real-provider canary:
   asset by itself
 
 The secret is referenced **by variable name only** (``HEYGEN_API_KEY``) in the
-configuration contract.  This module never reads, stores, or prints its value.
-Tests must be fake-only and never issue a real HeyGen request.
+configuration contract.  This module never reads, stores, caches, logs, returns,
+or prints the secret value, and it never writes it into evidence, business
+objects, or exception text.  The credential materializes **only** transiently on
+the outbound request headers at the HTTP signing boundary owned by
+``talking_head_arm.SignedApiKeyTransport``, and is scrubbed immediately after
+the delegate call.  Tests must be fake-only and never issue a real HeyGen
+request.
 """
 from __future__ import annotations
 
@@ -31,10 +36,11 @@ import httpx
 
 ADAPTER_VERSION = "aether-talking-head-v1"
 
-# Variable name only.  Never read this environment variable in this module;
-# authentication for a future real run is attached by the caller-owned,
-# already-signed HTTP transport, which keeps the credential boundary out of the
-# adapter and therefore out of audit/logging/artifact code.
+# Variable name only.  This module never reads this environment variable; the
+# credential boundary is owned by ``talking_head_arm.SignedApiKeyTransport``,
+# which materializes the value only on outbound request headers and scrubs it
+# after the delegate call.  This keeps the raw credential out of the adapter and
+# therefore out of audit/logging/artifact code and evidence.
 HEYGEN_API_KEY_ENV_VAR = "HEYGEN_API_KEY"
 
 HEYGEN_API_ORIGIN = ("https", "api.heygen.com", None)
