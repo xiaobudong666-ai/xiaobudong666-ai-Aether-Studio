@@ -14,8 +14,13 @@ and is a preparation-only artifact for the A1 real-provider canary:
   asset by itself
 
 The secret is referenced **by variable name only** (``HEYGEN_API_KEY``) in the
-configuration contract.  This module never reads, stores, or prints its value.
-Tests must be fake-only and never issue a real HeyGen request.
+configuration contract.  This module never reads, stores, caches, logs, returns,
+or prints the secret value, and it never writes it into evidence, business
+objects, or exception text.  The credential materializes **only** transiently on
+the outbound request headers at the HTTP signing boundary owned by
+``talking_head_arm.SignedApiKeyTransport``, and is scrubbed immediately after
+the delegate call.  Tests must be fake-only and never issue a real HeyGen
+request.
 """
 from __future__ import annotations
 
@@ -31,14 +36,16 @@ import httpx
 
 ADAPTER_VERSION = "aether-talking-head-v1"
 
-# Variable name only.  Never read this environment variable in this module;
-# authentication for a future real run is attached by the caller-owned,
-# already-signed HTTP transport, which keeps the credential boundary out of the
-# adapter and therefore out of audit/logging/artifact code.
+# Variable name only.  This module never reads this environment variable; the
+# credential boundary is owned by ``talking_head_arm.SignedApiKeyTransport``,
+# which materializes the value only on outbound request headers and scrubs it
+# after the delegate call.  This keeps the raw credential out of the adapter and
+# therefore out of audit/logging/artifact code and evidence.
 HEYGEN_API_KEY_ENV_VAR = "HEYGEN_API_KEY"
 
 HEYGEN_API_ORIGIN = ("https", "api.heygen.com", None)
 HEYGEN_AVATAR_VIDEO_PATH = "/v3/videos"
+HEYGEN_IDENTITY_PREFLIGHT_PATH = "/v3/users/me"
 
 # Artifact/media origin is intentionally decoupled from the API control-plane
 # origin.  HeyGen's completed-job ``video_url`` points at its media CDN, so the
@@ -215,8 +222,15 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
         cost_per_second_usd: float = HEYGEN_COST_PER_SECOND_USD,
         max_artifact_bytes: int | None = None,
         artifact_origins: tuple[tuple[str, str, int | None], ...] | None = None,
+        identity_only: bool = False,
+        artifact_host_verified: bool = False,
+        require_avatar_only: bool = False,
     ):
         self.enabled = enabled
+        self.identity_only = bool(identity_only)
+        self.artifact_host_verified = bool(artifact_host_verified)
+        self.require_avatar_only = bool(require_avatar_only)
+        self._observed_artifact_hosts: set[str] = set()
         self.timeout = float(
             timeout if timeout is not None else HEYGEN_DEFAULT_TIMEOUT_SECONDS
         )
@@ -371,6 +385,15 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
         job_spec.validate()
         if not self.enabled:
             raise TalkingHeadProviderDisabled()
+        if self.identity_only:
+            raise TalkingHeadProviderDisabled(
+                "Talking-head generation is not authorized in preflight mode"
+            )
+        if self.require_avatar_only and not job_spec.avatar_id:
+            raise TalkingHeadProviderError(
+                "First canary requires an avatar_id character",
+                code="AVATAR_ID_REQUIRED",
+            )
 
         estimated_cost = int(job_spec.duration_seconds) * self.cost_per_second_usd
         if estimated_cost > self.cost_ceiling_usd:
@@ -427,6 +450,10 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
     def status(self, job_id: str) -> dict:
         if not self.enabled:
             raise TalkingHeadProviderDisabled()
+        if self.identity_only:
+            raise TalkingHeadProviderDisabled(
+                "Talking-head generation is not authorized in preflight mode"
+            )
         self._validate_job_id(job_id)
         url = f"{self.api_url}{HEYGEN_AVATAR_VIDEO_PATH}/{job_id}"
         self._assert_identity(url)
@@ -487,9 +514,13 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
                     "HeyGen completed job omitted artifact URL",
                     code="ARTIFACT_URL_MISSING",
                 )
-            self._validated_artifact_url(str(video_url))
-            self._artifact_urls[job_id] = str(video_url)
+            url = self._validate_artifact_source(str(video_url))
+            self._artifact_urls[job_id] = url
+            host = self._artifact_host_candidate(url)
+            self._observed_artifact_hosts.add(host)
             result["providerArtifactId"] = job_id
+            result["artifactHost"] = host
+            result["artifactHostVerified"] = self.artifact_host_verified
         if status == "failed":
             result.update(
                 {
@@ -504,11 +535,20 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
     def artifact(self, job_id: str) -> BinaryIO:
         if not self.enabled:
             raise TalkingHeadProviderDisabled()
+        if self.identity_only:
+            raise TalkingHeadProviderDisabled(
+                "Talking-head generation is not authorized in preflight mode"
+            )
         self._validate_job_id(job_id)
         source = self._artifact_urls.get(job_id)
         if source is None:
             raise TalkingHeadArtifactError(
                 "Artifact identifier is unknown", code="ARTIFACT_ID_UNKNOWN"
+            )
+        if not self.artifact_host_verified:
+            raise TalkingHeadArtifactError(
+                "Artifact host is not verified; stopping before download",
+                code="ARTIFACT_HOST_UNVERIFIED",
             )
         url = self._validated_artifact_url(source)
         output = tempfile.SpooledTemporaryFile(
@@ -574,7 +614,66 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
                 "Provider job identifier rejected", code="PROVIDER_ID_INVALID"
             )
 
-    def _validated_artifact_url(self, source: str) -> str:
+    # -------------------------------------------------- identity preflight
+    def identity_preflight(self) -> dict:
+        """Read-only identity check (GET /v3/users/me).  Never authorizes generation."""
+        if not self.enabled:
+            raise TalkingHeadProviderDisabled()
+        url = f"{self.api_url}{HEYGEN_IDENTITY_PREFLIGHT_PATH}"
+        self._assert_identity(url)
+        try:
+            with self._client() as client:
+                response = client.get(url)
+        except (httpx.ReadTimeout, httpx.ReadError) as exc:
+            raise TalkingHeadProviderError(
+                "HeyGen identity preflight timed out", code="PROVIDER_READ_TIMEOUT"
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise TalkingHeadProviderError(
+                "HeyGen connection failed", code="PROVIDER_CONNECTION_FAILED"
+            ) from exc
+        except TalkingHeadProviderError:
+            raise
+        except Exception as exc:
+            raise TalkingHeadProviderError(
+                "HeyGen returned an invalid response", code="PROVIDER_RESPONSE_INVALID"
+            ) from exc
+
+        if response.status_code in {301, 302, 303, 307, 308}:
+            raise TalkingHeadIdentityError("HeyGen redirect rejected")
+        if response.status_code >= 400:
+            code = (
+                "PROVIDER_RATE_LIMITED" if response.status_code == 429
+                else "PROVIDER_BALANCE_INSUFFICIENT" if response.status_code == 402
+                else "PROVIDER_UNAUTHORIZED" if response.status_code == 401
+                else "PROVIDER_5XX" if response.status_code >= 500
+                else "PROVIDER_4XX"
+            )
+            raise TalkingHeadProviderError(
+                "HeyGen rejected identity preflight",
+                code=code,
+                status_code=response.status_code,
+            )
+        self._json_object(response)
+        return {
+            "status": "ok",
+            "provider": "heygen",
+            "accountIdentified": True,
+            "preflightPath": HEYGEN_IDENTITY_PREFLIGHT_PATH,
+        }
+
+    # ------------------------------------------------------- artifact host
+    def observed_artifact_hosts(self) -> tuple[str, ...]:
+        """De-identified hostname candidates observed from completed jobs."""
+        return tuple(sorted(self._observed_artifact_hosts))
+
+    @staticmethod
+    def _artifact_host_candidate(url: str) -> str:
+        parsed = urlsplit(url)
+        return (parsed.hostname or "").lower()
+
+    @staticmethod
+    def _validate_artifact_source(source: str) -> str:
         if not source or "\\" in source or "\x00" in source:
             raise TalkingHeadArtifactError(
                 "Artifact source rejected", code="ARTIFACT_SOURCE_INVALID"
@@ -589,7 +688,6 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
             parsed.scheme not in {"http", "https"}
             or parsed.username is not None
             or parsed.password is not None
-            or (parsed.scheme, parsed.hostname, parsed.port) not in self._artifact_origins
         ):
             raise TalkingHeadArtifactError(
                 "Artifact origin rejected", code="ARTIFACT_ORIGIN_REJECTED"
@@ -603,5 +701,14 @@ class HeyGenTalkingHeadAdapter(TalkingHeadProviderAdapter):
         if any(marker in query for marker in ("token", "secret", "key", "signature", "credential")):
             raise TalkingHeadArtifactError(
                 "Artifact query rejected", code="ARTIFACT_QUERY_REJECTED"
+            )
+        return decoded
+
+    def _validated_artifact_url(self, source: str) -> str:
+        decoded = self._validate_artifact_source(source)
+        parsed = urlsplit(decoded)
+        if (parsed.scheme, parsed.hostname, parsed.port) not in self._artifact_origins:
+            raise TalkingHeadArtifactError(
+                "Artifact origin rejected", code="ARTIFACT_ORIGIN_REJECTED"
             )
         return decoded

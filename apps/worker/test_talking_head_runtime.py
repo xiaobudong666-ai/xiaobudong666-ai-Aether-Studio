@@ -63,6 +63,7 @@ def golden_transport():
 
 
 def enabled_adapter(**kwargs):
+    kwargs.setdefault("artifact_host_verified", True)
     return HeyGenTalkingHeadAdapter(
         enabled=True, transport=golden_transport(), **kwargs
     )
@@ -236,7 +237,7 @@ def test_talking_head_runtime_maps_request_to_job_spec_and_pins_9_16():
         )
 
     adapter = HeyGenTalkingHeadAdapter(
-        enabled=True, transport=httpx.MockTransport(handler)
+        enabled=True, transport=httpx.MockTransport(handler), artifact_host_verified=True
     )
     queue = RecordingQueue()
     result = process_generation_task(
@@ -397,7 +398,7 @@ def test_talking_head_golden_chain_submits_exactly_once():
         return httpx.Response(404, request=request)
 
     adapter = HeyGenTalkingHeadAdapter(
-        enabled=True, transport=httpx.MockTransport(handler)
+        enabled=True, transport=httpx.MockTransport(handler), artifact_host_verified=True
     )
     queue = RecordingQueue()
     result = process_generation_task(
@@ -549,7 +550,7 @@ def test_existing_upstream_job_id_skips_submit():
         return httpx.Response(200, json={"data": {"video_id": "video-1"}}, request=request)
 
     adapter = HeyGenTalkingHeadAdapter(
-        enabled=True, transport=httpx.MockTransport(handler)
+        enabled=True, transport=httpx.MockTransport(handler), artifact_host_verified=True
     )
     queue = RecordingQueue()
     task = claimed_talking_head_task(upstreamJobId="video-1")
