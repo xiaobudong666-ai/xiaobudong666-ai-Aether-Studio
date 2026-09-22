@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
+
 from .ai_provider import AIProviderInterface
 from .ffmpeg_adapter import FFmpegAdapter
 from .generation_queue import GenerationQueueClient, GenerationQueueError
@@ -27,6 +29,7 @@ from .talking_head_provider_adapter import (
     TalkingHeadProviderAdapter,
     TalkingHeadProviderError,
 )
+from .talking_head_arm import TalkingHeadArmController
 from .task_queue import TaskQueueClient, TaskQueueError
 from .video_use_adapter import VideoUseAdapter
 
@@ -148,10 +151,15 @@ def initialize_worker() -> WorkerComponents:
         moneyprinter_adapter = MoneyPrinterTurboAdapter(degrade_on_failure=False)
     else:
         moneyprinter_adapter = DisabledMoneyPrinterAdapter()
-    # Talking-head Provider is wired but stays default-off.  It performs no
-    # network I/O and never reads HEYGEN_API_KEY; enabling is a future canary
-    # gate and is intentionally not reachable through this initialization path.
-    talking_head_adapter: object = HeyGenTalkingHeadAdapter()
+    # Talking-head Provider is wired through the operator arm switch.  It is
+    # default-off and performs no network I/O and never reads HEYGEN_API_KEY
+    # until the operator explicitly selects preflight (read-only identity) or
+    # armed (generation) mode.  Both require the frozen canary binding and a
+    # present, permission-valid secret; otherwise they fail closed to disabled.
+    talking_head_arm = TalkingHeadArmController.from_env()
+    talking_head_adapter: object = talking_head_arm.build_adapter(
+        transport=httpx.HTTPTransport(trust_env=False)
+    )
     return WorkerComponents(
         ffmpeg=FFmpegAdapter(),
         ai=AIProviderInterface(),

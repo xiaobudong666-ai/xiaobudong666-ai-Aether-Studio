@@ -184,7 +184,7 @@ def test_artifact_returns_binary_stream_not_publishable_url():
             request=request,
         )
 
-    adapter = adapter_with(handler)
+    adapter = adapter_with(handler, artifact_host_verified=True)
     adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
     stream = adapter.artifact("video-1")
     assert not isinstance(stream, str)
@@ -192,14 +192,15 @@ def test_artifact_returns_binary_stream_not_publishable_url():
 
 
 def test_artifact_rejects_non_mp4_and_wrong_origin():
-    adapter = adapter_with(
-        lambda request: httpx.Response(
+    def handler(request):
+        return httpx.Response(
             200,
             content=b"not-mp4",
             headers={"content-type": "application/octet-stream"},
             request=request,
         )
-    )
+
+    adapter = adapter_with(handler, artifact_host_verified=True)
     adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
     with pytest.raises(TalkingHeadArtifactError) as err:
         adapter.artifact("video-1")
@@ -230,7 +231,7 @@ def test_artifact_accepts_approved_media_origin():
             request=request,
         )
 
-    adapter = adapter_with(handler)
+    adapter = adapter_with(handler, artifact_host_verified=True)
     adapter._artifact_urls["video-1"] = approved  # noqa: SLF001
     assert adapter.artifact("video-1").read() == b"\x00\x00\x00\x18ftypmp42fake-mp4-bytes"
 
@@ -251,7 +252,7 @@ def test_artifact_rejects_redirect_from_approved_media_origin():
             302, headers={"location": "https://cdn.heygen.com/other.mp4"}, request=request
         )
 
-    adapter = adapter_with(handler)
+    adapter = adapter_with(handler, artifact_host_verified=True)
     adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
     with pytest.raises(TalkingHeadArtifactError) as err:
         adapter.artifact("video-1")
@@ -259,11 +260,12 @@ def test_artifact_rejects_redirect_from_approved_media_origin():
 
 
 def test_artifact_rejects_redirect_and_missing_source():
-    adapter = adapter_with(
-        lambda request: httpx.Response(
+    def handler(request):
+        return httpx.Response(
             302, headers={"location": "https://evil.example/a.mp4"}, request=request
         )
-    )
+
+    adapter = adapter_with(handler, artifact_host_verified=True)
     adapter._artifact_urls["video-1"] = "https://cdn.heygen.com/videos/video-1.mp4"  # noqa: SLF001
     with pytest.raises(TalkingHeadArtifactError) as err:
         adapter.artifact("video-1")
