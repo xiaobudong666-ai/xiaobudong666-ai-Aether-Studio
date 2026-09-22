@@ -26,6 +26,7 @@ import os
 import stat
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -48,6 +49,68 @@ ARM_BINDING = (
     HEYGEN_API_KEY_ENV_VAR,
     "talking-head-canary-v1",
 )
+
+# Controlled HeyGen egress: the only permitted route to the Provider is either a
+# direct connection (default) or the explicitly configured, strictly pinned
+# loopback HTTP proxy below.  No system proxy environment is ever consulted and
+# no other host/port is accepted; an invalid value fails closed.
+HEYGEN_EGRESS_PROXY_ENV_VAR = "AETHER_TALKING_HEAD_EGRESS_PROXY"
+HEYGEN_EGRESS_PROXY_HOST = "127.0.0.1"
+HEYGEN_EGRESS_PROXY_PORT = 7890
+HEYGEN_EGRESS_PROXY_URL = f"http://{HEYGEN_EGRESS_PROXY_HOST}:{HEYGEN_EGRESS_PROXY_PORT}"
+
+
+def parse_heygen_egress_proxy(value: str) -> str:
+    """Validate a loopback egress proxy URL and return its canonical form.
+
+    Fail closed unless ``value`` is exactly the pinned loopback HTTP proxy
+    ``http://127.0.0.1:7890``: scheme ``http`` only, hostname ``127.0.0.1``
+    only, port ``7890`` only, and no credentials, query, fragment, or non-root
+    path.  Wildcard hosts, non-loopback hosts, and arbitrary ports are refused.
+    """
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme
+        hostname = parsed.hostname
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+    except ValueError as exc:
+        raise TalkingHeadProviderError(
+            "HeyGen egress proxy URL is invalid", code="PROXY_POLICY_VIOLATION"
+        ) from exc
+    if (
+        scheme != "http"
+        or hostname != HEYGEN_EGRESS_PROXY_HOST
+        or port != HEYGEN_EGRESS_PROXY_PORT
+        or username is not None
+        or password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise TalkingHeadProviderError(
+            "HeyGen egress proxy violates the loopback policy",
+            code="PROXY_POLICY_VIOLATION",
+        )
+    return HEYGEN_EGRESS_PROXY_URL
+
+
+def build_heygen_transport() -> httpx.BaseTransport:
+    """Build the HeyGen outbound transport with zero retries and no fallback.
+
+    * Default (``AETHER_TALKING_HEAD_EGRESS_PROXY`` unset): a direct
+      ``trust_env=False`` transport.  System ``HTTP_PROXY``/``HTTPS_PROXY`` are
+      never consulted.
+    * Explicitly set: route exclusively through the pinned loopback proxy.  An
+      invalid value fails closed (``PROXY_POLICY_VIOLATION``) and never falls
+      back to a direct connection or to a system proxy.
+    """
+    raw = os.environ.get(HEYGEN_EGRESS_PROXY_ENV_VAR, "").strip()
+    if not raw:
+        return httpx.HTTPTransport(trust_env=False, retries=0)
+    proxy_url = parse_heygen_egress_proxy(raw)
+    return httpx.HTTPTransport(proxy=proxy_url, trust_env=False, retries=0)
 
 
 class TalkingHeadArmMode(str, Enum):
@@ -170,6 +233,12 @@ class SignedApiKeyTransport(httpx.BaseTransport):
             error = TalkingHeadProviderError(
                 "Signed HeyGen connection failed", code="PROVIDER_CONNECTION_FAILED"
             )
+        except httpx.ProxyError:
+            # A configured loopback egress proxy that is unreachable must fail
+            # closed to the same connection error; never fall back to direct.
+            error = TalkingHeadProviderError(
+                "Signed HeyGen proxy connection failed", code="PROVIDER_CONNECTION_FAILED"
+            )
         except Exception:
             error = TalkingHeadProviderError(
                 "Signed HeyGen request failed", code="SIGNED_REQUEST_FAILED"
@@ -279,8 +348,10 @@ class TalkingHeadArmController:
         """
         if self.is_disabled():
             return HeyGenTalkingHeadAdapter()
+        if transport is None:
+            transport = build_heygen_transport()
         secret = secret or SecretRef()
-        signed = SignedApiKeyTransport(secret, transport) if transport is not None else None
+        signed = SignedApiKeyTransport(secret, transport)
         if self.mode is TalkingHeadArmMode.PREFLIGHT:
             return HeyGenTalkingHeadAdapter(
                 enabled=True,
