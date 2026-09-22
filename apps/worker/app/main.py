@@ -8,8 +8,6 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import httpx
-
 from .ai_provider import AIProviderInterface
 from .ffmpeg_adapter import FFmpegAdapter
 from .generation_queue import GenerationQueueClient, GenerationQueueError
@@ -157,9 +155,11 @@ def initialize_worker() -> WorkerComponents:
     # armed (generation) mode.  Both require the frozen canary binding and a
     # present, permission-valid secret; otherwise they fail closed to disabled.
     talking_head_arm = TalkingHeadArmController.from_env()
-    talking_head_adapter: object = talking_head_arm.build_adapter(
-        transport=httpx.HTTPTransport(trust_env=False)
-    )
+    # The outbound transport (direct by default, or the strictly pinned loopback
+    # egress proxy when explicitly configured) is built inside ``build_adapter``
+    # only once the arm switch leaves ``disabled``, so proxy policy validation
+    # never fires while the Provider is default-off.
+    talking_head_adapter: object = talking_head_arm.build_adapter()
     return WorkerComponents(
         ffmpeg=FFmpegAdapter(),
         ai=AIProviderInterface(),
