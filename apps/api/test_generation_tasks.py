@@ -22,6 +22,7 @@ from app.models import (
     DBGenerationProviderConfigVersion,
     DBGenerationProviderEvent,
     DBGenerationTask,
+    DBRightsSnapshot,
     DBGenerationUsageEntry,
     DBProject,
     DBTenant,
@@ -1375,3 +1376,168 @@ def test_p0_runtime_bridge_revision_conflict_is_fail_closed(generation_context):
     )
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
+
+
+
+def _g72_fake_visual_fixture(sessions, project, allowed=True):
+    """Native SQLite image + REMIX rights fixture; never production evidence."""
+    with sessions() as db:
+        record = db.get(DBProject, project["id"])
+        assert record is not None
+        created = datetime.datetime.now(datetime.timezone.utc)
+        asset = DBAssetVersion(
+            id=str(uuid.uuid4()), tenant_id=record.tenant_id, project_id=record.id,
+            media_id="synthetic-fixture-image", version_no=1,
+            sha256="a" * 64, media_type="image", content_type="image/png",
+            size_bytes=100, probe_json={"image": {"width": 48, "height": 48}},
+            created_by=record.owner_id, created_at=created,
+        )
+        db.add(asset)
+        snapshot = DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=record.tenant_id,
+            project_id=record.id, asset_version_id=asset.id,
+            status="ALLOWED" if allowed else "DENIED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="synthetic-test-evidence", captured_by=record.owner_id,
+            captured_at=created,
+        )
+        db.add(snapshot)
+        db.commit()
+        return asset.id
+
+
+def _g72_fake_payload(client, project, asset_id, key="g72-fake-task"):
+    caps = client.get("/generation/providers/moneyprinter/capabilities").json()
+    return {
+        "text": "synthetic offline voice-over",
+        "durationSeconds": 1,
+        "aspectRatio": "9:16",
+        "resolution": "720p",
+        "voiceId": "synthetic-seed",
+        "imageAssetVersionId": asset_id,
+        "idempotencyKey": idempotency_uuid(key),
+        "expectedProjectRevision": project["revision"],
+        "capabilitySnapshotHash": caps["snapshotHash"],
+        "confirmSyntheticTestOnly": True,
+    }
+
+
+def test_g72_native_fake_http_db_create_claim_and_idempotency(generation_context):
+    client, sessions, _app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    preflight = client.post(path + "/validate", json=payload)
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["simulatedOutput"] is True
+    created = client.post(path, json=payload)
+    assert created.status_code == 202, created.text
+    task = created.json()
+    assert task["provider"] == "deterministic-fake-talking-head"
+    assert task["status"] == "QUEUED"
+    duplicate = client.post(path, json=payload)
+    assert duplicate.status_code == 202, duplicate.text
+    assert duplicate.json()["taskId"] == task["taskId"]
+    claimed = claim(client)
+    assert claimed.status_code == 200, claimed.text
+    body = claimed.json()
+    assert body["providerMode"] == "talking-head-fake"
+    assert body["taskId"] == task["taskId"]
+    assert body["request"]["imageAssetId"] == asset_id
+    assert body["request"]["fakeTaskType"] == "talking-head"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task["taskId"])
+        assert stored is not None and stored.requested_by is not None
+        assert stored.max_attempts == 1
+        assert len(list(db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == stored.id
+        )).scalars())) == 1
+
+
+def test_g72_native_fake_missing_asset_or_missing_rights_fail_closed(generation_context):
+    client, sessions, _app, _ = generation_context
+    project = create_project(client)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    unknown = _g72_fake_payload(client, project, "nonexistent-asset", key="g72-bad-asset")
+    response = client.post(path, json=unknown)
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "ASSET_VERSION_NOT_FOUND"
+    denied_id = _g72_fake_visual_fixture(sessions, project, allowed=False)
+    denied = _g72_fake_payload(client, project, denied_id, key="g72-no-rights")
+    response = client.post(path, json=denied)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "FAKE_VISUAL_RIGHTS_BLOCKED"
+    assert claim(client).status_code == 204
+
+
+def test_g72_native_fake_owner_session_only_and_default_off(generation_context):
+    client, sessions, app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-overrides")
+    malicious = {**payload, "requestedBy": "another-user", "tenantId": "another-tenant"}
+    assert client.post(path, json=malicious).status_code == 422
+    assert client.post(path, json={**payload, "confirmSyntheticTestOnly": False}).status_code == 422
+    app.state.generation_provider_mode = "disabled"
+    response = client.post(path, json=payload)
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "TALKING_HEAD_FAKE_DISABLED"
+    assert claim(client).status_code == 204
+
+
+def test_g72_native_fake_rights_revoke_after_enqueue_blocks_claim(generation_context):
+    client, sessions, _app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-revoke-before-claim")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(path, json=payload)
+    assert created.status_code == 202, created.text
+    with sessions() as db:
+        old = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=old.tenant_id, project_id=old.project_id,
+            asset_version_id=asset_id, status="DENIED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="test-revoked", captured_by=old.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+    assert claim(client).status_code == 204
+
+
+def test_g72_native_fake_revoked_input_rejected_at_artifact_intake(generation_context):
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-revoke-at-intake")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    response = client.post(path, json=payload)
+    assert response.status_code == 202
+    task_id = response.json()["taskId"]
+    assert claim(client).status_code == 200
+    with sessions() as db:
+        old = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=old.tenant_id, project_id=old.project_id,
+            asset_version_id=asset_id, status="REVOKED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="test-revoked", captured_by=old.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "synthetic-job-id"},
+        files={"file": ("synthetic.mp4", b"synthetic-mp4-bytes", "video/mp4")},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    assert media.uploads == 0
