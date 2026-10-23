@@ -1928,3 +1928,80 @@ def test_g72_native_video_use_http_store_survives_sidecar_restart(
         assert restarted.get(
             f"/media/{project_id}/{uuid.uuid4()}"
         ).status_code == 404
+
+
+def test_g72_foreign_tenant_owner_cannot_preflight_create_or_read(generation_context):
+    """Real auth/SQLite: even another tenant's owner cannot operate G72."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-foreign-tenant-isolated")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    password = secrets.token_urlsafe(24)
+    with sessions() as db:
+        tenant = DBTenant(
+            id="g72-foreign-tenant", name="G72 Foreign", slug="g72-foreign",
+            project_quota=50, storage_quota_bytes=1024**3,
+            used_storage_bytes=0, concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600, render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"), created_at=now, updated_at=now,
+        )
+        user = DBUser(
+            id="g72-foreign-owner", tenant_id=tenant.id,
+            email="g72-foreign-owner@example.com", display_name="Other Tenant Owner",
+            password_hash=hash_password(password), role="owner", is_active=True,
+            created_at=now, updated_at=now,
+        )
+        db.add_all([tenant, user])
+        db.commit()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "g72-foreign-owner@example.com", "password": password,
+    }).status_code == 200
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for endpoint in (base + "/validate", base):
+        response = client.post(endpoint, json=payload)
+        assert response.status_code == 404, response.text
+    assert client.get(f"/projects/{project['id']}").status_code == 404
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 0
+    assert media.uploads == 0
+
+
+def test_g72_wrong_worker_cannot_ingest_claimed_artifact(generation_context):
+    """Real FAKE API/SQLite lease guard: rejected intake has zero media side effect."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-wrong-lease-owner")
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(base, json=payload)
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    assert claim(client, worker_id="worker-a").status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="fake-job-a").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-job-a", providerArtifactId="fake-artifact-a",
+    ).status_code == 200
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-b"},
+        data={"providerArtifactId": "fake-artifact-a"},
+        files={"file": ("fake.mp4", b"synthetic-fake-media", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "LEASE_LOST"
+    assert media.uploads == 0
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "INGESTING" and task.asset_version_id is None
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
