@@ -11,8 +11,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import time
 import uuid
+
+# CI copies this script to /tmp; the API image installs native modules in /app.
+# Resolve imports explicitly, without changing application or Provider settings.
+sys.path.insert(0, "/app")
 
 import httpx
 from sqlalchemy import func, select
