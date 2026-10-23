@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger("video_use_service")
@@ -38,6 +40,9 @@ ALLOWED_EXTENSIONS = {
     ".m4a",
     ".aac",
 }
+IMAGE_EXTENSIONS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
+IMAGE_CONTENT_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+ALLOWED_EXTENSIONS.update(IMAGE_EXTENSIONS)
 MAX_UPLOAD_BYTES = int(os.environ.get("VIDEO_USE_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
 
 
@@ -691,7 +696,34 @@ def create_app(
                     if size > MAX_UPLOAD_BYTES:
                         raise HTTPException(status_code=413, detail="媒体文件过大")
                     output.write(chunk)
-            metadata = probe(destination)
+            if suffix in IMAGE_EXTENSIONS:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", Image.DecompressionBombWarning)
+                        with Image.open(destination) as image:
+                            image_format = image.format
+                            width, height = image.size
+                            frames = getattr(image, "n_frames", 1)
+                            if (
+                                image_format != IMAGE_EXTENSIONS[suffix]
+                                or frames != 1
+                                or width < 1 or height < 1
+                                or width > 8192 or height > 8192
+                            ):
+                                raise ValueError("Unsupported image format or dimensions")
+                            image.verify()
+                except (UnidentifiedImageError, OSError, ValueError,
+                        Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+                    raise HTTPException(status_code=415, detail="图片格式或内容无效") from exc
+                metadata = {
+                    "durationSeconds": None, "sizeBytes": size,
+                    "format": image_format.lower(), "video": None, "audio": None,
+                    "image": {"format": image_format, "width": width, "height": height},
+                }
+                content_type = IMAGE_CONTENT_TYPES[image_format]
+            else:
+                metadata = probe(destination)
+                content_type = file.content_type
         except Exception:
             destination.unlink(missing_ok=True)
             raise
@@ -702,7 +734,7 @@ def create_app(
             "mediaId": media_id,
             "projectId": projectId,
             "fileName": Path(file.filename or destination.name).name,
-            "contentType": file.content_type,
+            "contentType": content_type,
             "metadata": metadata,
         }
 
