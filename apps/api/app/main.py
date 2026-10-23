@@ -367,7 +367,17 @@ def create_app(
         resolved_generation_provider_mode = os.environ.get(
             "AETHER_GENERATION_PROVIDER_MODE", "disabled"
         )
-        if resolved_generation_provider_mode not in {"disabled", "moneyprinter"}:
+        # FAKE-only routing is opt-in for disposable nonproduction Compose tests.
+        # A stray provider-mode environment variable must remain fail-closed.
+        if resolved_generation_provider_mode == "deterministic-fake":
+            if (
+                os.environ.get("AETHER_FAKE_ONLY_NONPROD", "").lower() == "true"
+                and os.environ.get("AETHER_RUNTIME_STAGE", "").lower() == "nonproduction"
+            ):
+                pass
+            else:
+                resolved_generation_provider_mode = "disabled"
+        elif resolved_generation_provider_mode not in {"disabled", "moneyprinter"}:
             resolved_generation_provider_mode = "disabled"
     else:
         resolved_generation_provider_mode = generation_provider_mode
