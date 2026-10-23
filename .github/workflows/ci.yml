@@ -89,6 +89,40 @@ jobs:
           bash -n infra/docker/provider-canary.sh
           python infra/docker/provider-canary-smoke.py self-test
 
+  g72-fake-runtime-native:
+    # Independent evidence while another job is blocked by a security advisory.
+    # It does NOT waive the Node audit or enable release/merge approval.
+    name: G72 FAKE native routing (audit still required)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install native test dependencies
+        run: |
+          pip install -r apps/api/requirements.txt
+          pip install -r apps/worker/requirements.txt
+          pip install -r apps/video_use/requirements.txt
+
+      - name: Ensure offline FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+
+      - name: Run only scoped FAKE-only native API regressions
+        env:
+          PYTHONPATH: apps/api
+        run: |
+          python -m pytest apps/api/test_generation_tasks.py -v \
+            -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g72_native_video_use_http_store_survives_sidecar_restart or test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation or test_g76_late_success_does_not_close_open_circuit or test_g76_half_open_only_current_probe_can_close"
+
   playwright:
     name: Playwright workbench flow
     needs: build-and-test
