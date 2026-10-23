@@ -69,6 +69,16 @@ jobs:
           pip-audit -r apps/worker/requirements.txt
           pip-audit -r apps/video_use/requirements.txt
 
+      - name: Ensure offline FFmpeg for G72 native API/Worker audit test
+        run: |
+          # Test-only dependencies. No external Provider, no production configuration.
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
       - name: Run API tests
         env:
           PYTHONPATH: apps/api
