@@ -2101,3 +2101,43 @@ def test_g76_half_open_only_current_probe_can_close(generation_context):
             )
         ).scalar_one() == 1
 
+
+
+def test_g72_image_uploaded_through_public_api_can_be_used_as_fake_input(generation_context):
+    client, sessions, _app, media_store = generation_context
+    project = client.post("/projects", json={"name": "G72 image ingress"}).json()
+    def verified_image_upload(project_id, filename, content_type, stream):
+        payload = stream.read()
+        media_store.uploads += 1
+        return {
+            "mediaId": f"image-{media_store.uploads}", "projectId": project_id,
+            "fileName": filename, "contentType": "image/png",
+            "metadata": {
+                "sizeBytes": len(payload), "durationSeconds": None,
+                "video": None, "audio": None,
+                "image": {"format": "PNG", "width": 48, "height": 64},
+            },
+        }
+    media_store.upload_media = verified_image_upload
+    uploaded = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("portrait.png", b"synthetic-image-bytes", "image/png")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    asset = uploaded.json()["assetVersion"]
+    assert asset["mediaType"] == "image"
+    rights = client.post(
+        f"/projects/{project['id']}/asset-versions/{asset['id']}/rights-snapshots",
+        json={"status": "ALLOWED", "purpose": "REMIX", "territory": "TEST",
+              "evidenceRef": "synthetic-test-evidence"},
+    )
+    assert rights.status_code == 201, rights.text
+    current_project = uploaded.json()["project"]
+    request = _g72_fake_payload(client, current_project, asset["id"], key="g72-public-image-ingress")
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    assert created.json()["requestSummary"]["inputAssetVersionIds"] == [asset["id"]]
