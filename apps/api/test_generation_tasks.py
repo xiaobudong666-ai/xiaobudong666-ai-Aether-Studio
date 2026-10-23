@@ -2005,3 +2005,99 @@ def test_g72_wrong_worker_cannot_ingest_claimed_artifact(generation_context):
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one() == 0
+
+
+# G76 safety regression: probe-only circuit closure (FAKE-only, native HTTP+SQLite).
+# Keep the G76 gap OPEN until durable epoch/issuer and concurrency gates pass.
+def _g76_finish_claimed_fake_task(client, task_id, worker_id, suffix):
+    upstream = f"g76-upstream-{suffix}"
+    artifact = f"g76-artifact-{suffix}"
+    assert transition(
+        client, task_id, "RUNNING", worker_id=worker_id, upstreamJobId=upstream
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", worker_id=worker_id,
+        upstreamJobId=upstream, providerArtifactId=artifact,
+    ).status_code == 200
+    result = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+        data={"providerArtifactId": artifact},
+        files={"file": (f"{suffix}.mp4", b"g76-offline-test-video", "video/mp4")},
+    )
+    assert result.status_code == 201, result.text
+
+
+def test_g76_late_success_does_not_close_open_circuit(generation_context):
+    """An older completion cannot heal OPEN or erase its cooldown."""
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "G76 stale success during open")
+    task = create_task(client, project, key="g76-late-success-open")
+    assert claim(client, "worker-g76-old").json()["taskId"] == task["taskId"]
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
+            state="OPEN", failure_timestamps_json=[now.isoformat()], opened_at=now,
+            cooldown_until=now + datetime.timedelta(minutes=2), updated_at=now,
+        ))
+        db.commit()
+
+    _g76_finish_claimed_fake_task(client, task["taskId"], "worker-g76-old", "late-open")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        closed_events = db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one()
+        assert circuit.state == "OPEN"
+        assert circuit.cooldown_until is not None
+        assert circuit.half_open_task_id is None
+        assert closed_events == 0
+
+
+def test_g76_half_open_only_current_probe_can_close(generation_context):
+    """Wrong task cannot close HALF_OPEN; current probe closes exactly once."""
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "G76 wrong probe")
+    old = create_task(client, project, key="g76-old-not-probe")
+    probe = create_task(client, project, key="g76-current-probe")
+    assert claim(client, "worker-g76-old").json()["taskId"] == old["taskId"]
+    assert claim(client, "worker-g76-probe").json()["taskId"] == probe["taskId"]
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
+            state="HALF_OPEN", half_open_task_id=probe["taskId"],
+            failure_timestamps_json=[now.isoformat()],
+            opened_at=now - datetime.timedelta(minutes=2), updated_at=now,
+        ))
+        db.commit()
+
+    _g76_finish_claimed_fake_task(client, old["taskId"], "worker-g76-old", "wrong-probe")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.half_open_task_id == probe["taskId"]
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 0
+
+    _g76_finish_claimed_fake_task(client, probe["taskId"], "worker-g76-probe", "right-probe")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "CLOSED"
+        assert circuit.half_open_task_id is None
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 1
+
