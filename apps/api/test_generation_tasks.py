@@ -1846,3 +1846,85 @@ def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
             DBGenerationUsageEntry.task_id == task.id,
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one() == 1
+
+
+def test_g72_native_video_use_http_store_survives_sidecar_restart(
+    g72_true_native_flow_context, monkeypatch, tmp_path,
+):
+    """Native FAKE API/SQLite/Worker -> actual video-use HTTP -> disk -> restart.
+
+    In a CI runner without FFmpeg/FFprobe ONLY encoder bytes and sidecar media
+    probe are test doubles. API authorization, claim, Worker dispatch, HTTP
+    upload, on-disk storage, output SHA and DB audit use native components.
+    This is in-process nonproduction validation, not Compose/PG E2E.
+    """
+    import hashlib
+    import importlib.util
+    import shutil
+    import sys
+
+    _, sessions, media_store = g72_true_native_flow_context
+    sidecar_path = Path(__file__).resolve().parents[1] / "video_use" / "app" / "main.py"
+    module_name = f"_aether_g72_native_video_use_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, sidecar_path)
+    assert spec is not None and spec.loader is not None
+    sidecar_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = sidecar_module
+    spec.loader.exec_module(sidecar_module)
+
+    # The API-unit runner does not guarantee native encoders. Missing tooling
+    # is explicitly modeled; the Docker media job validates genuine FFmpeg.
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        def fixture_probe(path):
+            return {
+                "durationSeconds": 1.0, "sizeBytes": path.stat().st_size,
+                "video": {"codec": "h264", "width": 320, "height": 568},
+                "audio": {"codec": "aac"},
+            }
+        monkeypatch.setattr(sidecar_module, "probe", fixture_probe)
+
+    media_root = tmp_path / "g72-native-video-use-media"
+    sidecar_app = sidecar_module.create_app(media_root=media_root)
+    with TestClient(sidecar_app) as sidecar_client:
+        def native_video_use_upload(project_id, filename, content_type, stream):
+            response = sidecar_client.post(
+                "/media", data={"projectId": project_id},
+                files={"file": (filename, stream, content_type)},
+            )
+            assert response.status_code == 201, response.text
+            media_store.uploads += 1
+            return response.json()
+
+        monkeypatch.setattr(media_store, "upload_media", native_video_use_upload)
+        test_g72_native_worker_fastapi_sqlite_fake_flow(
+            g72_true_native_flow_context, monkeypatch,
+        )
+        with sessions() as db:
+            task = db.execute(select(DBGenerationTask)).scalar_one()
+            assert task.status == "RIGHTS_BLOCKED"
+            assert task.media_id and task.asset_version_id
+            project_id, media_id = task.project_id, task.media_id
+            asset = db.get(DBAssetVersion, task.asset_version_id)
+            assert asset is not None
+            sha256, size_bytes = asset.sha256, asset.size_bytes
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+            )).scalar_one() == 1
+        saved_file = media_root / "projects" / project_id / "media" / f"{media_id}.mp4"
+        assert saved_file.is_file()
+        payload = saved_file.read_bytes()
+        assert payload and sha256 == hashlib.sha256(payload).hexdigest()
+        assert size_bytes == len(payload)
+        first_read = sidecar_client.get(f"/media/{project_id}/{media_id}")
+        assert first_read.status_code == 200
+        assert first_read.content == payload
+
+    # Fresh service instance opens the existing persisted media directory.
+    with TestClient(sidecar_module.create_app(media_root=media_root)) as restarted:
+        response = restarted.get(f"/media/{project_id}/{media_id}")
+        assert response.status_code == 200
+        assert response.content == payload
+        assert restarted.get(
+            f"/media/{project_id}/{uuid.uuid4()}"
+        ).status_code == 404
