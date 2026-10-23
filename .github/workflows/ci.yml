@@ -438,3 +438,106 @@ jobs:
         if: always()
         # --volumes is safe only because COMPOSE_PROJECT_NAME is unique to this CI run.
         run: docker compose -f infra/docker/docker-compose.yml down --volumes
+
+
+  g72-fake-compose-network:
+    # Independent nonproduction evidence only. The primary Node/Python security
+    # audit remains the mandatory release gate; do not treat this as a waiver.
+    name: G72 FAKE-ONLY independent Compose network smoke (not a release gate)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      AETHER_COOKIE_SECURE: "false"
+      AETHER_API_PORT: "18100"
+      AETHER_WORKER_PORT: "18101"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare unique disposable stack and ephemeral credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "COMPOSE_PROJECT_NAME=aether-g72-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          password="ci-$(openssl rand -hex 24)"
+          worker_token="ci-$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
+          echo "::add-mask::$worker_token"
+          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+
+      - name: Confirm merged isolated FAKE-only network contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            config --format json > "$RUNNER_TEMP/g72-merged.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-merged.json").read_text())["services"]
+          api, worker = services["api"], services["worker"]
+          assert api["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert api["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert api["environment"]["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert worker["environment"]["AETHER_TALKING_HEAD_MODE"] == "disabled"
+          assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          assert set(api["networks"]) == {"aether-net"}
+          assert "aether-net" in worker["networks"]
+          assert set(services["video-use"]["networks"]) == {"aether-net"}
+          PY
+
+      - name: Start disposable API, Worker and video-use containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            up -d --build --wait --wait-timeout 300 api worker video-use
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
+
+      - name: Prove real Worker network, FFmpeg, sidecar persistence and audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py prepare
+
+      - name: Prove sidecar and Worker restart preserve exact asset and receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            restart video-use worker
+          sleep 12
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py verify
+
+      - name: Capture failure diagnostics without credentials
+        if: failure()
+        shell: bash
+        run: |
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            ps || true
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            logs --tail=75 api worker video-use || true
+
+      - name: Destroy only this CI run's disposable FAKE-only volumes
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              down --volumes --remove-orphans || true
+          fi
