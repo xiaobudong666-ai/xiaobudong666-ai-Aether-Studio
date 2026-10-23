@@ -1737,6 +1737,17 @@ def create_app(
     ):
         require_roles(context, "owner", "editor")
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        # G70/G71: a completed upstream job may already have produced billable output.
+        # A failed media transfer requires reconciliation of the ORIGINAL artifact,
+        # not another generation attempt with a new upstream job and possible charge.
+        if task.error_code == "ARTIFACT_INGEST_FAILED":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_REQUIRED",
+                    "message": "生成结果转存状态未确认，必须先核对原始产物，禁止重新生成",
+                },
+            )
         if task.status not in RETRYABLE_GENERATION_STATES or (task.error_code or "").startswith("NON_RETRYABLE_"):
             raise HTTPException(
                 status_code=409,
