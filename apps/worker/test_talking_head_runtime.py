@@ -649,7 +649,7 @@ def test_g72_worker_fake_route_rejects_disabled_operator(monkeypatch):
         "request": {"fakeTaskType": "talking-head", "imageAssetId": "version-1"},
     }, poll_interval=0)
     assert result["status"] == "FAILED"
-    assert result["errorCode"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
+    assert result["error_code"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
     assert not queue.intakes
 
 
@@ -667,5 +667,5 @@ def test_g72_worker_fake_route_rejects_missing_typed_scope(monkeypatch):
         "request": {"imageAssetId": "version-1"},  # no trusted API kind
     }, poll_interval=0)
     assert result["status"] == "FAILED"
-    assert result["errorCode"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
+    assert result["error_code"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
     assert not queue.intakes
