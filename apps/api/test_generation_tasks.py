@@ -1711,3 +1711,48 @@ def test_g72_native_worker_fastapi_sqlite_fake_flow(
             DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
         )).scalars())
         assert len(events) == 1
+
+
+def test_g72_viewer_rejected_without_generation_side_effects(generation_context):
+    """Native HTTP role gate must reject viewer before writing FAKE reservations."""
+    client, sessions, _app, _media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-viewer-role")
+    password = secrets.token_urlsafe(24)
+    registered = client.post("/admin/users", json={
+        "email": "g72-viewer@example.com", "displayName": "G72 Viewer",
+        "password": password, "role": "viewer",
+    })
+    assert registered.status_code == 201, registered.text
+    assert client.post("/auth/logout").status_code == 200
+    assert client.post("/auth/login", json={
+        "email": "g72-viewer@example.com", "password": password,
+    }).status_code == 200
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for endpoint in (path + "/validate", path):
+        rejected = client.post(endpoint, json=payload)
+        assert rejected.status_code == 403, rejected.text
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 0
+
+
+def test_g72_changed_payload_same_idempotency_key_is_rejected(generation_context):
+    """The same authenticated owner cannot reuse a key with altered content."""
+    client, sessions, _app, _media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-body-mutation")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    first = client.post(path, json=payload)
+    assert first.status_code == 202, first.text
+    changed = {**payload, "text": "different FAKE-only narration, same request key"}
+    second = client.post(path, json=changed)
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+    with sessions() as db:
+        tasks = list(db.execute(select(DBGenerationTask)).scalars())
+        assert len(tasks) == 1 and tasks[0].id == first.json()["taskId"]
+        assert len(list(db.execute(select(DBGenerationAttempt)).scalars())) == 1
+        assert len(list(db.execute(select(DBGenerationUsageEntry)).scalars())) == 1
