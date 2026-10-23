@@ -828,7 +828,13 @@ def create_app(
         db: Session, task: DBGenerationTask, *, now: datetime.datetime
     ) -> None:
         circuit = generation_circuit(db, task.tenant_id)
-        if circuit is None or circuit.state not in {"HALF_OPEN", "OPEN"}:
+        # Only the current HALF_OPEN probe may close the breaker.  A success
+        # from an older task cannot heal OPEN, DISABLED, or another probe.
+        if (
+            circuit is None
+            or circuit.state != "HALF_OPEN"
+            or circuit.half_open_task_id != task.id
+        ):
             return
         previous = circuit.state
         circuit.state = "CLOSED"
