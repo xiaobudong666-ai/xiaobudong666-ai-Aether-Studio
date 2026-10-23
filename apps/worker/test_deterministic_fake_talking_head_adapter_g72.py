@@ -114,3 +114,38 @@ def test_missing_status_and_artifact_sanitized_nonretryable(monkeypatch):
     adapter = DeterministicFakeTalkingHeadAdapter(native)
     assert_error("FAKE_STATUS_UNKNOWN", lambda: adapter.status("missing-fake-id"))
     assert_error("FAKE_ARTIFACT_UNAVAILABLE", lambda: adapter.artifact("missing-fake-id"))
+
+
+def test_g72_native_ffmpeg_media_contains_h264_and_aac(tmp_path, monkeypatch):
+    """Exercise real OFFLINE encoding in the FFmpeg Worker image, without media mocks."""
+    import json
+    import shutil
+    import subprocess
+    from app import deterministic_fake_adapter as fake_module
+
+    assert shutil.which("ffmpeg"), "FFmpeg is mandatory for this Worker acceptance test"
+    assert shutil.which("ffprobe"), "ffprobe is mandatory for real media verification"
+    monkeypatch.setitem(fake_module._ASPECT_DIMENSIONS, "9:16", (160, 288))
+    fake = DeterministicFakeAdapter(timeout_seconds=90)
+    adapter = DeterministicFakeTalkingHeadAdapter(fake)
+    assert adapter.network == "none"
+    job_id = adapter.submit(make_spec(text="G72 actual local FFmpeg media check"))
+    assert adapter.status(job_id)["status"] == "completed"
+    video_bytes = adapter.artifact(job_id).read()
+    assert len(video_bytes) > 256 and b"ftyp" in video_bytes[:64]
+    artifact = tmp_path / "g72-synthetic-local.mp4"
+    artifact.write_bytes(video_bytes)
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,width,height:format=duration",
+         "-of", "json", str(artifact)],
+        capture_output=True, text=True, check=True, timeout=15,
+    )
+    probe = json.loads(result.stdout)
+    video_streams = [s for s in probe["streams"] if s["codec_type"] == "video"]
+    audio_streams = [s for s in probe["streams"] if s["codec_type"] == "audio"]
+    assert len(video_streams) == len(audio_streams) == 1
+    assert video_streams[0]["codec_name"] == "h264"
+    assert (video_streams[0]["width"], video_streams[0]["height"]) == (160, 288)
+    assert audio_streams[0]["codec_name"] == "aac"
+    assert 0.8 <= float(probe["format"]["duration"]) <= 1.3
