@@ -1541,3 +1541,164 @@ def test_g72_native_fake_revoked_input_rejected_at_artifact_intake(generation_co
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
     assert media.uploads == 0
+
+
+@pytest.fixture()
+def g72_true_native_flow_context(tmp_path, monkeypatch):
+    """FAKE-only HTTP+SQLite+native Worker with local FFmpeg; mock media store only."""
+    monkeypatch.setenv("AETHER_MAX_UPLOAD_BYTES", str(16 * 1024 * 1024))
+    engine = build_engine(f"sqlite:///{tmp_path / 'g72-real-worker.db'}")
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def get_db():
+        with sessions() as db:
+            yield db
+
+    media_store = FakeGeneratedMediaStore()
+    app = create_app(
+        app_engine=engine, db_dependency=get_db, video_use_adapter=media_store,
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False, enforce_csrf=True,
+        generation_provider_mode="deterministic-fake",
+    )
+    with TestClient(app) as client:
+        assert client.post(
+            "/auth/login",
+            json={"email": "owner@example.com", "password": OWNER_PASSWORD},
+        ).status_code == 200
+        client.headers.update({"X-Aether-CSRF": "1"})
+        yield client, sessions, media_store
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+
+
+def test_g72_true_worker_fastapi_sqlite_ffmpeg_fake_flow(
+    g72_true_native_flow_context, monkeypatch,
+):
+    """Actually execute typed API -> SQLite claim -> Worker -> offline MP4 -> intake.
+
+    This is NOT full Compose/PostgreSQL or the real video-use media sidecar.
+    It DOES execute both native API and Worker modules with real local FFmpeg.
+    """
+    import importlib
+    import importlib.util
+    import shutil
+    import sys
+
+    assert shutil.which("ffmpeg"), "Native nonproduction FFmpeg is required"
+    client, sessions, media_store = g72_true_native_flow_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-native-full-fake-flow")
+    base_path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    create = client.post(base_path, json=payload)
+    assert create.status_code == 202, create.text
+    task_id = create.json()["taskId"]
+
+    # Load the actual Worker package under a separate package name. The API
+    # already owns the 'app' module name in this test Python process.
+    worker_pkg_dir = Path(__file__).resolve().parents[1] / "worker" / "app"
+    package_name = "_aether_g72_native_worker"
+    package_spec = importlib.util.spec_from_file_location(
+        package_name, worker_pkg_dir / "__init__.py",
+        submodule_search_locations=[str(worker_pkg_dir)],
+    )
+    assert package_spec is not None and package_spec.loader is not None
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[package_name] = package
+    package_spec.loader.exec_module(package)
+    worker = importlib.import_module(f"{package_name}.main")
+    fake_module = importlib.import_module(f"{package_name}.deterministic_fake_adapter")
+    fake_bridge = importlib.import_module(
+        f"{package_name}.deterministic_fake_talking_head_adapter"
+    )
+    # Keep the real encoder fast. Synthesized output remains a true MP4 with
+    # H.264/AAC, but its visual size is reduced in this test only.
+    monkeypatch.setitem(fake_module._ASPECT_DIMENSIONS, "9:16", (320, 568))
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "deterministic-fake")
+
+    class NativeApiTestQueue:
+        """HTTP-equivalent TestClient transport; no external network or credentials."""
+        def __init__(self, test_client):
+            self.test_client = test_client
+            self.worker_headers = {
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "worker-g72-native",
+            }
+
+        def claim(self):
+            response = self.test_client.post(
+                "/internal/generation-tasks/claim",
+                headers=self.worker_headers,
+            )
+            assert response.status_code in {200, 204}, response.text
+            return response.json() if response.status_code == 200 else None
+
+        def heartbeat(self, task_id):
+            response = self.test_client.post(
+                f"/internal/generation-tasks/{task_id}/heartbeat",
+                headers=self.worker_headers, json={},
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        def transition(self, task_id, **values):
+            data = {
+                "status": values.get("status"),
+                "progress": values.get("progress"),
+                "message": values.get("message"),
+                "upstreamJobId": values.get("upstream_job_id"),
+                "providerArtifactId": values.get("provider_artifact_id"),
+                "errorCode": values.get("error_code"),
+                "errorMessage": values.get("error_message"),
+                "retryable": values.get("retryable", False),
+            }
+            response = self.test_client.post(
+                f"/internal/generation-tasks/{task_id}/transition",
+                headers=self.worker_headers, json=data,
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        def artifact_intake(self, task_id, provider_artifact_id, stream):
+            response = self.test_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers=self.worker_headers,
+                data={"providerArtifactId": provider_artifact_id},
+                files={"file": ("synthetic.mp4", stream, "video/mp4")},
+            )
+            assert response.status_code == 201, response.text
+            return response.json()
+
+    queue = NativeApiTestQueue(client)
+    claimed = queue.claim()
+    assert claimed is not None and claimed["taskId"] == task_id
+    assert claimed["providerMode"] == "talking-head-fake"
+    local_native = fake_module.DeterministicFakeAdapter()
+    bridge = fake_bridge.DeterministicFakeTalkingHeadAdapter(local_native)
+    runtime = worker.WorkerComponents(
+        ffmpeg=None, ai=None, recovery=None, moneyprinter=None, video_use=None,
+        generation_queue=queue, talking_head=None, talking_head_fake=bridge,
+    )
+    outcome = worker.process_generation_task(runtime, claimed, poll_interval=0)
+    assert outcome["storedStatus"] == "RIGHTS_BLOCKED", outcome
+    assert media_store.uploads == 1
+    assert queue.claim() is None
+    with sessions() as db:
+        persisted = db.get(DBGenerationTask, task_id)
+        assert persisted is not None
+        assert persisted.status == "RIGHTS_BLOCKED"
+        assert persisted.upstream_job_id is not None
+        assert persisted.asset_version_id is not None
+        output_asset = db.get(DBAssetVersion, persisted.asset_version_id)
+        assert output_asset is not None
+        assert output_asset.sha256 and len(output_asset.sha256) == 64
+        assert output_asset.media_type == "video"
+        assert output_asset.probe_json["provenance"]["generationTaskId"] == task_id
+        events = list(db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalars())
+        assert len(events) == 1
