@@ -2355,12 +2355,12 @@ def create_app(
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
             metadata = uploaded.get("metadata") or {}
             duration_seconds = float(metadata.get("durationSeconds") or 0)
-            media_type = "video" if metadata.get("video") else "audio"
+            media_type = "image" if metadata.get("image") else ("video" if metadata.get("video") else "audio")
             media_id = uploaded["mediaId"]
             material = {
                 "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,
                 "url": f"/api/video-use/media/{project_id}/{media_id}", "type": media_type,
-                "contentType": file.content_type or ("video/mp4" if media_type == "video" else "audio/mpeg"),
+                "contentType": uploaded.get("contentType") or file.content_type or ("video/mp4" if media_type == "video" else "audio/mpeg"),
                 "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
                 "sizeBytes": int(metadata.get("sizeBytes") or upload_size),
             }
