@@ -588,3 +588,84 @@ def test_status_timeout_does_not_retry(monkeypatch):
     assert result["status"] == "UNKNOWN"
     assert result["error_code"] == "STATUS_TIMEOUT"
     assert len(_submits(calls)) == 1
+
+
+# G72: The fake-only dispatch is distinct from the real talking-head route.
+# This file is in the existing native Worker CI test list.
+def test_g72_worker_fake_route_is_offline_and_scopes_identical_content(monkeypatch):
+    import io
+
+    from app.deterministic_fake_adapter import DeterministicFakeAdapter
+    from app.deterministic_fake_talking_head_adapter import DeterministicFakeTalkingHeadAdapter
+
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "deterministic-fake")
+    native = DeterministicFakeAdapter()
+    calls = []
+
+    def synthetic_submit(**kwargs):
+        calls.append(kwargs)
+        return "synthetic-job-" + str(len(calls))
+
+    monkeypatch.setattr(native, "generate_video", synthetic_submit)
+    monkeypatch.setattr(native, "get_task_status", lambda job_id: {
+        "status": "completed", "progress": 100, "providerArtifactId": job_id,
+    })
+    monkeypatch.setattr(native, "stream_artifact", lambda job_id: io.BytesIO(b"fake-mp4-fixture"))
+    queue = RecordingQueue()
+    runtime = components(talking_head=None, queue=queue)
+    runtime.talking_head_fake = DeterministicFakeTalkingHeadAdapter(native)
+    request = {
+        "fakeTaskType": "talking-head",
+        "text": "local synthetic test only",
+        "durationSeconds": 1, "aspectRatio": "9:16",
+        "resolution": "720p", "imageAssetId": "same-asset",
+        "voiceId": "synthetic-seed",
+    }
+    for task_id in ("task-a", "task-b"):
+        result = process_generation_task(runtime, {
+            "taskId": task_id, "projectId": "project-1",
+            "attempt": 1, "providerMode": "talking-head-fake",
+            "request": request, "upstreamJobId": None,
+            "submissionConsumed": False,
+        }, poll_interval=0)
+        assert result["status"] == "RIGHTS_BLOCKED"
+    assert len(queue.intakes) == 2
+    assert all(data == b"fake-mp4-fixture" for _, _, data in queue.intakes)
+    assert calls[0]["voice_name"] != calls[1]["voice_name"]
+    assert all(call["voice_name"].startswith("synthetic-seed:") for call in calls)
+
+
+def test_g72_worker_fake_route_rejects_disabled_operator(monkeypatch):
+    from app.deterministic_fake_adapter import DeterministicFakeAdapter
+    from app.deterministic_fake_talking_head_adapter import DeterministicFakeTalkingHeadAdapter
+
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "disabled")
+    queue = RecordingQueue()
+    runtime = components(talking_head=None, queue=queue)
+    runtime.talking_head_fake = DeterministicFakeTalkingHeadAdapter(DeterministicFakeAdapter())
+    result = process_generation_task(runtime, {
+        "taskId": "fake-blocked", "projectId": "project-1",
+        "providerMode": "talking-head-fake",
+        "request": {"fakeTaskType": "talking-head", "imageAssetId": "version-1"},
+    }, poll_interval=0)
+    assert result["status"] == "FAILED"
+    assert result["errorCode"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
+    assert not queue.intakes
+
+
+def test_g72_worker_fake_route_rejects_missing_typed_scope(monkeypatch):
+    from app.deterministic_fake_adapter import DeterministicFakeAdapter
+    from app.deterministic_fake_talking_head_adapter import DeterministicFakeTalkingHeadAdapter
+
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "deterministic-fake")
+    queue = RecordingQueue()
+    runtime = components(talking_head=None, queue=queue)
+    runtime.talking_head_fake = DeterministicFakeTalkingHeadAdapter(DeterministicFakeAdapter())
+    result = process_generation_task(runtime, {
+        "taskId": "fake-bad-scope", "projectId": "project-1",
+        "providerMode": "talking-head-fake",
+        "request": {"imageAssetId": "version-1"},  # no trusted API kind
+    }, poll_interval=0)
+    assert result["status"] == "FAILED"
+    assert result["errorCode"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
+    assert not queue.intakes
