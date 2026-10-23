@@ -6,6 +6,7 @@ No real Provider or production credentials or services may be used.
 """
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import hashlib
 import json
@@ -32,20 +33,22 @@ API_BASE = "http://127.0.0.1:8000"
 VIDEO_USE_BASE = "http://video-use:8002"
 
 
-def authenticate() -> httpx.Client:
+@contextmanager
+def authenticate():
     assert os.getenv("AETHER_FAKE_ONLY_NONPROD") == "true"
     assert os.getenv("AETHER_RUNTIME_STAGE") == "nonproduction"
     assert os.getenv("AETHER_GENERATION_PROVIDER_MODE") == "deterministic-fake"
     password = os.environ.get("AETHER_BOOTSTRAP_ADMIN_PASSWORD")
     assert password and password.startswith("ci-"), "disposable CI credential required"
-    client = httpx.Client(base_url=API_BASE, timeout=30, trust_env=False)
-    reply = client.post("/auth/login", json={
-        "email": os.getenv("AETHER_BOOTSTRAP_ADMIN_EMAIL", "admin@aether.local"),
-        "password": password,
-    })
-    assert reply.status_code == 200, f"login failed: {reply.status_code}"
-    client.headers.update({"X-Aether-CSRF": "1"})
-    return client
+    # Open/close once; a client used for login cannot be entered a second time.
+    with httpx.Client(base_url=API_BASE, timeout=30, trust_env=False) as client:
+        reply = client.post("/auth/login", json={
+            "email": os.getenv("AETHER_BOOTSTRAP_ADMIN_EMAIL", "admin@aether.local"),
+            "password": password,
+        })
+        assert reply.status_code == 200, f"login failed: {reply.status_code}"
+        client.headers.update({"X-Aether-CSRF": "1"})
+        yield client
 
 
 def seed_test_image_and_remix_rights(project_id: str) -> str:
