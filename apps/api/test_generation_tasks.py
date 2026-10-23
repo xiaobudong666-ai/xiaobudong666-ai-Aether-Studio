@@ -2160,3 +2160,26 @@ def test_g76_half_open_only_current_probe_can_close(generation_context):
             )
         ).scalar_one() == 1
 
+@pytest.mark.parametrize(
+    ("requested", "sandbox_opt_in", "runtime_stage", "expected"),
+    [
+        ("deterministic-fake", "true", "nonproduction", "deterministic-fake"),
+        ("deterministic-fake", "false", "nonproduction", "disabled"),
+        ("deterministic-fake", "true", "production", "disabled"),
+        ("deterministic-fake", "true", "", "disabled"),
+        ("disabled", "true", "nonproduction", "disabled"),
+        ("moneyprinter", "false", "nonproduction", "moneyprinter"),
+    ],
+)
+def test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates(
+    monkeypatch, requested, sandbox_opt_in, runtime_stage, expected
+):
+    """A real API process must fail closed unless FAKE-only sandbox is explicit."""
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", requested)
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", sandbox_opt_in)
+    if runtime_stage:
+        monkeypatch.setenv("AETHER_RUNTIME_STAGE", runtime_stage)
+    else:
+        monkeypatch.delenv("AETHER_RUNTIME_STAGE", raising=False)
+    application = create_app()
+    assert application.state.generation_provider_mode == expected
