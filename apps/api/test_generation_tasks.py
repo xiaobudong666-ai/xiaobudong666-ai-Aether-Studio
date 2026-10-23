@@ -1725,7 +1725,7 @@ def test_g72_viewer_rejected_without_generation_side_effects(generation_context)
         "password": password, "role": "viewer",
     })
     assert registered.status_code == 201, registered.text
-    assert client.post("/auth/logout").status_code == 200
+    assert client.post("/auth/logout").status_code == 204
     assert client.post("/auth/login", json={
         "email": "g72-viewer@example.com", "password": password,
     }).status_code == 200
