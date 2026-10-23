@@ -767,6 +767,65 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
 
 
+
+
+def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(generation_context):
+    """G70/G71: original upstream output must be reconciled, never regenerated blindly.
+
+    FAKE-only fixture: temporarily model the 3-attempt paid-provider retry policy.
+    No external provider, credentials or paid call is involved.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g71-no-double-generation")
+    task = create_task(client, project, key="g71-ingest-ambiguous")
+    task_id = task["taskId"]
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        stored.max_attempts = 3
+        db.commit()
+
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="original-paid-job").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", upstreamJobId="original-paid-job",
+        providerArtifactId="original-paid-artifact",
+    ).status_code == 200
+    media_store.interrupt = True
+    with pytest.raises(RuntimeError, match="stream interrupted"):
+        client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "original-paid-artifact"},
+            files={"file": ("artifact.mp4", b"synthetic-bytes", "video/mp4")},
+        )
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "FAILED"
+        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
+        events_before = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+
+    blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "FAILED"
+        assert row.attempts == 1
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == attempts_before == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "SETTLED"
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_im15_01_new_environment_is_disabled_without_provider_calls(provider_control_context):
     client, sessions, app, _ = provider_control_context
     readiness = client.get("/generation/providers/moneyprinter/readiness").json()
