@@ -2183,3 +2183,70 @@ def test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates(
         monkeypatch.delenv("AETHER_RUNTIME_STAGE", raising=False)
     application = create_app()
     assert application.state.generation_provider_mode == expected
+
+@pytest.mark.parametrize("ineligible_count", [101, 205])
+def test_g73_keyset_claim_scans_past_ineligible_queue_pages(
+    generation_context, ineligible_count
+):
+    """Native API/SQLite FAKE-only: older, wrong-mode queue rows must not starve G72.
+
+    All extra queued records are synthetic local DB fixtures.  They never
+    contact an external Provider or consume a trusted billing source.
+    """
+    client, sessions, _app, media = generation_context
+    project = create_project(client, "G73 keyset scan synthetic queue")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, asset_id, key=f"g73-keyset-{ineligible_count}"
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    eligible_id = created.json()["taskId"]
+
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert project_row is not None and eligible is not None
+        first_created = eligible.created_at - datetime.timedelta(days=1)
+        old_rows = []
+        for idx in range(ineligible_count):
+            created_at = first_created + datetime.timedelta(microseconds=idx)
+            old_rows.append(DBGenerationTask(
+                id=str(uuid.uuid4()), tenant_id=project_row.tenant_id,
+                project_id=project_row.id, requested_by=project_row.owner_id,
+                provider="moneyprinter", status="QUEUED", progress=0,
+                message="synthetic older wrong-mode record",
+                request_json={"syntheticFixtureOnly": True},
+                request_hash=f"g73-fixture-{idx}",
+                capability_snapshot_json={"mode": "moneyprinter"},
+                capability_snapshot_hash="0" * 64,
+                idempotency_key=f"g73-fixture-{ineligible_count}-{idx}",
+                attempts=1, max_attempts=1,
+                created_at=created_at, updated_at=created_at,
+            ))
+        db.add_all(old_rows)
+        db.commit()
+
+    claimed = claim(client, worker_id="g73-safe-fake-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible_id
+    assert claimed.json()["providerMode"] == "talking-head-fake"
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-safe-fake-worker"
+        untouched = db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.provider == "moneyprinter",
+            DBGenerationTask.status == "QUEUED",
+            DBGenerationTask.project_id == project["id"],
+        )).scalar_one()
+        assert untouched == ineligible_count
+        claimed_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == eligible_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one()
+        assert claimed_events == 1
+    assert media.uploads == 0
