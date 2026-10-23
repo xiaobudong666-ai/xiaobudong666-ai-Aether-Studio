@@ -1756,3 +1756,93 @@ def test_g72_changed_payload_same_idempotency_key_is_rejected(generation_context
         assert len(tasks) == 1 and tasks[0].id == first.json()["taskId"]
         assert len(list(db.execute(select(DBGenerationAttempt)).scalars())) == 1
         assert len(list(db.execute(select(DBGenerationUsageEntry)).scalars())) == 1
+
+
+def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
+    g72_true_native_flow_context, monkeypatch, tmp_path,
+):
+    """FAKE-only API -> SQLite -> Worker -> actual FFmpeg -> temporary disk -> DB audit.
+
+    Deliberately NOT a video-use adapter / PostgreSQL / production E2E test.
+    """
+    import hashlib
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("Dedicated G72 offline integration requires FFmpeg and FFprobe")
+
+    _client, sessions, media_store = g72_true_native_flow_context
+    durable_dir = tmp_path / "g72-durable-media"
+    durable_dir.mkdir()
+    saved_files = []
+
+    def offline_durable_upload(project_id, filename, content_type, stream):
+        assert content_type == "video/mp4"
+        assert filename.endswith(".mp4")
+        media_id = f"g72-disk-{uuid.uuid4().hex}"
+        path = durable_dir / f"{media_id}.mp4"
+        path.write_bytes(stream.read())
+        saved_files.append(path)
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration:stream=codec_type,codec_name,width,height",
+                "-of", "json", str(path),
+            ],
+            check=True, capture_output=True, text=True, timeout=20,
+        )
+        probed = json.loads(result.stdout)
+        tracks = probed.get("streams") or []
+        videos = [track for track in tracks if track.get("codec_type") == "video"]
+        audios = [track for track in tracks if track.get("codec_type") == "audio"]
+        assert len(videos) == 1 and videos[0].get("codec_name") == "h264"
+        assert len(audios) == 1 and audios[0].get("codec_name") == "aac"
+        assert int(videos[0].get("width") or 0) > 0
+        assert int(videos[0].get("height") or 0) > 0
+        duration = float((probed.get("format") or {}).get("duration") or 0)
+        assert 0.5 <= duration <= 3.0
+        media_store.uploads += 1
+        return {
+            "mediaId": media_id,
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": duration,
+                "sizeBytes": path.stat().st_size,
+                "video": {
+                    "codec": "h264",
+                    "width": int(videos[0]["width"]),
+                    "height": int(videos[0]["height"]),
+                },
+                "audio": {"codec": "aac"},
+            },
+        }
+
+    # Only the test video-use replacement writes to local temporary storage;
+    # the API, SQLite, Worker routing, FAKE adapter, FFmpeg and audit are native.
+    monkeypatch.setattr(media_store, "upload_media", offline_durable_upload)
+    test_g72_native_worker_fastapi_sqlite_fake_flow(
+        g72_true_native_flow_context, monkeypatch,
+    )
+    assert len(saved_files) == 1
+    raw = saved_files[0].read_bytes()
+    assert len(raw) > 1024 and raw[4:8] == b"ftyp"
+    with sessions() as db:
+        task = db.execute(select(DBGenerationTask)).scalar_one()
+        assert task.status == "RIGHTS_BLOCKED"
+        assert task.media_id == saved_files[0].stem
+        asset = db.get(DBAssetVersion, task.asset_version_id)
+        assert asset is not None
+        assert asset.sha256 == hashlib.sha256(raw).hexdigest()
+        assert asset.size_bytes == len(raw)
+        assert asset.probe_json["provenance"]["generationTaskId"] == task.id
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task.id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task.id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 1
