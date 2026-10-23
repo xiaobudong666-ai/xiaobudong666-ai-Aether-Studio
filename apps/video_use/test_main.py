@@ -1,4 +1,7 @@
+import io
 import subprocess
+
+from PIL import Image
 import time
 from pathlib import Path
 
@@ -238,3 +241,33 @@ def test_canonical_timeline_render_preserves_gap_overlap_audio_and_idempotency(t
             capture_output=True,
         ).stdout
         assert gap_pixel and max(gap_pixel) < 20
+
+
+def test_image_upload_is_verified_and_remains_distinct_from_video(tmp_path):
+    image_data = io.BytesIO()
+    Image.new("RGB", (48, 64), (24, 80, 160)).save(image_data, format="PNG")
+    payload = image_data.getvalue()
+    media_root = tmp_path / "media"
+    with TestClient(create_app(media_root=media_root, upstream_root=tmp_path / "upstream")) as client:
+        upload = client.post(
+            "/media", data={"projectId": "image-project"},
+            files={"file": ("portrait.png", payload, "video/mp4")},
+        )
+        assert upload.status_code == 201
+        media = upload.json()
+        assert media["contentType"] == "image/png"
+        assert media["metadata"]["image"] == {"format": "PNG", "width": 48, "height": 64}
+        assert media["metadata"]["video"] is None
+        assert client.get(f"/media/image-project/{media['mediaId']}").content == payload
+
+        mismatched = client.post(
+            "/media", data={"projectId": "image-project"},
+            files={"file": ("wrong.jpg", payload, "image/jpeg")},
+        )
+        assert mismatched.status_code == 415
+        corrupt = client.post(
+            "/media", data={"projectId": "image-project"},
+            files={"file": ("corrupt.png", b"not an image", "image/png")},
+        )
+        assert corrupt.status_code == 415
+        assert len(list((media_root / "projects" / "image-project" / "media").glob("*"))) == 1
