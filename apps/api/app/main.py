@@ -1828,22 +1828,49 @@ def create_app(
         require_internal_token(x_worker_token)
         now = utc_now()
         begin_serialized_write(db)
-        claim_query = (
-            select(DBGenerationTask)
-            .where(
-                DBGenerationTask.status.in_(ACTIVE_GENERATION_STATES),
-                or_(DBGenerationTask.lease_expires_at.is_(None), DBGenerationTask.lease_expires_at < now),
-                DBGenerationTask.cancel_requested_at.is_(None),
-            )
-            .order_by(DBGenerationTask.created_at.asc(), DBGenerationTask.id.asc())
-            .limit(100)
-        )
-        if app_engine.dialect.name != "sqlite":
-            claim_query = claim_query.with_for_update(skip_locked=True)
-        candidates = list(db.execute(claim_query).scalars())
+        # G73: keyset-page beyond the first 100 queued rows.  A fixed
+        # top-100 scan can starve an eligible task indefinitely when older
+        # rows have a different provider mode or revoked rights.
+        # Keep the existing FIFO order, lease checks and SKIP LOCKED semantics.
+        def iter_claim_candidates() -> Generator[DBGenerationTask, None, None]:
+            cursor_created: datetime.datetime | None = None
+            cursor_id: str | None = None
+            while True:
+                claim_query = (
+                    select(DBGenerationTask)
+                    .where(
+                        DBGenerationTask.status.in_(ACTIVE_GENERATION_STATES),
+                        or_(
+                            DBGenerationTask.lease_expires_at.is_(None),
+                            DBGenerationTask.lease_expires_at < now,
+                        ),
+                        DBGenerationTask.cancel_requested_at.is_(None),
+                    )
+                    .order_by(DBGenerationTask.created_at.asc(), DBGenerationTask.id.asc())
+                    .limit(100)
+                )
+                if cursor_created is not None and cursor_id is not None:
+                    claim_query = claim_query.where(
+                        or_(
+                            DBGenerationTask.created_at > cursor_created,
+                            (
+                                (DBGenerationTask.created_at == cursor_created)
+                                & (DBGenerationTask.id > cursor_id)
+                            ),
+                        )
+                    )
+                if app_engine.dialect.name != "sqlite":
+                    claim_query = claim_query.with_for_update(skip_locked=True)
+                page = list(db.execute(claim_query).scalars())
+                if not page:
+                    return
+                cursor_created, cursor_id = page[-1].created_at, page[-1].id
+                yield from page
+                if len(page) < 100:
+                    return
         task: DBGenerationTask | None = None
         claim_attestation: DBGenerationProviderAttestation | None = None
-        for candidate in candidates:
+        for candidate in iter_claim_candidates():
             candidate_mode = candidate.capability_snapshot_json.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
