@@ -92,7 +92,7 @@ jobs:
   g72-fake-runtime-native:
     # Independent source-level runtime contract proof, NOT a waiver of Node audit
     # and NOT an independent release gate. Full G72 Compose E2E stays OPEN.
-    name: G72 FAKE API mode guard (security audit still required)
+    name: FAKE-only API safety G72/G73 (full security audit still required)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -106,12 +106,12 @@ jobs:
       - name: Install API test dependencies
         run: pip install -r apps/api/requirements.txt
 
-      - name: Run only new G72 FAKE sandbox mode guard cases
+      - name: Run G72 mode gates and G73 keyset claim regressions (FAKE-only)
         env:
           PYTHONPATH: apps/api
         run: |
           python -m pytest apps/api/test_generation_tasks.py -v \
-            -k test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates
+            -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g73_keyset_claim_scans_past_ineligible_queue_pages"
 
   playwright:
     name: Playwright workbench flow
