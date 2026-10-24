@@ -1365,23 +1365,30 @@ def create_app(
             id=str(uuid.uuid4()), generation_task_id=task_id, attempt_no=1,
             status="QUEUED", reconciliation_state="NOT_SUBMITTED", created_at=now,
         )
-        db.add_all([task, attempt])
-        add_usage_entry(
-            db, task=task, attempt=attempt, kind="RESERVED",
-            request_units=1, generated_seconds=0,
-            reservation_key=f"generation:{task.id}",
-            config_version_id=snapshot.get("configVersionId"), now=now,
-        )
-        add_generation_event(
-            db, task, attempt=attempt, event_type="TASK_CREATED",
-            actor_type="USER", actor_id=context.user_id, to_status="QUEUED",
-            metadata={
-                "fakeOnly": True, "simulatedOutput": True, "actorRole": context.role,
-                "inputAssetVersionId": asset.id, "sourceAssetSha256": asset.sha256,
-                "usageReserved": True,
-            }, now=now,
-        )
         try:
+            # Explicit FK insertion order is required on native PostgreSQL:
+            # without ORM relationships SQLAlchemy may flush the attempt before
+            # its task. Keep all flushes in this transaction and catch the
+            # first UNIQUE/foreign-key violation for safe idempotent replay.
+            db.add(task)
+            db.flush()
+            db.add(attempt)
+            db.flush()
+            add_usage_entry(
+                db, task=task, attempt=attempt, kind="RESERVED",
+                request_units=1, generated_seconds=0,
+                reservation_key=f"generation:{task.id}",
+                config_version_id=snapshot.get("configVersionId"), now=now,
+            )
+            add_generation_event(
+                db, task, attempt=attempt, event_type="TASK_CREATED",
+                actor_type="USER", actor_id=context.user_id, to_status="QUEUED",
+                metadata={
+                    "fakeOnly": True, "simulatedOutput": True, "actorRole": context.role,
+                    "inputAssetVersionId": asset.id, "sourceAssetSha256": asset.sha256,
+                    "usageReserved": True,
+                }, now=now,
+            )
             db.commit()
         except IntegrityError as exc:
             db.rollback()
