@@ -1924,8 +1924,10 @@ def create_app(
             # permission to reclaim the job and resubmit its original output.
             # Normal QUEUED tasks never carry this side-effect marker.
             if (
-                candidate.status != "QUEUED"
-                and candidate.provider_artifact_id is not None
+                (
+                    candidate.status in {"RUNNING", "INGESTING"}
+                    or candidate.provider_artifact_id is not None
+                )
                 and has_pending_artifact_upload_intent(db, candidate)
             ):
                 continue
