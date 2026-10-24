@@ -58,6 +58,9 @@ def _existing(media_dir: Path, media_id: str) -> Path | None:
     # Only final media names are considered. Pending uploads and per-key lock
     # files start with '.' and are deliberately invisible to recovery.
     matches = [p for p in media_dir.glob(f"{media_id}.*") if p.is_file()]
+    # A recovered file must not escape the disposable scoped media directory.
+    if any(p.is_symlink() or p.resolve().parent != media_dir.resolve() for p in matches):
+        raise RecoveryConflict(409, "Unsafe recovered media path")
     if len(matches) > 1:
         raise RecoveryConflict(409, "Ambiguous physical media identity")
     return matches[0] if matches else None
