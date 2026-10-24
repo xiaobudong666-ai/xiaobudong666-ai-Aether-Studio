@@ -15,3 +15,8 @@ services:
       AETHER_GENERATION_CREDENTIAL_STATE: ABSENT
       AETHER_GENERATION_CANARY_PROFILE: disabled
       AETHER_GENERATION_NETWORK_ISOLATION: NOT_ENFORCED
+  video-use:
+    environment:
+      # Only disposable fake-only Compose. Never include this override in prod.
+      AETHER_FAKE_ONLY_NONPROD: "true"
+      AETHER_RUNTIME_STAGE: nonproduction
