@@ -3391,5 +3391,5 @@ def test_g72_fake_rights_revoked_after_sidecar_upload_keeps_hold(generation_cont
         files={"file": ("synthetic.mp4", payload, "video/mp4")},
     )
     assert again.status_code == 409, again.text
-    assert again.json()["detail"]["code"] == "ARTIFACT_INTAKE_NOT_ALLOWED"
+    assert again.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
     assert media.uploads == 1
