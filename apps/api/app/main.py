@@ -2387,6 +2387,9 @@ def create_app(
         # Only the proven final SQL commit window is held for source-artifact recovery.
         # Other upload/validation failures keep their existing conservative handling.
         committing_uploaded_media = False
+        # A positive FAKE-only sidecar HTTP receipt proves that bytes may now be
+        # durable even if subsequent metadata, quota or SQL checks reject them.
+        sidecar_receipt_received = False
         media_id: str | None = None
         try:
             if fake_recovery_key is None:
@@ -2399,6 +2402,7 @@ def create_app(
                     recovery_key=fake_recovery_key,
                     expected_sha256=digest.hexdigest(),
                 )
+            sidecar_receipt_received = True
             metadata = uploaded.get("metadata") or {}
             if not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
                 raise ValueError("generated artifact did not pass media probe")
@@ -2493,7 +2497,11 @@ def create_app(
             db.commit()
         except Exception as exc:
             db.rollback()
-            if committing_uploaded_media or isinstance(exc, VideoUseError):
+            if (
+                committing_uploaded_media
+                or isinstance(exc, VideoUseError)
+                or (fake_recovery_key is not None and sidecar_receipt_received)
+            ):
                 # After an ambiguous sidecar transport/response, the bytes may
                 # already have been persisted even without a returned media ID.
                 # Fail closed and preserve the upload intent, quota and source
