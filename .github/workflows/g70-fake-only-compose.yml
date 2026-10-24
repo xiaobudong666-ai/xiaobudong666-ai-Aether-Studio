@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/fusion-m0-g70-postupload-db-fault-fake-only
+      - feat/fusion-m0-g70-postupload-validation-hold-fake-only
   workflow_dispatch:
 
 permissions:
@@ -15,7 +16,9 @@ concurrency:
 
 jobs:
   native-g70-original-readback:
-    if: github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-db-fault-fake-only'
+    if: >-
+      github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-db-fault-fake-only' ||
+      github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-validation-hold-fake-only'
     name: G70 API-to-sidecar restart/readback (not release gate)
     runs-on: ubuntu-latest
     timeout-minutes: 25
