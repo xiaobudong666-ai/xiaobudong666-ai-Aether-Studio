@@ -15,6 +15,10 @@ import json
 import os
 from pathlib import Path
 import uuid
+import sys
+
+# Copied into /tmp of the API image; installed application resides in /app.
+sys.path.insert(0, "/app")
 
 import httpx
 from fastapi.testclient import TestClient
