@@ -236,16 +236,29 @@ def verify_foreign_tenant_denials(saved: dict, replay_request: dict) -> None:
         for target in (
             f"/projects/{saved['projectId']}",
             f"/projects/{saved['projectId']}/generation-tasks/{saved['taskId']}",
+            f"/projects/{saved['projectId']}/generation-tasks/{saved['taskId']}/fake-recovery-check",
+            f"/video-use/media/{saved['projectId']}/{saved['mediaId']}",
         ):
             reply = foreign.get(target)
             assert reply.status_code == 404, (
                 f"foreign tenant GET exposed original project or task: {target} {reply.status_code}"
             )
+        # Range requests must never bypass tenant isolation or leak MP4 bytes.
+        ranged = foreign.get(
+            f"/video-use/media/{saved['projectId']}/{saved['mediaId']}",
+            headers={"Range": "bytes=0-31"},
+        )
+        assert ranged.status_code == 404, (
+            f"foreign tenant ranged media exposed bytes: {ranged.status_code}"
+        )
     print(json.dumps({
         "phase": "foreign_tenant_owner_auth",
         "fakeOnly": True, "foreignCreateDenied": True,
         "foreignPreflightDenied": True, "foreignProjectReadDenied": True,
         "foreignTaskReadDenied": True,
+        "foreignMediaReadDenied": True,
+        "foreignRecoveryCheckDenied": True,
+        "foreignRangeReadDenied": True,
     }), flush=True)
 
 
