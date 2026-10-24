@@ -106,12 +106,12 @@ jobs:
       - name: Install API test dependencies
         run: pip install -r apps/api/requirements.txt
 
-      - name: Run G72 mode gates and G73 keyset claim regressions (FAKE-only)
+      - name: Run scoped G72/G73 regressions and G70 expected-failure fault reproduction (FAKE-only)
         env:
           PYTHONPATH: apps/api
         run: |
           python -m pytest apps/api/test_generation_tasks.py -v \
-            -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g73_keyset_claim_scans_past_ineligible_queue_pages"
+            -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g73_keyset_claim_scans_past_ineligible_queue_pages or test_g70_repro_external_media_survives_failed_final_db_commit"
 
   playwright:
     name: Playwright workbench flow
