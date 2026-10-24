@@ -2189,6 +2189,22 @@ def create_app(
         while chunk := file.file.read(1024 * 1024):
             digest.update(chunk)
         file.file.seek(0)
+        # FAKE-ONLY scoped deterministic media receipt. A lost sidecar ACK can
+        # be read back by this key without another POST or Provider submit.
+        # Production/default intake deliberately keeps its existing contract.
+        fake_recovery_key: str | None = None
+        if (
+            created_app.state.generation_provider_mode == "deterministic-fake"
+            and os.environ.get("AETHER_FAKE_ONLY_NONPROD", "").lower() == "true"
+            and os.environ.get("AETHER_RUNTIME_STAGE", "").lower() == "nonproduction"
+        ):
+            recovery_identity = (
+                f"{task.tenant_id}:{task.project_id}:{task.id}:"
+                f"{task.attempts}:{providerArtifactId}"
+            )
+            fake_recovery_key = (
+                "g70-" + hashlib.sha256(recovery_identity.encode()).hexdigest()
+            )
         # The intent is a durable audit/repair anchor, not a claim that the
         # sidecar has accepted or persisted the bytes. Never send a second
         # upload for this attempt until the original outcome is reconciled.
@@ -2234,6 +2250,7 @@ def create_app(
                 "sha256": digest.hexdigest(),
                 "sizeBytes": upload_size,
                 "uploadName": f"generation-{task.id}.mp4",
+                "fakeRecoveryKey": fake_recovery_key,
                 "recoveryState": "PREPARED_BEFORE_SIDECAR_UPLOAD",
             }, now=now,
         )
@@ -2243,9 +2260,16 @@ def create_app(
         committing_uploaded_media = False
         media_id: str | None = None
         try:
-            uploaded = created_app.state.video_use.upload_media(
-                task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
-            )
+            if fake_recovery_key is None:
+                uploaded = created_app.state.video_use.upload_media(
+                    task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
+                )
+            else:
+                uploaded = created_app.state.video_use.upload_media(
+                    task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file,
+                    recovery_key=fake_recovery_key,
+                    expected_sha256=digest.hexdigest(),
+                )
             metadata = uploaded.get("metadata") or {}
             if not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
                 raise ValueError("generated artifact did not pass media probe")
