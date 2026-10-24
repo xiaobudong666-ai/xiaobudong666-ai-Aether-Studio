@@ -3365,7 +3365,7 @@ def test_g72_fake_rights_revoked_after_sidecar_upload_keeps_hold(generation_cont
         assert saved is not None and saved.status == "UNKNOWN"
         assert saved.asset_version_id is None
         assert saved.upstream_job_id == "fake-job-revoke"
-        assert saved.provider_artifact_id is None
+        assert saved.provider_artifact_id == "fake-artifact-revoke"
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project["id"],
             DBAssetVersion.media_type == "video",
@@ -3391,5 +3391,5 @@ def test_g72_fake_rights_revoked_after_sidecar_upload_keeps_hold(generation_cont
         files={"file": ("synthetic.mp4", payload, "video/mp4")},
     )
     assert again.status_code == 409, again.text
-    assert again.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert again.json()["detail"]["code"] == "ARTIFACT_INTAKE_NOT_ALLOWED"
     assert media.uploads == 1
