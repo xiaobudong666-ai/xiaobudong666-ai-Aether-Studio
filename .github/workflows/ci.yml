@@ -577,9 +577,13 @@ jobs:
               -f lavfi -i sine=frequency=440:sample_rate=48000 \
               -t 1 -c:v libx264 -pix_fmt yuv420p -c:a aac \
               -movflags +faststart /tmp/g72-midupload-ci.mp4
+          # Compose cp only supports service-to-host or host-to-service.
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
-            cp video-use:/tmp/g72-midupload-ci.mp4 api:/tmp/g72-midupload-ci.mp4
+            cp video-use:/tmp/g72-midupload-ci.mp4 "$RUNNER_TEMP/g72-midupload-ci.mp4"
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp "$RUNNER_TEMP/g72-midupload-ci.mp4" api:/tmp/g72-midupload-ci.mp4
           # Prevent normal Worker from racing the deterministic intake fixture.
           # Only the run-scoped FAKE-only worker is stopped.
           docker compose -f infra/docker/docker-compose.yml \
