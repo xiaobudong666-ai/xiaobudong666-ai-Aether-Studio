@@ -225,6 +225,8 @@ def prepare():
                 headers=headers,
                 json={
                     "status": status,
+                    "progress": 5 if status == "RUNNING" else 90,
+                    "message": "Synthetic FAKE-only source rights timing test",
                     "upstreamJobId": "ci-g72-offline-original",
                     "providerArtifactId": "ci-g72-offline-artifact" if status == "INGESTING" else None,
                 },
