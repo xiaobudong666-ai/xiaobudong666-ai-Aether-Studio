@@ -3294,3 +3294,102 @@ def test_g70_cross_process_real_sidecar_ack_loss_owner_readback(
         app.state.moneyprinter.assert_not_called()
     finally:
         stop_sidecar()
+
+
+
+def test_g72_fake_rights_revoked_after_sidecar_upload_keeps_hold(generation_context, monkeypatch):
+    """FAKE-only native API/SQLite: revoke during sidecar I/O cannot settle.
+
+    The sidecar upload succeeds, but the source image rights are revoked
+    before the API binds an immutable output. The original media and quota
+    must stay held for human review; there is no second upload or Provider call.
+    Synthetic rights snapshots are NOT M12 issuer/epoch evidence.
+    """
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    client, sessions, _app, media = generation_context
+    project = create_project(client, "G72 in-flight rights revoke synthetic")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(client, project, image_id, key="g72-midupload-revoke-hold")
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    claimed = claim(client, worker_id="worker-g72-revoke")
+    assert claimed.status_code == 200 and claimed.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", worker_id="worker-g72-revoke",
+        upstreamJobId="fake-job-revoke",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", worker_id="worker-g72-revoke",
+        upstreamJobId="fake-job-revoke", providerArtifactId="fake-artifact-revoke",
+    ).status_code == 200
+
+    original_upload = media.upload_media
+
+    def upload_then_revoke(project_id, filename, content_type, stream, **_fake_keys):
+        receipt = original_upload(project_id, filename, content_type, stream)
+        with sessions() as db:
+            old = db.execute(select(DBRightsSnapshot).where(
+                DBRightsSnapshot.asset_version_id == image_id,
+            ).order_by(DBRightsSnapshot.captured_at.desc())).scalars().first()
+            assert old is not None
+            db.add(DBRightsSnapshot(
+                id=str(uuid.uuid4()), tenant_id=old.tenant_id,
+                project_id=old.project_id, asset_version_id=image_id,
+                status="DENIED", purpose="REMIX", territory="TEST",
+                valid_from=None, valid_until=None, evidence_ref="synthetic-midupload-revocation",
+                captured_by=old.captured_by,
+                captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2),
+            ))
+            db.commit()
+        return receipt
+
+    monkeypatch.setattr(media, "upload_media", upload_then_revoke)
+    payload = b"g72-fake-only-midupload-revocation"
+    result = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-g72-revoke"},
+        data={"providerArtifactId": "fake-artifact-revoke"},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert result.status_code == 503, result.text
+    assert result.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert media.uploads == 1
+
+    with sessions() as db:
+        saved = db.get(DBGenerationTask, task_id)
+        assert saved is not None and saved.status == "UNKNOWN"
+        assert saved.asset_version_id is None
+        assert saved.upstream_job_id == "fake-job-revoke"
+        assert saved.provider_artifact_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+            DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
+        for event in ("ARTIFACT_UPLOAD_INTENT", "ARTIFACT_RECOVERY_HELD"):
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == event,
+            )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        assert tenant.used_storage_bytes == len(payload)
+
+    # A later Worker claim or duplicate intake cannot silently re-upload.
+    assert claim(client, worker_id="worker-g72-revoke").status_code == 204
+    again = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-g72-revoke"},
+        data={"providerArtifactId": "fake-artifact-revoke"},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert media.uploads == 1
