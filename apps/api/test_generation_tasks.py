@@ -2262,6 +2262,7 @@ def test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservatio
     All bytes are disposable synthetic test data, never a paid Provider.
     """
     import io
+    import hashlib
     from sqlalchemy import event
     from sqlalchemy.orm import Session as OrmSession
 
@@ -2279,10 +2280,40 @@ def test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservatio
     ).status_code == 200
 
     external_file = tmp_path / "external-sidecar-output.mp4"
-    state = {"uploaded": False, "faulted": False}
+    state = {"uploaded": False, "faulted": False, "intent_before_io": False, "replay_checked": False}
     original_upload = media_store.upload_media
 
     def durable_fake_upload(project_id, filename, content_type, stream):
+        # The SQL intent and quota reservation MUST exist before sidecar I/O.
+        with sessions() as prior_db:
+            intent = prior_db.execute(select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+            )).scalar_one()
+            md = intent.metadata_json
+            assert md["tenantId"] == prior_db.get(DBGenerationTask, task_id).tenant_id
+            assert md["projectId"] == project["id"]
+            assert md["attempt"] == 1
+            assert md["upstreamJobId"] == "original-upstream"
+            assert md["providerArtifactId"] == "original-output"
+            assert md["sha256"] == hashlib.sha256(b"synthetic-media-bytes").hexdigest()
+            assert md["sizeBytes"] == len(b"synthetic-media-bytes")
+            assert md["recoveryState"] == "PREPARED_BEFORE_SIDECAR_UPLOAD"
+            assert prior_db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(b"synthetic-media-bytes")
+            state["intent_before_io"] = True
+
+        # A concurrent delivery of the SAME attempt cannot reach sidecar;
+        # it must fail closed on the durable intent rather than upload twice.
+        if not state["replay_checked"]:
+            state["replay_checked"] = True
+            replay = client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+                data={"providerArtifactId": "original-output"},
+                files={"file": ("duplicate.mp4", b"synthetic-media-bytes", "video/mp4")},
+            )
+            assert replay.status_code == 409, replay.text
+            assert replay.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
         payload = stream.read()
         external_file.write_bytes(payload)
         state["uploaded"] = True
@@ -2309,6 +2340,7 @@ def test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservatio
         event.remove(OrmSession, "before_commit", fail_once_after_upload)
 
     assert state["uploaded"] and state["faulted"]
+    assert state["intent_before_io"] and state["replay_checked"]
     assert external_file.read_bytes() == b"synthetic-media-bytes"
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
@@ -2325,6 +2357,11 @@ def test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservatio
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.kind == "RELEASED"
         )).scalar_one() == 0
+        intent_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+        )).scalar_one()
+        assert intent_count == 1
         held = db.execute(select(DBGenerationEvent).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_HELD",
