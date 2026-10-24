@@ -262,6 +262,83 @@ def verify_foreign_tenant_denials(saved: dict, replay_request: dict) -> None:
     }), flush=True)
 
 
+
+def verify_same_tenant_actor_separation(saved: dict, replay_request: dict) -> None:
+    """Exercise native user-role isolation without inventing delegation policy.
+
+    Editor is the existing tenant role, NOT an authorized admin delegation.
+    This only verifies Owner request attribution, replay separation, and
+    denied privilege escalation. Real delegated-admin grants remain untested.
+    """
+    assert os.getenv("AETHER_FAKE_ONLY_NONPROD") == "true"
+    assert os.getenv("AETHER_RUNTIME_STAGE") == "nonproduction"
+    nonce = uuid.uuid4().hex
+    editor_email = f"ci-g72-editor-{nonce}@example.invalid"
+    viewer_email = f"ci-g72-viewer-{nonce}@example.invalid"
+    editor_password = "ci-" + uuid.uuid4().hex
+    viewer_password = "ci-" + uuid.uuid4().hex
+    with authenticate() as owner:
+        me = owner.get("/auth/me")
+        assert me.status_code == 200 and me.json()["role"] == "owner"
+        owner_id = me.json()["id"]
+        for email, password, role in (
+            (editor_email, editor_password, "editor"),
+            (viewer_email, viewer_password, "viewer"),
+        ):
+            created = owner.post("/admin/users", json={
+                "email": email,
+                "displayName": "Synthetic G72 " + role,
+                "password": password,
+                "role": role,
+            })
+            assert created.status_code == 201, (
+                f"Owner cannot seed {role} identity: {created.status_code}"
+            )
+    endpoint = f"/projects/{saved['projectId']}/talking-head/fake-generation-tasks"
+    with authenticate(email=editor_email, password_override=editor_password) as editor:
+        identity = editor.get("/auth/me")
+        assert identity.status_code == 200
+        assert identity.json()["role"] == "editor"
+        assert identity.json()["id"] != owner_id
+        # A same-tenant operator must not reuse an Owner-owned idempotency key.
+        replay = editor.post(endpoint, json=replay_request)
+        assert replay.status_code == 409, (
+            f"editor replayed Owner task: {replay.status_code}"
+        )
+        # The typed request is extra=forbid: actor identity cannot be forged.
+        forged = dict(replay_request)
+        forged["idempotencyKey"] = str(uuid.uuid4())
+        forged["requestedBy"] = owner_id
+        forge_result = editor.post(endpoint, json=forged)
+        assert forge_result.status_code == 422, (
+            f"untrusted actor override accepted: {forge_result.status_code}"
+        )
+        assert editor.get("/admin/users").status_code == 403, (
+            "editor received Owner-only user administration access"
+        )
+    with authenticate(email=viewer_email, password_override=viewer_password) as viewer:
+        for target in (endpoint + "/validate", endpoint):
+            denied = viewer.post(target, json=replay_request)
+            assert denied.status_code == 403, (
+                f"viewer may operate generation route {target}: {denied.status_code}"
+            )
+        assert viewer.get("/admin/users").status_code == 403
+    with SessionLocal() as db:
+        source = db.get(DBGenerationTask, saved["taskId"])
+        assert source is not None and source.requested_by == owner_id
+        assert db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.tenant_id == source.tenant_id,
+            DBGenerationTask.project_id == source.project_id,
+            DBGenerationTask.provider == "deterministic-fake-talking-head",
+        )).scalar_one() == 1, "denied identities changed the source project"
+    print(json.dumps({
+        "phase": "same_tenant_actor_isolation", "fakeOnly": True,
+        "ownerAttributed": True, "editorReusedOwnerKeyDenied": True,
+        "editorActorOverrideDenied": True, "editorAdminRouteDenied": True,
+        "viewerGenerationDenied": True, "delegatedAdminProof": "NOT_TESTED",
+    }), flush=True)
+
+
 def verify() -> None:
     state = json.loads(STATE_PATH.read_text(encoding="utf8"))
     saved = state["evidence"]
@@ -287,6 +364,7 @@ def verify() -> None:
             f"cross-project task visibility={wrong.status_code}"
         )
         verify_foreign_tenant_denials(saved, state["replayRequest"])
+        verify_same_tenant_actor_separation(saved, state["replayRequest"])
         evidence = check_asset_and_receipts(
             saved["projectId"], saved["taskId"], saved["sha256"],
         )
