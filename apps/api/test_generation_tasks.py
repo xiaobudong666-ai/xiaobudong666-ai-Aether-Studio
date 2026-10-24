@@ -2640,3 +2640,62 @@ def test_g70_ambiguous_sidecar_ack_holds_original_intent_without_refund(
     assert len(uploads) == 1
     app.state.moneyprinter.assert_not_called()
 
+
+def test_g70_fake_adapter_forwards_recovery_intent_and_reads_original(monkeypatch):
+    """Scoped adapter contract only: no HTTP network or paid Provider."""
+    import hashlib
+    import io
+    import httpx
+    import app.video_use_adapter as adapter_module
+
+    original = b"g70-fake-durable-original"
+    digest = hashlib.sha256(original).hexdigest()
+    calls = []
+
+    class FakeHttpClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            request = httpx.Request(method, url)
+            if method == "POST":
+                assert url.endswith("/media")
+                assert kwargs["data"] == {
+                    "projectId": "fake-project",
+                    "recoveryKey": "g70-abc123",
+                    "expectedSha256": digest,
+                }
+                assert kwargs["files"]["file"][1].read() == original
+                return httpx.Response(201, request=request, json={
+                    "mediaId": "g70-disposable-1", "projectId": "fake-project",
+                    "sha256": digest, "metadata": {"video": {"codec": "h264"}},
+                })
+            assert method == "GET"
+            assert url.endswith("/fake-recovery/fake-project/g70-abc123")
+            assert kwargs["params"] == {"expectedSha256": digest}
+            return httpx.Response(200, request=request, json={
+                "mediaId": "g70-disposable-1", "projectId": "fake-project",
+                "sha256": digest, "recovered": True,
+            })
+
+    monkeypatch.setattr(adapter_module.httpx, "Client", FakeHttpClient)
+    adapter = adapter_module.VideoUseAdapter(
+        api_url="http://disposable-sidecar.invalid", max_retries=2,
+    )
+    received = adapter.upload_media(
+        "fake-project", "source.mp4", "video/mp4", io.BytesIO(original),
+        recovery_key="g70-abc123", expected_sha256=digest,
+    )
+    looked_up = adapter.find_fake_recovery(
+        "fake-project", "g70-abc123", digest,
+    )
+    assert received["mediaId"] == looked_up["mediaId"]
+    assert looked_up["recovered"] is True
+    assert [method for method, _ in calls] == ["POST", "GET"]
