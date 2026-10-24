@@ -2126,7 +2126,14 @@ def create_app(
         require_internal_token(x_worker_token)
         if any(marker in providerArtifactId for marker in ("://", "..", "\\", "/")):
             raise HTTPException(status_code=422, detail={"code": "ARTIFACT_ID_INVALID", "message": "产物编号格式不安全"})
-        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        # Serialize intake until the original artifact's upload intent is durable.
+        # PostgreSQL uses a task row lock; SQLite uses BEGIN IMMEDIATE.
+        begin_serialized_write(db)
+        task = db.execute(
+            select(DBGenerationTask)
+            .where(DBGenerationTask.id == task_id)
+            .with_for_update()
+        ).scalar_one_or_none()
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         if task.provider == "deterministic-fake-talking-head":
@@ -2182,6 +2189,26 @@ def create_app(
         while chunk := file.file.read(1024 * 1024):
             digest.update(chunk)
         file.file.seek(0)
+        # The intent is a durable audit/repair anchor, not a claim that the
+        # sidecar has accepted or persisted the bytes. Never send a second
+        # upload for this attempt until the original outcome is reconciled.
+        attempt = current_generation_attempt(db, task)
+        existing_intent = db.execute(
+            select(DBGenerationEvent.id).where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.attempt_id == attempt.id,
+                DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+            )
+        ).scalar_one_or_none()
+        if existing_intent is not None:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_REQUIRED",
+                    "message": "原始媒体转存意图已登记，必须核对后才能继续",
+                },
+            )
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == task.tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
@@ -2190,6 +2217,26 @@ def create_app(
         if reservation.rowcount != 1:
             db.rollback()
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
+        # Persist the intent and storage reservation in ONE SQL transaction,
+        # before external sidecar I/O. If the process crashes at any later
+        # point, the original task, attempt, source identity and byte digest
+        # remain queryable without issuing another paid generation attempt.
+        add_generation_event(
+            db, task, attempt=attempt, event_type="ARTIFACT_UPLOAD_INTENT",
+            actor_type="WORKER", actor_id=x_worker_id,
+            from_status=task.status, to_status=task.status,
+            metadata={
+                "tenantId": task.tenant_id,
+                "projectId": task.project_id,
+                "attempt": task.attempts,
+                "upstreamJobId": task.upstream_job_id,
+                "providerArtifactId": providerArtifactId,
+                "sha256": digest.hexdigest(),
+                "sizeBytes": upload_size,
+                "uploadName": f"generation-{task.id}.mp4",
+                "recoveryState": "PREPARED_BEFORE_SIDECAR_UPLOAD",
+            }, now=now,
+        )
         db.commit()
         # Only the proven final SQL commit window is held for source-artifact recovery.
         # Other upload/validation failures keep their existing conservative handling.
