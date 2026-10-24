@@ -805,6 +805,24 @@ def create_app(
         if app_engine.dialect.name == "sqlite":
             db.execute(text("BEGIN IMMEDIATE"))
 
+    def has_pending_artifact_upload_intent(db: Session, task: DBGenerationTask) -> bool:
+        """G70/G71: durable upload intent takes priority over cancellation/retry.
+
+        Sidecar bytes may exist even when the API never received its HTTP ACK.
+        Only a separate original-artifact reconciliation gate may clear this
+        uncertainty; terminal worker reports must not release held usage.
+        """
+        if task.asset_version_id is not None:
+            return False
+        attempt = current_generation_attempt(db, task)
+        return db.execute(
+            select(DBGenerationEvent.id).where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.attempt_id == attempt.id,
+                DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+            )
+        ).scalar_one_or_none() is not None
+
     def require_internal_token(x_worker_token: str | None) -> None:
         if not resolved_worker_token or not x_worker_token or not hmac.compare_digest(resolved_worker_token, x_worker_token):
             raise HTTPException(status_code=401, detail={"code": "WORKER_AUTH_FAILED", "message": "工作节点认证失败"})
@@ -1703,7 +1721,22 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_roles(context, "owner", "editor")
+        # Serialize against intake's first durable SQL commit. A cancellation
+        # that races an external upload must not claim the sidecar was undone.
+        begin_serialized_write(db)
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        if app_engine.dialect.name != "sqlite":
+            db.execute(
+                select(DBGenerationTask.id).where(DBGenerationTask.id == task.id).with_for_update()
+            ).scalar_one()
+        if has_pending_artifact_upload_intent(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_REQUIRED",
+                    "message": "原始媒体转存尚未核对，禁止取消并提前释放额度",
+                },
+            )
         if task.cancel_requested_at is None and task.status not in TERMINAL_GENERATION_STATES:
             now = utc_now()
             previous = task.status
@@ -1746,7 +1779,20 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_roles(context, "owner", "editor")
+        begin_serialized_write(db)
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        if app_engine.dialect.name != "sqlite":
+            db.execute(
+                select(DBGenerationTask.id).where(DBGenerationTask.id == task.id).with_for_update()
+            ).scalar_one()
+        if has_pending_artifact_upload_intent(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_REQUIRED",
+                    "message": "上传意图已持久化，必须恢复原产物，不允许新生成尝试",
+                },
+            )
         # G70/G71: a completed upstream job may already have produced billable output.
         # A failed media transfer requires reconciliation of the ORIGINAL artifact,
         # not another generation attempt with a new upstream job and possible charge.
@@ -2060,6 +2106,16 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "ILLEGAL_GENERATION_TRANSITION", "message": "生成任务状态迁移不合法"})
         if req.upstreamJobId and task.upstream_job_id and req.upstreamJobId != task.upstream_job_id:
             raise HTTPException(status_code=409, detail={"code": "UPSTREAM_ID_IMMUTABLE", "message": "上游任务编号不可替换"})
+        # Once intake has committed its intent, a concurrent Worker FAILED
+        # or CANCELED report is not proof that the sidecar has no artifact.
+        if req.status in {"FAILED", "CANCELED", "PARTIAL", "UNKNOWN"} and has_pending_artifact_upload_intent(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_REQUIRED",
+                    "message": "原媒资上传已进入不确定区间，禁止终态转换和释放预留",
+                },
+            )
         previous = task.status
         attempt = current_generation_attempt(db, task)
         if req.upstreamJobId:
