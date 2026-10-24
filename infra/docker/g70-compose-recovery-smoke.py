@@ -161,7 +161,7 @@ def prepare():
         assert invariant(task_id, tenant_id) == expected
         STATE.write_text(json.dumps({
             "taskId":task_id,"tenantId":tenant_id,"projectId":pid,
-            "otherProjectId":other_id,"mediaId":uploaded["mediaId"],
+            "otherProjectId":other_id,"mediaId":uploaded["mediaId"],"sourceId":image_id,
             "key":key,"sha":sha,"size":len(original),"expected":expected}),encoding="utf8")
         print(json.dumps({"phase":"before_restart","fakeOnly":True,
             "fixture":"SYNTHETIC_DB_AND_FFMPEG","apiReadback":"FOUND_UNBOUND",
@@ -200,6 +200,35 @@ def verify():
     assert len(data.content) == state["size"]
     assert hashlib.sha256(data.content).hexdigest() == state["sha"]
     assert invariant(state["taskId"],state["tenantId"]) == state["expected"]
+    # A disposable, newer DENIED rights snapshot must fence any further
+    # owner-self recovery lookup before contacting sidecar.  This is a
+    # synthetic revocation, NOT an M12 trusted issuer or production policy.
+    with SessionLocal() as db:
+        project = db.get(DBProject, state["projectId"])
+        assert project is not None
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=state["tenantId"],
+            project_id=state["projectId"], asset_version_id=state["sourceId"],
+            status="DENIED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="SYNTHETIC_REVOCATION_NOT_M12",
+            captured_by=project.owner_id,
+            captured_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=2),
+        ))
+        db.commit()
+    with login() as client:
+        revoked = client.get(
+            f"/projects/{state['projectId']}/generation-tasks/{state['taskId']}/fake-recovery-check"
+        )
+        assert revoked.status_code == 409, revoked.text[:500]
+        assert revoked.json()["detail"]["code"] == "SOURCE_RIGHTS_REVOKED"
+    assert invariant(state["taskId"],state["tenantId"]) == state["expected"]
+    # Revocation fences business readback but never deletes original media.
+    remaining = adapter.find_fake_recovery(state["projectId"], state["key"], state["sha"])
+    assert remaining["mediaId"] == state["mediaId"] and remaining["sha256"] == state["sha"]
+    print(json.dumps({"phase":"rights_revoked","synthetic":True,
+        "ownerReadback":"DENIED","physicalMediaPreserved":True,
+        "settled":False}),flush=True)
     print(json.dumps({"phase":"after_restart","verified":True,
         "fixture":"SYNTHETIC_DB_AND_FFMPEG","readback":"FOUND_UNBOUND",
         "assetRelink":False,"settled":False,"sha256":state["sha"]}),flush=True)
