@@ -2756,7 +2756,8 @@ def test_g70_fake_api_durable_upload_key_precedes_sidecar_and_is_tenant_scoped(
         data={"providerArtifactId": "g70-fake-original-file"},
         files={"file": ("original.mp4", bytes_to_store, "video/mp4")},
     )
-    assert response.status_code == 200, response.text
+    # The artifact-intake route intentionally returns HTTP 201 on create.
+    assert response.status_code == 201, response.text
     assert len(seen) == 1
     assert media_store.uploads == 1
     app.state.moneyprinter.assert_not_called()
