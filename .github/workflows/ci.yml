@@ -116,6 +116,11 @@ jobs:
           python -m pytest apps/api/test_generation_tasks.py -v \
             -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g73_keyset_claim_scans_past_ineligible_queue_pages or test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservations or test_g70_native_video_use_http_orphan_persists_after_db_commit_failure or test_29_probe_failure_compensates_quota_and_creates_no_asset or test_30_success_creates_one_material_and_immutable_asset_with_provenance or test_40_stream_interruption_compensates_quota_and_records_failure or test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation or test_g70_video_use_adapter_media_upload_is_not_retried_after_ambiguous_response or test_g70_video_use_adapter_get_keeps_safe_retry or test_g70_ambiguous_sidecar_ack_holds_original_intent_without_refund or test_g70_fake_adapter_forwards_recovery_intent_and_reads_original or test_g70_fake_api_durable_upload_key_precedes_sidecar_and_is_tenant_scoped or test_g70_fake_owner_readonly_check_locates_original_without_binding_or_settlement"
 
+      - name: Provide FFmpeg and ffprobe for disposable native HTTP regression
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
       - name: Verify G70 API to native HTTP sidecar restart (FAKE-only)
         env:
           PYTHONPATH: apps/api
