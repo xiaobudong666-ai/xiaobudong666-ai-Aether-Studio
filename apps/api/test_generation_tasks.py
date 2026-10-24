@@ -834,6 +834,25 @@ def test_g70_durable_intent_blocks_cancel_worker_terminal_and_retry_without_rele
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.kind == "RELEASED",
         )).scalar_one() == 0
+        # Expired Worker lease after the upload intent must not cause
+        # a new Worker to submit or ingest the original output a second time.
+        row.lease_expires_at = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=5)
+        )
+        db.commit()
+
+    no_reclaim = claim(client, worker_id="worker-b")
+    assert no_reclaim.status_code == 204, no_reclaim.text
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.lease_owner == "worker-a"
+        assert row.upstream_job_id == "original-fake-job"
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "LEASE_RECOVERED",
+        )).scalar_one() == 0
         # Simulate an externally interrupted Worker leaving a stale FAILED
         # status WITHOUT executing a terminal API that knows about the intent.
         row.status = "FAILED"
