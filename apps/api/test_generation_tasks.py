@@ -771,6 +771,100 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
 
 
 
+
+def test_g70_durable_intent_blocks_cancel_worker_terminal_and_retry_without_release(
+    generation_context, monkeypatch
+):
+    """G70 crash window: intent is committed but sidecar ACK may be lost.
+
+    Native FastAPI+SQLite and synthetic event; no live sidecar or Provider call.
+    Cancellation, late Worker terminal status and manual retry must not erase
+    the original attempt, invent a refund or start another generation.
+    """
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "g70-intent-terminal-races")
+    task = create_task(client, project, key="g70-pending-intent-terminal-races")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="original-fake-job").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="original-fake-job", providerArtifactId="original-fake-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == row.attempts,
+        )).scalar_one()
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_UPLOAD_INTENT",
+            from_status="INGESTING", to_status="INGESTING",
+            actor_type="WORKER", actor_id="worker-a",
+            metadata_json={
+                "tenantId": row.tenant_id, "projectId": row.project_id,
+                "attempt": row.attempts, "upstreamJobId": row.upstream_job_id,
+                "providerArtifactId": row.provider_artifact_id,
+                "sha256": "a" * 64, "sizeBytes": 15,
+                "recoveryState": "PREPARED_BEFORE_SIDECAR_UPLOAD",
+            },
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+        ))
+        db.commit()
+
+    cancelled = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/cancel")
+    assert cancelled.status_code == 409, cancelled.text
+    assert cancelled.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+    worker_terminal = transition(
+        client, task_id, "FAILED", errorCode="PROVIDER_TIMEOUT", retryable=False,
+    )
+    assert worker_terminal.status_code == 409, worker_terminal.text
+    assert worker_terminal.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "INGESTING"
+        assert row.cancel_requested_at is None
+        assert row.upstream_job_id == "original-fake-job"
+        assert row.provider_artifact_id == "original-fake-artifact"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+        # Simulate an externally interrupted Worker leaving a stale FAILED
+        # status WITHOUT executing a terminal API that knows about the intent.
+        row.status = "FAILED"
+        row.error_code = "TRANSIENT_WORKER_CRASH"
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == row.attempts,
+        )).scalar_one()
+        attempt.status = "FAILED"
+        db.commit()
+
+    blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.attempts == 1
+        assert row.upstream_job_id == "original-fake-job"
+        assert row.provider_artifact_id == "original-fake-artifact"
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type.in_(["TASK_CANCELED", "TASK_RETRIED"]),
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind.in_(["RELEASED", "SETTLED"]),
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
 def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(generation_context):
     """G70/G71: original upstream output must be reconciled, never regenerated blindly.
 
