@@ -1,0 +1,88 @@
+name: G70 disposable FAKE-only native Compose
+
+on:
+  push:
+    branches:
+      - feat/fusion-m0-g70-postupload-db-fault-fake-only
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g70-disposable-compose-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-g70-original-readback:
+    if: github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-db-fault-fake-only'
+    name: G70 API-to-sidecar restart/readback (not release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: aether-g70-${{ github.run_id }}-${{ github.run_attempt }}
+      AETHER_COOKIE_SECURE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate disposable credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          password="ci-$(openssl rand -hex 24)"
+          worker_token="ci-$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
+          echo "::add-mask::$worker_token"
+          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+      - name: Validate isolated FAKE-only Compose
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml config --quiet
+      - name: Start disposable API and video-use containers
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            up -d --build --wait --wait-timeout 300 api video-use
+      - name: Generate genuine synthetic MP4 with offline FFmpeg
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T video-use ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i color=c=black:s=64x64:r=2 -t 1 \
+            -c:v mpeg4 -pix_fmt yuv420p -movflags +faststart \
+            /tmp/g70-ci-synthetic-original.mp4
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp video-use:/tmp/g70-ci-synthetic-original.mp4 "$RUNNER_TEMP/g70-ci-synthetic-original.mp4"
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp "$RUNNER_TEMP/g70-ci-synthetic-original.mp4" api:/tmp/g70-ci-synthetic-original.mp4
+      - name: Native API-to-sidecar readback after synthetic ACK loss
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g70-compose-recovery-smoke.py api:/tmp/g70-compose-recovery-smoke.py
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py prepare
+      - name: Restart two native services and verify durable original
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml restart video-use api
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            up -d --wait --wait-timeout 180 api video-use
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py verify
+      - name: Clean up only this disposable run's volumes
+        if: always()
+        run: |
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            down --volumes --remove-orphans || true
