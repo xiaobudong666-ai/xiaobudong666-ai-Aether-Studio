@@ -2403,12 +2403,14 @@ def create_app(
                     expected_sha256=digest.hexdigest(),
                 )
             sidecar_receipt_received = True
+            # Capture the returned media identity before validating its probe.
+            # A bad probe does NOT mean sidecar bytes were never persisted.
+            media_id = str(uploaded.get("mediaId") or "") or None
+            if not media_id or uploaded.get("projectId") != task.project_id:
+                raise ValueError("generated artifact returned invalid media scope")
             metadata = uploaded.get("metadata") or {}
             if not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
                 raise ValueError("generated artifact did not pass media probe")
-            media_id = str(uploaded.get("mediaId") or "")
-            if not media_id or uploaded.get("projectId") != task.project_id:
-                raise ValueError("generated artifact returned invalid media scope")
             project = db.execute(select(DBProject).where(DBProject.id == task.project_id, DBProject.tenant_id == task.tenant_id)).scalar_one()
             provenance = {
                 "provider": task.provider,
