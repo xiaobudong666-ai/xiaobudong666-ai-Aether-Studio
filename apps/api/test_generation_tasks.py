@@ -2699,3 +2699,64 @@ def test_g70_fake_adapter_forwards_recovery_intent_and_reads_original(monkeypatc
     assert received["mediaId"] == looked_up["mediaId"]
     assert looked_up["recovered"] is True
     assert [method for method, _ in calls] == ["POST", "GET"]
+
+
+def test_g70_fake_api_durable_upload_key_precedes_sidecar_and_is_tenant_scoped(
+    generation_context, monkeypatch,
+):
+    """Native FastAPI/SQLite + stubbed sidecar, not Docker or M12 trust."""
+    import hashlib
+
+    client, sessions, app, media_store = generation_context
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    project = create_project(client, "g70-native-fake-scoped-intent")
+    task = create_task(client, project, key="g70-native-fake-scoped-key")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="g70-fake-original-job"
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="g70-fake-original-job", providerArtifactId="g70-fake-original-file",
+    ).status_code == 200
+    original_upload = media_store.upload_media
+    bytes_to_store = b"g70-disposable-original-bytes"
+    seen = []
+
+    def fake_scoped_upload(project_id, filename, content_type, stream, **kwargs):
+        with sessions() as committed_session:
+            intent = committed_session.execute(select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+            )).scalar_one()
+            task_row = committed_session.get(DBGenerationTask, task_id)
+            stable_identity = (
+                f"{task_row.tenant_id}:{task_row.project_id}:{task_row.id}:"
+                f"{task_row.attempts}:g70-fake-original-file"
+            )
+            expected_key = "g70-" + hashlib.sha256(stable_identity.encode()).hexdigest()
+            expected_sha = hashlib.sha256(bytes_to_store).hexdigest()
+            assert intent.metadata_json["tenantId"] == task_row.tenant_id
+            assert intent.metadata_json["projectId"] == project_id
+            assert intent.metadata_json["fakeRecoveryKey"] == expected_key
+            assert intent.metadata_json["sha256"] == expected_sha
+            assert kwargs == {
+                "recovery_key": expected_key,
+                "expected_sha256": expected_sha,
+            }
+            seen.append((project_id, expected_key))
+        return original_upload(project_id, filename, content_type, stream)
+
+    monkeypatch.setattr(media_store, "upload_media", fake_scoped_upload)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "g70-fake-original-file"},
+        files={"file": ("original.mp4", bytes_to_store, "video/mp4")},
+    )
+    assert response.status_code == 200, response.text
+    assert len(seen) == 1
+    assert media_store.uploads == 1
+    app.state.moneyprinter.assert_not_called()
