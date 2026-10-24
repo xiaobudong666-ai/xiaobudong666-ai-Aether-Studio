@@ -84,15 +84,34 @@ class VideoUseAdapter:
         filename: str,
         content_type: str | None,
         stream: BinaryIO,
+        *,
+        recovery_key: str | None = None,
+        expected_sha256: str | None = None,
     ) -> dict[str, Any]:
+        form = {"projectId": project_id}
+        if recovery_key is not None or expected_sha256 is not None:
+            if not recovery_key or not expected_sha256:
+                raise ValueError("Incomplete FAKE media recovery intent")
+            form.update(recoveryKey=recovery_key, expectedSha256=expected_sha256)
         return self._json(
             self._request(
                 "POST",
                 "/media",
-                data={"projectId": project_id},
+                data=form,
                 files={"file": (filename, stream, content_type or "application/octet-stream")},
             )
         )
+
+    def find_fake_recovery(
+        self, project_id: str, recovery_key: str, expected_sha256: str,
+    ) -> dict[str, Any]:
+        # Only reads back the original scoped sidecar object; never resubmits
+        # Provider generation or retries the ambiguous media POST.
+        return self._json(self._request(
+            "GET",
+            f"/fake-recovery/{project_id}/{recovery_key}",
+            params={"expectedSha256": expected_sha256},
+        ))
 
     def submit_render(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._json(self._request("POST", "/renders", json=payload))
