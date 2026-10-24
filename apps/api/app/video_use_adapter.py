@@ -35,7 +35,12 @@ class VideoUseAdapter:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        # POST /media is not idempotent: the sidecar may have persisted bytes
+        # before a timeout or 5xx. A blind HTTP retry creates another object
+        # and may replay an already-consumed binary stream. Reconcile via the
+        # original durable upload intent instead of issuing a second upload.
+        retries = 0 if method.upper() == "POST" and path == "/media" else self.max_retries
+        for attempt in range(retries + 1):
             try:
                 with httpx.Client(timeout=self.timeout, trust_env=False) as client:
                     response = client.request(method, f"{self.api_url}{path}", **kwargs)
@@ -48,7 +53,7 @@ class VideoUseAdapter:
                 )
             except httpx.HTTPError as exc:
                 last_error = VideoUseConnectionError(f"video-use request failed: {exc}")
-            if attempt < self.max_retries:
+            if attempt < retries:
                 time.sleep(self.backoff_factor * (2**attempt))
         assert last_error is not None
         raise last_error
