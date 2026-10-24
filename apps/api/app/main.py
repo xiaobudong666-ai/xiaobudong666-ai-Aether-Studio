@@ -2114,6 +2114,135 @@ def create_app(
         db.commit()
         return {"taskId": task.id, "status": task.status, "progress": task.progress}
 
+    @created_app.get("/projects/{project_id}/generation-tasks/{task_id}/fake-recovery-check")
+    def check_original_fake_artifact_readonly(
+        project_id: str,
+        task_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        """G70 FAKE-ONLY: inspect an original sidecar artifact without binding it.
+
+        This endpoint is owner-self/read-only. Administrator acting-on-behalf,
+        automatic settlement, rights issuance and mutation are NOT admitted.
+        """
+        require_roles(context, "owner")
+        if not (
+            created_app.state.generation_provider_mode == "deterministic-fake"
+            and os.environ.get("AETHER_FAKE_ONLY_NONPROD", "").lower() == "true"
+            and os.environ.get("AETHER_RUNTIME_STAGE", "").lower() == "nonproduction"
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "FAKE_RECOVERY_DISABLED", "message": "非生产原媒资核对入口未启用"},
+            )
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        if (
+            task.status != "UNKNOWN"
+            or task.error_code != "ARTIFACT_INGEST_FAILED"
+            or task.asset_version_id is not None
+            or task.cancel_requested_at is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "RECOVERY_NOT_PENDING", "message": "当前任务不允许原媒资核对"},
+            )
+        circuit = generation_circuit(db, task.tenant_id)
+        if circuit is not None and circuit.state == "DISABLED":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROVIDER_EMERGENCY_STOPPED", "message": "停机期间禁止恢复操作"},
+            )
+        if task.provider == "deterministic-fake-talking-head":
+            source_id = (task.request_json or {}).get("imageAssetId")
+            source = db.execute(select(DBAssetVersion).where(
+                DBAssetVersion.id == source_id,
+                DBAssetVersion.tenant_id == task.tenant_id,
+                DBAssetVersion.project_id == task.project_id,
+            )).scalar_one_or_none()
+            if (
+                source is None or source.media_type != "image"
+                or source.sha256 != (task.request_json or {}).get("sourceAssetSha256")
+                or not rights_decision(
+                    latest_rights_snapshot(db, source.id, "REMIX"), utc_now()
+                )["allowed"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "SOURCE_RIGHTS_REVOKED", "message": "源素材授权已失效，禁止恢复"},
+                )
+        attempt = current_generation_attempt(db, task)
+        intent = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task.id,
+            DBGenerationEvent.attempt_id == attempt.id,
+            DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+        )).scalar_one_or_none()
+        metadata = (intent.metadata_json or {}) if intent is not None else {}
+        recovery_key = metadata.get("fakeRecoveryKey")
+        expected_sha = metadata.get("sha256")
+        expected_size = metadata.get("sizeBytes")
+        if not (
+            isinstance(recovery_key, str) and recovery_key.startswith("g70-")
+            and isinstance(expected_sha, str) and len(expected_sha) == 64
+            and isinstance(expected_size, int) and expected_size > 0
+            and metadata.get("tenantId") == task.tenant_id
+            and metadata.get("projectId") == task.project_id
+            and metadata.get("attempt") == task.attempts
+            and metadata.get("upstreamJobId") == task.upstream_job_id
+            and metadata.get("providerArtifactId") == task.provider_artifact_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "DURABLE_RECOVERY_INTENT_INVALID", "message": "原媒资持久凭据缺失或作用域不一致"},
+            )
+        try:
+            original = created_app.state.video_use.find_fake_recovery(
+                task.project_id, recovery_key, expected_sha
+            )
+        except VideoUseError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "ORIGINAL_MEDIA_LOOKUP_UNAVAILABLE", "message": "原媒资侧车核对失败，保持隔离"},
+            ) from exc
+        probe = original.get("metadata") or {}
+        try:
+            probe_valid = (
+                isinstance(probe, dict)
+                and bool(probe.get("video"))
+                and float(probe.get("durationSeconds") or 0) > 0
+                and int(probe.get("sizeBytes") or 0) == expected_size
+            )
+        except (ValueError, TypeError):
+            probe_valid = False
+        media_id = original.get("mediaId")
+        if not (
+            original.get("projectId") == task.project_id
+            and original.get("sha256") == expected_sha
+            and original.get("contentType") == "video/mp4"
+            and isinstance(media_id, str) and media_id.startswith("g70")
+            and (task.media_id is None or task.media_id == media_id)
+            and probe_valid
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORIGINAL_MEDIA_SCOPE_OR_HASH_MISMATCH", "message": "原媒资校验不通过，禁止重关联"},
+            )
+        # No SQL commit, asset mutation, SETTLED entry, refund, Provider
+        # resubmission or protected-store deletion occurs in this API.
+        return {
+            "taskId": task.id,
+            "projectId": task.project_id,
+            "attempt": task.attempts,
+            "recoveryState": "FOUND_UNBOUND",
+            "actorMode": "OWNER_SELF",
+            "mediaId": media_id,
+            "sha256": expected_sha,
+            "sizeBytes": expected_size,
+            "businessAssetBound": False,
+            "financialSettlementVerified": False,
+            "requiresSeparateRelinkGate": True,
+        }
+
     @created_app.post("/internal/generation-tasks/{task_id}/artifact-intake", status_code=201)
     def intake_generation_artifact(
         task_id: str,
