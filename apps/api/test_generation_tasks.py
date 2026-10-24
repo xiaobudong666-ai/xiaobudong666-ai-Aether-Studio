@@ -2254,6 +2254,96 @@ def test_g73_keyset_claim_scans_past_ineligible_queue_pages(
     assert media.uploads == 0
 
 
+def test_g70_fake_sidecar_ack_then_bad_probe_holds_original_without_refund(
+    generation_context, monkeypatch
+):
+    """Native FAKE-only: a successful sidecar ACK precedes an unusable probe.
+
+    A returned HTTP media identity means external bytes MAY remain durable.
+    Bad metadata must not release the reservation or permit another Provider
+    attempt. This is intentionally not a full business asset recovery test.
+    """
+    import hashlib
+
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-sidecar-ack-invalid-probe")
+    task = create_task(client, project, key="g70-sidecar-ack-invalid-probe")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="g70-probe-upstream"
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="g70-probe-upstream",
+        providerArtifactId="g70-probe-artifact",
+    ).status_code == 200
+
+    original = b"nonproduction-sidecar-uploaded-bytes"
+    acknowledged_media = "g70" + ("a" * 32)
+    uploads = []
+
+    def upload_ack_with_bad_probe(
+        project_id, filename, content_type, stream,
+        *, recovery_key=None, expected_sha256=None,
+    ):
+        payload = stream.read()
+        assert project_id == project["id"]
+        assert filename == f"generation-{task_id}.mp4"
+        assert content_type == "video/mp4"
+        assert recovery_key and recovery_key.startswith("g70-")
+        assert expected_sha256 == hashlib.sha256(original).hexdigest()
+        assert payload == original
+        uploads.append(payload)
+        # This ACK is positive even though its metadata is unusable.
+        return {
+            "mediaId": acknowledged_media, "projectId": project_id,
+            "fileName": filename, "contentType": "video/mp4",
+            "metadata": {"durationSeconds": 1.0, "sizeBytes": len(payload)},
+        }
+
+    monkeypatch.setattr(media_store, "upload_media", upload_ack_with_bad_probe)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "g70-probe-artifact"},
+        files={"file": ("disposable.mp4", original, "video/mp4")},
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert uploads == [original]
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "UNKNOWN"
+        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.media_id == acknowledged_media
+        assert row.asset_version_id is None
+        assert row.upstream_job_id == "g70-probe-upstream"
+        assert row.provider_artifact_id == "g70-probe-artifact"
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(original)
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind.in_(["RELEASED", "SETTLED"])
+        )).scalar_one() == 0
+        events = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type.in_(["ARTIFACT_UPLOAD_INTENT", "ARTIFACT_RECOVERY_HELD"]),
+        )).scalars().all()
+        assert len(events) == 2
+        held = next(e for e in events if e.event_type == "ARTIFACT_RECOVERY_HELD")
+        assert held.metadata_json["mediaId"] == acknowledged_media
+        assert held.metadata_json["sidecarAcknowledged"] is True
+        assert held.metadata_json["storageReservationHeld"] is True
+        assert held.metadata_json["financialSettlementVerified"] is False
+    denied = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert denied.status_code == 409
+    assert denied.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert uploads == [original]
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservations(
     generation_context, tmp_path, monkeypatch
 ):
