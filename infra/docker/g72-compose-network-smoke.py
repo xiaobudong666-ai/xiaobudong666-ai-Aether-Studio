@@ -186,7 +186,7 @@ def prepare() -> None:
         else:
             raise AssertionError(f"Worker never finished: {last_status}")
         evidence = check_asset_and_receipts(pid, task_id)
-        STATE_PATH.write_text(json.dumps(evidence), encoding="utf8")
+        STATE_PATH.write_text(json.dumps({"evidence": evidence, "replayRequest": payload}), encoding="utf8")
         print(json.dumps({
             "phase": "before_restart", "fakeOnly": True,
             "sourceAsset": "SYNTHETIC_DB_FIXTURE", "result": evidence,
@@ -194,14 +194,33 @@ def prepare() -> None:
 
 
 def verify() -> None:
-    saved = json.loads(STATE_PATH.read_text(encoding="utf8"))
+    state = json.loads(STATE_PATH.read_text(encoding="utf8"))
+    saved = state["evidence"]
     with authenticate() as client:
         task = get_result(client, saved["projectId"], saved["taskId"])
         assert task["status"] == "RIGHTS_BLOCKED", "replay after restart"
+        # Replay after a Worker/sidecar restart must not create another attempt.
+        replay = client.post(
+            f"/projects/{saved['projectId']}/talking-head/fake-generation-tasks",
+            json=state["replayRequest"],
+        )
+        assert replay.status_code == 202, f"replay={replay.status_code}"
+        assert replay.json()["taskId"] == saved["taskId"], "duplicate fake task"
+        # Same tenant, separate project: no cross-project task read.
+        foreign = client.post("/projects", json={
+            "name": "FAKE G72 isolated project " + uuid.uuid4().hex[:12],
+        })
+        assert foreign.status_code == 201, f"project={foreign.status_code}"
+        wrong = client.get(
+            f"/projects/{foreign.json()['id']}/generation-tasks/{saved['taskId']}",
+        )
+        assert wrong.status_code in (403, 404), (
+            f"cross-project task visibility={wrong.status_code}"
+        )
         evidence = check_asset_and_receipts(
             saved["projectId"], saved["taskId"], saved["sha256"],
         )
-        assert evidence == saved, "asset or receipt mutated after restart"
+        assert evidence == saved, "asset or receipts mutated after replay"
         media = client.get(
             f"/video-use/media/{saved['projectId']}/{saved['mediaId']}"
         )
