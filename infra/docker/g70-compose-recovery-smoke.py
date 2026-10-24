@@ -4,6 +4,7 @@ No business asset relinking, paid generation, refund, release, or Provider calls
 """
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import hashlib
 import io
@@ -36,14 +37,16 @@ def gates():
     assert not os.environ.get("HEYGEN_API_KEY")
     return password
 
+@contextmanager
 def login():
-    client = httpx.Client(base_url=BASE, timeout=30, trust_env=False)
-    response = client.post("/auth/login", json={
-        "email": os.getenv("AETHER_BOOTSTRAP_ADMIN_EMAIL", "admin@aether.local"),
-        "password": gates()})
-    assert response.status_code == 200, f"login={response.status_code}"
-    client.headers.update({"X-Aether-CSRF": "1"})
-    return client
+    # A client used for authentication may not be entered a second time.
+    with httpx.Client(base_url=BASE, timeout=30, trust_env=False) as client:
+        response = client.post("/auth/login", json={
+            "email": os.getenv("AETHER_BOOTSTRAP_ADMIN_EMAIL", "admin@aether.local"),
+            "password": gates()})
+        assert response.status_code == 200, f"login={response.status_code}"
+        client.headers.update({"X-Aether-CSRF": "1"})
+        yield client
 
 def invariant(task_id, tenant_id):
     with SessionLocal() as db:
