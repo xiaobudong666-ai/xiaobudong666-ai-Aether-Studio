@@ -2191,6 +2191,9 @@ def create_app(
             db.rollback()
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
+        # Only the proven final SQL commit window is held for source-artifact recovery.
+        # Other upload/validation failures keep their existing conservative handling.
+        committing_uploaded_media = False
         try:
             uploaded = created_app.state.video_use.upload_media(
                 task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
@@ -2285,9 +2288,61 @@ def create_app(
                 metadata={"assetVersionId": asset.id, "sha256": asset.sha256,
                           "sizeBytes": size_bytes, "generatedSeconds": generated_seconds}, now=now,
             )
+            committing_uploaded_media = True
             db.commit()
         except Exception as exc:
             db.rollback()
+            if committing_uploaded_media:
+                # The sidecar acknowledged a scoped media ID. A failed or
+                # ambiguous SQL commit must NOT refund the held storage/usage
+                # reservation or allow a second upstream generation attempt.
+                held_task = db.execute(select(DBGenerationTask).where(
+                    DBGenerationTask.id == task_id,
+                    DBGenerationTask.tenant_id == task.tenant_id,
+                    DBGenerationTask.project_id == task.project_id,
+                )).scalar_one()
+                if held_task.asset_version_id is None:
+                    held_attempt = current_generation_attempt(db, held_task)
+                    held_at = utc_now()
+                    held_from = held_task.status
+                    held_task.status = "UNKNOWN"
+                    held_task.message = "生成媒体已上传，业务提交待恢复核验"
+                    held_task.error_code = "ARTIFACT_INGEST_FAILED"
+                    held_task.error_message = "侧车媒体已确认，业务资产提交结果不确定"
+                    held_task.media_id = media_id
+                    held_task.completed_at = held_at
+                    held_task.updated_at = held_at
+                    held_task.lease_owner = None
+                    held_task.lease_expires_at = None
+                    held_attempt.status = "UNKNOWN"
+                    held_attempt.reconciliation_state = "UNKNOWN"
+                    held_attempt.error_code = held_task.error_code
+                    held_attempt.error_message = held_task.error_message
+                    held_attempt.completed_at = held_at
+                    add_generation_event(
+                        db, held_task, attempt=held_attempt,
+                        event_type="ARTIFACT_RECOVERY_HELD",
+                        actor_type="SYSTEM", actor_id="api",
+                        from_status=held_from, to_status="UNKNOWN",
+                        metadata={
+                            "mediaId": media_id,
+                            "providerArtifactId": providerArtifactId,
+                            "sha256": digest.hexdigest(),
+                            "sizeBytes": upload_size,
+                            "storageReservationHeld": True,
+                            "financialSettlementVerified": False,
+                        }, now=held_at,
+                    )
+                    db.commit()
+                # If the original SQL commit actually succeeded despite a
+                # post-commit error, never downgrade the already recorded asset.
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "ARTIFACT_RECOVERY_REQUIRED",
+                        "message": "媒体已上传但入库回执不确定，需核对原始媒体和业务账本",
+                    },
+                ) from exc
             db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
             failed_task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one()
             failed_attempt = current_generation_attempt(db, failed_task)
