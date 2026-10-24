@@ -2252,15 +2252,14 @@ def test_g73_keyset_claim_scans_past_ineligible_queue_pages(
     assert media.uploads == 0
 
 
-def test_g70_repro_external_media_survives_failed_final_db_commit(
+def test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservations(
     generation_context, tmp_path, monkeypatch
 ):
-    """FAKE-only fault injection: a successful external upload is not atomic with DB commit.
+    """FAKE-only native FastAPI/SQLite: final commit uncertainty is held safely.
 
-    This explicitly documents a KNOWN OPEN G70 risk; it is not proof of a fix.
-    The persisted file is a disposable local media-store stand-in, never
-    production or protected storage. A separate real video-use recovery test
-    and durable compensation protocol are still required.
+    This verifies a PARTIAL fail-closed mitigation only. The external media
+    still needs a durable recovery/compensation protocol and sidecar recheck.
+    All bytes are disposable synthetic test data, never a paid Provider.
     """
     import io
     from sqlalchemy import event
@@ -2298,13 +2297,14 @@ def test_g70_repro_external_media_survives_failed_final_db_commit(
 
     event.listen(OrmSession, "before_commit", fail_once_after_upload)
     try:
-        with pytest.raises(RuntimeError, match="injected DB final commit"):
-            client.post(
-                f"/internal/generation-tasks/{task_id}/artifact-intake",
-                headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
-                data={"providerArtifactId": "original-output"},
-                files={"file": ("artifact.mp4", b"synthetic-media-bytes", "video/mp4")},
-            )
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "original-output"},
+            files={"file": ("artifact.mp4", b"synthetic-media-bytes", "video/mp4")},
+        )
+        assert response.status_code == 503, response.text
+        assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
     finally:
         event.remove(OrmSession, "before_commit", fail_once_after_upload)
 
@@ -2312,20 +2312,33 @@ def test_g70_repro_external_media_survives_failed_final_db_commit(
     assert external_file.read_bytes() == b"synthetic-media-bytes"
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
-        assert stored.status == "FAILED"
+        assert stored.status == "UNKNOWN"
         assert stored.error_code == "ARTIFACT_INGEST_FAILED"
         assert stored.upstream_job_id == "original-upstream"
         assert stored.provider_artifact_id == "original-output"
+        assert stored.media_id == "generated-media-1"
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
-        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == 0
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(b"synthetic-media-bytes")
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.kind == "SETTLED"
         )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "RELEASED"
+        )).scalar_one() == 0
+        held = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_HELD",
+        )).scalar_one()
+        assert held.metadata_json["mediaId"] == "generated-media-1"
+        assert held.metadata_json["storageReservationHeld"] is True
+        assert held.metadata_json["financialSettlementVerified"] is False
+    denied = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    with sessions() as db:
+        assert db.get(DBGenerationTask, task_id).attempts == 1
+    assert media_store.uploads == 1
     app.state.moneyprinter.assert_not_called()
-    pytest.xfail(
-        "KNOWN_G70_OPEN: external media persisted without a DB asset; "
-        "native sidecar cleanup/recovery and crash-proof ledger not implemented"
-    )
 
 def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
     generation_context, tmp_path, monkeypatch
@@ -2397,13 +2410,14 @@ def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
 
         event.listen(OrmSession, "before_commit", fail_once_after_sidecar_upload)
         try:
-            with pytest.raises(RuntimeError, match="g70 injected final SQL commit failure"):
-                client.post(
-                    f"/internal/generation-tasks/{task_id}/artifact-intake",
-                    headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
-                    data={"providerArtifactId": "g70-original-output"},
-                    files={"file": ("original.mp4", synthetic_bytes, "video/mp4")},
-                )
+            response = client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+                data={"providerArtifactId": "g70-original-output"},
+                files={"file": ("original.mp4", synthetic_bytes, "video/mp4")},
+            )
+            assert response.status_code == 503, response.text
+            assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
         finally:
             event.remove(OrmSession, "before_commit", fail_once_after_sidecar_upload)
 
@@ -2427,18 +2441,23 @@ def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
         assert response.content == synthetic_bytes
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
-        assert stored.status == "FAILED"
+        assert stored.status == "UNKNOWN"
         assert stored.error_code == "ARTIFACT_INGEST_FAILED"
         assert stored.upstream_job_id == "g70-original-upstream"
         assert stored.provider_artifact_id == "g70-original-output"
+        assert stored.media_id == media_id
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
-        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == 0
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(synthetic_bytes)
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_HELD",
+        )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.kind == "SETTLED"
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
     pytest.xfail(
-        "KNOWN_G70_OPEN: native video-use media remains after successful upload "
-        "and failed business commit; durable repair/reconciliation not implemented"
+        "KNOWN_G70_OPEN: native video-use bytes remain without a committed asset; "
+        "recovery/compensation and crash-proof transfer intent are still missing"
     )
 
