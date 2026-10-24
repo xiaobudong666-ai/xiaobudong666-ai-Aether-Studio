@@ -2761,3 +2761,145 @@ def test_g70_fake_api_durable_upload_key_precedes_sidecar_and_is_tenant_scoped(
     assert len(seen) == 1
     assert media_store.uploads == 1
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_fake_owner_readonly_check_locates_original_without_binding_or_settlement(
+    generation_context, monkeypatch,
+):
+    """Native API + SQLite, synthetic sidecar responses; no real Provider/asset apply."""
+    import hashlib
+    from app.video_use_adapter import VideoUseTimeoutError, VideoUseConnectionError
+
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-owner-recovery-read-only")
+    other_project = create_project(client, "g70-owner-other-project")
+    task = create_task(client, project, key="g70-owner-recovery-check")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="g70-recovery-original-upstream"
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="g70-recovery-original-upstream",
+        providerArtifactId="g70-recovery-original-artifact",
+    ).status_code == 200
+
+    original = b"synthetic-g70-original-not-real-video"
+    sha = hashlib.sha256(original).hexdigest()
+    persisted = {}
+    calls = []
+
+    def upload_then_ack_loss(project_id, filename, content_type, stream, **kwargs):
+        assert project_id == project["id"] and content_type == "video/mp4"
+        assert stream.read() == original
+        assert kwargs["expected_sha256"] == sha
+        persisted.update(key=kwargs["recovery_key"], project=project_id)
+        raise VideoUseTimeoutError("synthetic lost sidecar ACK")
+
+    def lookup(project_id, recovery_key, expected_sha256):
+        calls.append((project_id, recovery_key, expected_sha256))
+        assert project_id == persisted["project"]
+        assert recovery_key == persisted["key"]
+        assert expected_sha256 == sha
+        return {
+            "mediaId": "g70originalmedia",
+            "projectId": project_id,
+            "sha256": sha,
+            "contentType": "video/mp4",
+            "metadata": {
+                "sizeBytes": len(original), "durationSeconds": 1.0,
+                "video": {"codec": "h264", "width": 320, "height": 568},
+            },
+        }
+
+    monkeypatch.setattr(media_store, "upload_media", upload_then_ack_loss)
+    monkeypatch.setattr(media_store, "find_fake_recovery", lookup, raising=False)
+    intake = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "g70-recovery-original-artifact"},
+        files={"file": ("original.mp4", original, "video/mp4")},
+    )
+    assert intake.status_code == 503, intake.text
+    assert intake.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+    endpoint = f"/projects/{project['id']}/generation-tasks/{task_id}/fake-recovery-check"
+    with sessions() as db:
+        before_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        before_quota = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+        assert before_quota == len(original)
+
+    for _ in range(2):
+        checked = client.get(endpoint)
+        assert checked.status_code == 200, checked.text
+        body = checked.json()
+        assert body["recoveryState"] == "FOUND_UNBOUND"
+        assert body["actorMode"] == "OWNER_SELF"
+        assert body["taskId"] == task_id and body["mediaId"] == "g70originalmedia"
+        assert body["sha256"] == sha and body["sizeBytes"] == len(original)
+        assert body["businessAssetBound"] is False
+        assert body["financialSettlementVerified"] is False
+        assert body["requiresSeparateRelinkGate"] is True
+    assert len(calls) == 2
+
+    # No access to an unrelated project; no sidecar lookup before DB scope check.
+    foreign = client.get(
+        f"/projects/{other_project['id']}/generation-tasks/{task_id}/fake-recovery-check"
+    )
+    assert foreign.status_code == 404
+    assert len(calls) == 2
+
+    editor_password = secrets.token_urlsafe(24)
+    created = client.post("/admin/users", json={
+        "email": "g70-editor@example.invalid", "displayName": "FAKE Editor",
+        "password": editor_password, "role": "editor",
+    })
+    assert created.status_code == 201, created.text
+    with TestClient(app) as editor:
+        assert editor.post("/auth/login", json={
+            "email": "g70-editor@example.invalid", "password": editor_password,
+        }).status_code == 200
+        assert editor.get(endpoint).status_code == 403
+    assert len(calls) == 2
+
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "production")
+    disabled = client.get(endpoint)
+    assert disabled.status_code == 404
+    assert disabled.json()["detail"]["code"] == "FAKE_RECOVERY_DISABLED"
+    assert len(calls) == 2
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+
+    def mismatch(*args):
+        candidate = lookup(*args)
+        candidate["sha256"] = "0" * 64
+        return candidate
+
+    monkeypatch.setattr(media_store, "find_fake_recovery", mismatch)
+    bad = client.get(endpoint)
+    assert bad.status_code == 409
+    assert bad.json()["detail"]["code"] == "ORIGINAL_MEDIA_SCOPE_OR_HASH_MISMATCH"
+    monkeypatch.setattr(
+        media_store, "find_fake_recovery",
+        lambda *_args: (_ for _ in ()).throw(VideoUseConnectionError("fake sidecar down")),
+    )
+    unavailable = client.get(endpoint)
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"]["code"] == "ORIGINAL_MEDIA_LOOKUP_UNAVAILABLE"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "UNKNOWN" and row.asset_version_id is None
+        assert row.media_id is None and row.attempts == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == before_events
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == before_quota
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "SETTLED"
+        )).scalar_one() == 0
+    assert client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
+    ).status_code == 409
+    app.state.moneyprinter.assert_not_called()
