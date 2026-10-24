@@ -564,19 +564,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Normal API->Worker golden path has passed; stop the real Worker so
-          # the independent API TestClient can deterministically claim ONE
-          # synthetic task. Sidecar stays live in its own disposable container.
-          docker compose -f infra/docker/docker-compose.yml \\
-            -f infra/docker/docker-compose.g72-fake-only.override.yml \\
-            cp infra/docker/g72-compose-revocation-race-smoke.py api:/tmp/g72-compose-revocation-race-smoke.py
-          docker compose -f infra/docker/docker-compose.yml \\
-            -f infra/docker/docker-compose.g72-fake-only.override.yml \\
-            stop worker
+          # Normal API->Worker golden path passed. Stop Worker so the
+          # TestClient can claim one synthetic job without a claim race.
+          # All services/media are disposable and FAKE-only.
+          docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml cp infra/docker/g72-compose-revocation-race-smoke.py api:/tmp/g72-compose-revocation-race-smoke.py
+          docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml stop worker
           trap 'docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml start worker || true' EXIT
-          docker compose -f infra/docker/docker-compose.yml \\
-            -f infra/docker/docker-compose.g72-fake-only.override.yml \\
-            exec -T api python /tmp/g72-compose-revocation-race-smoke.py
+          docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml exec -T api python /tmp/g72-compose-revocation-race-smoke.py
 
       - name: Capture failure diagnostics without credentials
         if: failure()
