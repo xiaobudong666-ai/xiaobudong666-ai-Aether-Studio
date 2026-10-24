@@ -20,6 +20,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from . import g70_fake_recovery
+
 logger = logging.getLogger("video_use_service")
 
 UPSTREAM_REPOSITORY = "https://github.com/browser-use/video-use"
@@ -673,11 +675,27 @@ def create_app(
     async def upload_media(
         projectId: str = Form(...),
         file: UploadFile = File(...),
+        recoveryKey: str | None = Form(default=None),
+        expectedSha256: str | None = Form(default=None),
     ):
         try:
             validate_identifier(projectId, "projectId")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # This contract is *exclusively* for disposable FAKE-only media recovery.
+        # The production/default upload path below is unchanged.
+        if recoveryKey is not None or expectedSha256 is not None:
+            if not g70_fake_recovery.enabled():
+                raise HTTPException(status_code=403, detail="FAKE recovery disabled")
+            if not recoveryKey or not expectedSha256:
+                raise HTTPException(status_code=422, detail="Incomplete FAKE recovery intent")
+            try:
+                return await g70_fake_recovery.upload(
+                    store.media_dir(projectId), projectId, recoveryKey,
+                    expectedSha256, file, probe, MAX_UPLOAD_BYTES,
+                )
+            except g70_fake_recovery.RecoveryConflict as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in ALLOWED_EXTENSIONS:
             raise HTTPException(status_code=415, detail="不支持该媒体文件扩展名")
@@ -705,6 +723,25 @@ def create_app(
             "contentType": file.content_type,
             "metadata": metadata,
         }
+
+    @app.get("/fake-recovery/{project_id}/{recovery_key}")
+    def lookup_fake_media(
+        project_id: str, recovery_key: str, expectedSha256: str,
+    ):
+        # Not a public entitlement API, not a release endpoint, and never
+        # enabled outside the two explicit nonproduction FAKE-only gates.
+        if not g70_fake_recovery.enabled():
+            raise HTTPException(status_code=403, detail="FAKE recovery disabled")
+        try:
+            validate_identifier(project_id, "projectId")
+            return g70_fake_recovery.lookup(
+                store.media_dir(project_id), project_id,
+                recovery_key, expectedSha256, probe,
+            )
+        except g70_fake_recovery.RecoveryConflict as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid recovery scope") from exc
 
     @app.get("/media/{project_id}/{media_id}")
     def get_media(project_id: str, media_id: str):
