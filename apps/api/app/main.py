@@ -2478,6 +2478,22 @@ def create_app(
             metadata = uploaded.get("metadata") or {}
             if not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
                 raise ValueError("generated artifact did not pass media probe")
+            # G72 FAKE-ONLY: rights may change while the HTTP sidecar persists
+            # media. The pre-upload authorization check is not sufficient.
+            # A revoked input must never become an adopted/settled asset.
+            # G70's durable upload intent holds the physical result for review.
+            if fake_recovery_key is not None and task.provider == "deterministic-fake-talking-head":
+                original = db.execute(select(DBAssetVersion).where(
+                    DBAssetVersion.id == (task.request_json or {}).get("imageAssetId"),
+                    DBAssetVersion.tenant_id == task.tenant_id,
+                    DBAssetVersion.project_id == task.project_id,
+                )).scalar_one_or_none()
+                if (
+                    original is None or original.media_type != "image"
+                    or original.sha256 != (task.request_json or {}).get("sourceAssetSha256")
+                    or not rights_decision(latest_rights_snapshot(db, original.id, "REMIX"), utc_now())["allowed"]
+                ):
+                    raise ValueError("FAKE_TALKING_HEAD_SOURCE_REVOKED_AFTER_UPLOAD")
             project = db.execute(select(DBProject).where(DBProject.id == task.project_id, DBProject.tenant_id == task.tenant_id)).scalar_one()
             provenance = {
                 "provider": task.provider,
