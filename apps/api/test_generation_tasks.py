@@ -2498,3 +2498,145 @@ def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
         "recovery/compensation and crash-proof transfer intent are still missing"
     )
 
+@pytest.mark.parametrize("failure_mode", ["timeout-after-body", "server-503"])
+def test_g70_video_use_adapter_media_upload_is_not_retried_after_ambiguous_response(
+    monkeypatch, failure_mode
+):
+    """An unacknowledged POST may have persisted the bytes: exactly ONE attempt."""
+    import io
+    import httpx
+    import app.video_use_adapter as adapter_module
+
+    received = []
+    payload = b"disposable-g70-transport-test-video"
+
+    class OneRequestClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def request(self, method, url, **kwargs):
+            assert method == "POST" and url.endswith("/media")
+            assert kwargs["data"]["projectId"] == "fake-project"
+            received.append(kwargs["files"]["file"][1].read())
+            if failure_mode == "timeout-after-body":
+                raise httpx.ReadTimeout("synthetic timeout after accepting request body")
+            return httpx.Response(503, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(adapter_module.httpx, "Client", OneRequestClient)
+    adapter = adapter_module.VideoUseAdapter(
+        api_url="http://synthetic-sidecar.invalid", max_retries=3, backoff_factor=0
+    )
+    with pytest.raises((adapter_module.VideoUseTimeoutError, adapter_module.VideoUseConnectionError)):
+        adapter.upload_media("fake-project", "fake.mp4", "video/mp4", io.BytesIO(payload))
+    assert received == [payload]
+
+
+def test_g70_video_use_adapter_get_keeps_safe_retry(monkeypatch):
+    import httpx
+    import app.video_use_adapter as adapter_module
+
+    calls = []
+
+    class RetryClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def request(self, method, url, **_kwargs):
+            calls.append((method, url))
+            if len(calls) == 1:
+                raise httpx.ReadTimeout("synthetic transient read timeout")
+            return httpx.Response(200, request=httpx.Request(method, url), json={"status": "healthy"})
+
+    monkeypatch.setattr(adapter_module.httpx, "Client", RetryClient)
+    adapter = adapter_module.VideoUseAdapter(
+        api_url="http://synthetic-sidecar.invalid", max_retries=3, backoff_factor=0
+    )
+    assert adapter.check_health() == {"status": "healthy"}
+    assert len(calls) == 2
+    assert all(method == "GET" for method, _ in calls)
+
+
+@pytest.mark.parametrize("error_kind", ["timeout", "connection"])
+def test_g70_ambiguous_sidecar_ack_holds_original_intent_without_refund(
+    generation_context, monkeypatch, tmp_path, error_kind
+):
+    """Lost sidecar ACK is UNKNOWN, never FAILED/refunded/reissued."""
+    from app.video_use_adapter import VideoUseConnectionError, VideoUseTimeoutError
+
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, f"g70-ambiguous-{error_kind}")
+    task = create_task(client, project, key=f"g70-ambiguous-{error_kind}-1")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="g70-original-upstream").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="g70-original-upstream", providerArtifactId="g70-original-output",
+    ).status_code == 200
+
+    incoming = b"g70-original-disposable-media-bytes"
+    sidecar_file = tmp_path / "possible-unacknowledged-sidecar-media.mp4"
+    uploads = []
+
+    def upload_then_lose_ack(project_id, filename, content_type, stream):
+        assert project_id == project["id"] and content_type == "video/mp4"
+        uploads.append(filename)
+        sidecar_file.write_bytes(stream.read())
+        exc_class = VideoUseTimeoutError if error_kind == "timeout" else VideoUseConnectionError
+        raise exc_class("injected sidecar ACK loss after saving fake bytes")
+
+    monkeypatch.setattr(media_store, "upload_media", upload_then_lose_ack)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "g70-original-output"},
+        files={"file": ("original.mp4", incoming, "video/mp4")},
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert uploads == [f"generation-{task_id}.mp4"]
+    assert sidecar_file.read_bytes() == incoming
+
+    with sessions() as db:
+        saved = db.get(DBGenerationTask, task_id)
+        assert saved.status == "UNKNOWN"
+        assert saved.upstream_job_id == "g70-original-upstream"
+        assert saved.provider_artifact_id == "g70-original-output"
+        assert saved.media_id is None
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(incoming)
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind.in_(["RELEASED", "SETTLED"])
+        )).scalar_one() == 0
+        events = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type.in_(["ARTIFACT_UPLOAD_INTENT", "ARTIFACT_RECOVERY_HELD"]),
+        )).scalars().all()
+        assert len(events) == 2
+        intent = next(e for e in events if e.event_type == "ARTIFACT_UPLOAD_INTENT")
+        held = next(e for e in events if e.event_type == "ARTIFACT_RECOVERY_HELD")
+        assert intent.metadata_json["providerArtifactId"] == "g70-original-output"
+        assert intent.metadata_json["sizeBytes"] == len(incoming)
+        assert held.metadata_json["mediaId"] is None
+        assert held.metadata_json["sidecarAcknowledged"] is False
+        assert held.metadata_json["storageReservationHeld"] is True
+        assert held.metadata_json["financialSettlementVerified"] is False
+
+    retry = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert retry.status_code == 409
+    assert retry.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert len(uploads) == 1
+    app.state.moneyprinter.assert_not_called()
+
