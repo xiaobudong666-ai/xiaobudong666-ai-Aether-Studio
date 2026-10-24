@@ -66,8 +66,10 @@ class FakeGeneratedMediaStore:
 
 
 @pytest.fixture()
-def generation_context(tmp_path, monkeypatch):
-    monkeypatch.setenv("AETHER_MAX_UPLOAD_BYTES", "1024")
+def generation_context(tmp_path, monkeypatch, request):
+    # Most existing tests retain the 1 KiB cap; explicitly scoped integration
+    # cases may request a larger disposable FAKE-only fixture upload.
+    monkeypatch.setenv("AETHER_MAX_UPLOAD_BYTES", str(getattr(request, "param", 1024)))
     engine = build_engine(f"sqlite:///{tmp_path / 'generation.db'}")
     sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -2903,3 +2905,183 @@ def test_g70_fake_owner_readonly_check_locates_original_without_binding_or_settl
         f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
     ).status_code == 409
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("generation_context", [1024 * 1024], indirect=True)
+def test_g70_cross_process_real_sidecar_ack_loss_owner_readback(
+    generation_context, tmp_path, monkeypatch,
+):
+    """G70 nonproduction native HTTP proof: API TestClient -> real sidecar process.
+
+    FAKE only; local loopback, disposable SQLite/media, real FFmpeg/ffprobe.
+    The HTTP ACK loss is injected AFTER sidecar returns success. This does
+    not prove Docker/PG, true packet loss, trusted M12, or asset relink.
+    """
+    import hashlib
+    import os
+    import shutil
+    import socket
+    import subprocess
+    import sys
+    import time
+
+    import httpx
+    from app.video_use_adapter import VideoUseAdapter, VideoUseTimeoutError
+
+    assert shutil.which("ffmpeg") and shutil.which("ffprobe"), (
+        "This evidence gate requires native FFmpeg and ffprobe"
+    )
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    client, sessions, app, unused_mock = generation_context
+    video_use_root = Path(__file__).resolve().parents[1] / "video_use"
+    media_root = tmp_path / "original-sidecar-media"
+    output = tmp_path / "original.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=64x64:r=2",
+            "-t", "1", "-c:v", "mpeg4", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", str(output),
+        ],
+        check=True, timeout=30,
+    )
+    original = output.read_bytes()
+    expected_sha = hashlib.sha256(original).hexdigest()
+    assert len(original) > 500 and original[4:8] == b"ftyp"
+
+    # Explicit loopback-only temporary port. No real Provider or WAN egress.
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+    base_url = f"http://127.0.0.1:{port}"
+    env = os.environ.copy()
+    env.update({
+        "AETHER_FAKE_ONLY_NONPROD": "true",
+        "AETHER_RUNTIME_STAGE": "nonproduction",
+        "VIDEO_USE_MEDIA_ROOT": str(media_root),
+        "PYTHONPATH": str(video_use_root),
+    })
+    process = None
+
+    def stop_sidecar():
+        nonlocal process
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=8)
+            process = None
+
+    def start_sidecar():
+        nonlocal process
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "uvicorn", "app.main:app",
+                "--host", "127.0.0.1", "--port", str(port),
+            ],
+            cwd=str(video_use_root), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        for _ in range(90):
+            if process.poll() is not None:
+                raise AssertionError(f"Disposable sidecar exited {process.returncode}")
+            try:
+                reply = httpx.get(base_url + "/health", timeout=0.5, trust_env=False)
+                if reply.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.15)
+        raise AssertionError("Disposable native sidecar did not become healthy")
+
+    try:
+        start_sidecar()
+        adapter = VideoUseAdapter(api_url=base_url, timeout=8, max_retries=0)
+        # Replace the fixture's stand-in with a REAL HTTP adapter.
+        app.state.video_use = adapter
+        project = create_project(client, "g70-native-http-ack-loss")
+        other = create_project(client, "g70-native-http-other-project")
+        task = create_task(client, project, key="g70-native-http-ack-original")
+        task_id = task["taskId"]
+        assert claim(client).status_code == 200
+        assert transition(
+            client, task_id, "RUNNING", upstreamJobId="native-original-job",
+        ).status_code == 200
+        assert transition(
+            client, task_id, "INGESTING",
+            upstreamJobId="native-original-job",
+            providerArtifactId="native-original-artifact",
+        ).status_code == 200
+
+        native_upload = adapter.upload_media
+        calls = []
+
+        def persist_then_lose_ack(*args, **kwargs):
+            receipt = native_upload(*args, **kwargs)
+            calls.append(receipt)
+            assert receipt["sha256"] == expected_sha
+            assert receipt["projectId"] == project["id"]
+            raise VideoUseTimeoutError("Injected response loss after real HTTP upload")
+
+        monkeypatch.setattr(adapter, "upload_media", persist_then_lose_ack)
+        posted = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "native-original-artifact"},
+            files={"file": ("original.mp4", original, "video/mp4")},
+        )
+        assert posted.status_code == 503, posted.text
+        assert posted.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+        assert len(calls) == 1, "Never submit the same original media twice"
+        physical = list(media_root.rglob("g70*.mp4"))
+        assert len(physical) == 1
+        assert hashlib.sha256(physical[0].read_bytes()).hexdigest() == expected_sha
+
+        # Real separate process restart: same physical bytes, no second upload.
+        stop_sidecar()
+        start_sidecar()
+        endpoint = (
+            f"/projects/{project['id']}/generation-tasks/{task_id}"
+            "/fake-recovery-check"
+        )
+        for _ in range(2):
+            readback = client.get(endpoint)
+            assert readback.status_code == 200, readback.text
+            result = readback.json()
+            assert result["recoveryState"] == "FOUND_UNBOUND"
+            assert result["mediaId"] == calls[0]["mediaId"]
+            assert result["sha256"] == expected_sha
+            assert result["sizeBytes"] == len(original)
+            assert result["financialSettlementVerified"] is False
+            assert result["businessAssetBound"] is False
+        denied = client.get(
+            f"/projects/{other['id']}/generation-tasks/{task_id}/fake-recovery-check"
+        )
+        assert denied.status_code == 404
+        replay = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "native-original-artifact"},
+            files={"file": ("original.mp4", original, "video/mp4")},
+        )
+        assert replay.status_code == 409
+        assert len(calls) == 1
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            assert row.status == "UNKNOWN" and row.asset_version_id is None
+            assert row.media_id is None
+            assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.kind == "SETTLED"
+            )).scalar_one() == 0
+            assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(original)
+        assert client.post(
+            f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
+        ).status_code == 409
+        assert len(list(media_root.rglob("g70*.mp4"))) == 1
+        app.state.moneyprinter.assert_not_called()
+    finally:
+        stop_sidecar()
