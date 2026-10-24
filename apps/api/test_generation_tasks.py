@@ -2250,3 +2250,79 @@ def test_g73_keyset_claim_scans_past_ineligible_queue_pages(
         )).scalar_one()
         assert claimed_events == 1
     assert media.uploads == 0
+
+
+def test_g70_repro_external_media_survives_failed_final_db_commit(
+    generation_context, tmp_path, monkeypatch
+):
+    """FAKE-only fault injection: a successful external upload is not atomic with DB commit.
+
+    This explicitly documents a KNOWN OPEN G70 risk; it is not proof of a fix.
+    The persisted file is a disposable local media-store stand-in, never
+    production or protected storage. A separate real video-use recovery test
+    and durable compensation protocol are still required.
+    """
+    import io
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session as OrmSession
+
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-upload-then-db-fault")
+    task = create_task(client, project, key="g70-external-upload-db-fault")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="original-upstream"
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="original-upstream", providerArtifactId="original-output",
+    ).status_code == 200
+
+    external_file = tmp_path / "external-sidecar-output.mp4"
+    state = {"uploaded": False, "faulted": False}
+    original_upload = media_store.upload_media
+
+    def durable_fake_upload(project_id, filename, content_type, stream):
+        payload = stream.read()
+        external_file.write_bytes(payload)
+        state["uploaded"] = True
+        return original_upload(project_id, filename, content_type, io.BytesIO(payload))
+
+    monkeypatch.setattr(media_store, "upload_media", durable_fake_upload)
+
+    def fail_once_after_upload(session):
+        if state["uploaded"] and not state["faulted"]:
+            state["faulted"] = True
+            raise RuntimeError("injected DB final commit after external upload")
+
+    event.listen(OrmSession, "before_commit", fail_once_after_upload)
+    try:
+        with pytest.raises(RuntimeError, match="injected DB final commit"):
+            client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+                data={"providerArtifactId": "original-output"},
+                files={"file": ("artifact.mp4", b"synthetic-media-bytes", "video/mp4")},
+            )
+    finally:
+        event.remove(OrmSession, "before_commit", fail_once_after_upload)
+
+    assert state["uploaded"] and state["faulted"]
+    assert external_file.read_bytes() == b"synthetic-media-bytes"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.upstream_job_id == "original-upstream"
+        assert stored.provider_artifact_id == "original-output"
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "SETTLED"
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+    pytest.xfail(
+        "KNOWN_G70_OPEN: external media persisted without a DB asset; "
+        "native sidecar cleanup/recovery and crash-proof ledger not implemented"
+    )
