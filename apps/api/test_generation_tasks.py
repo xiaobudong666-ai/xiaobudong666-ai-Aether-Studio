@@ -772,8 +772,9 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
 
 
 
+@pytest.mark.parametrize("artifact_id_reported", [True, False])
 def test_g70_durable_intent_blocks_cancel_worker_terminal_and_retry_without_release(
-    generation_context, monkeypatch
+    generation_context, monkeypatch, artifact_id_reported
 ):
     """G70 crash window: intent is committed but sidecar ACK may be lost.
 
@@ -791,7 +792,8 @@ def test_g70_durable_intent_blocks_cancel_worker_terminal_and_retry_without_rele
     assert transition(client, task_id, "RUNNING", upstreamJobId="original-fake-job").status_code == 200
     assert transition(
         client, task_id, "INGESTING",
-        upstreamJobId="original-fake-job", providerArtifactId="original-fake-artifact",
+        upstreamJobId="original-fake-job",
+        **({"providerArtifactId": "original-fake-artifact"} if artifact_id_reported else {}),
     ).status_code == 200
     with sessions() as db:
         row = db.get(DBGenerationTask, task_id)
@@ -807,7 +809,7 @@ def test_g70_durable_intent_blocks_cancel_worker_terminal_and_retry_without_rele
             metadata_json={
                 "tenantId": row.tenant_id, "projectId": row.project_id,
                 "attempt": row.attempts, "upstreamJobId": row.upstream_job_id,
-                "providerArtifactId": row.provider_artifact_id,
+                "providerArtifactId": "original-fake-artifact",
                 "sha256": "a" * 64, "sizeBytes": 15,
                 "recoveryState": "PREPARED_BEFORE_SIDECAR_UPLOAD",
             },
@@ -830,7 +832,9 @@ def test_g70_durable_intent_blocks_cancel_worker_terminal_and_retry_without_rele
         assert row.status == "INGESTING"
         assert row.cancel_requested_at is None
         assert row.upstream_job_id == "original-fake-job"
-        assert row.provider_artifact_id == "original-fake-artifact"
+        assert row.provider_artifact_id == (
+            "original-fake-artifact" if artifact_id_reported else None
+        )
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.kind == "RELEASED",
         )).scalar_one() == 0
@@ -871,7 +875,9 @@ def test_g70_durable_intent_blocks_cancel_worker_terminal_and_retry_without_rele
         row = db.get(DBGenerationTask, task_id)
         assert row.attempts == 1
         assert row.upstream_job_id == "original-fake-job"
-        assert row.provider_artifact_id == "original-fake-artifact"
+        assert row.provider_artifact_id == (
+            "original-fake-artifact" if artifact_id_reported else None
+        )
         assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
             DBGenerationAttempt.generation_task_id == task_id,
         )).scalar_one() == 1
