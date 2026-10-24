@@ -483,7 +483,7 @@ jobs:
     # Independent nonproduction evidence only. The primary Node/Python security
     # audit remains the mandatory release gate; do not treat this as a waiver.
     name: G72 FAKE-ONLY independent Compose network smoke (not a release gate)
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route' || github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-validation-hold-fake-only' || github.ref == 'refs/heads/feat/fusion-m0-g72-media-auth-negative-20261025')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route' || github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-validation-hold-fake-only' || github.ref == 'refs/heads/feat/fusion-m0-g72-media-auth-negative-20261025' || github.ref == 'refs/heads/feat/fusion-m0-g72-crosscontainer-revocation-20261025')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -559,6 +559,24 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py verify
+
+      - name: Inject synthetic mid-upload revocation against real Sidecar HTTP (FAKE-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Normal API->Worker golden path has passed; stop the real Worker so
+          # the independent API TestClient can deterministically claim ONE
+          # synthetic task. Sidecar stays live in its own disposable container.
+          docker compose -f infra/docker/docker-compose.yml \\
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \\
+            cp infra/docker/g72-compose-revocation-race-smoke.py api:/tmp/g72-compose-revocation-race-smoke.py
+          docker compose -f infra/docker/docker-compose.yml \\
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \\
+            stop worker
+          trap 'docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml start worker || true' EXIT
+          docker compose -f infra/docker/docker-compose.yml \\
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \\
+            exec -T api python /tmp/g72-compose-revocation-race-smoke.py
 
       - name: Capture failure diagnostics without credentials
         if: failure()
