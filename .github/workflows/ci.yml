@@ -560,6 +560,45 @@ jobs:
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py verify
 
+      - name: Prove real-sidecar post-ACK synthetic rights revoke and restart hold
+        # Isolated API TestClient with the repo's native create_app, SQLite,
+        # and true HTTP to the running video-use container. Synthetic rights;
+        # not PostgreSQL concurrency, M12 issuance, or release acceptance.
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g72-midupload-revocation-smoke.py api:/tmp/g72-midupload-revocation-smoke.py
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T video-use ffmpeg -y -hide_banner -loglevel error \
+              -f lavfi -i color=c=black:s=320x568:r=24 \
+              -f lavfi -i sine=frequency=440:sample_rate=48000 \
+              -t 1 -c:v libx264 -pix_fmt yuv420p -c:a aac \
+              -movflags +faststart /tmp/g72-midupload-ci.mp4
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp video-use:/tmp/g72-midupload-ci.mp4 api:/tmp/g72-midupload-ci.mp4
+          # Prevent normal Worker from racing the deterministic intake fixture.
+          # Only the run-scoped FAKE-only worker is stopped.
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            stop worker
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g72-midupload-revocation-smoke.py prepare
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            restart video-use
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            start worker
+          sleep 12
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g72-midupload-revocation-smoke.py verify
+
       - name: Capture failure diagnostics without credentials
         if: failure()
         shell: bash
