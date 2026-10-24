@@ -2241,6 +2241,7 @@ def create_app(
         # Only the proven final SQL commit window is held for source-artifact recovery.
         # Other upload/validation failures keep their existing conservative handling.
         committing_uploaded_media = False
+        media_id: str | None = None
         try:
             uploaded = created_app.state.video_use.upload_media(
                 task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
@@ -2339,8 +2340,11 @@ def create_app(
             db.commit()
         except Exception as exc:
             db.rollback()
-            if committing_uploaded_media:
-                # The sidecar acknowledged a scoped media ID. A failed or
+            if committing_uploaded_media or isinstance(exc, VideoUseError):
+                # After an ambiguous sidecar transport/response, the bytes may
+                # already have been persisted even without a returned media ID.
+                # Fail closed and preserve the upload intent, quota and source
+                # identity; never release/retry until reconciled. A failed or
                 # ambiguous SQL commit must NOT refund the held storage/usage
                 # reservation or allow a second upstream generation attempt.
                 held_task = db.execute(select(DBGenerationTask).where(
@@ -2353,9 +2357,9 @@ def create_app(
                     held_at = utc_now()
                     held_from = held_task.status
                     held_task.status = "UNKNOWN"
-                    held_task.message = "生成媒体已上传，业务提交待恢复核验"
+                    held_task.message = "媒体转存或业务提交结果不确定，等待恢复核验"
                     held_task.error_code = "ARTIFACT_INGEST_FAILED"
-                    held_task.error_message = "侧车媒体已确认，业务资产提交结果不确定"
+                    held_task.error_message = "侧车媒体结果或业务资产提交结果不确定"
                     held_task.media_id = media_id
                     held_task.completed_at = held_at
                     held_task.updated_at = held_at
@@ -2373,6 +2377,7 @@ def create_app(
                         from_status=held_from, to_status="UNKNOWN",
                         metadata={
                             "mediaId": media_id,
+                            "sidecarAcknowledged": media_id is not None,
                             "providerArtifactId": providerArtifactId,
                             "sha256": digest.hexdigest(),
                             "sizeBytes": upload_size,
@@ -2387,7 +2392,7 @@ def create_app(
                     status_code=503,
                     detail={
                         "code": "ARTIFACT_RECOVERY_REQUIRED",
-                        "message": "媒体已上传但入库回执不确定，需核对原始媒体和业务账本",
+                        "message": "媒体转存或入库回执不确定，需核对原始媒体和业务账本",
                     },
                 ) from exc
             db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
