@@ -20,7 +20,22 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from . import g70_fake_recovery
+# Native API regressions load this file by path without its package context.
+# Load the disposable FAKE helper only on an explicitly gated code path.
+import importlib.util
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _load_g70_fake_recovery():
+    helper = Path(__file__).resolve().with_name("g70_fake_recovery.py")
+    spec = importlib.util.spec_from_file_location("_aether_g70_fake_recovery", helper)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("FAKE media recovery module is missing")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 logger = logging.getLogger("video_use_service")
 
@@ -685,16 +700,17 @@ def create_app(
         # This contract is *exclusively* for disposable FAKE-only media recovery.
         # The production/default upload path below is unchanged.
         if recoveryKey is not None or expectedSha256 is not None:
-            if not g70_fake_recovery.enabled():
+            recovery = _load_g70_fake_recovery()
+            if not recovery.enabled():
                 raise HTTPException(status_code=403, detail="FAKE recovery disabled")
             if not recoveryKey or not expectedSha256:
                 raise HTTPException(status_code=422, detail="Incomplete FAKE recovery intent")
             try:
-                return await g70_fake_recovery.upload(
+                return await recovery.upload(
                     store.media_dir(projectId), projectId, recoveryKey,
                     expectedSha256, file, probe, MAX_UPLOAD_BYTES,
                 )
-            except g70_fake_recovery.RecoveryConflict as exc:
+            except recovery.RecoveryConflict as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in ALLOWED_EXTENSIONS:
@@ -730,15 +746,16 @@ def create_app(
     ):
         # Not a public entitlement API, not a release endpoint, and never
         # enabled outside the two explicit nonproduction FAKE-only gates.
-        if not g70_fake_recovery.enabled():
+        recovery = _load_g70_fake_recovery()
+        if not recovery.enabled():
             raise HTTPException(status_code=403, detail="FAKE recovery disabled")
         try:
             validate_identifier(project_id, "projectId")
-            return g70_fake_recovery.lookup(
+            return recovery.lookup(
                 store.media_dir(project_id), project_id,
                 recovery_key, expectedSha256, probe,
             )
-        except g70_fake_recovery.RecoveryConflict as exc:
+        except recovery.RecoveryConflict as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="Invalid recovery scope") from exc
