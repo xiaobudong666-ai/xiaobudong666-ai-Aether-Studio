@@ -23,9 +23,11 @@ sys.path.insert(0, "/app")
 import httpx
 from sqlalchemy import func, select
 from app.database import SessionLocal
+from app.auth import hash_password
 from app.models import (
     DBAssetVersion, DBGenerationAttempt, DBGenerationEvent,
     DBGenerationTask, DBGenerationUsageEntry, DBProject, DBRightsSnapshot,
+    DBTenant, DBUser,
 )
 
 STATE_PATH = Path("/tmp/g72-ci-fake-only-network-state.json")
@@ -34,16 +36,16 @@ VIDEO_USE_BASE = "http://video-use:8002"
 
 
 @contextmanager
-def authenticate():
+def authenticate(*, email: str | None = None, password_override: str | None = None):
     assert os.getenv("AETHER_FAKE_ONLY_NONPROD") == "true"
     assert os.getenv("AETHER_RUNTIME_STAGE") == "nonproduction"
     assert os.getenv("AETHER_GENERATION_PROVIDER_MODE") == "deterministic-fake"
-    password = os.environ.get("AETHER_BOOTSTRAP_ADMIN_PASSWORD")
+    password = password_override or os.environ.get("AETHER_BOOTSTRAP_ADMIN_PASSWORD")
     assert password and password.startswith("ci-"), "disposable CI credential required"
     # Open/close once; a client used for login cannot be entered a second time.
     with httpx.Client(base_url=API_BASE, timeout=30, trust_env=False) as client:
         reply = client.post("/auth/login", json={
-            "email": os.getenv("AETHER_BOOTSTRAP_ADMIN_EMAIL", "admin@aether.local"),
+            "email": email or os.getenv("AETHER_BOOTSTRAP_ADMIN_EMAIL", "admin@aether.local"),
             "password": password,
         })
         assert reply.status_code == 200, f"login failed: {reply.status_code}"
@@ -193,6 +195,60 @@ def prepare() -> None:
         }), flush=True)
 
 
+
+def verify_foreign_tenant_denials(saved: dict, replay_request: dict) -> None:
+    """Native nonproduction auth negative, independent of Owner's session.
+
+    A foreign tenant's Owner may not preflight, create, or read the first
+    tenant's project/task; neither may the attempt mutate prior receipts.
+    The fixture is synthetic, and must never be used against production.
+    """
+    assert os.getenv("AETHER_FAKE_ONLY_NONPROD") == "true"
+    assert os.getenv("AETHER_RUNTIME_STAGE") == "nonproduction"
+    now = dt.datetime.now(dt.timezone.utc)
+    nonce = uuid.uuid4().hex
+    foreign_email = f"ci-g72-foreign-{nonce}@example.invalid"
+    foreign_password = "ci-" + uuid.uuid4().hex
+    with SessionLocal() as db:
+        foreign_tenant = DBTenant(
+            id=str(uuid.uuid4()), name="Synthetic foreign G72 tenant",
+            slug="ci-g72-foreign-" + nonce,
+            project_quota=2, storage_quota_bytes=1024**3,
+            used_storage_bytes=0, concurrent_render_quota=1,
+            monthly_render_seconds_quota=600, render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"), created_at=now, updated_at=now,
+        )
+        foreign_owner = DBUser(
+            id=str(uuid.uuid4()), tenant_id=foreign_tenant.id,
+            email=foreign_email, display_name="Synthetic foreign Owner",
+            password_hash=hash_password(foreign_password), role="owner",
+            is_active=True, created_at=now, updated_at=now,
+        )
+        db.add_all([foreign_tenant, foreign_owner])
+        db.commit()
+    base = f"/projects/{saved['projectId']}/talking-head/fake-generation-tasks"
+    with authenticate(email=foreign_email, password_override=foreign_password) as foreign:
+        for target in (base + "/validate", base):
+            reply = foreign.post(target, json=replay_request)
+            assert reply.status_code == 404, (
+                f"foreign tenant operation exposed original project: {target} {reply.status_code}"
+            )
+        for target in (
+            f"/projects/{saved['projectId']}",
+            f"/projects/{saved['projectId']}/generation-tasks/{saved['taskId']}",
+        ):
+            reply = foreign.get(target)
+            assert reply.status_code == 404, (
+                f"foreign tenant GET exposed original project or task: {target} {reply.status_code}"
+            )
+    print(json.dumps({
+        "phase": "foreign_tenant_owner_auth",
+        "fakeOnly": True, "foreignCreateDenied": True,
+        "foreignPreflightDenied": True, "foreignProjectReadDenied": True,
+        "foreignTaskReadDenied": True,
+    }), flush=True)
+
+
 def verify() -> None:
     state = json.loads(STATE_PATH.read_text(encoding="utf8"))
     saved = state["evidence"]
@@ -217,6 +273,7 @@ def verify() -> None:
         assert wrong.status_code in (403, 404), (
             f"cross-project task visibility={wrong.status_code}"
         )
+        verify_foreign_tenant_denials(saved, state["replayRequest"])
         evidence = check_asset_and_receipts(
             saved["projectId"], saved["taskId"], saved["sha256"],
         )
