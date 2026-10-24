@@ -1,0 +1,73 @@
+name: G72 isolated PostgreSQL native FAKE-only checks
+
+on:
+  push:
+    branches:
+      - feat/fusion-m0-g72-media-auth-negative-20261025
+    paths:
+      - apps/api/test_g72_postgres_concurrency.py
+      - apps/api/app/**
+      - .github/workflows/g72-postgres-fake-only.yml
+
+permissions:
+  contents: read
+
+jobs:
+  g72-postgres-native-fake:
+    # Evidence for scoped API/DB concurrency only, NOT release acceptance,
+    # M12 trusted issuance or real-Provider/production approval.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci_g72
+          POSTGRES_PASSWORD: ci-only-postgres-password
+          POSTGRES_DB: aether_g72_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ci_g72 -d aether_g72_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      AETHER_FAKE_ONLY_NONPROD: "true"
+      AETHER_RUNTIME_STAGE: nonproduction
+      AETHER_GENERATION_PROVIDER_MODE: deterministic-fake
+      AETHER_GENERATION_CREDENTIAL_STATE: ABSENT
+      AETHER_TALKING_HEAD_MODE: disabled
+      G72_PG_CI_DATABASE_URL: postgresql+psycopg://ci_g72:ci-only-postgres-password@127.0.0.1:5432/aether_g72_ci
+      PYTHONPATH: apps/api
+    steps:
+      - name: Checkout isolated nonproduction branch
+        uses: actions/checkout@v4
+      - name: Install Python for native API PostgreSQL tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install API dependencies plus CI-only PostgreSQL driver
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r apps/api/requirements.txt 'psycopg[binary]>=3.2,<4'
+      - name: Prove PostgreSQL and explicit FAKE-only confinement
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          assert os.environ['AETHER_FAKE_ONLY_NONPROD'] == 'true'
+          assert os.environ['AETHER_RUNTIME_STAGE'] == 'nonproduction'
+          assert os.environ['AETHER_GENERATION_CREDENTIAL_STATE'] == 'ABSENT'
+          assert os.environ['AETHER_TALKING_HEAD_MODE'] == 'disabled'
+          engine = create_engine(os.environ['G72_PG_CI_DATABASE_URL'])
+          assert engine.dialect.name == 'postgresql'
+          with engine.connect() as con:
+              assert con.scalar(text('select current_database()')) == 'aether_g72_ci'
+              assert con.scalar(text("select current_setting('server_version_num')")) is not None
+          engine.dispose()
+          PY
+      - name: Native G72 PostgreSQL concurrent claims and synthetic revocation
+        shell: bash
+        run: python -m pytest apps/api/test_g72_postgres_concurrency.py -v -s
