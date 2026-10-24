@@ -2326,3 +2326,119 @@ def test_g70_repro_external_media_survives_failed_final_db_commit(
         "KNOWN_G70_OPEN: external media persisted without a DB asset; "
         "native sidecar cleanup/recovery and crash-proof ledger not implemented"
     )
+
+def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
+    generation_context, tmp_path, monkeypatch
+):
+    """FAKE-only native video-use HTTP/disk fault reproduction, not a remediation.
+
+    A real video-use FastAPI TestClient writes a disposable media file; only
+    the codec metadata probe is synthesized so the fault is deterministic.
+    A DB final-commit failure then leaves those sidecar bytes readable after
+    a new service instance starts, but no corresponding business asset.
+    This intentionally records the OPEN defect without deleting any bytes.
+    """
+    import importlib.util
+    import sys
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session as OrmSession
+
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-native-sidecar-db-fault")
+    task = create_task(client, project, key="g70-native-sidecar-commit-fault")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="g70-original-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="g70-original-upstream", providerArtifactId="g70-original-output",
+    ).status_code == 200
+
+    sidecar_path = Path(__file__).resolve().parents[1] / "video_use" / "app" / "main.py"
+    name = f"_g70_native_sidecar_fault_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, sidecar_path)
+    assert spec is not None and spec.loader is not None
+    sidecar_module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = sidecar_module
+    spec.loader.exec_module(sidecar_module)
+    monkeypatch.setattr(
+        sidecar_module, "probe",
+        lambda path: {
+            "durationSeconds": 1.0,
+            "sizeBytes": path.stat().st_size,
+            "video": {"codec": "h264", "width": 320, "height": 568},
+            "audio": {"codec": "aac"},
+        },
+    )
+    media_root = tmp_path / "g70-native-sidecar-root"
+    state = {"uploaded": False, "faulted": False, "media": None}
+    synthetic_bytes = b"g70-disposable-synthetic-mp4-placeholder"
+
+    with TestClient(sidecar_module.create_app(media_root=media_root)) as sidecar:
+        def native_upload(project_id, filename, content_type, stream):
+            response = sidecar.post(
+                "/media",
+                data={"projectId": project_id},
+                files={"file": (filename, stream, content_type)},
+            )
+            assert response.status_code == 201, response.text
+            state["media"] = response.json()
+            state["uploaded"] = True
+            return state["media"]
+
+        monkeypatch.setattr(media_store, "upload_media", native_upload)
+
+        def fail_once_after_sidecar_upload(session):
+            if state["uploaded"] and not state["faulted"]:
+                state["faulted"] = True
+                raise RuntimeError("g70 injected final SQL commit failure")
+
+        event.listen(OrmSession, "before_commit", fail_once_after_sidecar_upload)
+        try:
+            with pytest.raises(RuntimeError, match="g70 injected final SQL commit failure"):
+                client.post(
+                    f"/internal/generation-tasks/{task_id}/artifact-intake",
+                    headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+                    data={"providerArtifactId": "g70-original-output"},
+                    files={"file": ("original.mp4", synthetic_bytes, "video/mp4")},
+                )
+        finally:
+            event.remove(OrmSession, "before_commit", fail_once_after_sidecar_upload)
+
+        assert state["uploaded"] and state["faulted"]
+        uploaded = state["media"]
+        assert uploaded["projectId"] == project["id"]
+        media_id = uploaded["mediaId"]
+        persisted = (
+            media_root / "projects" / project["id"] / "media" / f"{media_id}.mp4"
+        )
+        assert persisted.is_file()
+        assert persisted.read_bytes() == synthetic_bytes
+        response = sidecar.get(f"/media/{project['id']}/{media_id}")
+        assert response.status_code == 200 and response.content == synthetic_bytes
+
+    # Reopening the native sidecar with the same disposable root confirms
+    # the orphan survives service restart, not just a fake in-memory adapter.
+    with TestClient(sidecar_module.create_app(media_root=media_root)) as restarted:
+        response = restarted.get(f"/media/{project['id']}/{media_id}")
+        assert response.status_code == 200
+        assert response.content == synthetic_bytes
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.upstream_job_id == "g70-original-upstream"
+        assert stored.provider_artifact_id == "g70-original-output"
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "SETTLED"
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+    pytest.xfail(
+        "KNOWN_G70_OPEN: native video-use media remains after successful upload "
+        "and failed business commit; durable repair/reconciliation not implemented"
+    )
+
