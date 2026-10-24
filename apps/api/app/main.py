@@ -1920,6 +1920,15 @@ def create_app(
             candidate_mode = candidate.capability_snapshot_json.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
+            # G70: a lease timeout after persistent upload intent is NOT
+            # permission to reclaim the job and resubmit its original output.
+            # Normal QUEUED tasks never carry this side-effect marker.
+            if (
+                candidate.status != "QUEUED"
+                and candidate.provider_artifact_id is not None
+                and has_pending_artifact_upload_intent(db, candidate)
+            ):
+                continue
             if candidate.provider == "deterministic-fake-talking-head":
                 # Recheck the immutable image version and latest REMIX rights
                 # when a Worker claims a FAKE-only task; NEVER allow a real mode.
