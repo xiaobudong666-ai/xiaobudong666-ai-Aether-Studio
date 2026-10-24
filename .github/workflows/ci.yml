@@ -483,7 +483,7 @@ jobs:
     # Independent nonproduction evidence only. The primary Node/Python security
     # audit remains the mandatory release gate; do not treat this as a waiver.
     name: G72 FAKE-ONLY independent Compose network smoke (not a release gate)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route' || github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-validation-hold-fake-only')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
