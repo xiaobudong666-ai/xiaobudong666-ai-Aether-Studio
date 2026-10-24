@@ -111,7 +111,7 @@ jobs:
           PYTHONPATH: apps/api
         run: |
           python -m pytest apps/api/test_generation_tasks.py -v \
-            -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g73_keyset_claim_scans_past_ineligible_queue_pages or test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservations or test_g70_native_video_use_http_orphan_persists_after_db_commit_failure"
+            -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g73_keyset_claim_scans_past_ineligible_queue_pages or test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservations or test_g70_native_video_use_http_orphan_persists_after_db_commit_failure or test_29_probe_failure_compensates_quota_and_creates_no_asset or test_30_success_creates_one_material_and_immutable_asset_with_provenance or test_40_stream_interruption_compensates_quota_and_records_failure or test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation"
 
   playwright:
     name: Playwright workbench flow
