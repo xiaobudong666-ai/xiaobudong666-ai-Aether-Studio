@@ -923,11 +923,21 @@ def create_app(
 
     @created_app.get("/health")
     def health_check(db: Session = Depends(db_dependency)):
-        journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
+        # SQLite PRAGMA is not valid SQL in PostgreSQL. Query the active
+        # connection instead of misreporting a healthy nonproduction PG API
+        # as unavailable; preserve the existing SQLite WAL health contract.
+        dialect = db.get_bind().dialect.name
+        if dialect == "sqlite":
+            journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
+        elif dialect == "postgresql":
+            assert db.execute(text("SELECT 1")).scalar_one() == 1
+            journal_mode = None
+        else:
+            raise RuntimeError("Unsupported database dialect")
         return {
             "status": "healthy",
             "service": "api",
-            "database": "sqlite",
+            "database": dialect,
             "journal_mode": journal_mode,
             "setupRequired": created_app.state.setup_required,
             "timestamp": iso_utc(utc_now()),

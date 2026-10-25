@@ -312,3 +312,14 @@ def test_g72_pg_independent_worker_processes_claim_once(pg_fake_context):
             DBGenerationUsageEntry.kind == "RESERVED",
         )).scalar_one() == 1
     assert store.uploads == 0
+
+
+def test_g72_pg_health_uses_postgres_probe(pg_fake_context):
+    """PG API liveness must never execute SQLite-only PRAGMA statements."""
+    client, _sessions, _store = pg_fake_context
+    response = client.get("/health")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "healthy"
+    assert response.json()["database"] == "postgresql"
+    assert response.json()["journal_mode"] is None
+
