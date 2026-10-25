@@ -930,7 +930,7 @@ def create_app(
         if dialect == "sqlite":
             journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
         elif dialect == "postgresql":
-            assert db.execute(text("SELECT 1")).scalar_one() == 1
+            db.execute(text("SELECT 1")).scalar_one()
             journal_mode = None
         else:
             raise RuntimeError("Unsupported database dialect")
