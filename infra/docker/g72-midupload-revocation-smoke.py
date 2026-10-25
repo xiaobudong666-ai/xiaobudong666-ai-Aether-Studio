@@ -217,10 +217,33 @@ def prepare():
             "confirmSyntheticTestOnly": True,
         }
         base = f"/projects/{pid}/talking-head/fake-generation-tasks"
-        preflight = client.post(base + "/validate", json=payload)
-        assert preflight.status_code == 200, preflight.text
-        created_task = client.post(base, json=payload)
-        assert created_task.status_code == 202, created_task.text
+        # Capability hashes rotate at UTC minute boundaries. If a snapshot
+        # expires between the GET and preflight/create, re-read once as an
+        # actual client would; never retry any other 4xx/5xx or a paid submit.
+        for attempt in range(3):
+            preflight = client.post(base + "/validate", json=payload)
+            if preflight.status_code == 409 and (
+                preflight.json().get("detail", {}).get("code")
+                == "CAPABILITY_SNAPSHOT_UNKNOWN"
+            ):
+                updated = client.get("/generation/providers/moneyprinter/capabilities")
+                assert updated.status_code == 200, updated.text
+                payload["capabilitySnapshotHash"] = updated.json()["snapshotHash"]
+                continue
+            assert preflight.status_code == 200, preflight.text
+            created_task = client.post(base, json=payload)
+            if created_task.status_code == 409 and (
+                created_task.json().get("detail", {}).get("code")
+                == "CAPABILITY_SNAPSHOT_UNKNOWN"
+            ):
+                updated = client.get("/generation/providers/moneyprinter/capabilities")
+                assert updated.status_code == 200, updated.text
+                payload["capabilitySnapshotHash"] = updated.json()["snapshotHash"]
+                continue
+            assert created_task.status_code == 202, created_task.text
+            break
+        else:
+            raise AssertionError("CI capability snapshot kept rotating at minute boundary")
         task_id = created_task.json()["taskId"]
         headers = {
             "X-Worker-Token": os.environ["AETHER_WORKER_TOKEN"],
