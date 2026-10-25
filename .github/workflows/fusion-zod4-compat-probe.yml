@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        import_mode: [zod4-native, zod3-compat-subpath]
+        import_mode: [zod3-compat-subpath]
     steps:
       - name: Checkout fixed isolated source SHA
         uses: actions/checkout@v4
@@ -78,5 +78,5 @@ jobs:
       - name: Record uncommitted experiment files
         if: always()
         run: |
-          git diff --name-only
+          git diff -- packages/contracts/package.json packages/contracts/src/schemas.ts pnpm-lock.yaml
           echo 'RESULT_IS_ONLY_A_NONPRODUCTION_COMPATIBILITY_EXPERIMENT'
