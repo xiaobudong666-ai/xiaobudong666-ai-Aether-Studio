@@ -226,6 +226,138 @@ def verify():
     # Revocation fences business readback but never deletes original media.
     remaining = adapter.find_fake_recovery(state["projectId"], state["key"], state["sha"])
     assert remaining["mediaId"] == state["mediaId"] and remaining["sha256"] == state["sha"]
+
+    # Separate synthetic task: prove the new FAKE-only owner-self relink path
+    # against the real Compose sidecar after restart. The earlier task remains
+    # unbound because its source rights were deliberately revoked above.
+    original_bytes = VIDEO.read_bytes()
+    relink_sha = hashlib.sha256(original_bytes).hexdigest()
+    relink_size = len(original_bytes)
+    relink_task_id, relink_attempt_id, relink_source_id = [str(uuid.uuid4()) for _ in range(3)]
+    relink_provider_artifact = "synthetic-original-relink-output"
+    relink_key = "g70-" + hashlib.sha256(
+        f"{state['tenantId']}:{state['projectId']}:{relink_task_id}:1:{relink_provider_artifact}".encode()
+    ).hexdigest()
+    now = dt.datetime.now(dt.timezone.utc)
+    with SessionLocal() as db:
+        project = db.get(DBProject, state["projectId"])
+        tenant = db.get(DBTenant, state["tenantId"])
+        assert project is not None and tenant is not None
+        source = DBAssetVersion(
+            id=relink_source_id, tenant_id=state["tenantId"], project_id=state["projectId"],
+            version_no=1, media_id="g70-relink-source-" + uuid.uuid4().hex,
+            sha256="d" * 64, media_type="image", content_type="image/png",
+            size_bytes=128, probe_json={"image":{"width":64,"height":64}},
+            created_by=project.owner_id, created_at=now)
+        rights = DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=state["tenantId"], project_id=state["projectId"],
+            asset_version_id=relink_source_id, status="ALLOWED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="SYNTHETIC_RELINK_FIXTURE_NOT_M12",
+            captured_by=project.owner_id, captured_at=now)
+        task = DBGenerationTask(
+            id=relink_task_id, tenant_id=state["tenantId"], project_id=state["projectId"],
+            requested_by=project.owner_id, provider="deterministic-fake-talking-head",
+            status="UNKNOWN", progress=90, message="Synthetic ambiguous sidecar ACK",
+            request_json={"imageAssetId":relink_source_id, "sourceAssetSha256":"d"*64},
+            request_hash="e"*64, capability_snapshot_json={}, capability_snapshot_hash="f"*64,
+            idempotency_key=str(uuid.uuid4()), upstream_job_id="synthetic-relink-job",
+            provider_artifact_id=relink_provider_artifact, media_id=None, asset_version_id=None,
+            attempts=1, max_attempts=1, lease_owner=None, lease_expires_at=None,
+            cancel_requested_at=None, error_code="ARTIFACT_INGEST_FAILED",
+            error_message="Synthetic ACK lost", created_at=now, updated_at=now,
+            started_at=now, completed_at=now)
+        attempt = DBGenerationAttempt(
+            id=relink_attempt_id, generation_task_id=relink_task_id, attempt_no=1,
+            status="UNKNOWN", submission_started_at=now, upstream_job_id=task.upstream_job_id,
+            reconciliation_state="UNKNOWN", error_code="ARTIFACT_INGEST_FAILED",
+            error_message="Synthetic ACK lost", created_at=now, completed_at=now)
+        intent = DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=relink_task_id, attempt_id=relink_attempt_id,
+            event_type="ARTIFACT_UPLOAD_INTENT", from_status="INGESTING", to_status="INGESTING",
+            actor_type="WORKER", actor_id="synthetic-relink-ci",
+            metadata_json={"tenantId":state["tenantId"], "projectId":state["projectId"],
+                "attempt":1, "upstreamJobId":task.upstream_job_id,
+                "providerArtifactId":relink_provider_artifact, "sha256":relink_sha,
+                "sizeBytes":relink_size, "uploadName":f"generation-{relink_task_id}.mp4",
+                "fakeRecoveryKey":relink_key, "recoveryState":"PREPARED_BEFORE_SIDECAR_UPLOAD"},
+            created_at=now)
+        reserved = DBGenerationUsageEntry(
+            id=str(uuid.uuid4()), tenant_id=state["tenantId"], project_id=state["projectId"],
+            task_id=relink_task_id, attempt_id=relink_attempt_id, kind="RESERVED",
+            request_units=1, generated_seconds=0,
+            reservation_key=f"generation:{relink_task_id}", config_version_id=None, created_at=now)
+        tenant.used_storage_bytes += relink_size
+        db.add_all([source, rights, task, attempt, intent, reserved])
+        db.commit()
+
+    uploaded = adapter.upload_media(
+        state["projectId"], "synthetic-original-relink.mp4", "video/mp4",
+        io.BytesIO(original_bytes), recovery_key=relink_key, expected_sha256=relink_sha)
+    assert uploaded["projectId"] == state["projectId"]
+    assert uploaded["sha256"] == relink_sha and uploaded["mediaId"].startswith("g70")
+    relink_url = (
+        f"/projects/{state['projectId']}/generation-tasks/{relink_task_id}/fake-recovery-relink"
+    )
+    with login() as client:
+        first = client.post(relink_url)
+        assert first.status_code == 200, first.text[:500]
+        bound = first.json()
+        assert bound["recoveryState"] == "BOUND_UNSETTLED"
+        assert bound["actorMode"] == "OWNER_SELF"
+        assert bound["businessAssetBound"] is True
+        assert bound["financialSettlementVerified"] is False
+        assert bound["settlementCreated"] is False
+        assert bound["reservationPreserved"] is True
+        assert bound["idempotent"] is False
+        assert bound["mediaId"] == uploaded["mediaId"] and bound["sha256"] == relink_sha
+        second = client.post(relink_url)
+        assert second.status_code == 200, second.text[:500]
+        replay = second.json()
+        assert replay["idempotent"] is True
+        assert replay["assetVersionId"] == bound["assetVersionId"]
+        foreign = client.post(
+            f"/projects/{state['otherProjectId']}/generation-tasks/{relink_task_id}/fake-recovery-relink")
+        assert foreign.status_code == 404
+
+    with SessionLocal() as db:
+        task = db.get(DBGenerationTask, relink_task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == relink_task_id)).scalar_one()
+        assets = db.execute(select(DBAssetVersion).where(
+            DBAssetVersion.project_id == state["projectId"],
+            DBAssetVersion.media_id == uploaded["mediaId"])).scalars().all()
+        relinks = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == relink_task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED")).scalar_one()
+        settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == relink_task_id,
+            DBGenerationUsageEntry.kind == "SETTLED")).scalar_one()
+        released = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == relink_task_id,
+            DBGenerationUsageEntry.kind == "RELEASED")).scalar_one()
+        reserved_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == relink_task_id,
+            DBGenerationUsageEntry.kind == "RESERVED")).scalar_one()
+        tenant = db.get(DBTenant, state["tenantId"])
+        project = db.get(DBProject, state["projectId"])
+        assert task.status == "UNKNOWN" and task.error_code == "ARTIFACT_RECOVERY_UNSETTLED"
+        assert task.asset_version_id == bound["assetVersionId"] and task.media_id == uploaded["mediaId"]
+        assert attempt.reconciliation_state == "ASSET_RELINKED_UNSETTLED"
+        assert len(assets) == 1 and assets[0].sha256 == relink_sha
+        assert assets[0].probe_json["provenance"]["generationTaskId"] == relink_task_id
+        assert relinks == 1 and settled == 0 and released == 0 and reserved_count == 1
+        assert tenant.used_storage_bytes == state["size"] + relink_size
+        assert len([item for item in (project.materials or []) if item.get("id") == uploaded["mediaId"]]) == 1
+    original_readback = httpx.get(
+        f"{SIDECAR}/media/{state['projectId']}/{uploaded['mediaId']}",
+        timeout=20, trust_env=False)
+    assert original_readback.status_code == 200
+    assert hashlib.sha256(original_readback.content).hexdigest() == relink_sha
+    print(json.dumps({"phase":"asset_relinked","verified":True,"fixture":"REAL_COMPOSE_SIDECAR_AND_FFMPEG",
+        "actorMode":"OWNER_SELF","assetRelink":True,"idempotentRetry":True,
+        "settled":False,"released":False,"providerResubmitted":False,
+        "sha256":relink_sha,"assetVersionId":bound["assetVersionId"]}),flush=True)
     print(json.dumps({"phase":"rights_revoked","synthetic":True,
         "ownerReadback":"DENIED","physicalMediaPreserved":True,
         "settled":False}),flush=True)
