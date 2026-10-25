@@ -5,6 +5,7 @@ on:
     branches:
       - feat/fusion-m0-g70-postupload-db-fault-fake-only
       - feat/fusion-m0-g70-postupload-validation-hold-fake-only
+      - feat/fusion-m0-g70-asset-relink-fake-only-20261025
   workflow_dispatch:
 
 permissions:
@@ -19,6 +20,7 @@ jobs:
     if: >-
       github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-db-fault-fake-only' ||
       github.ref == 'refs/heads/feat/fusion-m0-g70-postupload-validation-hold-fake-only'
+      github.ref == 'refs/heads/feat/fusion-m0-g70-asset-relink-fake-only-20261025' ||
     name: G70 API-to-sidecar restart/readback (not release gate)
     runs-on: ubuntu-latest
     timeout-minutes: 25
