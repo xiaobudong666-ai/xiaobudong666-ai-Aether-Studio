@@ -1,7 +1,7 @@
 """G72 FAKE-ONLY: real API source + real HTTP sidecar, revocation during upload.
 
-This is a disposable cross-container component test, NOT an end-to-end
-Worker concurrency, PostgreSQL, M12 trusted issuance, or release acceptance.
+This is a disposable FAKE-only cross-container test, NOT M12 trusted
+issuance, simultaneous Worker takeover, or release acceptance.
 The permission change is a synthetic DB fixture inserted after the sidecar
 returns its physical-media receipt and before API business-asset binding.
 """
@@ -188,7 +188,43 @@ def physical_media(state: dict):
     assert found["sha256"] == state["sha256"]
 
 
-def prepare():
+def _finish_intake(client, sidecar, task_id, pid, tenant_id, storage_before, data, sha, headers):
+    intake = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers=headers, data={"providerArtifactId": "ci-g72-offline-artifact"},
+        files={"file": ("ci-g72-midupload.mp4", data, "video/mp4")},
+    )
+    assert intake.status_code == 503, intake.text
+    assert intake.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert sidecar.receipt and sidecar.recovery_key
+    state = {
+        "projectId": pid, "tenantId": tenant_id,
+        "taskId": task_id, "mediaId": sidecar.receipt["mediaId"],
+        "recoveryKey": sidecar.recovery_key, "sha256": sha,
+        "bytes": len(data), "storageBefore": storage_before,
+    }
+    row = counts(task_id, tenant_id)
+    assert_held(row, state)
+    denied = client.get(f"/projects/{pid}/generation-tasks/{task_id}/fake-recovery-check")
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "SOURCE_RIGHTS_REVOKED"
+    duplicate = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers=headers, data={"providerArtifactId": "ci-g72-offline-artifact"},
+        files={"file": ("ci-g72-midupload.mp4", data, "video/mp4")},
+    )
+    assert duplicate.status_code == 409, duplicate.text
+    assert duplicate.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    assert counts(task_id, tenant_id) == row
+    physical_media(state)
+    STATE.write_text(json.dumps(state), encoding="utf8")
+    print(json.dumps({
+        "phase": "post_ack_revocation_held", "fakeOnly": True,
+        "sourceRights": "SYNTHETIC_REVOKED",
+        "crossContainerHttp": True, "result": row, "sha256": sha,
+    }), flush=True)
+
+def prepare(arm_only=False):
     guard()
     data = INPUT.read_bytes()
     assert len(data) > 1000 and data[4:8] == b"ftyp"
@@ -268,40 +304,50 @@ def prepare():
         with SessionLocal() as db:
             tenant_id = db.get(DBProject, pid).tenant_id
             storage_before = db.get(DBTenant, tenant_id).used_storage_bytes
-        intake = client.post(
-            f"/internal/generation-tasks/{task_id}/artifact-intake",
-            headers=headers, data={"providerArtifactId": "ci-g72-offline-artifact"},
-            files={"file": ("ci-g72-midupload.mp4", data, "video/mp4")},
-        )
-        assert intake.status_code == 503, intake.text
-        assert intake.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
-        assert sidecar.receipt and sidecar.recovery_key
-        state = {
-            "projectId": pid, "tenantId": tenant_id,
-            "taskId": task_id, "mediaId": sidecar.receipt["mediaId"],
-            "recoveryKey": sidecar.recovery_key, "sha256": sha,
-            "bytes": len(data), "storageBefore": storage_before,
+        if arm_only:
+            STATE.write_text(json.dumps({
+                "phase": "armed", "projectId": pid, "tenantId": tenant_id,
+                "taskId": task_id, "sourceId": image_id,
+                "sha256": sha, "bytes": len(data),
+                "storageBefore": storage_before,
+            }), encoding="utf8")
+            print("G72_PG_POSTACK_ARMED_WITH_WORKER_LEASE", flush=True)
+            return
+        _finish_intake(client, sidecar, task_id, pid, tenant_id,
+                       storage_before, data, sha, headers)
+
+
+def inject_live_workers():
+    """Inject a synthetic revocation at real Sidecar ACK while two normal
+    Worker daemons remain running. Claim ownership is pre-armed; this does
+    NOT prove simultaneous Worker takeover, trusted M12, or real Provider.
+    """
+    guard()
+    state = json.loads(STATE.read_text(encoding="utf8"))
+    assert state.get("phase") == "armed", "unarmed fault is forbidden"
+    data = INPUT.read_bytes()
+    assert len(data) == state["bytes"]
+    sha = hashlib.sha256(data).hexdigest()
+    assert sha == state["sha256"]
+    with SessionLocal() as db:
+        task = db.get(DBGenerationTask, state["taskId"])
+        assert task is not None
+        assert task.tenant_id == state["tenantId"]
+        assert task.project_id == state["projectId"]
+        assert task.status == "INGESTING", task.status
+        assert task.asset_version_id is None and task.media_id is None
+    sidecar = RevokingSidecar()
+    sidecar.source_id = state["sourceId"]
+    with owner_client(sidecar) as client:
+        login(client)
+        headers = {
+            "X-Worker-Token": os.environ["AETHER_WORKER_TOKEN"],
+            "X-Worker-Id": "g72-revocation-test-worker",
         }
-        row = counts(task_id, tenant_id)
-        assert_held(row, state)
-        denied = client.get(f"/projects/{pid}/generation-tasks/{task_id}/fake-recovery-check")
-        assert denied.status_code == 409, denied.text
-        assert denied.json()["detail"]["code"] == "SOURCE_RIGHTS_REVOKED"
-        duplicate = client.post(
-            f"/internal/generation-tasks/{task_id}/artifact-intake",
-            headers=headers, data={"providerArtifactId": "ci-g72-offline-artifact"},
-            files={"file": ("ci-g72-midupload.mp4", data, "video/mp4")},
-        )
-        assert duplicate.status_code == 409, duplicate.text
-        assert duplicate.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
-        assert counts(task_id, tenant_id) == row
-        physical_media(state)
-        STATE.write_text(json.dumps(state), encoding="utf8")
-        print(json.dumps({
-            "phase": "post_ack_revocation_held", "fakeOnly": True,
-            "sourceRights": "SYNTHETIC_REVOKED",
-            "crossContainerHttp": True, "result": row, "sha256": sha,
-        }), flush=True)
+        _finish_intake(client, sidecar, state["taskId"], state["projectId"],
+                       state["tenantId"], state["storageBefore"], data, sha, headers)
+    print("G72_PG_POSTACK_LIVE_DAEMONS_HELD_NO_ASSET_NO_SETTLEMENT_PASS",
+          flush=True)
 
 
 def verify():
@@ -333,6 +379,7 @@ def verify():
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("prepare", "verify"))
+    parser.add_argument("phase", choices=("prepare", "arm", "inject-live", "verify"))
     args = parser.parse_args()
-    (prepare if args.phase == "prepare" else verify)()
+    {"prepare": prepare, "arm": lambda: prepare(arm_only=True),
+     "inject-live": inject_live_workers, "verify": verify}[args.phase]()
