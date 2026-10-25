@@ -15,7 +15,7 @@ import sys
 import uuid
 sys.path.insert(0, "/app")
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from app.database import SessionLocal
 from app.models import (DBAssetVersion, DBGenerationAttempt, DBGenerationEvent,
                         DBGenerationTask, DBGenerationUsageEntry, DBProject,
@@ -90,97 +90,137 @@ def prepare():
         other = client.post("/projects", json={"name": "G70 unrelated " + uuid.uuid4().hex[:8]})
         assert other.status_code == 201
         other_id = other.json()["id"]
-        now = dt.datetime.now(dt.timezone.utc)
-        task_id, attempt_id, image_id = [str(uuid.uuid4()) for _ in range(3)]
-        upstream, artifact = "synthetic-original-job", "synthetic-original-output"
+
+    now = dt.datetime.now(dt.timezone.utc)
+    task_id, attempt_id, image_id = [str(uuid.uuid4()) for _ in range(3)]
+    upstream, artifact, worker_id = "synthetic-original-job", "synthetic-original-output", "g70-ci-worker"
+    with SessionLocal() as db:
+        project = db.get(DBProject, pid)
+        tenant_id = project.tenant_id
+        source = DBAssetVersion(
+            id=image_id, tenant_id=tenant_id, project_id=pid, version_no=1,
+            media_id="synthetic-source-" + uuid.uuid4().hex,
+            sha256="a" * 64, media_type="image", content_type="image/png",
+            size_bytes=100, probe_json={"image":{"width":64,"height":64}},
+            created_by=project.owner_id, created_at=now)
+        rights = DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=pid,
+            asset_version_id=image_id, status="ALLOWED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="SYNTHETIC_FIXTURE_NOT_M12",
+            captured_by=project.owner_id, captured_at=now)
+        task = DBGenerationTask(
+            id=task_id, tenant_id=tenant_id, project_id=pid,
+            requested_by=project.owner_id, provider="deterministic-fake-talking-head",
+            status="RUNNING", progress=50, message="Synthetic worker awaiting artifact intake",
+            request_json={"imageAssetId":image_id, "sourceAssetSha256":"a"*64},
+            request_hash="b"*64,
+            capability_snapshot_json={"quota":{"monthlyGeneratedSecondsLimit":100}},
+            capability_snapshot_hash="c"*64, idempotency_key=str(uuid.uuid4()),
+            upstream_job_id=upstream, provider_artifact_id=None,
+            media_id=None, asset_version_id=None, attempts=1, max_attempts=1,
+            lease_owner=worker_id, lease_expires_at=now + dt.timedelta(minutes=15),
+            cancel_requested_at=None, error_code=None, error_message=None,
+            created_at=now, updated_at=now, started_at=now, completed_at=None)
+        attempt = DBGenerationAttempt(
+            id=attempt_id, generation_task_id=task_id, attempt_no=1,
+            status="RUNNING", submission_started_at=now,
+            upstream_job_id=upstream, reconciliation_state="SUBMITTED",
+            error_code=None, error_message=None, created_at=now, completed_at=None)
+        reserved = DBGenerationUsageEntry(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=pid,
+            task_id=task_id, attempt_id=attempt_id, kind="RESERVED",
+            request_units=1, generated_seconds=0,
+            reservation_key=f"generation:{task_id}", config_version_id=None, created_at=now)
+        tenant = db.get(DBTenant, tenant_id)
+        assert tenant.used_storage_bytes == 0, "must be fresh disposable DB"
+        db.add_all([source, rights, task, attempt, reserved])
+        db.commit()
+
+    # Inject the failure at the actual final business-asset INSERT commit.
+    # The trigger is created only in the disposable SQLite CI database, scoped
+    # to this random project and video assets; it is removed immediately after
+    # the one HTTP request and is never part of application or production code.
+    trigger_name = "g70_final_commit_fault_" + uuid.uuid4().hex
+    with SessionLocal() as db:
+        assert db.get_bind().dialect.name == "sqlite", "this fault injector is SQLite-CI-only"
+        quote = db.get_bind().dialect.identifier_preparer.quote
+        table_name = quote(DBAssetVersion.__tablename__)
+        trigger_sql_name = quote(trigger_name)
+        project_literal = pid.replace("'", "''")
+        db.execute(text(
+            f"CREATE TRIGGER {trigger_sql_name} BEFORE INSERT ON {table_name} "
+            f"WHEN NEW.project_id = '{project_literal}' AND NEW.media_type = 'video' "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic G70 final SQL commit fault'); END"
+        ))
+        db.commit()
+
+    try:
+        worker_token = os.getenv("AETHER_WORKER_TOKEN", "")
+        assert worker_token.startswith("ci-") and len(worker_token) > 20
+        with login() as client:
+            with VIDEO.open("rb") as media_file:
+                intake = client.post(
+                    f"/internal/generation-tasks/{task_id}/artifact-intake",
+                    data={"providerArtifactId": artifact},
+                    files={"file": ("synthetic-original.mp4", media_file, "video/mp4")},
+                    headers={"X-Worker-Token": worker_token, "X-Worker-Id": worker_id},
+                )
+            assert intake.status_code == 503, (
+                f"expected injected final SQL commit failure to fail closed; "
+                f"status={intake.status_code} body={intake.text[:500]}"
+            )
+            assert intake.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    finally:
         with SessionLocal() as db:
-            project = db.get(DBProject, pid)
-            tenant_id = project.tenant_id
-            key = "g70-" + hashlib.sha256(
-                f"{tenant_id}:{pid}:{task_id}:1:{artifact}".encode()).hexdigest()
-            source = DBAssetVersion(
-                id=image_id, tenant_id=tenant_id, project_id=pid, version_no=1,
-                media_id="synthetic-source-" + uuid.uuid4().hex,
-                sha256="a" * 64, media_type="image", content_type="image/png",
-                size_bytes=100, probe_json={"image":{"width":64,"height":64}},
-                created_by=project.owner_id, created_at=now)
-            rights = DBRightsSnapshot(
-                id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=pid,
-                asset_version_id=image_id, status="ALLOWED", purpose="REMIX",
-                territory="TEST", valid_from=None, valid_until=None,
-                evidence_ref="SYNTHETIC_FIXTURE_NOT_M12",
-                captured_by=project.owner_id, captured_at=now)
-            task = DBGenerationTask(
-                id=task_id, tenant_id=tenant_id, project_id=pid,
-                requested_by=project.owner_id, provider="deterministic-fake-talking-head",
-                status="UNKNOWN", progress=90, message="Synthetic ambiguous media ACK",
-                request_json={"imageAssetId":image_id, "sourceAssetSha256":"a"*64},
-                request_hash="b"*64, capability_snapshot_json={},
-                capability_snapshot_hash="c"*64, idempotency_key=str(uuid.uuid4()),
-                upstream_job_id=upstream, provider_artifact_id=artifact,
-                media_id=None, asset_version_id=None, attempts=1, max_attempts=1,
-                lease_owner=None, lease_expires_at=None, cancel_requested_at=None,
-                error_code="ARTIFACT_INGEST_FAILED", error_message="Synthetic ACK lost",
-                created_at=now, updated_at=now, started_at=now, completed_at=now)
-            attempt = DBGenerationAttempt(
-                id=attempt_id, generation_task_id=task_id, attempt_no=1,
-                status="UNKNOWN", submission_started_at=now,
-                upstream_job_id=upstream, reconciliation_state="UNKNOWN",
-                error_code="ARTIFACT_INGEST_FAILED", error_message="Synthetic ACK lost",
-                created_at=now, completed_at=now)
-            intent = DBGenerationEvent(
-                id=str(uuid.uuid4()), generation_task_id=task_id, attempt_id=attempt_id,
-                event_type="ARTIFACT_UPLOAD_INTENT",
-                from_status="INGESTING", to_status="INGESTING",
-                actor_type="WORKER", actor_id="synthetic-ci",
-                metadata_json={"tenantId":tenant_id, "projectId":pid, "attempt":1,
-                               "upstreamJobId":upstream, "providerArtifactId":artifact,
-                               "sha256":sha, "sizeBytes":len(original),
-                               "fakeRecoveryKey":key,
-                               "recoveryState":"PREPARED_BEFORE_SIDECAR_UPLOAD"},
-                created_at=now)
-            reserved = DBGenerationUsageEntry(
-                id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=pid,
-                task_id=task_id, attempt_id=attempt_id, kind="RESERVED",
-                request_units=1, generated_seconds=0,
-                reservation_key=f"generation:{task_id}", config_version_id=None, created_at=now)
-            tenant = db.get(DBTenant, tenant_id)
-            assert tenant.used_storage_bytes == 0, "must be fresh disposable DB"
-            tenant.used_storage_bytes += len(original)
-            db.add_all([source, rights, task, attempt, intent, reserved])
-            db.commit()   # Intent + held quota BEFORE external HTTP upload.
-        adapter = VideoUseAdapter(api_url=SIDECAR, timeout=20, max_retries=0)
-        uploaded = adapter.upload_media(
-            pid, "synthetic-original.mp4", "video/mp4", io.BytesIO(original),
-            recovery_key=key, expected_sha256=sha)
-        assert uploaded["projectId"] == pid and uploaded["sha256"] == sha
-        assert uploaded["mediaId"].startswith("g70")
-        # ACK deliberately not propagated into business DB; no second POST.
+            quote = db.get_bind().dialect.identifier_preparer.quote
+            db.execute(text(f"DROP TRIGGER IF EXISTS {quote(trigger_name)}"))
+            db.commit()
+
+    with login() as client:
         endpoint = f"/projects/{pid}/generation-tasks/{task_id}/fake-recovery-check"
         found = client.get(endpoint)
         assert found.status_code == 200, found.text[:500]
         body = found.json()
         assert body["recoveryState"] == "FOUND_UNBOUND"
-        assert body["sha256"] == sha and body["mediaId"] == uploaded["mediaId"]
-        assert body["sizeBytes"] == len(original)
-        assert body["businessAssetBound"] is False
+        assert body["sha256"] == sha and body["sizeBytes"] == len(original)
+        assert body["mediaId"] and body["businessAssetBound"] is False
         assert body["financialSettlementVerified"] is False
         assert client.get(
             f"/projects/{other_id}/generation-tasks/{task_id}/fake-recovery-check"
         ).status_code == 404
-        expected = {"status":"UNKNOWN", "error":"ARTIFACT_INGEST_FAILED",
-                    "businessAssetId":None, "mediaId":None,
-                    "attempts":1, "events":1, "videoAssets":0,
-                    "settlement":0, "reserved":1, "released":0, "relinked":0,
-                    "storageHeld":len(original)}
-        assert invariant(task_id, tenant_id) == expected
-        STATE.write_text(json.dumps({
-            "taskId":task_id,"tenantId":tenant_id,"projectId":pid,
-            "otherProjectId":other_id,"mediaId":uploaded["mediaId"],"sourceId":image_id,
-            "key":key,"sha":sha,"size":len(original),"expected":expected}),encoding="utf8")
-        print(json.dumps({"phase":"before_restart","fakeOnly":True,
-            "fixture":"SYNTHETIC_DB_AND_FFMPEG","apiReadback":"FOUND_UNBOUND",
-            "sha256":sha}),flush=True)
+
+    with SessionLocal() as db:
+        intent = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT")).scalar_one()
+        held = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_HELD")).scalar_one()
+        key = (intent.metadata_json or {}).get("fakeRecoveryKey")
+        assert isinstance(key, str) and key.startswith("g70-")
+        assert (held.metadata_json or {}).get("sidecarAcknowledged") is True
+        assert (held.metadata_json or {}).get("storageReservationHeld") is True
+
+    expected = {
+        "status":"UNKNOWN", "error":"ARTIFACT_INGEST_FAILED",
+        "businessAssetId":None, "mediaId":body["mediaId"],
+        "attempts":1, "events":2, "videoAssets":0,
+        "settlement":0, "reserved":1, "released":0, "relinked":0,
+        "storageHeld":len(original)}
+    assert invariant(task_id, tenant_id) == expected
+    STATE.write_text(json.dumps({
+        "taskId":task_id,"tenantId":tenant_id,"projectId":pid,
+        "otherProjectId":other_id,"mediaId":body["mediaId"],"sourceId":image_id,
+        "key":key,"sha":sha,"size":len(original),"expected":expected}),encoding="utf8")
+    print(json.dumps({
+        "phase":"live_artifact_intake_final_commit_fault",
+        "fakeOnly":True,"fixture":"SYNTHETIC_DB_AND_FFMPEG",
+        "faultInjection":"SQLite trigger rejected final video-asset INSERT after real Sidecar HTTP ACK",
+        "apiStatus":intake.status_code,"apiCode":intake.json()["detail"]["code"],
+        "recoveryState":body["recoveryState"],"sameTask":task_id,
+        "attempts":1,"reserved":1,"settled":0,"released":0,
+        "sha256":sha}),flush=True)
 
 def verify():
     gates()
