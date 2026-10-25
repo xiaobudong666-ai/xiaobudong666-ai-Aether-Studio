@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v3";
 
 // RationalTime schema for validation
 export const RationalTimeSchema = z.object({
