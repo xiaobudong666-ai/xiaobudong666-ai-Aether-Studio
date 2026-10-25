@@ -204,3 +204,111 @@ def test_g72_pg_revoke_between_claim_and_intake_fails_closed(pg_fake_context):
             DBGenerationUsageEntry.kind.in_(["SETTLED", "RELEASED"])
         )).scalar_one() == 0
     assert store.uploads == 0
+
+
+def _pg_claim_in_independent_process(url, worker_id, ready, go, results):
+    """Separate OS process, SQLAlchemy pool and FastAPI lifespan; synthetic only."""
+    import traceback
+
+    engine = None
+    announced = False
+    try:
+        engine = build_engine(url)
+        sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+        def get_db():
+            with sessions() as db:
+                yield db
+
+        app = create_app(
+            app_engine=engine, db_dependency=get_db,
+            video_use_adapter=NoUploadMedia(),
+            bootstrap_admin_email="ci-g72-pg-owner@example.invalid",
+            bootstrap_admin_password=OWNER_PASSWORD,
+            worker_token=WORKER_TOKEN, cookie_secure=False, enforce_csrf=True,
+            generation_provider_mode="deterministic-fake",
+        )
+        with TestClient(app) as client:
+            ready.put((worker_id, "READY"))
+            announced = True
+            if not go.wait(timeout=30):
+                raise RuntimeError("CI-only process-claim synchronization timed out")
+            reply = claim(client, worker_id)
+            results.put((worker_id, reply.status_code, reply.text[:300]))
+    except Exception:
+        error = (worker_id, "ERROR", traceback.format_exc()[-1800:])
+        (results if announced else ready).put(error)
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
+def test_g72_pg_independent_worker_processes_claim_once(pg_fake_context):
+    """Native PG claim arbitration across isolated API/Worker OS processes.
+
+    Every child constructs its own FastAPI application and database connection
+    pool; the task, fake actor and REMIX authorization are synthetic.  This
+    does NOT validate a physical Sidecar, M12 issuance or delegated admins.
+    """
+    import multiprocessing
+
+    client, sessions, store = pg_fake_context
+    project, _, payload = make_task_request(
+        client, sessions, key=str(uuid.uuid4())
+    )
+    created = client.post(
+        f"/projects/{project}/talking-head/fake-generation-tasks",
+        json=payload,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    assert os.environ["AETHER_FAKE_ONLY_NONPROD"] == "true"
+    url = os.environ["G72_PG_CI_DATABASE_URL"]
+
+    context = multiprocessing.get_context("spawn")
+    ready, results = context.Queue(), context.Queue()
+    go = context.Event()
+    workers = [
+        context.Process(
+            target=_pg_claim_in_independent_process,
+            args=(url, f"ci-pg-process-{i}", ready, go, results),
+        )
+        for i in range(4)
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        announced = [ready.get(timeout=45) for _ in workers]
+        assert all(message[1] == "READY" for message in announced), announced
+        go.set()
+        outcomes = [results.get(timeout=45) for _ in workers]
+    finally:
+        go.set()
+        for worker in workers:
+            worker.join(timeout=8)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=8)
+
+    assert all(worker.exitcode == 0 for worker in workers), [
+        worker.exitcode for worker in workers
+    ]
+    assert all(isinstance(result[1], int) for result in outcomes), outcomes
+    assert [result[1] for result in outcomes].count(200) == 1, outcomes
+    assert all(result[1] in {200, 204} for result in outcomes), outcomes
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "SUBMITTING"
+        assert task.lease_owner in {item[0] for item in outcomes}
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+    assert store.uploads == 0
