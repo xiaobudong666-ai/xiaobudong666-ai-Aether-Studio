@@ -409,6 +409,19 @@ export interface ServerGenerationRequest {
   confirmExternalGeneration: true;
 }
 
+export interface TalkingHeadFakeGenerationRequest {
+  text: string;
+  durationSeconds: number;
+  aspectRatio: "16:9" | "9:16" | "1:1";
+  resolution: "720p";
+  voiceId: "synthetic-seed";
+  imageAssetVersionId: string;
+  idempotencyKey: string;
+  expectedProjectRevision: number;
+  capabilitySnapshotHash: string;
+  confirmSyntheticTestOnly: true;
+}
+
 export interface ServerGenerationResult {
   assetVersionId: string;
   mediaId: string;
@@ -480,6 +493,28 @@ export class GenerationApiClient {
 
   create(projectId: string, body: ServerGenerationRequest): Promise<ServerGenerationTask> {
     return this.json(`/projects/${encodeURIComponent(projectId)}/generation-tasks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Aether-CSRF": "1",
+        "Idempotency-Key": body.idempotencyKey,
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  validateFakeTalkingHead(projectId: string, body: TalkingHeadFakeGenerationRequest): Promise<{
+    allowed: true; fakeOnly: true; simulatedOutput: true; publishable: false;
+  }> {
+    return this.json("/projects/" + encodeURIComponent(projectId) + "/talking-head/fake-generation-tasks/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Aether-CSRF": "1" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  createFakeTalkingHead(projectId: string, body: TalkingHeadFakeGenerationRequest): Promise<ServerGenerationTask> {
+    return this.json("/projects/" + encodeURIComponent(projectId) + "/talking-head/fake-generation-tasks", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
