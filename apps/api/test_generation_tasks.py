@@ -3393,3 +3393,346 @@ def test_g72_fake_rights_revoked_after_sidecar_upload_keeps_hold(generation_cont
     assert again.status_code == 409, again.text
     assert again.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
     assert media.uploads == 1
+
+
+def _seed_g70_relink_case(client, sessions, app, *, suffix="happy"):
+    """Create a disposable UNKNOWN task with a durable FAKE-only upload intent."""
+    import hashlib
+
+    project_json = create_project(client, f"G70 relink {suffix}")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    task_id, attempt_id, source_id = [str(uuid.uuid4()) for _ in range(3)]
+    provider_artifact_id = f"g70-original-{suffix}"
+    original_bytes = (b"synthetic-original-media:" + suffix.encode()) * 64
+    expected_sha = hashlib.sha256(original_bytes).hexdigest()
+    expected_size = len(original_bytes)
+    recovery_key = "g70-" + hashlib.sha256(
+        f"seed:{project_json['id']}:{task_id}:{provider_artifact_id}".encode()
+    ).hexdigest()
+    with sessions() as db:
+        project = db.get(DBProject, project_json["id"])
+        tenant = db.get(DBTenant, project.tenant_id)
+        source = DBAssetVersion(
+            id=source_id,
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            media_id=f"g70-source-{uuid.uuid4().hex}",
+            version_no=1,
+            sha256="a" * 64,
+            media_type="image",
+            content_type="image/png",
+            size_bytes=128,
+            probe_json={"image": {"width": 64, "height": 64}},
+            created_by=project.owner_id,
+            created_at=now,
+        )
+        rights = DBRightsSnapshot(
+            id=str(uuid.uuid4()),
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            asset_version_id=source_id,
+            status="ALLOWED",
+            purpose="REMIX",
+            territory="TEST",
+            valid_from=None,
+            valid_until=None,
+            evidence_ref="SYNTHETIC_FIXTURE_NOT_M12",
+            captured_by=project.owner_id,
+            captured_at=now,
+        )
+        task = DBGenerationTask(
+            id=task_id,
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            requested_by=project.owner_id,
+            provider="deterministic-fake-talking-head",
+            status="UNKNOWN",
+            progress=90,
+            message="Synthetic ambiguous sidecar ACK",
+            request_json={"imageAssetId": source_id, "sourceAssetSha256": "a" * 64},
+            request_hash="b" * 64,
+            capability_snapshot_json={},
+            capability_snapshot_hash="c" * 64,
+            idempotency_key=str(uuid.uuid4()),
+            upstream_job_id=f"upstream-{suffix}",
+            provider_artifact_id=provider_artifact_id,
+            media_id=None,
+            asset_version_id=None,
+            attempts=1,
+            max_attempts=1,
+            lease_owner=None,
+            lease_expires_at=None,
+            cancel_requested_at=None,
+            error_code="ARTIFACT_INGEST_FAILED",
+            error_message="Synthetic ACK lost",
+            created_at=now,
+            updated_at=now,
+            started_at=now,
+            completed_at=now,
+        )
+        attempt = DBGenerationAttempt(
+            id=attempt_id,
+            generation_task_id=task_id,
+            attempt_no=1,
+            status="UNKNOWN",
+            submission_started_at=now,
+            upstream_job_id=task.upstream_job_id,
+            reconciliation_state="UNKNOWN",
+            error_code="ARTIFACT_INGEST_FAILED",
+            error_message="Synthetic ACK lost",
+            created_at=now,
+            completed_at=now,
+        )
+        intent = DBGenerationEvent(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_id=attempt_id,
+            event_type="ARTIFACT_UPLOAD_INTENT",
+            from_status="INGESTING",
+            to_status="INGESTING",
+            actor_type="WORKER",
+            actor_id="synthetic-ci",
+            metadata_json={
+                "tenantId": project.tenant_id,
+                "projectId": project.id,
+                "attempt": 1,
+                "upstreamJobId": task.upstream_job_id,
+                "providerArtifactId": provider_artifact_id,
+                "sha256": expected_sha,
+                "sizeBytes": expected_size,
+                "uploadName": f"generation-{task_id}.mp4",
+                "fakeRecoveryKey": recovery_key,
+                "recoveryState": "PREPARED_BEFORE_SIDECAR_UPLOAD",
+            },
+            created_at=now,
+        )
+        reserved = DBGenerationUsageEntry(
+            id=str(uuid.uuid4()),
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            kind="RESERVED",
+            request_units=1,
+            generated_seconds=0,
+            reservation_key=f"generation:{task_id}",
+            config_version_id=None,
+            created_at=now,
+        )
+        tenant.used_storage_bytes += expected_size
+        db.add_all([source, rights, task, attempt, intent, reserved])
+        db.commit()
+
+    sidecar_result = {
+        "mediaId": f"g70-media-{suffix}",
+        "projectId": project_json["id"],
+        "sha256": expected_sha,
+        "contentType": "video/mp4",
+        "metadata": {
+            "sizeBytes": expected_size,
+            "durationSeconds": 1.25,
+            "video": {"codec": "h264", "width": 320, "height": 568},
+        },
+        "recovered": True,
+    }
+    lookups = []
+
+    def lookup(project_id, key, sha):
+        lookups.append((project_id, key, sha))
+        assert project_id == project_json["id"]
+        assert key == recovery_key
+        assert sha == expected_sha
+        return sidecar_result
+
+    app.state.video_use.find_fake_recovery = lookup
+    return {
+        "project": project_json,
+        "taskId": task_id,
+        "tenantId": project.tenant_id,
+        "sourceId": source_id,
+        "mediaId": sidecar_result["mediaId"],
+        "sha": expected_sha,
+        "size": expected_size,
+        "recoveryKey": recovery_key,
+        "sidecarResult": sidecar_result,
+        "lookups": lookups,
+    }
+
+
+def test_g70_owner_self_relink_is_idempotent_and_never_settles(
+    generation_context, monkeypatch,
+):
+    import os
+
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    client, sessions, app, _media_store = generation_context
+    case = _seed_g70_relink_case(client, sessions, app, suffix="idempotent")
+    endpoint = (
+        f"/projects/{case['project']['id']}/generation-tasks/"
+        f"{case['taskId']}/fake-recovery-relink"
+    )
+
+    first = client.post(endpoint)
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["recoveryState"] == "BOUND_UNSETTLED"
+    assert body["actorMode"] == "OWNER_SELF"
+    assert body["businessAssetBound"] is True
+    assert body["financialSettlementVerified"] is False
+    assert body["settlementCreated"] is False
+    assert body["reservationPreserved"] is True
+    assert body["idempotent"] is False
+    assert body["mediaId"] == case["mediaId"] and body["sha256"] == case["sha"]
+
+    second = client.post(endpoint)
+    assert second.status_code == 200, second.text
+    replay = second.json()
+    assert replay["idempotent"] is True
+    assert replay["assetVersionId"] == body["assetVersionId"]
+    assert replay["mediaId"] == body["mediaId"]
+    assert replay["financialSettlementVerified"] is False
+    # The first call performs read-only validation + an exact media readback;
+    # the second call is answered from the durable binding/audit event.
+    assert len(case["lookups"]) == 2
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, case["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == case["taskId"],
+        )).scalar_one()
+        assets = db.execute(select(DBAssetVersion).where(
+            DBAssetVersion.project_id == case["project"]["id"],
+            DBAssetVersion.media_id == case["mediaId"],
+        )).scalars().all()
+        relinks = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == case["taskId"],
+            DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED",
+        )).scalar_one()
+        settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == case["taskId"],
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        released = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == case["taskId"],
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one()
+        reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == case["taskId"],
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        tenant = db.get(DBTenant, case["tenantId"])
+        project = db.get(DBProject, case["project"]["id"])
+        assert task.status == "UNKNOWN"
+        assert task.error_code == "ARTIFACT_RECOVERY_UNSETTLED"
+        assert task.asset_version_id == body["assetVersionId"]
+        assert task.media_id == case["mediaId"]
+        assert attempt.reconciliation_state == "ASSET_RELINKED_UNSETTLED"
+        assert len(assets) == 1 and assets[0].sha256 == case["sha"]
+        assert assets[0].probe_json["provenance"]["generationTaskId"] == case["taskId"]
+        assert relinks == 1
+        assert settled == 0 and released == 0 and reserved == 1
+        assert tenant.used_storage_bytes == case["size"]
+        assert len([item for item in (project.materials or []) if item.get("id") == case["mediaId"]]) == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_owner_self_relink_fails_closed_for_wrong_actor_scope_hash_and_revocation(
+    generation_context, monkeypatch,
+):
+    import os
+
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
+    client, sessions, app, _media_store = generation_context
+    case = _seed_g70_relink_case(client, sessions, app, suffix="negative")
+    endpoint = (
+        f"/projects/{case['project']['id']}/generation-tasks/"
+        f"{case['taskId']}/fake-recovery-relink"
+    )
+
+    # Another owner in the same tenant cannot impersonate the original task requester.
+    other_password = secrets.token_urlsafe(24)
+    created = client.post("/admin/users", json={
+        "email": f"g70-other-owner-{uuid.uuid4().hex[:8]}@example.invalid",
+        "displayName": "Other Owner",
+        "password": other_password,
+        "role": "owner",
+    })
+    assert created.status_code == 201, created.text
+    with TestClient(app) as other_client:
+        logged_in = other_client.post("/auth/login", json={
+            "email": created.json()["email"], "password": other_password,
+        })
+        assert logged_in.status_code == 200
+        other_client.headers.update({"X-Aether-CSRF": "1"})
+        denied_actor = other_client.post(endpoint)
+        assert denied_actor.status_code == 403, denied_actor.text
+        assert denied_actor.json()["detail"]["code"] == "OWNER_SELF_ONLY"
+
+    # Wrong project scope is hidden as not found and never queries the sidecar.
+    other_project = create_project(client, "G70 unrelated project")
+    foreign = client.post(
+        f"/projects/{other_project['id']}/generation-tasks/{case['taskId']}/fake-recovery-relink"
+    )
+    assert foreign.status_code == 404
+    assert len(case["lookups"]) == 0
+
+    # Sidecar hash mismatch must not create an asset or audit a binding.
+    original_lookup = app.state.video_use.find_fake_recovery
+
+    def wrong_hash(project_id, key, sha):
+        result = dict(original_lookup(project_id, key, sha))
+        result["sha256"] = "0" * 64
+        return result
+
+    app.state.video_use.find_fake_recovery = wrong_hash
+    mismatch = client.post(endpoint)
+    assert mismatch.status_code == 409, mismatch.text
+    assert mismatch.json()["detail"]["code"] == "ORIGINAL_MEDIA_SCOPE_OR_HASH_MISMATCH"
+    with sessions() as db:
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == case["project"]["id"],
+        )).scalar_one() == 1  # only the source image
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == case["taskId"],
+            DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED",
+        )).scalar_one() == 0
+
+    # A newer synthetic DENIED snapshot fences the binding. This is not M12 proof.
+    app.state.video_use.find_fake_recovery = original_lookup
+    with sessions() as db:
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()),
+            tenant_id=case["tenantId"],
+            project_id=case["project"]["id"],
+            asset_version_id=case["sourceId"],
+            status="DENIED",
+            purpose="REMIX",
+            territory="TEST",
+            valid_from=None,
+            valid_until=None,
+            evidence_ref="SYNTHETIC_REVOCATION_NOT_M12",
+            captured_by=db.get(DBProject, case["project"]["id"]).owner_id,
+            captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2),
+        ))
+        db.commit()
+    revoked = client.post(endpoint)
+    assert revoked.status_code == 409, revoked.text
+    assert revoked.json()["detail"]["code"] == "SOURCE_RIGHTS_REVOKED"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, case["taskId"])
+        assert task.asset_version_id is None and task.media_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == case["project"]["id"],
+            DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == case["taskId"],
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == case["taskId"],
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
