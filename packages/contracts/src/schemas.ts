@@ -1,4 +1,4 @@
-import { z } from "zod/v3";
+import { z } from "zod";
 
 // RationalTime schema for validation
 export const RationalTimeSchema = z.object({
@@ -44,7 +44,7 @@ export const TimelineSchema = z.object({
   version: z.literal("1.1"),
   output: TimelineOutputSchema.nullish().transform((value) => value ?? undefined),
   tracks: z.array(TrackSchema),
-});
+}).partial({ output: true });
 
 // Material schema
 export const MaterialSchema = z.object({
@@ -119,7 +119,7 @@ export const AssetVersionSchema = z.object({
   mediaType: z.enum(["video", "audio", "image"]),
   contentType: z.string().nullable(),
   sizeBytes: z.number().int().nonnegative(),
-  probe: z.record(z.unknown()),
+  probe: z.record(z.string(), z.unknown()),
   createdBy: z.string().min(1),
   createdAt: z.string().min(1),
 });
