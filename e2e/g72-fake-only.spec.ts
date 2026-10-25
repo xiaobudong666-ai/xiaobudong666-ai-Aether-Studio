@@ -57,7 +57,7 @@ test("G72 浏览器正常入口→专用 FAKE-only API→Worker，权利阻断�
   expect(createResponse.status()).toBe(202);
   await expect(page.getByText(/FAKE-only口播任务 .* 已进入服务端Worker队列/)).toBeVisible();
 
-  await expect(page.getByText(/等待权利审核/)).toBeVisible({ timeout: 120_000 });
+  await expect(page.getByText(/等待权利审核/).first()).toBeVisible({ timeout: 120_000 });
   await expect(page.getByText("FAKE-only模拟产物：不可采纳或发布。")).toBeVisible();
   await expect(page.getByRole("button", { name: "用于快速制作" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "应用到口播草稿" })).toHaveCount(0);
