@@ -137,11 +137,11 @@ def prepare():
         db.add_all([source, rights, task, attempt, reserved])
         db.commit()
 
-    # Inject the failure at the actual final business-asset INSERT commit.
+    # Inject the failure at the final business-asset INSERT within the artifact-intake transaction.
     # The trigger is created only in the disposable SQLite CI database, scoped
     # to this random project and video assets; it is removed immediately after
     # the one HTTP request and is never part of application or production code.
-    trigger_name = "g70_final_commit_fault_" + uuid.uuid4().hex
+    trigger_name = "g70_final_asset_insert_fault_" + uuid.uuid4().hex
     with SessionLocal() as db:
         assert db.get_bind().dialect.name == "sqlite", "this fault injector is SQLite-CI-only"
         quote = db.get_bind().dialect.identifier_preparer.quote
@@ -151,7 +151,7 @@ def prepare():
         db.execute(text(
             f"CREATE TRIGGER {trigger_sql_name} BEFORE INSERT ON {table_name} "
             f"WHEN NEW.project_id = '{project_literal}' AND NEW.media_type = 'video' "
-            "BEGIN SELECT RAISE(ABORT, 'synthetic G70 final SQL commit fault'); END"
+            "BEGIN SELECT RAISE(ABORT, 'synthetic G70 final asset INSERT fault'); END"
         ))
         db.commit()
 
@@ -167,7 +167,7 @@ def prepare():
                     headers={"X-Worker-Token": worker_token, "X-Worker-Id": worker_id},
                 )
             assert intake.status_code == 503, (
-                f"expected injected final SQL commit failure to fail closed; "
+                f"expected injected final asset INSERT failure to fail closed; "
                 f"status={intake.status_code} body={intake.text[:500]}"
             )
             assert intake.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
@@ -214,7 +214,7 @@ def prepare():
         "otherProjectId":other_id,"mediaId":body["mediaId"],"sourceId":image_id,
         "key":key,"sha":sha,"size":len(original),"expected":expected}),encoding="utf8")
     print(json.dumps({
-        "phase":"live_artifact_intake_final_commit_fault",
+        "phase":"live_artifact_intake_final_asset_insert_fault",
         "fakeOnly":True,"fixture":"SYNTHETIC_DB_AND_FFMPEG",
         "faultInjection":"SQLite trigger rejected final video-asset INSERT after real Sidecar HTTP ACK",
         "apiStatus":intake.status_code,"apiCode":intake.json()["detail"]["code"],
