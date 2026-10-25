@@ -65,7 +65,7 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             cp "$RUNNER_TEMP/g70-ci-synthetic-original.mp4" api:/tmp/g70-ci-synthetic-original.mp4
-      - name: Inject live artifact-intake final SQL commit failure and preserve original task
+      - name: Inject live artifact-intake final asset INSERT failure after Sidecar ACK
         run: |
           set -euo pipefail
           docker compose -f infra/docker/docker-compose.yml \
