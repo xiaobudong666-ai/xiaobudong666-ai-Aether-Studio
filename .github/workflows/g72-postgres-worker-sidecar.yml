@@ -159,13 +159,15 @@ jobs:
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
             exec -T video-use ffmpeg -hide_banner -loglevel error -y \
-            -f lavfi -i color=c=black:s=64x64:r=2 -t 1 \
+            -f lavfi -i testsrc=size=320x240:rate=12 -t 3 \
             -c:v mpeg4 -pix_fmt yuv420p -movflags +faststart \
             /tmp/g72-midupload-ci.mp4
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
             cp video-use:/tmp/g72-midupload-ci.mp4 "$RUNNER_TEMP/g72-midupload-ci.mp4"
+          test "$(stat -c%s "$RUNNER_TEMP/g72-midupload-ci.mp4")" -gt 1000 \
+            || { echo "synthetic MP4 too small to satisfy native smoke input guard" >&2; exit 1; }
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
