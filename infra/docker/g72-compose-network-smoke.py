@@ -61,7 +61,7 @@ def seed_test_image_and_remix_rights(project_id: str) -> str:
         assert project is not None
         asset = DBAssetVersion(
             id=str(uuid.uuid4()), tenant_id=project.tenant_id,
-            project_id=project.id, media_id="synthetic-g72-ci-image",
+            project_id=project.id, media_id=f"synthetic-g72-ci-image-{project_id[:8]}",
             version_no=1, sha256="a" * 64, media_type="image",
             content_type="image/png", size_bytes=100,
             probe_json={"image": {"width": 48, "height": 48}},
@@ -196,6 +196,31 @@ def prepare() -> None:
 
 
 
+def prepare_browser_fixture() -> None:
+    """Seed a synthetic image/right for the browser-driven FAKE-only UI test.
+
+    The fixture has no uploaded source bytes and is never production evidence.
+    The browser still performs the normal UI preflight/create flow through the
+    same-origin API and waits for the live disposable Worker to finish.
+    """
+    project_name = "FAKE G72 browser E2E " + uuid.uuid4().hex[:12]
+    with authenticate() as client:
+        response = client.post("/projects", json={"name": project_name})
+        assert response.status_code == 201, (
+            f"browser fixture project create={response.status_code}"
+        )
+        project = response.json()
+        asset_id = seed_test_image_and_remix_rights(project["id"])
+        print(json.dumps({
+            "phase": "browser_fixture_ready",
+            "fakeOnly": True,
+            "fixture": "SYNTHETIC_DB_IMAGE_AND_REMIX_RIGHTS_NO_SOURCE_BYTES",
+            "projectId": project["id"],
+            "projectName": project_name,
+            "assetVersionId": asset_id,
+        }), flush=True)
+
+
 def verify_foreign_tenant_denials(saved: dict, replay_request: dict) -> None:
     """Native nonproduction auth negative, independent of Owner's session.
 
@@ -291,9 +316,11 @@ def verify() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("prepare", "verify"))
+    parser.add_argument("phase", choices=("prepare", "verify", "prepare-browser"))
     args = parser.parse_args()
     if args.phase == "prepare":
         prepare()
-    else:
+    elif args.phase == "verify":
         verify()
+    else:
+        prepare_browser_fixture()
