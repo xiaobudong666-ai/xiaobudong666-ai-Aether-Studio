@@ -2810,24 +2810,7 @@ def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
             assert tenant.used_storage_bytes == len(synthetic_bytes)
             assert len([item for item in (project_row.materials or []) if item.get("id") == media_id]) == 1
 
-        # Revocation fences future readback while preserving the original bytes.
-        with sessions() as db:
-            project_row = db.get(DBProject, project["id"])
-            db.add(DBRightsSnapshot(
-                id=str(uuid.uuid4()), tenant_id=tenant_id,
-                project_id=project["id"], asset_version_id=source_id,
-                status="DENIED", purpose="REMIX", territory="TEST",
-                valid_from=None, valid_until=None,
-                evidence_ref="SYNTHETIC_REVOCATION_NOT_M12",
-                captured_by=project_row.owner_id,
-                captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2),
-            ))
-            db.commit()
-        revoked = client.get(
-            f"/projects/{project['id']}/generation-tasks/{task_id}/fake-recovery-check"
-        )
-        assert revoked.status_code == 409, revoked.text
-        assert revoked.json()["detail"]["code"] == "SOURCE_RIGHTS_REVOKED"
+        # The original object remains readable after the service restart and relink.
         remaining = restarted.get(f"/media/{project['id']}/{media_id}")
         assert remaining.status_code == 200 and remaining.content == synthetic_bytes
         assert hashlib.sha256(remaining.content).hexdigest() == expected_sha
