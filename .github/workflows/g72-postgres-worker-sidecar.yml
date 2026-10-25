@@ -9,6 +9,7 @@ on:
       - infra/docker/docker-compose.g72-postgres-ci.override.yml
       - infra/docker/docker-compose.g72-fake-only.override.yml
       - infra/docker/g72-compose-network-smoke.py
+      - infra/docker/g72-pg-native-worker-lock-race-smoke.py
       - .github/workflows/g72-postgres-worker-sidecar.yml
       - apps/api/app/**
       - apps/worker/app/**
@@ -205,6 +206,99 @@ jobs:
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
             exec -e G72_PG_POSTACK_INJECTION=true -T api \
             python /tmp/g72-midupload-revocation-smoke.py verify
+
+      - name: Force two native Worker containers through one PostgreSQL table-lock barrier
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          # Pause only the ordinary daemon replicas; the two native Worker
+          # clients below use separate disposable Worker service containers.
+          compose stop worker
+          compose cp infra/docker/g72-pg-native-worker-lock-race-smoke.py \
+            api:/tmp/g72-pg-native-worker-lock-race-smoke.py
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py submit
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py lock \
+            > "$RUNNER_TEMP/g72-pg-lock-race.log" 2>&1 &
+          lock_pid=$!
+          ready=false
+          for i in $(seq 1 150); do
+            if grep -q G72_PG_LOCK_RACE_LOCK_HELD "$RUNNER_TEMP/g72-pg-lock-race.log"; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$lock_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/g72-pg-lock-race.log"
+              exit 1
+            fi
+            sleep .2
+          done
+          test "$ready" = true || { echo "PG lock barrier not armed" >&2; exit 1; }
+          compose run --rm --no-deps -T -e AETHER_WORKER_ID=g72-ci-lock-race-a \
+            worker python - > "$RUNNER_TEMP/g72-pg-native-a.log" 2>&1 <<'PY' &
+          import json, os
+          from app.main import initialize_worker, process_generation_task
+          assert os.environ["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert os.environ["AETHER_TALKING_HEAD_MODE"] == "disabled"
+          assert os.environ["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          c = initialize_worker()
+          print("G72_NATIVE_READY_A", flush=True)
+          job = c.generation_queue.claim()
+          print("G72_NATIVE_CLAIM_RESULT " + json.dumps({
+              "worker": "A", "claimed": bool(job),
+              "taskId": job.get("taskId") if job else None,
+          }), flush=True)
+          if job is not None:
+              result = process_generation_task(c, job, poll_interval=.2)
+              print("G72_NATIVE_PROCESS_RESULT " + str(result.get("status")), flush=True)
+          PY
+          a_pid=$!
+          compose run --rm --no-deps -T -e AETHER_WORKER_ID=g72-ci-lock-race-b \
+            worker python - > "$RUNNER_TEMP/g72-pg-native-b.log" 2>&1 <<'PY' &
+          import json, os
+          from app.main import initialize_worker, process_generation_task
+          assert os.environ["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert os.environ["AETHER_TALKING_HEAD_MODE"] == "disabled"
+          assert os.environ["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          c = initialize_worker()
+          print("G72_NATIVE_READY_B", flush=True)
+          job = c.generation_queue.claim()
+          print("G72_NATIVE_CLAIM_RESULT " + json.dumps({
+              "worker": "B", "claimed": bool(job),
+              "taskId": job.get("taskId") if job else None,
+          }), flush=True)
+          if job is not None:
+              result = process_generation_task(c, job, poll_interval=.2)
+              print("G72_NATIVE_PROCESS_RESULT " + str(result.get("status")), flush=True)
+          PY
+          b_pid=$!
+          wait "$lock_pid"
+          wait "$a_pid"
+          wait "$b_pid"
+          grep -q G72_PG_LOCK_RACE_TWO_CLAIMS_WAITING "$RUNNER_TEMP/g72-pg-lock-race.log"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          outcomes = []
+          for suffix in ("a", "b"):
+              log = (root / f"g72-pg-native-{suffix}.log").read_text()
+              rows = [line.split("G72_NATIVE_CLAIM_RESULT ", 1)[1]
+                      for line in log.splitlines()
+                      if "G72_NATIVE_CLAIM_RESULT " in line]
+              assert len(rows) == 1, (suffix, log[-1500:])
+              outcomes.append(json.loads(rows[0]))
+          assert [x["claimed"] for x in outcomes].count(True) == 1, outcomes
+          assert [x["claimed"] for x in outcomes].count(False) == 1, outcomes
+          print("G72_PG_NATIVE_DUAL_CLAIM_EXACTLY_ONE_PASS", flush=True)
+          PY
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify
+          compose up -d --wait --wait-timeout 180 --scale worker=2 worker
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify
 
       - name: Nonsecret failure diagnostics
         if: failure()
