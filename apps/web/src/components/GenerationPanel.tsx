@@ -40,6 +40,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   );
   const requestSequence = useRef(0);
   const idempotencyKeyRef = useRef<string | null>(null);
+  const lastModeRef = useRef<GenerationCapabilitySnapshot["mode"] | null>(null);
   const [open, setOpen] = useState(false);
   const [capabilities, setCapabilities] = useState<GenerationCapabilitySnapshot | null>(null);
   const [tasks, setTasks] = useState<ServerGenerationTask[]>([]);
@@ -107,11 +108,24 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   useEffect(() => {
     invalidatePreflight();
     setSelectedAssetIds([]);
+    setConfirmed(false);
     setReferences([]);
     setMessage(project?.id ? "已切换项目，正在从服务端恢复任务状态。" : null);
     void loadServerState();
     return () => { requestSequence.current += 1; };
   }, [loadServerState, project?.id]);
+
+  useEffect(() => {
+    const mode = capabilities?.mode;
+    if (!mode) return;
+    if (lastModeRef.current !== null && lastModeRef.current !== mode) {
+      setConfirmed(false);
+      setPreflightBody(null);
+      idempotencyKeyRef.current = null;
+      setMessage("生成模式已变化，旧确认与预检已失效；请重新确认后提交。");
+    }
+    lastModeRef.current = mode;
+  }, [capabilities?.mode]);
 
   useEffect(() => {
     if (!open || !project?.id || !tasks.some((task) => ACTIVE_STATUSES.has(task.status))) return undefined;
@@ -285,7 +299,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   </section>;
 
   if (!open) return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
-    <div><strong>AI 受治理生成</strong><span>任务状态由服务端持久化；真实 Provider 默认保持禁用。</span></div>
+    <div><strong>{fakeTalkingHeadMode ? "G72 · FAKE-only口播" : "AI 受治理生成"}</strong><span>{fakeTalkingHeadMode ? "仅本地合成，不调用真实Provider；输出不可发布。" : "任务状态由服务端持久化；真实 Provider 默认保持禁用。"}</span></div>
     {renderReadiness(true)}
     <button type="button" disabled={!project} onClick={() => setOpen(true)}>打开生成任务</button>
   </section>;
