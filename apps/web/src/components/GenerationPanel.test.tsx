@@ -151,7 +151,7 @@ describe("GenerationPanel server authority", () => {
   test("G72 mode change invalidates old confirmation and preflight", async () => {
     const fakeCapabilities = { ...capabilities, mode: "deterministic-fake", operatorMode: "deterministic-fake" };
     let readinessCalls = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/generation/providers/moneyprinter/readiness")) {
         readinessCalls += 1;
