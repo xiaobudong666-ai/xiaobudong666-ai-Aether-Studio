@@ -2591,30 +2591,42 @@ def test_g70_postupload_commit_failure_preserves_recovery_receipt_and_reservatio
 def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
     generation_context, tmp_path, monkeypatch
 ):
-    """FAKE-only native video-use HTTP/disk fault reproduction, not a remediation.
+    """FAKE-only native HTTP fault: the exact orphan is owner-self relinked after restart.
 
-    A real video-use FastAPI TestClient writes a disposable media file; only
-    the codec metadata probe is synthesized so the fault is deterministic.
-    A DB final-commit failure then leaves those sidecar bytes readable after
-    a new service instance starts, but no corresponding business asset.
-    This intentionally records the OPEN defect without deleting any bytes.
+    Uses a disposable talking-head task and a real sidecar FastAPI service/disk.
+    The only injected fault is the API's final SQL commit after the sidecar has
+    durably accepted the original bytes. No real Provider, trusted M12 issuer,
+    settlement, refund, quota release, or Provider resubmission is exercised.
     """
+    import hashlib
     import importlib.util
     import sys
     from sqlalchemy import event
     from sqlalchemy.orm import Session as OrmSession
 
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
+    monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-native-sidecar-db-fault")
-    task = create_task(client, project, key="g70-native-sidecar-commit-fault")
-    task_id = task["taskId"]
-    assert claim(client).status_code == 200
+    source_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, source_id, key="g70-native-sidecar-commit-fault",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=payload,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    claimed = claim(client)
+    assert claimed.status_code == 200 and claimed.json()["taskId"] == task_id
     assert transition(
         client, task_id, "RUNNING", upstreamJobId="g70-original-upstream",
     ).status_code == 200
     assert transition(
         client, task_id, "INGESTING",
-        upstreamJobId="g70-original-upstream", providerArtifactId="g70-original-output",
+        upstreamJobId="g70-original-upstream",
+        providerArtifactId="g70-original-output",
     ).status_code == 200
 
     sidecar_path = Path(__file__).resolve().parents[1] / "video_use" / "app" / "main.py"
@@ -2635,27 +2647,51 @@ def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
     )
     media_root = tmp_path / "g70-native-sidecar-root"
     state = {"uploaded": False, "faulted": False, "media": None}
+    sidecar_holder = {"client": None}
     synthetic_bytes = b"g70-disposable-synthetic-mp4-placeholder"
+    expected_sha = hashlib.sha256(synthetic_bytes).hexdigest()
+
+    def native_upload(
+        project_id, filename, content_type, stream, *,
+        recovery_key=None, expected_sha256=None,
+    ):
+        assert project_id == project["id"] and content_type == "video/mp4"
+        assert recovery_key and expected_sha256 == expected_sha
+        response = sidecar_holder["client"].post(
+            "/media",
+            data={
+                "projectId": project_id,
+                "recoveryKey": recovery_key,
+                "expectedSha256": expected_sha256,
+            },
+            files={"file": (filename, stream, content_type)},
+        )
+        assert response.status_code == 201, response.text
+        state.update(
+            uploaded=True, media=response.json(),
+            recovery_key=recovery_key, expected_sha256=expected_sha256,
+        )
+        return state["media"]
+
+    def lookup(project_id, recovery_key, expected_sha256):
+        response = sidecar_holder["client"].get(
+            f"/fake-recovery/{project_id}/{recovery_key}",
+            params={"expectedSha256": expected_sha256},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    monkeypatch.setattr(media_store, "upload_media", native_upload)
+    monkeypatch.setattr(media_store, "find_fake_recovery", lookup, raising=False)
+    app.state.video_use = media_store
+
+    def fail_once_after_sidecar_upload(session):
+        if state["uploaded"] and not state["faulted"]:
+            state["faulted"] = True
+            raise RuntimeError("g70 injected final SQL commit failure")
 
     with TestClient(sidecar_module.create_app(media_root=media_root)) as sidecar:
-        def native_upload(project_id, filename, content_type, stream):
-            response = sidecar.post(
-                "/media",
-                data={"projectId": project_id},
-                files={"file": (filename, stream, content_type)},
-            )
-            assert response.status_code == 201, response.text
-            state["media"] = response.json()
-            state["uploaded"] = True
-            return state["media"]
-
-        monkeypatch.setattr(media_store, "upload_media", native_upload)
-
-        def fail_once_after_sidecar_upload(session):
-            if state["uploaded"] and not state["faulted"]:
-                state["faulted"] = True
-                raise RuntimeError("g70 injected final SQL commit failure")
-
+        sidecar_holder["client"] = sidecar
         event.listen(OrmSession, "before_commit", fail_once_after_sidecar_upload)
         try:
             response = client.post(
@@ -2673,41 +2709,131 @@ def test_g70_native_video_use_http_orphan_persists_after_db_commit_failure(
         uploaded = state["media"]
         assert uploaded["projectId"] == project["id"]
         media_id = uploaded["mediaId"]
-        persisted = (
-            media_root / "projects" / project["id"] / "media" / f"{media_id}.mp4"
-        )
-        assert persisted.is_file()
-        assert persisted.read_bytes() == synthetic_bytes
-        response = sidecar.get(f"/media/{project['id']}/{media_id}")
-        assert response.status_code == 200 and response.content == synthetic_bytes
+        persisted = media_root / "projects" / project["id"] / "media" / f"{media_id}.mp4"
+        assert persisted.is_file() and persisted.read_bytes() == synthetic_bytes
+        assert sidecar.get(f"/media/{project['id']}/{media_id}").content == synthetic_bytes
 
-    # Reopening the native sidecar with the same disposable root confirms
-    # the orphan survives service restart, not just a fake in-memory adapter.
+    # A new sidecar service instance reads the same durable original bytes.
     with TestClient(sidecar_module.create_app(media_root=media_root)) as restarted:
-        response = restarted.get(f"/media/{project['id']}/{media_id}")
-        assert response.status_code == 200
-        assert response.content == synthetic_bytes
-    with sessions() as db:
-        stored = db.get(DBGenerationTask, task_id)
-        assert stored.status == "UNKNOWN"
-        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
-        assert stored.upstream_job_id == "g70-original-upstream"
-        assert stored.provider_artifact_id == "g70-original-output"
-        assert stored.media_id == media_id
-        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
-        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(synthetic_bytes)
-        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
-            DBGenerationEvent.generation_task_id == task_id,
-            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_HELD",
-        )).scalar_one() == 1
-        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.kind == "SETTLED"
-        )).scalar_one() == 0
+        sidecar_holder["client"] = restarted
+        readback = client.get(
+            f"/projects/{project['id']}/generation-tasks/{task_id}/fake-recovery-check"
+        )
+        assert readback.status_code == 200, readback.text
+        original = readback.json()
+        assert original["recoveryState"] == "FOUND_UNBOUND"
+        assert original["mediaId"] == media_id
+        assert original["sha256"] == expected_sha
+        assert original["sizeBytes"] == len(synthetic_bytes)
+        assert original["businessAssetBound"] is False
+        assert original["financialSettlementVerified"] is False
+
+        with sessions() as db:
+            stored = db.get(DBGenerationTask, task_id)
+            tenant_id = stored.tenant_id
+            assert stored.status == "UNKNOWN"
+            assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+            assert stored.upstream_job_id == "g70-original-upstream"
+            assert stored.provider_artifact_id == "g70-original-output"
+            assert stored.media_id == media_id and stored.asset_version_id is None
+            assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 1  # source image only
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.kind == "SETTLED"
+            )).scalar_one() == 0
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.kind == "RELEASED"
+            )).scalar_one() == 0
+            assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == len(synthetic_bytes)
+
+        retry = client.post(
+            f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
+        )
+        assert retry.status_code == 409
+        assert retry.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+        relink_url = (
+            f"/projects/{project['id']}/generation-tasks/{task_id}/fake-recovery-relink"
+        )
+        first = client.post(relink_url)
+        assert first.status_code == 200, first.text
+        bound = first.json()
+        assert bound["recoveryState"] == "BOUND_UNSETTLED"
+        assert bound["actorMode"] == "OWNER_SELF"
+        assert bound["businessAssetBound"] is True
+        assert bound["financialSettlementVerified"] is False
+        assert bound["settlementCreated"] is False
+        assert bound["reservationPreserved"] is True
+        assert bound["idempotent"] is False
+        assert bound["mediaId"] == media_id and bound["sha256"] == expected_sha
+
+        second = client.post(relink_url)
+        assert second.status_code == 200, second.text
+        replay = second.json()
+        assert replay["idempotent"] is True
+        assert replay["assetVersionId"] == bound["assetVersionId"]
+
+        with sessions() as db:
+            stored = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )).scalar_one()
+            assets = db.execute(select(DBAssetVersion).where(
+                DBAssetVersion.project_id == project["id"],
+                DBAssetVersion.media_id == media_id,
+            )).scalars().all()
+            relinks = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED",
+            )).scalar_one()
+            settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one()
+            released = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "RELEASED",
+            )).scalar_one()
+            reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "RESERVED",
+            )).scalar_one()
+            tenant = db.get(DBTenant, tenant_id)
+            project_row = db.get(DBProject, project["id"])
+            assert stored.status == "UNKNOWN"
+            assert stored.error_code == "ARTIFACT_RECOVERY_UNSETTLED"
+            assert stored.media_id == media_id
+            assert stored.asset_version_id == bound["assetVersionId"]
+            assert attempt.reconciliation_state == "ASSET_RELINKED_UNSETTLED"
+            assert len(assets) == 1 and assets[0].sha256 == expected_sha
+            assert assets[0].probe_json["provenance"]["generationTaskId"] == task_id
+            assert relinks == 1 and settled == 0 and released == 0 and reserved == 1
+            assert tenant.used_storage_bytes == len(synthetic_bytes)
+            assert len([item for item in (project_row.materials or []) if item.get("id") == media_id]) == 1
+
+        # Revocation fences future readback while preserving the original bytes.
+        with sessions() as db:
+            project_row = db.get(DBProject, project["id"])
+            db.add(DBRightsSnapshot(
+                id=str(uuid.uuid4()), tenant_id=tenant_id,
+                project_id=project["id"], asset_version_id=source_id,
+                status="DENIED", purpose="REMIX", territory="TEST",
+                valid_from=None, valid_until=None,
+                evidence_ref="SYNTHETIC_REVOCATION_NOT_M12",
+                captured_by=project_row.owner_id,
+                captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2),
+            ))
+            db.commit()
+        revoked = client.get(
+            f"/projects/{project['id']}/generation-tasks/{task_id}/fake-recovery-check"
+        )
+        assert revoked.status_code == 409, revoked.text
+        assert revoked.json()["detail"]["code"] == "SOURCE_RIGHTS_REVOKED"
+        remaining = restarted.get(f"/media/{project['id']}/{media_id}")
+        assert remaining.status_code == 200 and remaining.content == synthetic_bytes
+        assert hashlib.sha256(remaining.content).hexdigest() == expected_sha
+
     app.state.moneyprinter.assert_not_called()
-    pytest.xfail(
-        "KNOWN_G70_OPEN: native video-use bytes remain without a committed asset; "
-        "recovery/compensation and crash-proof transfer intent are still missing"
-    )
+
 
 @pytest.mark.parametrize("failure_mode", ["timeout-after-body", "server-503"])
 def test_g70_video_use_adapter_media_upload_is_not_retried_after_ambiguous_response(
