@@ -73,7 +73,12 @@ jobs:
           old = 'probe: z.record(z.unknown())'
           if data.count(old) != 1:
               raise SystemExit('Expected exactly one legacy typed record signature')
-          path.write_text(data.replace(old, 'probe: z.record(z.string(), z.unknown())'))
+          data = data.replace(old, 'probe: z.record(z.string(), z.unknown())')
+          output_marker = "  output: TimelineOutputSchema.nullish().transform((value) => value ?? undefined),\\n  tracks: z.array(TrackSchema),\\n});"
+          if data.count(output_marker) != 1:
+              raise SystemExit('Expected exactly one timeline optional-output marker')
+          data = data.replace(output_marker, output_marker[:-3] + "}).partial({ output: true });")
+          path.write_text(data)
           print('ZOD4_NATIVE_RECORD_SIGNATURE_FIXED_IN_EPHEMERAL_WORKTREE')
           PY
 
