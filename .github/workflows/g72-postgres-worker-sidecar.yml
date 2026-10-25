@@ -296,6 +296,12 @@ jobs:
           mapfile -t after_ids < <(compose ps -q worker | sort)
           test "${before_ids[*]}" = "${after_ids[*]}" || { echo "Daemon container changed" >&2; exit 1; }
           echo "G72_PG_LIVE_DAEMONS_REVOKE_CLAIM_NO_DISPATCH_PASS"
+          # Verify that this fail-closed decision survives a real daemon restart.
+          # Do not release RESERVED or mutate Owner-controlled refund policy.
+          compose restart worker
+          sleep 12
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify-revoked
+          echo "G72_PG_PRECLAIM_REVOKED_RESTART_NO_DISPATCH_PASS"
           # QUEUED remains open with RESERVED held: not a full lifecycle closure.
 
       - name: Nonsecret failure diagnostics
