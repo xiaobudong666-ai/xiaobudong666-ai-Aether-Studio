@@ -1,6 +1,6 @@
-"""FAKE-ONLY G70 Compose API -> video-use original media readback.
+"""FAKE-ONLY G70 Compose recovery for the same post-upload-ACK DB-failure task.
 Synthetic SQL identity/REMIX rights and FFmpeg bytes, not M11/M12 evidence.
-No business asset relinking, paid generation, refund, release, or Provider calls.
+Owner-self relink is exercised; no paid generation, settlement, refund, release, or Provider calls.
 """
 from __future__ import annotations
 import argparse
@@ -255,6 +255,8 @@ def verify():
         relinks = db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == state["taskId"],
             DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED")).scalar_one()
+        attempts = db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == state["taskId"])).scalar_one()
         settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == state["taskId"],
             DBGenerationUsageEntry.kind == "SETTLED")).scalar_one()
@@ -271,7 +273,8 @@ def verify():
         assert attempt.reconciliation_state == "ASSET_RELINKED_UNSETTLED"
         assert len(assets) == 1 and assets[0].sha256 == state["sha"]
         assert assets[0].probe_json["provenance"]["generationTaskId"] == state["taskId"]
-        assert relinks == 1 and settled == 0 and released == 0 and reserved_count == 1
+        assert relinks == 1 and attempts == 1 and task.attempts == 1
+        assert settled == 0 and released == 0 and reserved_count == 1
         assert tenant.used_storage_bytes == state["size"]
         assert len([item for item in (project.materials or []) if item.get("id") == state["mediaId"]]) == 1
 
