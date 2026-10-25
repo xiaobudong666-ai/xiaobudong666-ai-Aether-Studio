@@ -2511,10 +2511,12 @@ def create_app(
             )
 
         project = db.execute(
-            select(DBProject).where(
+            select(DBProject)
+            .where(
                 DBProject.id == task.project_id,
                 DBProject.tenant_id == task.tenant_id,
             )
+            .with_for_update()
         ).scalar_one_or_none()
         if project is None:
             raise HTTPException(status_code=404, detail={"code": "PROJECT_NOT_FOUND", "message": "项目不存在"})
