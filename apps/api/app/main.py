@@ -2337,16 +2337,22 @@ def create_app(
 
         # Serialize repeated recovery attempts before checking or mutating the task.
         begin_serialized_write(db)
-        task = generation_task_for_tenant(db, project_id, task_id, context)
+        # Lock the scoped row in the first read. Do not pre-load a stale task
+        # into the SQLAlchemy identity map before acquiring the PostgreSQL lock.
         task = db.execute(
             select(DBGenerationTask)
             .where(
-                DBGenerationTask.id == task.id,
+                DBGenerationTask.id == task_id,
                 DBGenerationTask.tenant_id == context.tenant_id,
                 DBGenerationTask.project_id == project_id,
             )
             .with_for_update()
-        ).scalar_one()
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"},
+            )
 
         # This endpoint is Owner-self only. It is not an admin delegation path.
         if context.user_id != task.requested_by:
