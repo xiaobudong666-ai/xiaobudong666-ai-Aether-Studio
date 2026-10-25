@@ -37,7 +37,17 @@ def guard():
     assert os.getenv("AETHER_FAKE_ONLY_NONPROD") == "true"
     assert os.getenv("AETHER_RUNTIME_STAGE") == "nonproduction"
     assert os.getenv("AETHER_GENERATION_PROVIDER_MODE") == "deterministic-fake"
-    assert os.getenv("DATABASE_URL") == "sqlite:////data/aether.db"
+    database_url = os.getenv("DATABASE_URL", "")
+    if os.getenv("G72_PG_POSTACK_INJECTION") == "true":
+        # The ONLY permitted PG target is this disposable CI container.
+        assert database_url == (
+            "postgresql+psycopg://ci_g72:ci-only-postgres-password@"
+            "postgres-g72:5432/aether_g72_ci"
+        ), "nonproduction disposable PostgreSQL required"
+        assert engine.dialect.name == "postgresql"
+    else:
+        # Retain the existing independent SQLite post-ACK test guard.
+        assert database_url == "sqlite:////data/aether.db"
     assert os.getenv("VIDEO_USE_API_URL") == VIDEO_USE
     assert os.getenv("AETHER_BOOTSTRAP_ADMIN_PASSWORD", "").startswith("ci-")
     assert os.getenv("AETHER_WORKER_TOKEN", "").startswith("ci-")
