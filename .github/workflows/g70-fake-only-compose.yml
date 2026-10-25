@@ -74,7 +74,7 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py prepare
-      - name: Restart two native services and verify durable original
+      - name: Restart services and relink the same failed task idempotently
         run: |
           set -euo pipefail
           docker compose -f infra/docker/docker-compose.yml \
