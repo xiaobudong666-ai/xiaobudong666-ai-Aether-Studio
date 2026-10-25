@@ -257,6 +257,47 @@ jobs:
           done
           echo "G72_PG_TWO_LIVE_DAEMONS_LOCK_RACE_PASS"
 
+      - name: Two live Worker daemons blocked on PG claim while synthetic source rights revoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          # The same two real Worker daemon loops, no new Provider capability.
+          # Stop solely to arm an independent FAKE-only task and PG lock.
+          compose stop worker
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py submit-revoke
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py lock-revoke \
+            > "$RUNNER_TEMP/g72-pg-revoked-claim-race.log" 2>&1 &
+          lock_pid=$!
+          barrier_ready=false
+          for i in $(seq 1 150); do
+            if grep -q G72_PG_LOCK_RACE_LOCK_HELD "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"; then
+              barrier_ready=true
+              break
+            fi
+            if ! kill -0 "$lock_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"
+              exit 1
+            fi
+            sleep .2
+          done
+          test "$barrier_ready" = true || { echo "PG revoked-claim barrier not armed" >&2; exit 1; }
+          compose up -d --no-deps --scale worker=2 worker
+          mapfile -t before_ids < <(compose ps -q worker | sort)
+          test "${#before_ids[@]}" -eq 2 || { echo "Two daemon containers required" >&2; exit 1; }
+          wait "$lock_pid"
+          grep -q G72_PG_LOCK_RACE_TWO_CLAIMS_WAITING "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"
+          grep -q G72_PG_TWO_CLAIM_WAITERS_REVOKED_BEFORE_UNLOCK "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify-revoked
+          mapfile -t after_ids < <(compose ps -q worker | sort)
+          test "${before_ids[*]}" = "${after_ids[*]}" || { echo "Daemon container changed" >&2; exit 1; }
+          echo "G72_PG_LIVE_DAEMONS_REVOKE_CLAIM_NO_DISPATCH_PASS"
+          # QUEUED remains open with RESERVED held: not a full lifecycle closure.
+
       - name: Nonsecret failure diagnostics
         if: failure()
         shell: bash
