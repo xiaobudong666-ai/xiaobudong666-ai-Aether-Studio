@@ -117,7 +117,7 @@ def prepare():
             request_hash="b"*64,
             capability_snapshot_json={"quota":{"monthlyGeneratedSecondsLimit":100}},
             capability_snapshot_hash="c"*64, idempotency_key=str(uuid.uuid4()),
-            upstream_job_id=upstream, provider_artifact_id=None,
+            upstream_job_id=upstream, provider_artifact_id=artifact,
             media_id=None, asset_version_id=None, attempts=1, max_attempts=1,
             lease_owner=worker_id, lease_expires_at=now + dt.timedelta(minutes=15),
             cancel_requested_at=None, error_code=None, error_message=None,
