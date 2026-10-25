@@ -10,6 +10,7 @@ on:
       - infra/docker/docker-compose.g72-fake-only.override.yml
       - infra/docker/g72-compose-network-smoke.py
       - infra/docker/g72-pg-native-worker-lock-race-smoke.py
+      - infra/docker/g72-midupload-revocation-smoke.py
       - .github/workflows/g72-postgres-worker-sidecar.yml
       - apps/api/app/**
       - apps/worker/app/**
