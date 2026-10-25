@@ -1,0 +1,154 @@
+name: G72 PostgreSQL Worker Sidecar FAKE-only integration
+
+on:
+  push:
+    branches:
+      - feat/fusion-m0-g72-media-auth-negative-20261025
+    paths:
+      - infra/docker/api.g72-postgres-ci.Dockerfile
+      - infra/docker/docker-compose.g72-postgres-ci.override.yml
+      - infra/docker/docker-compose.g72-fake-only.override.yml
+      - infra/docker/g72-compose-network-smoke.py
+      - .github/workflows/g72-postgres-worker-sidecar.yml
+      - apps/api/app/**
+      - apps/worker/app/**
+
+permissions:
+  contents: read
+
+jobs:
+  g72-postgres-worker-sidecar:
+    # Nonproduction FAKE-only evidence; NOT real Provider, M12, or release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE_PROJECT_NAME: aether-g72pg-${{ github.run_id }}-${{ github.run_attempt }}
+      AETHER_COOKIE_SECURE: "false"
+      AETHER_API_PORT: "18300"
+      AETHER_WORKER_PORT: "18301"
+    steps:
+      - name: Checkout exact isolated branch SHA
+        uses: actions/checkout@v4
+
+      - name: Generate disposable Owner and Worker credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_password="ci-$(openssl rand -hex 24)"
+          worker_token="ci-$(openssl rand -hex 32)"
+          echo "::add-mask::$owner_password"
+          echo "::add-mask::$worker_token"
+          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$owner_password" >> "$GITHUB_ENV"
+          echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+
+      - name: Fail closed unless isolated PostgreSQL and fake-only settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            config --format json > "$RUNNER_TEMP/g72-pg-config.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-pg-config.json").read_text())["services"]
+          api, worker, sidecar, pg = (services[n] for n in ("api", "worker", "video-use", "postgres-g72"))
+          assert api["environment"]["DATABASE_URL"] == (
+              "postgresql+psycopg://ci_g72:ci-only-postgres-password@postgres-g72:5432/aether_g72_ci"
+          )
+          assert api["build"]["dockerfile"] == "infra/docker/api.g72-postgres-ci.Dockerfile"
+          assert api["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert api["environment"]["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert api["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert worker["environment"]["AETHER_TALKING_HEAD_MODE"] == "disabled"
+          assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          assert worker["environment"]["AETHER_GENERATION_CANARY_PROFILE"] == "disabled"
+          assert sidecar["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert not pg.get("ports") and set(pg["networks"]) == {"aether-net"}
+          assert pg["environment"]["POSTGRES_DB"] == "aether_g72_ci"
+          assert set(api["networks"]) == {"aether-net"}
+          assert not api["environment"].get("HEYGEN_API_KEY")
+          PY
+
+      - name: Build and start real API Worker Sidecar with PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            up -d --build --wait --wait-timeout 420 api worker video-use
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
+
+      - name: Verify API connected to real disposable PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -T api python - <<'PY'
+          import os
+          from sqlalchemy import text
+          from app.database import engine
+          assert os.environ["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert os.environ["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert engine.dialect.name == "postgresql"
+          with engine.connect() as db:
+              assert db.scalar(text("SELECT current_database()")) == "aether_g72_ci"
+              assert int(db.scalar(text("SHOW server_version_num"))) >= 160000
+          print("G72_PG_API_CONNECTION_PASS", flush=True)
+          PY
+
+      - name: Real Worker to Sidecar media and database receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py prepare
+
+      - name: Restart real Worker and Sidecar then verify immutable media and auth
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            restart video-use worker
+          sleep 12
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py verify
+
+      - name: Nonsecret failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            ps || true
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            logs --tail=80 api worker video-use postgres-g72 2>&1 \
+            | sed -E 's/ci-only-postgres-password/[REDACTED]/g' || true
+
+      - name: Destroy the complete disposable stack and database volume
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+              down --volumes --remove-orphans || true
+          fi
