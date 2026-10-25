@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        import_mode: [zod3-compat-subpath]
+        import_mode: [zod4-native-record-fix]
     steps:
       - name: Checkout fixed isolated source SHA
         uses: actions/checkout@v4
@@ -61,6 +61,20 @@ jobs:
           print('ZOD3_COMPAT_IMPORT_FILES=', count)
           if count == 0:
               raise SystemExit('No Zod imports located; compatibility branch would test unchanged imports')
+          PY
+
+      - name: Apply only the Zod v4 typed-record signature fix (runner only)
+        if: matrix.import_mode == 'zod4-native-record-fix'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('packages/contracts/src/schemas.ts')
+          data = path.read_text()
+          old = 'probe: z.record(z.unknown())'
+          if data.count(old) != 1:
+              raise SystemExit('Expected exactly one legacy typed record signature')
+          path.write_text(data.replace(old, 'probe: z.record(z.string(), z.unknown())'))
+          print('ZOD4_NATIVE_RECORD_SIGNATURE_FIXED_IN_EPHEMERAL_WORKTREE')
           PY
 
       - name: Verify advisory patch with unchanged audit policy
