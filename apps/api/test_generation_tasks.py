@@ -3549,7 +3549,7 @@ def _seed_g70_relink_case(client, sessions, app, *, suffix="happy"):
     return {
         "project": project_json,
         "taskId": task_id,
-        "tenantId": project.tenant_id,
+        "tenantId": tenant_id,
         "sourceId": source_id,
         "mediaId": sidecar_result["mediaId"],
         "sha": expected_sha,
