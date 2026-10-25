@@ -1,0 +1,82 @@
+name: FUSION-M0 Zod v4 compatibility probe (FAKE-only, no release)
+
+on:
+  push:
+    branches:
+      - test/fusion-m0-zod4-compat-probe-20261025
+    paths:
+      - .github/workflows/fusion-zod4-compat-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zod4-isolated-compatibility:
+    # This is a disposable package-resolution experiment only. It must never
+    # waive the normal CI security audit or change committed runtime packages.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        import_mode: [zod4-native, zod3-compat-subpath]
+    steps:
+      - name: Checkout fixed isolated source SHA
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm 10.30.3
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Verify committed lockfile before experiment
+        run: pnpm install --frozen-lockfile
+
+      - name: Install patched Zod only in disposable runner
+        run: |
+          set -euo pipefail
+          pnpm --filter @aether/contracts add zod@4.6.6 --save-exact
+          pnpm --filter @aether/contracts list zod --depth 0
+          node -e "const v=require('./packages/contracts/node_modules/zod/package.json').version; if(v!=='4.6.6') process.exit(1); console.log('ZOD_EXACT_PATCHED_VERSION='+v)"
+
+      - name: Try compatibility import surface (runner only)
+        if: matrix.import_mode == 'zod3-compat-subpath'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          files = list(Path('packages/contracts/src').rglob('*.ts'))
+          count = 0
+          for path in files:
+              data = path.read_text()
+              new = data.replace('from "zod"', 'from "zod/v3"').replace("from 'zod'", "from 'zod/v3'")
+              if new != data:
+                  path.write_text(new)
+                  count += 1
+          print('ZOD3_COMPAT_IMPORT_FILES=', count)
+          if count == 0:
+              raise SystemExit('No Zod imports located; compatibility branch would test unchanged imports')
+          PY
+
+      - name: Verify advisory patch with unchanged audit policy
+        run: pnpm audit --prod
+
+      - name: Lint all packages (temporary dependency only)
+        run: pnpm lint
+
+      - name: Typecheck and build all packages
+        run: pnpm build
+
+      - name: Run package and web unit tests
+        run: pnpm test
+
+      - name: Record uncommitted experiment files
+        if: always()
+        run: |
+          git diff --name-only
+          echo 'RESULT_IS_ONLY_A_NONPRODUCTION_COMPATIBILITY_EXPERIMENT'
