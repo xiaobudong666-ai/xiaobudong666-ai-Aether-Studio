@@ -2310,6 +2310,339 @@ def create_app(
             "requiresSeparateRelinkGate": True,
         }
 
+
+    @created_app.post("/projects/{project_id}/generation-tasks/{task_id}/fake-recovery-relink")
+    def relink_original_fake_artifact_owner_self(
+        project_id: str,
+        task_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        """G70 FAKE-only one-time asset binding; never settles or refunds usage.
+
+        Only the original task requester acting as owner may bind the verified
+        original sidecar object. Admin acting-on-behalf, trusted rights issuance,
+        settlement, refund and Provider resubmission are deliberately excluded.
+        """
+        require_roles(context, "owner")
+        if not (
+            created_app.state.generation_provider_mode == "deterministic-fake"
+            and os.environ.get("AETHER_FAKE_ONLY_NONPROD", "").lower() == "true"
+            and os.environ.get("AETHER_RUNTIME_STAGE", "").lower() == "nonproduction"
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "FAKE_RECOVERY_DISABLED", "message": "非生产原媒资恢复入口未启用"},
+            )
+
+        # Serialize repeated recovery attempts before checking or mutating the task.
+        begin_serialized_write(db)
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        task = db.execute(
+            select(DBGenerationTask)
+            .where(
+                DBGenerationTask.id == task.id,
+                DBGenerationTask.tenant_id == context.tenant_id,
+                DBGenerationTask.project_id == project_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+
+        # This endpoint is Owner-self only. It is not an admin delegation path.
+        if context.user_id != task.requested_by:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "OWNER_SELF_ONLY", "message": "原媒资重关联仅允许原任务发起Owner本人操作"},
+            )
+        if task.provider != "deterministic-fake-talking-head":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "RECOVERY_PROVIDER_NOT_SUPPORTED", "message": "当前仅支持隔离FAKE口播原媒资恢复"},
+            )
+
+        if task.asset_version_id is not None:
+            asset = db.execute(
+                select(DBAssetVersion).where(
+                    DBAssetVersion.id == task.asset_version_id,
+                    DBAssetVersion.tenant_id == task.tenant_id,
+                    DBAssetVersion.project_id == task.project_id,
+                )
+            ).scalar_one_or_none()
+            event = db.execute(
+                select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == task.id,
+                    DBGenerationEvent.attempt_id == current_generation_attempt(db, task).id,
+                    DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED",
+                    DBGenerationEvent.actor_type == "OWNER_SELF",
+                    DBGenerationEvent.actor_id == context.user_id,
+                )
+            ).scalar_one_or_none()
+            event_metadata = (event.metadata_json or {}) if event is not None else {}
+            if (
+                asset is not None
+                and event is not None
+                and event_metadata.get("assetVersionId") == asset.id
+                and event_metadata.get("mediaId") == asset.media_id == task.media_id
+                and event_metadata.get("sha256") == asset.sha256
+                and event_metadata.get("financialSettlementVerified") is False
+            ):
+                db.rollback()
+                return {
+                    "taskId": task.id,
+                    "projectId": task.project_id,
+                    "recoveryState": "BOUND_UNSETTLED",
+                    "actorMode": "OWNER_SELF",
+                    "assetVersionId": asset.id,
+                    "mediaId": asset.media_id,
+                    "sha256": asset.sha256,
+                    "businessAssetBound": True,
+                    "financialSettlementVerified": False,
+                    "settlementCreated": False,
+                    "idempotent": True,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ASSET_ALREADY_BOUND", "message": "任务已关联资产，但缺少匹配的G70恢复审计凭据"},
+            )
+
+        if (
+            task.status != "UNKNOWN"
+            or task.error_code != "ARTIFACT_INGEST_FAILED"
+            or task.cancel_requested_at is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "RECOVERY_NOT_PENDING", "message": "当前任务不允许原媒资重关联"},
+            )
+        circuit = generation_circuit(db, task.tenant_id)
+        if circuit is not None and circuit.state == "DISABLED":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROVIDER_EMERGENCY_STOPPED", "message": "停机期间禁止恢复操作"},
+            )
+
+        # Reuse the existing read-only validator for durable intent, tenant/project
+        # scope, original media hash/probe and current synthetic rights checks.
+        checked = check_original_fake_artifact_readonly(project_id, task_id, context, db)
+        attempt = current_generation_attempt(db, task)
+        intent = db.execute(
+            select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.attempt_id == attempt.id,
+                DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+            )
+        ).scalar_one_or_none()
+        intent_metadata = (intent.metadata_json or {}) if intent is not None else {}
+        recovery_key = intent_metadata.get("fakeRecoveryKey")
+        expected_sha = intent_metadata.get("sha256")
+        expected_size = intent_metadata.get("sizeBytes")
+        if not (
+            checked.get("recoveryState") == "FOUND_UNBOUND"
+            and checked.get("mediaId")
+            and checked.get("sha256") == expected_sha
+            and checked.get("sizeBytes") == expected_size
+            and isinstance(recovery_key, str)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "DURABLE_RECOVERY_INTENT_INVALID", "message": "原媒资核对结果与持久意图不一致"},
+            )
+
+        try:
+            original = created_app.state.video_use.find_fake_recovery(
+                task.project_id, recovery_key, expected_sha
+            )
+        except VideoUseError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "ORIGINAL_MEDIA_LOOKUP_UNAVAILABLE", "message": "原媒资侧车核对失败，保持隔离"},
+            ) from exc
+        metadata = original.get("metadata") or {}
+        try:
+            duration_seconds = float(metadata.get("durationSeconds") or 0)
+            size_bytes = int(metadata.get("sizeBytes") or 0)
+            probe_valid = bool(metadata.get("video")) and duration_seconds > 0 and size_bytes == expected_size
+        except (TypeError, ValueError):
+            probe_valid = False
+            duration_seconds = 0.0
+            size_bytes = 0
+        media_id = original.get("mediaId")
+        if not (
+            original.get("projectId") == task.project_id
+            and original.get("sha256") == expected_sha
+            and original.get("contentType") == "video/mp4"
+            and media_id == checked.get("mediaId")
+            and isinstance(media_id, str)
+            and media_id.startswith("g70")
+            and probe_valid
+            and (task.media_id is None or task.media_id == media_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORIGINAL_MEDIA_SCOPE_OR_HASH_MISMATCH", "message": "原媒资校验不通过，禁止重关联"},
+            )
+
+        # Recheck source scope and current FAKE rights immediately before binding.
+        # This is not a substitute for M12 trusted issuer/epoch or a serialized
+        # revocation protocol; those remain separate acceptance gates.
+        source_id = (task.request_json or {}).get("imageAssetId")
+        source = db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.id == source_id,
+                DBAssetVersion.tenant_id == task.tenant_id,
+                DBAssetVersion.project_id == task.project_id,
+            )
+        ).scalar_one_or_none()
+        if (
+            source is None
+            or source.media_type != "image"
+            or source.sha256 != (task.request_json or {}).get("sourceAssetSha256")
+            or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), utc_now())["allowed"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "SOURCE_RIGHTS_REVOKED", "message": "源素材授权已失效，禁止原媒资重关联"},
+            )
+
+        project = db.execute(
+            select(DBProject).where(
+                DBProject.id == task.project_id,
+                DBProject.tenant_id == task.tenant_id,
+            )
+        ).scalar_one_or_none()
+        if project is None:
+            raise HTTPException(status_code=404, detail={"code": "PROJECT_NOT_FOUND", "message": "项目不存在"})
+
+        provenance = {
+            "provider": task.provider,
+            "providerArtifactId": task.provider_artifact_id,
+            "generationTaskId": task.id,
+            "attempt": task.attempts,
+            "capabilitySnapshotHash": task.capability_snapshot_hash,
+            "recoveredOriginalMedia": True,
+        }
+        probe = {**metadata, "provenance": provenance}
+        existing_assets = db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == task.project_id,
+                DBAssetVersion.media_id == media_id,
+            )
+        ).scalars().all()
+        if existing_assets:
+            if len(existing_assets) != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ASSET_MEDIA_ID_COLLISION", "message": "原媒资对应多个资产版本，禁止自动重关联"},
+                )
+            asset = existing_assets[0]
+            existing_provenance = (asset.probe_json or {}).get("provenance") or {}
+            if not (
+                asset.tenant_id == task.tenant_id
+                and asset.sha256 == expected_sha
+                and asset.media_type == "video"
+                and asset.content_type == "video/mp4"
+                and asset.size_bytes == expected_size
+                and existing_provenance.get("generationTaskId") == task.id
+                and existing_provenance.get("attempt") == task.attempts
+                and existing_provenance.get("providerArtifactId") == task.provider_artifact_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ASSET_MEDIA_ID_COLLISION", "message": "已有资产与原任务/哈希证明不一致"},
+                )
+        else:
+            next_version = (
+                db.execute(
+                    select(func.max(DBAssetVersion.version_no)).where(
+                        DBAssetVersion.project_id == task.project_id,
+                        DBAssetVersion.media_id == media_id,
+                    )
+                ).scalar_one_or_none()
+                or 0
+            ) + 1
+            asset = DBAssetVersion(
+                id=str(uuid.uuid4()),
+                tenant_id=task.tenant_id,
+                project_id=task.project_id,
+                media_id=media_id,
+                version_no=next_version,
+                sha256=expected_sha,
+                media_type="video",
+                content_type="video/mp4",
+                size_bytes=size_bytes,
+                probe_json=probe,
+                created_by=task.requested_by,
+                created_at=utc_now(),
+            )
+            db.add(asset)
+
+        now = utc_now()
+        material = {
+            "id": media_id,
+            "name": f"generation-{task.id}.mp4",
+            "url": f"/api/video-use/media/{task.project_id}/{media_id}",
+            "type": "video",
+            "contentType": "video/mp4",
+            "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
+            "sizeBytes": size_bytes,
+        }
+        materials = list(project.materials or [])
+        if not any(item.get("id") == media_id for item in materials):
+            project.materials = [*materials, material]
+            project.revision += 1
+            project.updated_at = now
+
+        previous_error = task.error_code
+        task.media_id = media_id
+        task.asset_version_id = asset.id
+        task.error_code = "ARTIFACT_RECOVERY_UNSETTLED"
+        task.error_message = "原始媒体已恢复关联；可信结算仍待独立核验"
+        task.message = "原始媒体已幂等关联，结算状态待独立核验"
+        task.updated_at = now
+        attempt.reconciliation_state = "ASSET_RELINKED_UNSETTLED"
+        attempt.error_code = task.error_code
+        attempt.error_message = task.error_message
+        add_generation_event(
+            db,
+            task,
+            attempt=attempt,
+            event_type="ARTIFACT_ASSET_RELINKED",
+            actor_type="OWNER_SELF",
+            actor_id=context.user_id,
+            from_status="UNKNOWN",
+            to_status="UNKNOWN",
+            metadata={
+                "actorMode": "OWNER_SELF",
+                "assetVersionId": asset.id,
+                "mediaId": media_id,
+                "sha256": expected_sha,
+                "sizeBytes": size_bytes,
+                "previousErrorCode": previous_error,
+                "financialSettlementVerified": False,
+                "settlementCreated": False,
+                "reservationPreserved": True,
+                "providerResubmitted": False,
+                "trustedM12": False,
+            },
+            now=now,
+        )
+        db.commit()
+        return {
+            "taskId": task.id,
+            "projectId": task.project_id,
+            "recoveryState": "BOUND_UNSETTLED",
+            "actorMode": "OWNER_SELF",
+            "assetVersionId": asset.id,
+            "mediaId": media_id,
+            "sha256": expected_sha,
+            "sizeBytes": size_bytes,
+            "businessAssetBound": True,
+            "financialSettlementVerified": False,
+            "settlementCreated": False,
+            "reservationPreserved": True,
+            "idempotent": False,
+        }
+
     @created_app.post("/internal/generation-tasks/{task_id}/artifact-intake", status_code=201)
     def intake_generation_artifact(
         task_id: str,
