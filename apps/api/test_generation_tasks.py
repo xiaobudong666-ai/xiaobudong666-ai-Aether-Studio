@@ -3412,6 +3412,7 @@ def _seed_g70_relink_case(client, sessions, app, *, suffix="happy"):
     with sessions() as db:
         project = db.get(DBProject, project_json["id"])
         tenant = db.get(DBTenant, project.tenant_id)
+        tenant_id = project.tenant_id
         source = DBAssetVersion(
             id=source_id,
             tenant_id=project.tenant_id,
@@ -3493,7 +3494,7 @@ def _seed_g70_relink_case(client, sessions, app, *, suffix="happy"):
             actor_type="WORKER",
             actor_id="synthetic-ci",
             metadata_json={
-                "tenantId": project.tenant_id,
+                "tenantId": tenant_id,
                 "projectId": project.id,
                 "attempt": 1,
                 "upstreamJobId": task.upstream_job_id,
@@ -3562,8 +3563,6 @@ def _seed_g70_relink_case(client, sessions, app, *, suffix="happy"):
 def test_g70_owner_self_relink_is_idempotent_and_never_settles(
     generation_context, monkeypatch,
 ):
-    import os
-
     monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
     monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
     client, sessions, app, _media_store = generation_context
@@ -3640,8 +3639,6 @@ def test_g70_owner_self_relink_is_idempotent_and_never_settles(
 def test_g70_owner_self_relink_fails_closed_for_wrong_actor_scope_hash_and_revocation(
     generation_context, monkeypatch,
 ):
-    import os
-
     monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", "true")
     monkeypatch.setenv("AETHER_RUNTIME_STAGE", "nonproduction")
     client, sessions, app, _media_store = generation_context
