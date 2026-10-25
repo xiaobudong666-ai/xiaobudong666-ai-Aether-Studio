@@ -6,6 +6,7 @@ issuance, delegated-Owner acceptance, or production evidence.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -13,12 +14,13 @@ import runpy
 import sys
 import time
 import uuid
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 
 # CI copies this file to /tmp; native API modules live in /app.
 sys.path.insert(0, "/app")
 
 STATE = Path("/tmp/g72-pg-native-worker-lock-race.json")
+REVOKED_STATE = Path("/tmp/g72-pg-native-worker-revoked-claim.json")
 SMOKE = Path("/tmp/g72-compose-network-smoke.py")
 PG = ("postgresql+psycopg://ci_g72:ci-only-postgres-password@"
       "postgres-g72:5432/aether_g72_ci")
@@ -34,7 +36,7 @@ def guard():
     assert SMOKE.is_file()
 
 
-def submit():
+def submit(state_path: Path = STATE):
     from app.database import SessionLocal
     from app.models import DBGenerationTask
     smoke = runpy.run_path(str(SMOKE))
@@ -64,12 +66,13 @@ def submit():
     with SessionLocal() as db:
         row = db.get(DBGenerationTask, task_id)
         assert row and row.status == "QUEUED" and row.lease_owner is None
-    assert not STATE.exists(), "state must be disposable and unique"
-    STATE.write_text(json.dumps({"projectId": pid, "taskId": task_id}))
+    assert not state_path.exists(), "state must be disposable and unique"
+    state_path.write_text(json.dumps({"projectId": pid, "taskId": task_id,
+                                      "sourceId": image}))
     print("G72_PG_LOCK_RACE_TASK_QUEUED", flush=True)
 
 
-def lock():
+def lock(inject_revoke: bool = False):
     from app.database import engine
     assert engine.dialect.name == "postgresql"
     # ACCESS EXCLUSIVE holds both real API Worker-claim SQL statements at the
@@ -87,6 +90,34 @@ def lock():
                 )) or 0)
             if n >= 2:
                 print("G72_PG_LOCK_RACE_TWO_CLAIMS_WAITING", flush=True)
+                if inject_revoke:
+                    # The claims are blocked on generation_tasks while a
+                    # separate SQL transaction durably revokes REMIX rights.
+                    # The physical Sidecar remains untouched.
+                    from app.database import SessionLocal
+                    from app.models import DBAssetVersion, DBRightsSnapshot
+                    state = json.loads(REVOKED_STATE.read_text())
+                    with SessionLocal() as db:
+                        source = db.get(DBAssetVersion, state["sourceId"])
+                        assert source and source.project_id == state["projectId"]
+                        previous = db.execute(select(DBRightsSnapshot).where(
+                            DBRightsSnapshot.asset_version_id == source.id,
+                            DBRightsSnapshot.purpose == "REMIX",
+                        ).order_by(DBRightsSnapshot.captured_at.desc())).scalars().first()
+                        assert previous and previous.status == "ALLOWED"
+                        db.add(DBRightsSnapshot(
+                            id=str(uuid.uuid4()), tenant_id=source.tenant_id,
+                            project_id=source.project_id, asset_version_id=source.id,
+                            status="REVOKED", purpose="REMIX", territory="TEST",
+                            valid_from=None, valid_until=None,
+                            evidence_ref="SYNTHETIC_G72_PG_TWO_LIVE_DAEMON_REVOKE",
+                            captured_by=previous.captured_by,
+                            captured_at=dt.datetime.now(dt.timezone.utc)
+                                + dt.timedelta(seconds=2),
+                        ))
+                        db.commit()
+                    print("G72_PG_TWO_CLAIM_WAITERS_REVOKED_BEFORE_UNLOCK",
+                          flush=True)
                 break
             time.sleep(.1)
         else:
@@ -120,9 +151,84 @@ def verify():
     }), flush=True)
 
 
+
+def verify_revoked():
+    """Synthetic rights revoked while two daemon claims wait in real PG.
+
+    SAFETY ONLY: the current API skips revoked queued tasks, which leaves them
+    QUEUED with RESERVED usage. This deliberately does not mark G72 closed or
+    decide any Owner-controlled cancellation/refund policy.
+    """
+    from app.database import SessionLocal
+    from app.models import (
+        DBAssetVersion, DBGenerationTask, DBGenerationEvent,
+        DBGenerationAttempt, DBGenerationUsageEntry, DBRightsSnapshot,
+    )
+    state = json.loads(REVOKED_STATE.read_text())
+    time.sleep(8)  # prove both running daemon loops have time to retry claim
+    with SessionLocal() as db:
+        task = db.get(DBGenerationTask, state["taskId"])
+        assert task and task.project_id == state["projectId"]
+        latest = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == state["sourceId"],
+            DBRightsSnapshot.purpose == "REMIX",
+        ).order_by(DBRightsSnapshot.captured_at.desc())).scalars().first()
+        assert latest and latest.status == "REVOKED"
+        def count(model, *predicates):
+            return db.execute(select(func.count(model.id)).where(*predicates)).scalar_one()
+        claimed = count(DBGenerationEvent,
+            DBGenerationEvent.generation_task_id == task.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED")
+        attempts = count(DBGenerationAttempt,
+            DBGenerationAttempt.generation_task_id == task.id)
+        settled = count(DBGenerationUsageEntry,
+            DBGenerationUsageEntry.task_id == task.id,
+            DBGenerationUsageEntry.kind == "SETTLED")
+        released = count(DBGenerationUsageEntry,
+            DBGenerationUsageEntry.task_id == task.id,
+            DBGenerationUsageEntry.kind == "RELEASED")
+        reserved = count(DBGenerationUsageEntry,
+            DBGenerationUsageEntry.task_id == task.id,
+            DBGenerationUsageEntry.kind == "RESERVED")
+        ingested = count(DBGenerationEvent,
+            DBGenerationEvent.generation_task_id == task.id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED")
+        videos = count(DBAssetVersion,
+            DBAssetVersion.project_id == task.project_id,
+            DBAssetVersion.media_type == "video")
+        assert task.status == "QUEUED" and task.lease_owner is None, (
+            "Current pending-rights lifecycle changed: re-review Owner policies",
+            task.status, task.lease_owner)
+        assert (claimed, attempts, settled, released, reserved, ingested, videos) == (
+            0, 1, 0, 0, 1, 0, 0), {
+                "claimed": claimed, "attempts": attempts, "settled": settled,
+                "released": released, "reserved": reserved,
+                "ingested": ingested, "videos": videos}
+    print(json.dumps({
+        "gate": "G72_PG_TWO_LIVE_DAEMONS_PRECLAIM_REVOKE_FAIL_CLOSED",
+        "result": "NO_CLAIM_NO_ARTIFACT_NO_SETTLEMENT",
+        "status": "QUEUED", "lifecycle": "OPEN_STALE_QUEUED_AFTER_REVOKE",
+        "rights": "SYNTHETIC_ONLY", "claimed": 0,
+        "attempts": 1, "reserved": 1, "settled": 0,
+        "released": 0, "ingested": 0, "videos": 0,
+    }), flush=True)
+
+
+def submit_revoke():
+    submit(state_path=REVOKED_STATE)
+
+
+def lock_revoke():
+    lock(inject_revoke=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("submit", "lock", "verify"))
+    parser.add_argument("mode", choices=("submit", "lock", "verify",
+                                         "submit-revoke", "lock-revoke",
+                                         "verify-revoked"))
     args = parser.parse_args()
     guard()
-    {"submit": submit, "lock": lock, "verify": verify}[args.mode]()
+    {"submit": submit, "lock": lock, "verify": verify,
+     "submit-revoke": submit_revoke, "lock-revoke": lock_revoke,
+     "verify-revoked": verify_revoked}[args.mode]()
