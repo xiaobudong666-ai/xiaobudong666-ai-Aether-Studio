@@ -5,6 +5,7 @@ import {
   GenerationApiClient,
   GenerationCapabilitySnapshot,
   ServerGenerationRequest,
+  TalkingHeadFakeGenerationRequest,
   ServerGenerationResult,
   ServerGenerationStatus,
   ServerGenerationTask,
@@ -39,6 +40,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   );
   const requestSequence = useRef(0);
   const idempotencyKeyRef = useRef<string | null>(null);
+  const lastModeRef = useRef<GenerationCapabilitySnapshot["mode"] | null>(null);
   const [open, setOpen] = useState(false);
   const [capabilities, setCapabilities] = useState<GenerationCapabilitySnapshot | null>(null);
   const [tasks, setTasks] = useState<ServerGenerationTask[]>([]);
@@ -51,7 +53,9 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   const [outputCount, setOutputCount] = useState(1);
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
   const [confirmed, setConfirmed] = useState(false);
-  const [preflightBody, setPreflightBody] = useState<ServerGenerationRequest | null>(null);
+  const [preflightBody, setPreflightBody] = useState<
+    ServerGenerationRequest | TalkingHeadFakeGenerationRequest | null
+  >(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const generationReady = Boolean(
@@ -64,9 +68,13 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     && (capabilities.quota?.monthlyGeneratedSecondsRemaining ?? 0) > 0
   );
 
+  const fakeTalkingHeadMode = capabilities?.mode === "deterministic-fake";
   const availableAssets = useMemo(
-    () => assetVersions.filter((version) => version.projectId === project?.id),
-    [assetVersions, project?.id],
+    () => assetVersions.filter((version) =>
+      version.projectId === project?.id
+      && (!fakeTalkingHeadMode || version.mediaType === "image"),
+    ),
+    [assetVersions, project?.id, fakeTalkingHeadMode],
   );
   const invalidatePreflight = () => {
     setPreflightBody(null);
@@ -100,6 +108,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   useEffect(() => {
     invalidatePreflight();
     setSelectedAssetIds([]);
+    setConfirmed(false);
     setReferences([]);
     setMessage(project?.id ? "已切换项目，正在从服务端恢复任务状态。" : null);
     void loadServerState();
@@ -107,14 +116,44 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   }, [loadServerState, project?.id]);
 
   useEffect(() => {
+    const mode = capabilities?.mode;
+    if (!mode) return;
+    if (lastModeRef.current !== null && lastModeRef.current !== mode) {
+      setConfirmed(false);
+      setPreflightBody(null);
+      idempotencyKeyRef.current = null;
+      setMessage("生成模式已变化，旧确认与预检已失效；请重新确认后提交。");
+    }
+    lastModeRef.current = mode;
+  }, [capabilities?.mode]);
+
+  useEffect(() => {
     if (!open || !project?.id || !tasks.some((task) => ACTIVE_STATUSES.has(task.status))) return undefined;
     const timer = window.setInterval(() => { void loadServerState(true); }, 3000);
     return () => window.clearInterval(timer);
   }, [loadServerState, open, project?.id, tasks]);
 
-  const buildRequest = (): ServerGenerationRequest | null => {
+  const buildRequest = (): ServerGenerationRequest | TalkingHeadFakeGenerationRequest | null => {
     if (!project || !capabilities || !confirmed) return null;
     idempotencyKeyRef.current ||= newIdempotencyKey();
+    if (capabilities.mode === "deterministic-fake") {
+      const selectedImages = availableAssets.filter(
+        (version) => selectedAssetIds.includes(version.id) && version.mediaType === "image",
+      );
+      if (selectedImages.length !== 1) return null;
+      return {
+        text: prompt.trim(),
+        durationSeconds: clipDuration,
+        aspectRatio: aspect,
+        resolution: "720p",
+        voiceId: "synthetic-seed",
+        imageAssetVersionId: selectedImages[0].id,
+        idempotencyKey: idempotencyKeyRef.current,
+        expectedProjectRevision: project.revision,
+        capabilitySnapshotHash: capabilities.snapshotHash,
+        confirmSyntheticTestOnly: true,
+      };
+    }
     return {
       videoSubject: prompt.trim(), videoAspect: aspect, voiceName,
       videoConcatMode: concatMode, videoClipDuration: clipDuration, outputCount,
@@ -128,14 +167,21 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   const preflight = async () => {
     const body = buildRequest();
     if (!body || !project) {
-      setMessage("请填写生成主题、确认外部生成边界，并等待能力快照载入。");
+      setMessage(fakeTalkingHeadMode
+        ? "FAKE-only口播需要且只能选择1个当前项目图片版本，并确认仅本地合成。"
+        : "请填写生成主题、确认外部生成边界，并等待能力快照载入。");
       return;
     }
     setBusy(true);
     try {
-      await api.validate(project.id, body);
+      if (capabilities?.mode === "deterministic-fake") {
+        await api.validateFakeTalkingHead(project.id, body as TalkingHeadFakeGenerationRequest);
+        setMessage("FAKE-only口播预检通过：仅本地合成，不调用真实Provider，结果不可发布。");
+      } else {
+        await api.validate(project.id, body as ServerGenerationRequest);
+        setMessage("服务端预检通过：可创建受治理生成任务。");
+      }
       setPreflightBody(body);
-      setMessage("服务端预检通过：可创建受治理生成任务。");
     } catch (error) {
       invalidatePreflight();
       setMessage(error instanceof Error ? error.message : "服务端预检失败。");
@@ -148,9 +194,13 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     if (!project || !preflightBody || !idempotencyKeyRef.current) return;
     setBusy(true);
     try {
-      const task = await api.create(project.id, preflightBody);
+      const task = capabilities?.mode === "deterministic-fake"
+        ? await api.createFakeTalkingHead(project.id, preflightBody as TalkingHeadFakeGenerationRequest)
+        : await api.create(project.id, preflightBody as ServerGenerationRequest);
       setTasks((previous) => [task, ...previous.filter((candidate) => candidate.taskId !== task.taskId)]);
-      setMessage(`任务 ${task.taskId} 已进入服务端队列；重复提交使用同一幂等键。`);
+      setMessage(capabilities?.mode === "deterministic-fake"
+        ? "FAKE-only口播任务 " + task.taskId + " 已进入服务端Worker队列；不调用真实Provider，结果不可发布。"
+        : "任务 " + task.taskId + " 已进入服务端队列；重复提交使用同一幂等键。");
       invalidatePreflight();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "生成任务创建失败。");
@@ -221,7 +271,8 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
       {task.results.map((result) => <div className="generation-result" key={result.assetVersionId}>
         <span>{result.contentType} · {result.checksum.slice(0, 12)} · {result.rights.code}</span>
         <span>来源任务：{String(result.provenance.generationTaskId || task.taskId)}</span>
-        {!readOnly && <>
+        {task.provider === "deterministic-fake-talking-head" && <span className="generation-boundary">FAKE-only模拟产物：不可采纳或发布。</span>}
+        {!readOnly && task.provider !== "deterministic-fake-talking-head" && <>
           <button type="button" disabled={!result.rights.allowed} onClick={() => createEditorReference(task, result)}>用于快速制作</button>
           <button type="button" disabled={busy || !result.rights.allowed} onClick={() => void applyTalkingHeadDraft(task, result)}>应用到口播草稿</button>
         </>}
@@ -248,44 +299,49 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   </section>;
 
   if (!open) return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
-    <div><strong>AI 受治理生成</strong><span>任务状态由服务端持久化；真实 Provider 默认保持禁用。</span></div>
+    <div><strong>{fakeTalkingHeadMode ? "G72 · FAKE-only口播" : "AI 受治理生成"}</strong><span>{fakeTalkingHeadMode ? "仅本地合成，不调用真实Provider；输出不可发布。" : "任务状态由服务端持久化；真实 Provider 默认保持禁用。"}</span></div>
     {renderReadiness(true)}
     <button type="button" disabled={!project} onClick={() => setOpen(true)}>打开生成任务</button>
   </section>;
 
   return <section className="generation-panel" aria-label="AI 受治理生成任务" data-tenant={tenantId} data-actor={actorId}>
     <div className="generation-heading">
-      <div><strong>IM12–IM14 · 服务端受治理生成桥接</strong><span>项目：{project?.name || "未选择"}</span></div>
+      <div><strong>{fakeTalkingHeadMode ? "G72 · FAKE-only口播" : "IM12–IM14 · 服务端受治理生成桥接"}</strong><span>项目：{project?.name || "未选择"}</span></div>
       <button type="button" className="secondary" onClick={() => setOpen(false)}>收起</button>
     </div>
     {renderReadiness()}
     <div className="generation-grid">
       <fieldset disabled={busy || !generationReady}>
-        <legend>生成请求</legend>
+        <legend>{fakeTalkingHeadMode ? "FAKE-only口播请求" : "生成请求"}</legend>
         <button type="button" className="secondary" onClick={() => {
           setAspect("9:16");
           setConcatMode("sequential");
           setOutputCount(1);
           invalidatePreflight();
-          setMessage("已应用口播 P0 预设：9:16、顺序编排、单输出；仍需服务端预检后才能提交。");
-        }}>口播视频预设</button>
+          setMessage(fakeTalkingHeadMode
+            ? "已应用FAKE-only口播预设：9:16、720p、单图片、单输出；仍需服务端预检。"
+            : "已应用口播 P0 预设：9:16、顺序编排、单输出；仍需服务端预检后才能提交。");
+        }}>{fakeTalkingHeadMode ? "应用FAKE-only口播预设" : "口播视频预设"}</button>
         <label>生成主题<textarea aria-label="生成主题" maxLength={500} value={prompt} onChange={(event) => { setPrompt(event.target.value); invalidatePreflight(); }} /></label>
         <label>目标比例<select aria-label="目标比例" value={aspect} onChange={(event) => { setAspect(event.target.value as ServerGenerationRequest["videoAspect"]); invalidatePreflight(); }}>{(capabilities?.videoAspects || ["9:16"]).map((value) => <option key={value}>{value}</option>)}</select></label>
-        <label>声音<select aria-label="声音" value={voiceName} onChange={(event) => { setVoiceName(event.target.value); invalidatePreflight(); }}>{(capabilities?.voices || [voiceName]).map((value) => <option key={value}>{value}</option>)}</select></label>
-        <label>拼接模式<select aria-label="拼接模式" value={concatMode} onChange={(event) => { setConcatMode(event.target.value as ServerGenerationRequest["videoConcatMode"]); invalidatePreflight(); }}><option value="random">随机</option><option value="sequential">顺序</option></select></label>
-        <label>单片段时长（秒）<input aria-label="单片段时长" type="number" min="1" max="10" value={clipDuration} onChange={(event) => { setClipDuration(Number(event.target.value)); invalidatePreflight(); }} /></label>
-        <label>输出数量<input aria-label="输出数量" type="number" min="1" max={capabilities?.maxOutputs || 1} value={outputCount} onChange={(event) => { setOutputCount(Number(event.target.value)); invalidatePreflight(); }} /></label>
+        {fakeTalkingHeadMode
+          ? <p>合成音色：synthetic-seed（本地FAKE固定值，不调用真实Provider）。</p>
+          : <label>声音<select aria-label="声音" value={voiceName} onChange={(event) => { setVoiceName(event.target.value); invalidatePreflight(); }}>{(capabilities?.voices || [voiceName]).map((value) => <option key={value}>{value}</option>)}</select></label>}
+        {!fakeTalkingHeadMode && <label>拼接模式<select aria-label="拼接模式" value={concatMode} onChange={(event) => { setConcatMode(event.target.value as ServerGenerationRequest["videoConcatMode"]); invalidatePreflight(); }}><option value="random">随机</option><option value="sequential">顺序</option></select></label>}
+        <label>单片段时长（秒）<input aria-label="单片段时长" type="number" min={capabilities?.clipDurationSeconds.min || 1} max={capabilities?.clipDurationSeconds.max || 10} value={clipDuration} onChange={(event) => { setClipDuration(Number(event.target.value)); invalidatePreflight(); }} /></label>
+        {!fakeTalkingHeadMode && <label>输出数量<input aria-label="输出数量" type="number" min="1" max={capabilities?.maxOutputs || 1} value={outputCount} onChange={(event) => { setOutputCount(Number(event.target.value)); invalidatePreflight(); }} /></label>}
       </fieldset>
       <fieldset disabled={busy || !generationReady}>
-        <legend>参考素材与确认</legend>
-        {availableAssets.length === 0 && <span>当前项目暂无可选素材版本。</span>}
-        {availableAssets.map((version) => <label key={version.id}><input type="checkbox" checked={selectedAssetIds.includes(version.id)} onChange={(event) => { setSelectedAssetIds((previous) => event.target.checked ? [...previous, version.id] : previous.filter((id) => id !== version.id)); invalidatePreflight(); }} />版本 {version.versionNo} · {version.sha256.slice(0, 12)}</label>)}
-        <label><input aria-label="确认外部生成边界" type="checkbox" checked={confirmed} onChange={(event) => { setConfirmed(event.target.checked); invalidatePreflight(); }} />确认任务只进入受治理队列，结果默认受权利阻断。</label>
+        <legend>{fakeTalkingHeadMode ? "输入图片与合成确认" : "参考素材与确认"}</legend>
+        {availableAssets.length === 0 && <span>{fakeTalkingHeadMode ? "当前项目暂无可选图片版本。" : "当前项目暂无可选素材版本。"}</span>}
+        {availableAssets.map((version) => <label key={version.id}><input type="checkbox" checked={selectedAssetIds.includes(version.id)} onChange={(event) => { setSelectedAssetIds((previous) => event.target.checked ? [...previous, version.id] : previous.filter((id) => id !== version.id)); invalidatePreflight(); }} />{fakeTalkingHeadMode ? "图片版本" : "版本"} {version.versionNo} · {version.sha256.slice(0, 12)}</label>)}
+        {fakeTalkingHeadMode && <p>FAKE-only口播必须且只能选择1个当前项目图片版本；服务端会重新校验租户、项目、权利快照与素材哈希。</p>}
+        <label><input aria-label={fakeTalkingHeadMode ? "确认合成测试边界" : "确认外部生成边界"} type="checkbox" checked={confirmed} onChange={(event) => { setConfirmed(event.target.checked); invalidatePreflight(); }} />{fakeTalkingHeadMode ? "确认仅运行FAKE-only合成口播；不调用真实Provider，输出不可发布。" : "确认任务只进入受治理队列，结果默认受权利阻断。"}</label>
         <p>Provider：{capabilities?.mode || "载入中"} · {capabilities?.sourceVersion || "未知"}</p>
       </fieldset>
       <fieldset>
         <legend>预检与提交</legend>
-        <button type="button" disabled={busy || !generationReady || !prompt.trim() || !confirmed} onClick={() => void preflight()}>执行服务端预检</button>
+        <button type="button" disabled={busy || !generationReady || !prompt.trim() || !confirmed || (fakeTalkingHeadMode && availableAssets.filter((version) => selectedAssetIds.includes(version.id)).length !== 1)} onClick={() => void preflight()}>执行服务端预检</button>
         <button type="button" disabled={busy || !preflightBody} onClick={() => void submit()}>提交生成</button>
         <button type="button" className="secondary" disabled={busy || !project} onClick={() => void loadServerState()}>刷新任务</button>
         <p>状态：{preflightBody ? "预检通过" : "等待预检"}</p>

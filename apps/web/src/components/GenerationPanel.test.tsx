@@ -1,4 +1,4 @@
-import { ProjectDTO } from "@aether/contracts";
+import { AssetVersionDTO, ProjectDTO } from "@aether/contracts";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ServerGenerationTask } from "../generation";
@@ -11,14 +11,14 @@ const project: ProjectDTO = {
 };
 
 const capabilities = {
-  provider: "moneyprinter", mode: "deterministic-fake", enabled: true, healthy: true,
+  provider: "moneyprinter", mode: "moneyprinter", enabled: true, healthy: true,
   sourceVersion: "im12-im14-deterministic-fake-v1",
   issuedAt: "2026-08-27T00:00:00Z", expiresAt: "2026-08-27T00:05:00Z",
   videoAspects: ["16:9", "9:16", "1:1"], videoConcatModes: ["random", "sequential"],
   clipDurationSeconds: { min: 1, max: 10 }, maxOutputs: 1,
   voices: ["en-US-JennyNeural"], snapshotHash: "a".repeat(64),
   reasonCode: null, configVersionId: null, policyHash: null,
-  operatorMode: "deterministic-fake",
+  operatorMode: "moneyprinter",
   ownerPolicy: { published: true, enabledIntent: true },
   workerProof: { present: true, fresh: true },
   quota: {
@@ -42,11 +42,17 @@ function response(payload: unknown, status = 200): Response {
   return { ok: status >= 200 && status < 300, status, json: async () => payload } as Response;
 }
 
-function installFetch(list: ServerGenerationTask[] = []) {
+function installFetch(list: ServerGenerationTask[] = [], snapshot = capabilities) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.endsWith("/generation/providers/moneyprinter/readiness")) return response(capabilities);
+    if (url.endsWith("/generation/providers/moneyprinter/readiness")) return response(snapshot);
     if (url.includes("generation-tasks?pageSize=100")) return response({ items: list, nextCursor: null });
+    if (url.endsWith("/talking-head/fake-generation-tasks/validate")) {
+      return response({ allowed: true, status: "PREFLIGHT", fakeOnly: true, simulatedOutput: true, publishable: false });
+    }
+    if (url.endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST") {
+      return response({ ...queuedTask, provider: "deterministic-fake-talking-head" }, 202);
+    }
     if (url.endsWith("/generation-tasks/validate")) return response({ allowed: true, status: "PREFLIGHT" });
     if (url.endsWith("/generation-tasks") && init?.method === "POST") return response(queuedTask, 202);
     if (url.endsWith("/cancel")) return response({ ...queuedTask, status: "CANCELED", storedStatus: "CANCELED" });
@@ -86,6 +92,97 @@ describe("GenerationPanel server authority", () => {
     expect(screen.queryByRole("button", { name: /运行本地任务/ })).toBeNull();
     const createCall = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith("/generation-tasks") && init?.method === "POST");
     expect(createCall?.[1]?.headers).toMatchObject({ "X-Aether-CSRF": "1" });
+  });
+
+  test("G72 FAKE-only normal entry uses the dedicated API-to-Worker route", async () => {
+    const fakeCapabilities = { ...capabilities, mode: "deterministic-fake", operatorMode: "deterministic-fake" };
+    const fetchMock = installFetch([], fakeCapabilities);
+    const imageVersion: AssetVersionDTO = {
+      id: "asset-image-1", projectId: "project-1", mediaId: "media-image-1",
+      versionNo: 1, sha256: "a".repeat(64), mediaType: "image", contentType: "image/png",
+      sizeBytes: 1024, probe: {}, createdBy: "owner-1", createdAt: "2026-08-27T00:00:00Z",
+    };
+    render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[imageVersion]} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "仅本地合成口播测试" } });
+    fireEvent.click(screen.getByLabelText("确认合成测试边界"));
+    fireEvent.click(screen.getByRole("checkbox", { name: /图片版本 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "执行服务端预检" }));
+    expect(await screen.findByText(/FAKE-only口播预检通过/)).toBeTruthy();
+
+    const validateCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/talking-head/fake-generation-tasks/validate") && init?.method === "POST");
+    expect(validateCall).toBeTruthy();
+    expect(JSON.parse(String(validateCall?.[1]?.body))).toMatchObject({
+      text: "仅本地合成口播测试", durationSeconds: 5, aspectRatio: "9:16",
+      resolution: "720p", voiceId: "synthetic-seed", imageAssetVersionId: "asset-image-1",
+      confirmSyntheticTestOnly: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "提交生成" }));
+    expect(await screen.findByText(/FAKE-only口播任务 .* 已进入服务端Worker队列/)).toBeTruthy();
+    const createCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST");
+    expect(createCall).toBeTruthy();
+    expect(createCall?.[1]?.headers).toMatchObject({
+      "X-Aether-CSRF": "1",
+      "Idempotency-Key": JSON.parse(String(createCall?.[1]?.body)).idempotencyKey,
+    });
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({
+      imageAssetVersionId: "asset-image-1", confirmSyntheticTestOnly: true,
+    });
+    expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/generation-tasks") && init?.method === "POST")).toBe(false);
+  });
+
+  test("G72 FAKE-only entry blocks preflight unless exactly one image is selected", async () => {
+    const fakeCapabilities = { ...capabilities, mode: "deterministic-fake", operatorMode: "deterministic-fake" };
+    installFetch([], fakeCapabilities);
+    render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "仅本地合成口播测试" } });
+    fireEvent.click(screen.getByLabelText("确认合成测试边界"));
+    expect((screen.getByRole("button", { name: "执行服务端预检" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/必须且只能选择1个当前项目图片版本/)).toBeTruthy();
+  });
+
+  test("G72 mode change invalidates old confirmation and preflight", async () => {
+    const fakeCapabilities = { ...capabilities, mode: "deterministic-fake", operatorMode: "deterministic-fake" };
+    let readinessCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/generation/providers/moneyprinter/readiness")) {
+        readinessCalls += 1;
+        return response(readinessCalls === 1 ? fakeCapabilities : capabilities);
+      }
+      if (url.includes("generation-tasks?pageSize=100")) return response({ items: [], nextCursor: null });
+      if (url.endsWith("/talking-head/fake-generation-tasks/validate")) {
+        return response({ allowed: true, status: "PREFLIGHT", fakeOnly: true, simulatedOutput: true, publishable: false });
+      }
+      if (url.endsWith("/generation-tasks/validate")) return response({ allowed: true, status: "PREFLIGHT" });
+      throw new Error("Unexpected fetch: " + url);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const imageVersion: AssetVersionDTO = {
+      id: "asset-image-1", projectId: "project-1", mediaId: "media-image-1",
+      versionNo: 1, sha256: "a".repeat(64), mediaType: "image", contentType: "image/png",
+      sizeBytes: 1024, probe: {}, createdBy: "owner-1", createdAt: "2026-08-27T00:00:00Z",
+    };
+    render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[imageVersion]} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "仅本地合成口播测试" } });
+    fireEvent.click(screen.getByLabelText("确认合成测试边界"));
+    fireEvent.click(screen.getByRole("checkbox", { name: /图片版本 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "执行服务端预检" }));
+    expect(await screen.findByText(/FAKE-only口播预检通过/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "刷新任务" }));
+    await waitFor(() => expect((screen.getByLabelText("确认外部生成边界") as HTMLInputElement).checked).toBe(false));
+    expect(screen.getByText(/生成模式已变化，旧确认与预检已失效/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "提交生成" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   test("component rebuild restores tasks from server rather than localStorage", async () => {
