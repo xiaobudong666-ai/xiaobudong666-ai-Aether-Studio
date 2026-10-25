@@ -5,6 +5,7 @@ on:
     branches:
       - feat/fusion-m0-g72-media-auth-negative-20261025
       - feat/fusion-m0-g72-postack-liveworkers-fake-20261025
+      - test/fusion-m0-zod4-g72-pg-regression-20261025
     paths:
       - infra/docker/api.g72-postgres-ci.Dockerfile
       - infra/docker/docker-compose.g72-postgres-ci.override.yml
