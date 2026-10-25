@@ -106,6 +106,14 @@ def check_asset_and_receipts(project_id: str, task_id: str,
             DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
         )).scalars().all()
         assert len(events) == 1, f"ingest events={len(events)}"
+        # With two independent real Worker replicas, exactly one claim must
+        # persist for this task. A second claim means lease/attempt fencing
+        # failed even when the final media happens to look correct.
+        claim_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one()
+        assert claim_events == 1, f"duplicate Worker claims={claim_events}"
         attempts = db.execute(select(func.count(DBGenerationAttempt.id)).where(
             DBGenerationAttempt.generation_task_id == task_id,
         )).scalar_one()
@@ -131,7 +139,7 @@ def check_asset_and_receipts(project_id: str, task_id: str,
         "taskId": task_id, "projectId": project_id, "mediaId": media_id,
         "sha256": digest, "bytes": len(data),
         "settledEntries": settled, "ingestEvents": len(events),
-        "attempts": attempts,
+        "claimedEvents": claim_events, "attempts": attempts,
     }
 
 
