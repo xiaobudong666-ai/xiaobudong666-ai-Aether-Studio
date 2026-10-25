@@ -61,7 +61,7 @@ jobs:
           assert api["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
           assert api["environment"]["AETHER_RUNTIME_STAGE"] == "nonproduction"
           assert api["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
-          assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert not worker.get("ports"), "FAKE-only dual Worker test must not publish health ports"\n          assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
           assert worker["environment"]["AETHER_TALKING_HEAD_MODE"] == "disabled"
           assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
           assert worker["environment"]["AETHER_GENERATION_CANARY_PROFILE"] == "disabled"
@@ -79,11 +79,29 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
-            up -d --build --wait --wait-timeout 420 api worker video-use
+            up -d --build --wait --wait-timeout 420 --scale worker=2 api worker video-use
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
             cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
+
+      - name: Verify two real Worker replicas healthy before submitting FAKE task
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t worker_ids < <(docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            ps -q worker)
+          if [ "${#worker_ids[@]}" -ne 2 ]; then
+            printf 'Expected 2 running Workers, got %s\\n' "${#worker_ids[@]}" >&2
+            exit 1
+          fi
+          for worker_id in "${worker_ids[@]}"; do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$worker_id")"
+            test "$health" = healthy || { echo "FAKE Worker unhealthy: $health" >&2; exit 1; }
+          done
+          echo "G72_PG_DUAL_REAL_WORKER_HEALTHY count=2"
 
       - name: Verify API connected to real disposable PostgreSQL
         shell: bash
