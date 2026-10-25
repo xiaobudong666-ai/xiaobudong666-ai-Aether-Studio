@@ -10,9 +10,13 @@ import json
 import os
 from pathlib import Path
 import runpy
+import sys
 import time
 import uuid
 from sqlalchemy import text
+
+# CI copies this file to /tmp; native API modules live in /app.
+sys.path.insert(0, "/app")
 
 STATE = Path("/tmp/g72-pg-native-worker-lock-race.json")
 SMOKE = Path("/tmp/g72-compose-network-smoke.py")
