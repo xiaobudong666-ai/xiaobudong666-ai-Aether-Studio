@@ -1,0 +1,355 @@
+name: G72 PostgreSQL Worker Sidecar FAKE-only integration
+
+on:
+  push:
+    branches:
+      - test/fusion-m0-v704-current-g72-pg-20261026
+    paths:
+      - infra/docker/api.g72-postgres-ci.Dockerfile
+      - infra/docker/docker-compose.g72-postgres-ci.override.yml
+      - infra/docker/docker-compose.g72-fake-only.override.yml
+      - infra/docker/g72-compose-network-smoke.py
+      - infra/docker/g72-pg-native-worker-lock-race-smoke.py
+      - infra/docker/g72-midupload-revocation-smoke.py
+      - .github/workflows/g72-postgres-worker-sidecar.yml
+      - apps/api/app/**
+      - apps/worker/app/**
+
+permissions:
+  contents: read
+
+jobs:
+  g72-postgres-worker-sidecar:
+    # Nonproduction FAKE-only evidence; NOT real Provider, M12, or release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE_PROJECT_NAME: aether-g72pg-${{ github.run_id }}-${{ github.run_attempt }}
+      AETHER_COOKIE_SECURE: "false"
+      AETHER_API_PORT: "18300"
+      AETHER_WORKER_PORT: "18301"
+    steps:
+      - name: Checkout exact isolated branch SHA
+        uses: actions/checkout@v4
+
+      - name: Generate disposable Owner and Worker credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_password="ci-$(openssl rand -hex 24)"
+          worker_token="ci-$(openssl rand -hex 32)"
+          echo "::add-mask::$owner_password"
+          echo "::add-mask::$worker_token"
+          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$owner_password" >> "$GITHUB_ENV"
+          echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+
+      - name: Fail closed unless isolated PostgreSQL and fake-only settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            config --format json > "$RUNNER_TEMP/g72-pg-config.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-pg-config.json").read_text())["services"]
+          api, worker, sidecar, pg = (services[n] for n in ("api", "worker", "video-use", "postgres-g72"))
+          assert api["environment"]["DATABASE_URL"] == (
+              "postgresql+psycopg://ci_g72:ci-only-postgres-password@postgres-g72:5432/aether_g72_ci"
+          )
+          assert api["build"]["dockerfile"] == "infra/docker/api.g72-postgres-ci.Dockerfile"
+          assert api["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert api["environment"]["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert api["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert not worker.get("ports"), "FAKE-only dual Worker test must not publish health ports"
+          assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert worker["environment"]["AETHER_TALKING_HEAD_MODE"] == "disabled"
+          assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          assert worker["environment"]["AETHER_GENERATION_CANARY_PROFILE"] == "disabled"
+          assert sidecar["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert not pg.get("ports") and set(pg["networks"]) == {"aether-net"}
+          assert pg["environment"]["POSTGRES_DB"] == "aether_g72_ci"
+          assert set(api["networks"]) == {"aether-net"}
+          assert not api["environment"].get("HEYGEN_API_KEY")
+          PY
+
+      - name: Build and start real API Worker Sidecar with PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            up -d --build --wait --wait-timeout 420 --scale worker=2 api worker video-use
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
+
+      - name: Verify two real Worker replicas healthy before submitting FAKE task
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t worker_ids < <(docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            ps -q worker)
+          if [ "${#worker_ids[@]}" -ne 2 ]; then
+            printf 'Expected 2 running Workers, got %s\\n' "${#worker_ids[@]}" >&2
+            exit 1
+          fi
+          for worker_id in "${worker_ids[@]}"; do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$worker_id")"
+            test "$health" = healthy || { echo "FAKE Worker unhealthy: $health" >&2; exit 1; }
+          done
+          echo "G72_PG_DUAL_REAL_WORKER_HEALTHY count=2"
+
+      - name: Verify API connected to real disposable PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -T api python - <<'PY'
+          import os
+          from sqlalchemy import text
+          from app.database import engine
+          assert os.environ["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert os.environ["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert engine.dialect.name == "postgresql"
+          with engine.connect() as db:
+              assert db.scalar(text("SELECT current_database()")) == "aether_g72_ci"
+              assert int(db.scalar(text("SHOW server_version_num"))) >= 160000
+          print("G72_PG_API_CONNECTION_PASS", flush=True)
+          PY
+
+      - name: Real Worker to Sidecar media and database receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py prepare
+
+      - name: Restart real Worker and Sidecar then verify immutable media and auth
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            restart video-use worker
+          sleep 12
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py verify
+
+      - name: Stop both real Workers for deterministic post-ACK PostgreSQL rights fault
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            stop worker
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -T video-use ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc=size=320x240:rate=12 -t 3 \
+            -c:v mpeg4 -pix_fmt yuv420p -movflags +faststart \
+            /tmp/g72-midupload-ci.mp4
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            cp video-use:/tmp/g72-midupload-ci.mp4 "$RUNNER_TEMP/g72-midupload-ci.mp4"
+          test "$(stat -c%s "$RUNNER_TEMP/g72-midupload-ci.mp4")" -gt 1000 \
+            || { echo "synthetic MP4 too small to satisfy native smoke input guard" >&2; exit 1; }
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            cp "$RUNNER_TEMP/g72-midupload-ci.mp4" api:/tmp/g72-midupload-ci.mp4
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            cp infra/docker/g72-midupload-revocation-smoke.py api:/tmp/g72-midupload-revocation-smoke.py
+
+      - name: Arm claimed FAKE-only task before revocation with Workers stopped
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -e G72_PG_POSTACK_INJECTION=true -T api \
+            python /tmp/g72-midupload-revocation-smoke.py arm
+
+      - name: Keep two live Worker daemons running through real Sidecar ACK and synthetic revocation
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          compose up -d --wait --wait-timeout 240 --scale worker=2 worker video-use
+          mapfile -t before_ids < <(compose ps -q worker | sort)
+          test "${#before_ids[@]}" -eq 2 || { echo "two running Worker daemons required" >&2; exit 1; }
+          for worker_id in "${before_ids[@]}"; do
+            test "$(docker inspect -f '{{.State.Running}}' "$worker_id")" = true
+            test "$(docker inspect -f '{{.State.Health.Status}}' "$worker_id")" = healthy
+          done
+          compose exec -e G72_PG_POSTACK_INJECTION=true -T api \
+            python /tmp/g72-midupload-revocation-smoke.py inject-live
+          mapfile -t after_ids < <(compose ps -q worker | sort)
+          test "${before_ids[*]}" = "${after_ids[*]}" || { echo "Worker container replaced during revoke" >&2; exit 1; }
+          for worker_id in "${after_ids[@]}"; do
+            test "$(docker inspect -f '{{.State.Running}}' "$worker_id")" = true
+          done
+          echo "G72_PG_POSTACK_LIVE_TWO_WORKERS_ONGOING_PASS"
+
+      - name: Restart real Sidecar and two Workers and prove held media immutable
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            restart video-use
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            up -d --wait --wait-timeout 240 --scale worker=2 worker video-use
+          sleep 8
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            exec -e G72_PG_POSTACK_INJECTION=true -T api \
+            python /tmp/g72-midupload-revocation-smoke.py verify
+
+      - name: Force two continuously running Worker daemons through one PostgreSQL claim barrier
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          # The original two daemon replicas are paused only while preparing
+          # the new synthetic task and exclusive PostgreSQL barrier.
+          compose stop worker
+          compose cp infra/docker/g72-pg-native-worker-lock-race-smoke.py \
+            api:/tmp/g72-pg-native-worker-lock-race-smoke.py
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py submit
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py lock \
+            > "$RUNNER_TEMP/g72-pg-daemon-race.log" 2>&1 &
+          lock_pid=$!
+          barrier_ready=false
+          for i in $(seq 1 150); do
+            if grep -q G72_PG_LOCK_RACE_LOCK_HELD "$RUNNER_TEMP/g72-pg-daemon-race.log"; then
+              barrier_ready=true
+              break
+            fi
+            if ! kill -0 "$lock_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/g72-pg-daemon-race.log"
+              exit 1
+            fi
+            sleep .2
+          done
+          test "$barrier_ready" = true || { echo "PG daemon barrier not armed" >&2; exit 1; }
+          # Resume BOTH ordinary daemon loops, not disposable single-claim
+          # Python clients. Neither can receive a claim until PG unlocks.
+          compose up -d --no-deps --scale worker=2 worker
+          mapfile -t before_ids < <(compose ps -q worker | sort)
+          test "${#before_ids[@]}" -eq 2 || { echo "two running Worker daemons required" >&2; exit 1; }
+          for worker_id in "${before_ids[@]}"; do
+            test "$(docker inspect -f '{{.State.Running}}' "$worker_id")" = true
+          done
+          wait "$lock_pid"
+          grep -q G72_PG_LOCK_RACE_TWO_CLAIMS_WAITING "$RUNNER_TEMP/g72-pg-daemon-race.log"
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify
+          mapfile -t after_ids < <(compose ps -q worker | sort)
+          test "${before_ids[*]}" = "${after_ids[*]}" || { echo "Worker daemon containers unexpectedly replaced" >&2; exit 1; }
+          for worker_id in "${after_ids[@]}"; do
+            test "$(docker inspect -f '{{.State.Running}}' "$worker_id")" = true
+          done
+          echo "G72_PG_TWO_LIVE_DAEMONS_LOCK_RACE_PASS"
+
+      - name: Two live Worker daemons blocked on PG claim while synthetic source rights revoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          # The same two real Worker daemon loops, no new Provider capability.
+          # Stop solely to arm an independent FAKE-only task and PG lock.
+          compose stop worker
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py submit-revoke
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py lock-revoke \
+            > "$RUNNER_TEMP/g72-pg-revoked-claim-race.log" 2>&1 &
+          lock_pid=$!
+          barrier_ready=false
+          for i in $(seq 1 150); do
+            if grep -q G72_PG_LOCK_RACE_LOCK_HELD "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"; then
+              barrier_ready=true
+              break
+            fi
+            if ! kill -0 "$lock_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"
+              exit 1
+            fi
+            sleep .2
+          done
+          test "$barrier_ready" = true || { echo "PG revoked-claim barrier not armed" >&2; exit 1; }
+          compose up -d --no-deps --scale worker=2 worker
+          mapfile -t before_ids < <(compose ps -q worker | sort)
+          test "${#before_ids[@]}" -eq 2 || { echo "Two daemon containers required" >&2; exit 1; }
+          wait "$lock_pid"
+          grep -q G72_PG_LOCK_RACE_TWO_CLAIMS_WAITING "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"
+          grep -q G72_PG_TWO_CLAIM_WAITERS_REVOKED_BEFORE_UNLOCK "$RUNNER_TEMP/g72-pg-revoked-claim-race.log"
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify-revoked
+          mapfile -t after_ids < <(compose ps -q worker | sort)
+          test "${before_ids[*]}" = "${after_ids[*]}" || { echo "Daemon container changed" >&2; exit 1; }
+          echo "G72_PG_LIVE_DAEMONS_REVOKE_CLAIM_NO_DISPATCH_PASS"
+          # Verify that this fail-closed decision survives a real daemon restart.
+          # Do not release RESERVED or mutate Owner-controlled refund policy.
+          compose restart worker
+          sleep 12
+          compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify-revoked
+          echo "G72_PG_PRECLAIM_REVOKED_RESTART_NO_DISPATCH_PASS"
+          # QUEUED remains open with RESERVED held: not a full lifecycle closure.
+
+      - name: Nonsecret failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            ps || true
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+            logs --tail=80 api worker video-use postgres-g72 2>&1 \
+            | sed -E 's/ci-only-postgres-password/[REDACTED]/g' || true
+
+      - name: Destroy the complete disposable stack and database volume
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
+              down --volumes --remove-orphans || true
+          fi
