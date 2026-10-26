@@ -542,14 +542,20 @@ def create_app(
         ).scalar_one_or_none()
 
     def generation_circuit(
-        db: Session, tenant_id: str, *, create: bool = False
+        db: Session, tenant_id: str, *, create: bool = False,
+        for_update: bool = False,
     ) -> DBGenerationCircuitState | None:
-        circuit = db.execute(
-            select(DBGenerationCircuitState).where(
-                DBGenerationCircuitState.tenant_id == tenant_id,
-                DBGenerationCircuitState.provider == "moneyprinter",
-            )
-        ).scalar_one_or_none()
+        query = select(DBGenerationCircuitState).where(
+            DBGenerationCircuitState.tenant_id == tenant_id,
+            DBGenerationCircuitState.provider == "moneyprinter",
+        )
+        if for_update:
+            # G75: refresh the identity-map value after a concurrent claimant
+            # releases this tenant's circuit row lock.
+            query = query.execution_options(populate_existing=True)
+            if app_engine.dialect.name != "sqlite":
+                query = query.with_for_update()
+        circuit = db.execute(query).scalar_one_or_none()
         if circuit is None and create:
             circuit = DBGenerationCircuitState(
                 id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
@@ -1962,28 +1968,7 @@ def create_app(
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
-            candidate_circuit = generation_circuit(db, candidate.tenant_id)
-            if candidate_circuit is not None:
-                if candidate_circuit.state == "DISABLED":
-                    continue
-                if candidate_circuit.state == "OPEN":
-                    cooldown_until = _as_utc(candidate_circuit.cooldown_until)
-                    if cooldown_until is None or now < cooldown_until:
-                        continue
-                    candidate_circuit.state = "HALF_OPEN"
-                    candidate_circuit.half_open_task_id = None
-                    candidate_circuit.updated_at = now
-                    add_provider_event(
-                        db, tenant_id=candidate.tenant_id,
-                        event_type="CIRCUIT_HALF_OPENED", actor_type="SYSTEM",
-                        actor_id="api", now=now,
-                    )
-                if candidate_circuit.state == "HALF_OPEN":
-                    if candidate_circuit.half_open_task_id not in {None, candidate.id}:
-                        continue
-                    candidate_circuit.half_open_task_id = candidate.id
-                    candidate_circuit.updated_at = now
-            if candidate_mode == "moneyprinter":
+            # G75: validate provider configuration and Worker attestation before\n            # changing circuit state or assigning a HALF_OPEN probe.\n            if candidate_mode == "moneyprinter":
                 config = published_generation_config(db, candidate.tenant_id)
                 if (
                     config is None
@@ -2023,6 +2008,27 @@ def create_app(
                     continue
             elif candidate_mode != "deterministic-fake":
                 continue
+            candidate_circuit = generation_circuit(db, candidate.tenant_id, for_update=True)
+            if candidate_circuit is not None:
+                if candidate_circuit.state == "DISABLED":
+                    continue
+                if candidate_circuit.state == "OPEN":
+                    cooldown_until = _as_utc(candidate_circuit.cooldown_until)
+                    if cooldown_until is None or now < cooldown_until:
+                        continue
+                    candidate_circuit.state = "HALF_OPEN"
+                    candidate_circuit.half_open_task_id = None
+                    candidate_circuit.updated_at = now
+                    add_provider_event(
+                        db, tenant_id=candidate.tenant_id,
+                        event_type="CIRCUIT_HALF_OPENED", actor_type="SYSTEM",
+                        actor_id="api", now=now,
+                    )
+                if candidate_circuit.state == "HALF_OPEN":
+                    if candidate_circuit.half_open_task_id not in {None, candidate.id}:
+                        continue
+                    candidate_circuit.half_open_task_id = candidate.id
+                    candidate_circuit.updated_at = now
             task = candidate
             break
         if task is None:
