@@ -393,6 +393,8 @@ jobs:
             -c:v mpeg4 -pix_fmt yuv420p -movflags +faststart \
             /tmp/g71-preack-original.mp4
           compose cp video-use:/tmp/g71-preack-original.mp4 \
+            "$RUNNER_TEMP/g71-preack-original.mp4"
+          compose cp "$RUNNER_TEMP/g71-preack-original.mp4" \
             api:/tmp/g71-preack-original.mp4
           compose cp infra/docker/g71-preack-manual-retry-smoke.py \
             api:/tmp/g71-preack-manual-retry-smoke.py
