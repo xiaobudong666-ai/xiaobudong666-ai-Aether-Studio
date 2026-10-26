@@ -375,6 +375,8 @@ def seed_g75_moneyprinter_task(
             attempts=1, max_attempts=1, created_at=created_at,
             updated_at=created_at,
         ))
+        # Flush the parent task before inserting its FK-dependent attempt.
+        db.flush()
         db.add(DBGenerationAttempt(
             id=attempt_id, generation_task_id=task_id, attempt_no=1,
             status="QUEUED", reconciliation_state="NOT_SUBMITTED",
