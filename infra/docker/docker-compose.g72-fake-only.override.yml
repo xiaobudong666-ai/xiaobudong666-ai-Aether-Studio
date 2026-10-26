@@ -21,10 +21,15 @@ services:
       AETHER_FAKE_ONLY_NONPROD: "true"
       AETHER_RUNTIME_STAGE: nonproduction
 
-# The base topology attaches MoneyPrinterTurbo to provider-egress. Even though
-# this FAKE-only suite does not invoke it and gives it no test credentials, the
-# disposable stack must not have external egress. Keep the network name and
-# service topology unchanged while making this test-only network internal.
+# The base topology attaches every app service to a normal bridge network,
+# and MoneyPrinterTurbo also has provider-egress. The disposable FAKE-only
+# stack must have no outbound route at all. Keep names/topology unchanged while
+# making every network used by the test stack internal. Host-published web
+# access remains loopback-only and is verified by the CI config gate.
 networks:
+  aether-net:
+    internal: true
+  provider-control:
+    internal: true
   provider-egress:
     internal: true
