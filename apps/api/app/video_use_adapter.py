@@ -113,6 +113,23 @@ class VideoUseAdapter:
             params={"expectedSha256": expected_sha256},
         ))
 
+    def find_fake_recovery_optional(
+        self, project_id: str, recovery_key: str, expected_sha256: str,
+    ) -> dict[str, Any] | None:
+        """Read a scoped FAKE recovery object, returning None only on explicit 404.
+
+        Transport errors, 5xx, disabled recovery and hash conflicts are not
+        interpreted as absence; callers must fail closed on ambiguous lookup.
+        """
+        response = self._request(
+            "GET",
+            f"/fake-recovery/{project_id}/{recovery_key}",
+            params={"expectedSha256": expected_sha256},
+        )
+        if response.status_code == 404:
+            return None
+        return self._json(response)
+
     def submit_render(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._json(self._request("POST", "/renders", json=payload))
 
