@@ -2325,6 +2325,214 @@ def create_app(
         }
 
 
+    @created_app.post("/projects/{project_id}/generation-tasks/{task_id}/fake-recovery-upload-retry")
+    def retry_original_fake_artifact_upload_owner_self(
+        project_id: str,
+        task_id: str,
+        file: UploadFile = File(...),
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        """G71 FAKE-only manual resend of the exact original bytes, never regeneration.
+
+        Owner-self may resend only the byte sequence whose digest and size were
+        durably recorded before the first Sidecar POST. The deterministic
+        Sidecar key makes repeated calls idempotent. This route never binds an
+        asset, settles usage, refunds quota, or creates a generation attempt.
+        """
+        require_roles(context, "owner")
+        if not (
+            created_app.state.generation_provider_mode == "deterministic-fake"
+            and os.environ.get("AETHER_FAKE_ONLY_NONPROD", "").lower() == "true"
+            and os.environ.get("AETHER_RUNTIME_STAGE", "").lower() == "nonproduction"
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "FAKE_RECOVERY_DISABLED", "message": "非生产原媒资恢复入口未启用"},
+            )
+
+        begin_serialized_write(db)
+        task = db.execute(
+            select(DBGenerationTask).where(
+                DBGenerationTask.id == task_id,
+                DBGenerationTask.tenant_id == context.tenant_id,
+                DBGenerationTask.project_id == project_id,
+            ).with_for_update()
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"},
+            )
+        if context.user_id != task.requested_by:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "OWNER_SELF_ONLY", "message": "原媒资人工重试仅允许原任务发起Owner本人操作"},
+            )
+        if task.provider != "deterministic-fake-talking-head":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "RECOVERY_PROVIDER_NOT_SUPPORTED", "message": "当前仅支持隔离FAKE口播原媒资恢复"},
+            )
+        if (
+            task.status != "UNKNOWN"
+            or task.error_code != "ARTIFACT_INGEST_FAILED"
+            or task.asset_version_id is not None
+            or task.cancel_requested_at is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "RECOVERY_NOT_PENDING", "message": "当前任务不允许原媒资人工重试"},
+            )
+        circuit = generation_circuit(db, task.tenant_id)
+        if circuit is not None and circuit.state == "DISABLED":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROVIDER_EMERGENCY_STOPPED", "message": "紧急停机期间禁止恢复操作"},
+            )
+
+        attempt = current_generation_attempt(db, task)
+        intent = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task.id,
+            DBGenerationEvent.attempt_id == attempt.id,
+            DBGenerationEvent.event_type == "ARTIFACT_UPLOAD_INTENT",
+        )).scalar_one_or_none()
+        metadata = (intent.metadata_json or {}) if intent is not None else {}
+        recovery_key = metadata.get("fakeRecoveryKey")
+        expected_sha = metadata.get("sha256")
+        expected_size = metadata.get("sizeBytes")
+        if not (
+            isinstance(recovery_key, str) and recovery_key.startswith("g70-")
+            and isinstance(expected_sha, str) and len(expected_sha) == 64
+            and all(ch in "0123456789abcdef" for ch in expected_sha)
+            and type(expected_size) is int and expected_size > 0
+            and metadata.get("tenantId") == task.tenant_id
+            and metadata.get("projectId") == task.project_id
+            and metadata.get("attempt") == task.attempts
+            and metadata.get("upstreamJobId") == task.upstream_job_id
+            and metadata.get("providerArtifactId") == task.provider_artifact_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "DURABLE_RECOVERY_INTENT_INVALID", "message": "原媒资持久凭据缺失或作用域不一致"},
+            )
+
+        # Recheck source version and current REMIX rights before any physical write.
+        source_id = (task.request_json or {}).get("imageAssetId")
+        source = db.execute(select(DBAssetVersion).where(
+            DBAssetVersion.id == source_id,
+            DBAssetVersion.tenant_id == task.tenant_id,
+            DBAssetVersion.project_id == task.project_id,
+        )).scalar_one_or_none()
+        if (
+            source is None or source.media_type != "image"
+            or source.sha256 != (task.request_json or {}).get("sourceAssetSha256")
+            or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), utc_now())["allowed"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "SOURCE_RIGHTS_REVOKED", "message": "源素材授权或版本已失效，禁止人工重试"},
+            )
+
+        if file.content_type != "video/mp4":
+            raise HTTPException(
+                status_code=415,
+                detail={"code": "ARTIFACT_CONTENT_TYPE_INVALID", "message": "仅接受与原始意图完全匹配的MP4字节"},
+            )
+        file.file.seek(0, os.SEEK_END)
+        upload_size = file.file.tell()
+        file.file.seek(0)
+        if upload_size != expected_size or upload_size > max_upload_bytes:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORIGINAL_MEDIA_SIZE_MISMATCH", "message": "人工重试字节长度与原始意图不一致"},
+            )
+        digest = hashlib.sha256()
+        while chunk := file.file.read(1024 * 1024):
+            digest.update(chunk)
+        file.file.seek(0)
+        if digest.hexdigest() != expected_sha:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORIGINAL_MEDIA_SHA256_MISMATCH", "message": "人工重试字节摘要与原始意图不一致"},
+            )
+
+        # Only explicit 404 means absent. A timeout, 5xx, disabled route or hash
+        # conflict must not trigger a second Sidecar POST.
+        try:
+            original = created_app.state.video_use.find_fake_recovery_optional(
+                task.project_id, recovery_key, expected_sha
+            )
+        except VideoUseError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "ORIGINAL_MEDIA_LOOKUP_UNAVAILABLE", "message": "原媒资状态不明确，保持隔离且不重复上传"},
+            ) from exc
+
+        upload_performed = False
+        if original is None:
+            try:
+                original = created_app.state.video_use.upload_media(
+                    task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file,
+                    recovery_key=recovery_key, expected_sha256=expected_sha,
+                )
+                upload_performed = True
+            except VideoUseError as exc:
+                # Sidecar may have persisted bytes before an ACK was lost. Keep
+                # the same durable intent and let a later lookup reconcile it.
+                db.rollback()
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "ORIGINAL_MEDIA_REUPLOAD_UNCERTAIN", "message": "原媒资重传结果不明确；保留原任务并在下次先核对"},
+                ) from exc
+
+        original_metadata = original.get("metadata") or {}
+        try:
+            duration_seconds = float(original_metadata.get("durationSeconds") or 0)
+            receipt_size = int(original_metadata.get("sizeBytes") or 0)
+            probe_valid = bool(original_metadata.get("video")) and duration_seconds > 0 and receipt_size == expected_size
+        except (TypeError, ValueError):
+            probe_valid = False
+            receipt_size = 0
+        media_id = original.get("mediaId")
+        if not (
+            original.get("projectId") == task.project_id
+            and original.get("sha256") == expected_sha
+            and original.get("contentType") == "video/mp4"
+            and isinstance(media_id, str) and media_id.startswith("g70")
+            and probe_valid
+        ):
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORIGINAL_MEDIA_SCOPE_OR_HASH_MISMATCH", "message": "Sidecar原媒资凭据校验失败，保持未绑定"},
+            )
+
+        now = utc_now()
+        add_generation_event(
+            db, task, attempt=attempt, event_type="ARTIFACT_RECOVERY_REUPLOAD",
+            actor_type="OWNER_SELF", actor_id=context.user_id,
+            from_status=task.status, to_status=task.status,
+            metadata={
+                "mediaId": media_id, "sha256": expected_sha, "sizeBytes": expected_size,
+                "uploadPerformed": upload_performed, "idempotent": not upload_performed,
+                "businessAssetBound": False, "financialSettlementVerified": False,
+                "settlementCreated": False, "reservationPreserved": True,
+                "providerResubmitted": False,
+            }, now=now,
+        )
+        db.commit()
+        return {
+            "taskId": task.id, "projectId": task.project_id, "attempt": task.attempts,
+            "recoveryState": "FOUND_UNBOUND", "actorMode": "OWNER_SELF",
+            "mediaId": media_id, "sha256": expected_sha, "sizeBytes": expected_size,
+            "uploadPerformed": upload_performed, "idempotent": not upload_performed,
+            "businessAssetBound": False, "financialSettlementVerified": False,
+            "settlementCreated": False, "reservationPreserved": True,
+            "requiresSeparateRelinkGate": True,
+        }
+
     @created_app.post("/projects/{project_id}/generation-tasks/{task_id}/fake-recovery-relink")
     def relink_original_fake_artifact_owner_self(
         project_id: str,
