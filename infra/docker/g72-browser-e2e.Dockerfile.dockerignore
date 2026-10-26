@@ -56,12 +56,27 @@ test-results-g72
 **/.azure/**
 .config/gcloud/
 **/.config/gcloud/**
+.config/gh/
+**/.config/gh/**
+.config/containers/
+**/.config/containers/**
+.config/helm/
+**/.config/helm/**
+.config/terraform.d/
+**/.config/terraform.d/**
 .docker/config.json
 **/.docker/config.json
 .kube/
 **/.kube/**
 .vault-token
 **/.vault-token
+.git-credentials
+**/.git-credentials
+.terraformrc
+**/.terraformrc
+.terraform.d/
+**/.terraform.d/**
+**/credentials.tfrc.json
 **/*credentials*.json
 **/*service-account*.json
 **/*service_account*.json
@@ -83,6 +98,10 @@ secrets/
 **/*.mobileprovision
 **/id_rsa*
 **/id_ed25519*
+**/id_ecdsa*
+**/id_dsa*
+**/id_xmss*
+**/id_sk*
 
 # Provider canary inputs and evidence are never part of browser test images.
 *provider-canary*.toml
