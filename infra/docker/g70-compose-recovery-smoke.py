@@ -250,7 +250,7 @@ def prepare(state_path: Path = STATE):
     print(json.dumps({
         "phase":"live_artifact_intake_final_asset_insert_fault",
         "fakeOnly":True,"fixture":"SYNTHETIC_DB_AND_FFMPEG",
-        "faultInjection":"SQLite trigger rejected final video-asset INSERT after real Sidecar HTTP ACK",
+        "faultInjection": f"{dialect.upper()} trigger rejected final video-asset INSERT after real Sidecar HTTP ACK",
         "apiStatus":intake.status_code,"apiCode":intake.json()["detail"]["code"],
         "recoveryState":body["recoveryState"],"sameTask":task_id,
         "attempts":1,"reserved":1,"settled":0,"released":0,
