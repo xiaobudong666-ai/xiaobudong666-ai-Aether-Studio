@@ -11,6 +11,7 @@ on:
       - infra/docker/g72-compose-network-smoke.py
       - infra/docker/g72-pg-native-worker-lock-race-smoke.py
       - infra/docker/g72-midupload-revocation-smoke.py
+      - infra/docker/g70-compose-recovery-smoke.py
       - .github/workflows/g72-postgres-worker-sidecar.yml
       - apps/api/app/**
       - apps/worker/app/**
@@ -328,6 +329,54 @@ jobs:
           compose exec -T api python /tmp/g72-pg-native-worker-lock-race-smoke.py verify-revoked
           echo "G72_PG_PRECLAIM_REVOKED_RESTART_NO_DISPATCH_PASS"
           # QUEUED remains open with RESERVED held: not a full lifecycle closure.
+
+      - name: Prepare G70 synthetic media for PostgreSQL recovery tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          compose exec -T video-use ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i color=c=black:s=64x64:r=2 -t 1 \
+            -c:v mpeg4 -pix_fmt yuv420p -movflags +faststart \
+            /tmp/g70-ci-synthetic-original.mp4
+          compose cp video-use:/tmp/g70-ci-synthetic-original.mp4 \
+            "$RUNNER_TEMP/g70-ci-synthetic-original.mp4"
+          compose cp "$RUNNER_TEMP/g70-ci-synthetic-original.mp4" \
+            api:/tmp/g70-ci-synthetic-original.mp4
+          compose cp infra/docker/g70-compose-recovery-smoke.py \
+            api:/tmp/g70-compose-recovery-smoke.py
+
+      - name: G70 PostgreSQL final asset INSERT failure and concurrent idempotent Owner-self relink
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          compose exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py prepare
+          compose restart video-use api
+          compose up -d --wait --wait-timeout 240 api video-use
+          compose exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py verify-concurrent
+
+      - name: G70 PostgreSQL concurrent rights revocation versus original artifact relink
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          compose exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py prepare-revoke-race
+          compose restart video-use api
+          compose up -d --wait --wait-timeout 240 api video-use
+          compose exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py verify-revoke-race
 
       - name: Nonsecret failure diagnostics
         if: failure()

@@ -2506,12 +2506,15 @@ def create_app(
         # This is not a substitute for M12 trusted issuer/epoch or a serialized
         # revocation protocol; those remain separate acceptance gates.
         source_id = (task.request_json or {}).get("imageAssetId")
+        # Lock the source asset before the final rights read. The rights-snapshot
+        # writer takes the same row lock, serializing a concurrent revoke either
+        # before this check (relink denied) or after the one-time bind.
         source = db.execute(
             select(DBAssetVersion).where(
                 DBAssetVersion.id == source_id,
                 DBAssetVersion.tenant_id == task.tenant_id,
                 DBAssetVersion.project_id == task.project_id,
-            )
+            ).with_for_update()
         ).scalar_one_or_none()
         if (
             source is None
@@ -3197,7 +3200,20 @@ def create_app(
     ):
         require_roles(context, "owner", "editor")
         project_for_tenant(db, project_id, context)
-        asset_for_tenant(db, project_id, asset_version_id, context)
+        # Serialize rights mutation with G70's final source-rights check. This
+        # preserves the existing authority model and makes the two writes linearizable.
+        locked_asset = db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.id == asset_version_id,
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == context.tenant_id,
+            ).with_for_update()
+        ).scalar_one_or_none()
+        if locked_asset is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "ASSET_VERSION_NOT_FOUND", "message": "未找到该资产版本"},
+            )
         snapshot = DBRightsSnapshot(
             id=str(uuid.uuid4()),
             tenant_id=context.tenant_id,

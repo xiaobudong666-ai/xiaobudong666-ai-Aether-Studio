@@ -5,6 +5,7 @@ Owner-self relink is exercised; no paid generation, settlement, refund, release,
 from __future__ import annotations
 import argparse
 from contextlib import contextmanager
+from concurrent.futures import Barrier, ThreadPoolExecutor
 import datetime as dt
 import hashlib
 import io
@@ -23,6 +24,7 @@ from app.models import (DBAssetVersion, DBGenerationAttempt, DBGenerationEvent,
 from app.video_use_adapter import VideoUseAdapter, VideoUseError
 
 STATE = Path("/tmp/g70-compose-original-state.json")
+STATE_REVOKE_RACE = Path("/tmp/g70-compose-revoke-race-state.json")
 VIDEO = Path("/tmp/g70-ci-synthetic-original.mp4")
 BASE = "http://127.0.0.1:8000"
 SIDECAR = "http://video-use:8002"
@@ -79,7 +81,7 @@ def invariant(task_id, tenant_id):
                               & (DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED")),
             "storageHeld": tenant.used_storage_bytes}
 
-def prepare():
+def prepare(state_path: Path = STATE):
     original = VIDEO.read_bytes()
     sha = hashlib.sha256(original).hexdigest()
     assert len(original) > 900 and original[4:8] == b"ftyp"
@@ -133,7 +135,7 @@ def prepare():
             request_units=1, generated_seconds=0,
             reservation_key=f"generation:{task_id}", config_version_id=None, created_at=now)
         tenant = db.get(DBTenant, tenant_id)
-        assert tenant.used_storage_bytes == 0, "must be fresh disposable DB"
+        storage_before = tenant.used_storage_bytes
         db.add_all([source, rights, task, attempt, reserved])
         db.commit()
 
@@ -142,17 +144,34 @@ def prepare():
     # to this random project and video assets; it is removed immediately after
     # the one HTTP request and is never part of application or production code.
     trigger_name = "g70_final_asset_insert_fault_" + uuid.uuid4().hex
+    function_name = "g70_final_asset_insert_fault_fn_" + uuid.uuid4().hex
     with SessionLocal() as db:
-        assert db.get_bind().dialect.name == "sqlite", "this fault injector is SQLite-CI-only"
+        dialect = db.get_bind().dialect.name
         quote = db.get_bind().dialect.identifier_preparer.quote
         table_name = quote(DBAssetVersion.__tablename__)
         trigger_sql_name = quote(trigger_name)
+        function_sql_name = quote(function_name)
         project_literal = pid.replace("'", "''")
-        db.execute(text(
-            f"CREATE TRIGGER {trigger_sql_name} BEFORE INSERT ON {table_name} "
-            f"WHEN NEW.project_id = '{project_literal}' AND NEW.media_type = 'video' "
-            "BEGIN SELECT RAISE(ABORT, 'synthetic G70 final asset INSERT fault'); END"
-        ))
+        if dialect == "sqlite":
+            db.execute(text(
+                f"CREATE TRIGGER {trigger_sql_name} BEFORE INSERT ON {table_name} "
+                f"WHEN NEW.project_id = '{project_literal}' AND NEW.media_type = 'video' "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic G70 final asset INSERT fault'); END"
+            ))
+        elif dialect == "postgresql":
+            db.execute(text(
+                f"CREATE FUNCTION {function_sql_name}() RETURNS trigger "
+                "LANGUAGE plpgsql AS $g70$ BEGIN "
+                f"IF NEW.project_id = '{project_literal}' AND NEW.media_type = 'video' THEN "
+                "RAISE EXCEPTION 'synthetic G70 final asset INSERT fault'; "
+                "END IF; RETURN NEW; END; $g70$;"
+            ))
+            db.execute(text(
+                f"CREATE TRIGGER {trigger_sql_name} BEFORE INSERT ON {table_name} "
+                f"FOR EACH ROW EXECUTE FUNCTION {function_sql_name}()"
+            ))
+        else:
+            raise AssertionError(f"unsupported G70 fault-injection dialect: {dialect}")
         db.commit()
 
     try:
@@ -174,7 +193,12 @@ def prepare():
     finally:
         with SessionLocal() as db:
             quote = db.get_bind().dialect.identifier_preparer.quote
-            db.execute(text(f"DROP TRIGGER IF EXISTS {quote(trigger_name)}"))
+            table_name = quote(DBAssetVersion.__tablename__)
+            if dialect == "sqlite":
+                db.execute(text(f"DROP TRIGGER IF EXISTS {quote(trigger_name)}"))
+            else:
+                db.execute(text(f"DROP TRIGGER IF EXISTS {quote(trigger_name)} ON {table_name}"))
+                db.execute(text(f"DROP FUNCTION IF EXISTS {quote(function_name)}()"))
             db.commit()
 
     with login() as client:
@@ -207,12 +231,13 @@ def prepare():
         "businessAssetId":None, "mediaId":body["mediaId"],
         "attempts":1, "events":2, "videoAssets":0,
         "settlement":0, "reserved":1, "released":0, "relinked":0,
-        "storageHeld":len(original)}
+        "storageHeld":storage_before + len(original)}
     assert invariant(task_id, tenant_id) == expected
-    STATE.write_text(json.dumps({
+    state_path.write_text(json.dumps({
         "taskId":task_id,"tenantId":tenant_id,"projectId":pid,
         "otherProjectId":other_id,"mediaId":body["mediaId"],"sourceId":image_id,
-        "key":key,"sha":sha,"size":len(original),"expected":expected}),encoding="utf8")
+        "key":key,"sha":sha,"size":len(original),"storageBefore":storage_before,
+        "expected":expected}),encoding="utf8")
     print(json.dumps({
         "phase":"live_artifact_intake_final_asset_insert_fault",
         "fakeOnly":True,"fixture":"SYNTHETIC_DB_AND_FFMPEG",
@@ -222,9 +247,9 @@ def prepare():
         "attempts":1,"reserved":1,"settled":0,"released":0,
         "sha256":sha}),flush=True)
 
-def verify():
+def verify(state_path: Path = STATE, mode: str = "serial"):
     gates()
-    state = json.loads(STATE.read_text(encoding="utf8"))
+    state = json.loads(state_path.read_text(encoding="utf8"))
     adapter = VideoUseAdapter(api_url=SIDECAR, timeout=20, max_retries=0)
     original = adapter.find_fake_recovery(
         state["projectId"],state["key"],state["sha"])
@@ -262,10 +287,23 @@ def verify():
     relink_url = (
         f"/projects/{state['projectId']}/generation-tasks/{state['taskId']}/fake-recovery-relink"
     )
-    with login() as client:
-        first = client.post(relink_url)
-        assert first.status_code == 200, first.text[:500]
-        bound = first.json()
+    bound = None
+    if mode == "concurrent":
+        barrier = Barrier(2)
+        def relink_call():
+            with login() as client:
+                barrier.wait(timeout=15)
+                response = client.post(relink_url)
+                return response.status_code, response.json()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(relink_call) for _ in range(2)]
+            answers = [future.result(timeout=90) for future in futures]
+        assert all(status == 200 for status, _ in answers), answers
+        bodies = [body for _, body in answers]
+        fresh = [body for body in bodies if body.get("idempotent") is False]
+        replayed = [body for body in bodies if body.get("idempotent") is True]
+        assert len(fresh) == len(replayed) == 1, bodies
+        bound, replay = fresh[0], replayed[0]
         assert bound["taskId"] == state["taskId"]
         assert bound["recoveryState"] == "BOUND_UNSETTLED"
         assert bound["actorMode"] == "OWNER_SELF"
@@ -273,17 +311,150 @@ def verify():
         assert bound["financialSettlementVerified"] is False
         assert bound["settlementCreated"] is False
         assert bound["reservationPreserved"] is True
-        assert bound["idempotent"] is False
         assert bound["mediaId"] == state["mediaId"] and bound["sha256"] == state["sha"]
-        second = client.post(relink_url)
-        assert second.status_code == 200, second.text[:500]
-        replay = second.json()
-        assert replay["idempotent"] is True
         assert replay["assetVersionId"] == bound["assetVersionId"]
+    elif mode == "revoke-race":
+        barrier = Barrier(2)
+        rights_url = (
+            f"/projects/{state['projectId']}/asset-versions/{state['sourceId']}/rights-snapshots"
+        )
+        revoke_payload = {
+            "status": "REVOKED", "purpose": "REMIX", "territory": "TEST",
+            "evidenceRef": "SYNTHETIC_G70_PG_CONCURRENT_REVOKE",
+            "validFrom": None, "validUntil": None,
+        }
+        def relink_call():
+            with login() as client:
+                barrier.wait(timeout=15)
+                response = client.post(relink_url)
+                return response.status_code, response.json()
+        def revoke_call():
+            with login() as client:
+                barrier.wait(timeout=15)
+                response = client.post(rights_url, json=revoke_payload)
+                return response.status_code, response.json()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            relink_future = pool.submit(relink_call)
+            revoke_future = pool.submit(revoke_call)
+            relink_status, relink_body = relink_future.result(timeout=90)
+            revoke_status, revoke_body = revoke_future.result(timeout=90)
+        assert revoke_status == 201, (revoke_status, revoke_body)
+        assert revoke_body["status"] == "REVOKED"
+        if relink_status == 200:
+            bound = relink_body
+            assert bound["recoveryState"] == "BOUND_UNSETTLED"
+            assert bound["idempotent"] is False
+            with SessionLocal() as db:
+                event = db.execute(select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == state["taskId"],
+                    DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED",
+                )).scalar_one()
+                latest = db.execute(select(DBRightsSnapshot).where(
+                    DBRightsSnapshot.asset_version_id == state["sourceId"],
+                    DBRightsSnapshot.purpose == "REMIX",
+                ).order_by(DBRightsSnapshot.captured_at.desc()).limit(1)).scalar_one()
+                assert latest.status == "REVOKED"
+                event_at = event.created_at
+                if event_at.tzinfo is None:
+                    event_at = event_at.replace(tzinfo=dt.timezone.utc)
+                rights_at = dt.datetime.fromisoformat(
+                    revoke_body["capturedAt"].replace("Z", "+00:00")
+                )
+                assert event_at <= rights_at, {
+                    "relinkEventAt": event_at.isoformat(),
+                    "revocationAt": rights_at.isoformat(),
+                }
+        elif relink_status == 409:
+            assert relink_body.get("detail", {}).get("code") == "SOURCE_RIGHTS_REVOKED", relink_body
+        else:
+            raise AssertionError(f"unexpected concurrent relink response {relink_status}: {relink_body}")
+        print(json.dumps({
+            "phase": "concurrent_owner_relink_vs_rights_revoke",
+            "fakeOnly": True,
+            "relinkStatus": relink_status,
+            "revocationStatus": revoke_status,
+            "outcome": "RELINK_LINEARIZED_BEFORE_REVOKE" if bound else "REVOKE_LINEARIZED_BEFORE_RELINK",
+        }), flush=True)
+    elif mode == "serial":
+        with login() as client:
+            first = client.post(relink_url)
+            assert first.status_code == 200, first.text[:500]
+            bound = first.json()
+            assert bound["taskId"] == state["taskId"]
+            assert bound["recoveryState"] == "BOUND_UNSETTLED"
+            assert bound["actorMode"] == "OWNER_SELF"
+            assert bound["businessAssetBound"] is True
+            assert bound["financialSettlementVerified"] is False
+            assert bound["settlementCreated"] is False
+            assert bound["reservationPreserved"] is True
+            assert bound["idempotent"] is False
+            assert bound["mediaId"] == state["mediaId"] and bound["sha256"] == state["sha"]
+            second = client.post(relink_url)
+            assert second.status_code == 200, second.text[:500]
+            replay = second.json()
+            assert replay["idempotent"] is True
+            assert replay["assetVersionId"] == bound["assetVersionId"]
+    else:
+        raise AssertionError(f"unknown G70 verification mode: {mode}")
+
+    with login() as client:
         foreign = client.post(
             f"/projects/{state['otherProjectId']}/generation-tasks/{state['taskId']}/fake-recovery-relink"
         )
         assert foreign.status_code == 404
+
+    if bound is None:
+        with SessionLocal() as db:
+            task = db.get(DBGenerationTask, state["taskId"])
+            assets = db.execute(select(DBAssetVersion).where(
+                DBAssetVersion.project_id == state["projectId"],
+                DBAssetVersion.media_id == state["mediaId"])).scalars().all()
+            relinks = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == state["taskId"],
+                DBGenerationEvent.event_type == "ARTIFACT_ASSET_RELINKED")).scalar_one()
+            attempts = db.execute(select(func.count(DBGenerationAttempt.id)).where(
+                DBGenerationAttempt.generation_task_id == state["taskId"])).scalar_one()
+            settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == state["taskId"],
+                DBGenerationUsageEntry.kind == "SETTLED")).scalar_one()
+            released = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == state["taskId"],
+                DBGenerationUsageEntry.kind == "RELEASED")).scalar_one()
+            reserved_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == state["taskId"],
+                DBGenerationUsageEntry.kind == "RESERVED")).scalar_one()
+            latest = db.execute(select(DBRightsSnapshot).where(
+                DBRightsSnapshot.asset_version_id == state["sourceId"],
+                DBRightsSnapshot.purpose == "REMIX"
+            ).order_by(DBRightsSnapshot.captured_at.desc()).limit(1)).scalar_one()
+            tenant = db.get(DBTenant, state["tenantId"])
+            task_state = {"status": task.status, "error": task.error_code,
+                          "assetVersionId": task.asset_version_id, "mediaId": task.media_id}
+            assert task.status == "UNKNOWN" and task.error_code == "ARTIFACT_INGEST_FAILED", task_state
+            assert task.asset_version_id is None and task.media_id == state["mediaId"], task_state
+            assert latest.status == "REVOKED"
+            assert len(assets) == relinks == settled == released == 0
+            assert attempts == task.attempts == 1 and reserved_count == 1
+            assert tenant.used_storage_bytes == state["storageBefore"] + state["size"]
+        final_media = httpx.get(
+            f"{SIDECAR}/media/{state['projectId']}/{state['mediaId']}",
+            timeout=20, trust_env=False)
+        assert final_media.status_code == 200
+        assert len(final_media.content) == state["size"]
+        assert hashlib.sha256(final_media.content).hexdigest() == state["sha"]
+        print(json.dumps({
+            "phase": "revoke_wins_fail_closed",
+            "verified": True,
+            "taskId": state["taskId"],
+            "assetBound": False,
+            "attempts": 1,
+            "reserved": 1,
+            "settled": 0,
+            "released": 0,
+            "providerResubmitted": False,
+            "sha256": state["sha"],
+        }), flush=True)
+        return
 
     with SessionLocal() as db:
         task = db.get(DBGenerationTask, state["taskId"])
@@ -315,7 +486,7 @@ def verify():
         assert assets[0].probe_json["provenance"]["generationTaskId"] == state["taskId"]
         assert relinks == 1 and attempts == 1 and task.attempts == 1
         assert settled == 0 and released == 0 and reserved_count == 1
-        assert tenant.used_storage_bytes == state["size"]
+        assert tenant.used_storage_bytes == state["storageBefore"] + state["size"]
         assert len([item for item in (project.materials or []) if item.get("id") == state["mediaId"]]) == 1
 
     final_media = httpx.get(
@@ -324,7 +495,7 @@ def verify():
     assert final_media.status_code == 200
     assert len(final_media.content) == state["size"]
     assert hashlib.sha256(final_media.content).hexdigest() == state["sha"]
-    print(json.dumps({"phase":"asset_relinked","verified":True,
+    print(json.dumps({"phase":"asset_relinked","verified":True,"verificationMode":mode,
         "taskId":state["taskId"],"sameTaskAsUploadFailure":True,
         "fixture":"REAL_COMPOSE_SIDECAR_AND_FFMPEG",
         "actorMode":"OWNER_SELF","assetRelink":True,"idempotentRetry":True,
@@ -333,5 +504,16 @@ def verify():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase",choices=("prepare","verify"))
-    (prepare if parser.parse_args().phase == "prepare" else verify)()
+    parser.add_argument("phase", choices=("prepare", "verify", "verify-concurrent",
+                                         "prepare-revoke-race", "verify-revoke-race"))
+    phase = parser.parse_args().phase
+    if phase == "prepare":
+        prepare(STATE)
+    elif phase == "verify":
+        verify(STATE, mode="serial")
+    elif phase == "verify-concurrent":
+        verify(STATE, mode="concurrent")
+    elif phase == "prepare-revoke-race":
+        prepare(STATE_REVOKE_RACE)
+    else:
+        verify(STATE_REVOKE_RACE, mode="revoke-race")
