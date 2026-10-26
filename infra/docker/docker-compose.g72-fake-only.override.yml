@@ -20,12 +20,14 @@ services:
       # Only disposable fake-only Compose. Never include this override in prod.
       AETHER_FAKE_ONLY_NONPROD: "true"
       AETHER_RUNTIME_STAGE: nonproduction
+  web:
+    # No host-published port: the Playwright runner joins the same internal
+    # aether-net and uses http://web, so no external ingress/egress is needed.
+    ports: !reset []
 
-# The base topology attaches every app service to a normal bridge network,
-# and MoneyPrinterTurbo also has provider-egress. The disposable FAKE-only
-# stack must have no outbound route at all. Keep names/topology unchanged while
-# making every network used by the test stack internal. Host-published web
-# access remains loopback-only and is verified by the CI config gate.
+# The disposable FAKE-only stack must have no outbound route at all.
+# Every network used by the stack is internal; browser E2E runs as a container
+# attached only to aether-net, never to provider-control/provider-egress.
 networks:
   aether-net:
     internal: true
