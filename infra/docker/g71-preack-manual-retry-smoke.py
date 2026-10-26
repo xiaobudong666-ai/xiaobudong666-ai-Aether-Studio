@@ -19,10 +19,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from app.database import SessionLocal, engine, get_db
+from app.auth import hash_password
 from app.main import create_app
 from app.models import (
     DBAssetVersion, DBGenerationAttempt, DBGenerationEvent,
-    DBGenerationTask, DBGenerationUsageEntry, DBProject, DBRightsSnapshot, DBTenant,
+    DBGenerationTask, DBGenerationUsageEntry, DBProject, DBRightsSnapshot, DBTenant, DBUser,
 )
 from app.video_use_adapter import VideoUseAdapter
 
@@ -61,6 +62,26 @@ def login(client):
     })
     assert response.status_code == 200, f"Owner login: {response.status_code} {response.text}"
     client.headers["X-Aether-CSRF"] = "1"
+
+
+def actor_client(tenant_id: str, role: str):
+    """Create a disposable same-tenant non-requester identity for denial tests."""
+    from datetime import datetime, timezone
+    email = f"g71-{role}-{uuid.uuid4().hex}@example.test"
+    password = "G71-test-only-" + uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        db.add(DBUser(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, email=email,
+            display_name=f"G71 synthetic {role}", password_hash=hash_password(password),
+            role=role, is_active=True, created_at=now, updated_at=now,
+        ))
+        db.commit()
+    client = owner_client()
+    response = client.post("/auth/login", json={"email": email, "password": password})
+    assert response.status_code == 200, f"synthetic {role} login: {response.status_code} {response.text}"
+    client.headers["X-Aether-CSRF"] = "1"
+    return client
 
 
 def seed_image(project_id: str) -> str:
@@ -253,10 +274,31 @@ def manual_retry():
     with owner_client() as client:
         login(client)
         check_url = f"/projects/{state['projectId']}/generation-tasks/{state['taskId']}/fake-recovery-check"
+        retry_url = f"/projects/{state['projectId']}/generation-tasks/{state['taskId']}/fake-recovery-upload-retry"
+
+        # Only the original requester may perform this Owner-self recovery. The
+        # current role model has no privileged admin-delegation contract, so an
+        # admin-role actor must fail closed rather than acting on the Owner's task.
+        before_actor_denials = counts(state["taskId"], state["tenantId"], state["projectId"])
+        for role, expected_code in (("owner", "OWNER_SELF_ONLY"), ("admin", "PERMISSION_DENIED")):
+            with actor_client(state["tenantId"], role) as delegated:
+                denied = delegated.post(
+                    retry_url, files={"file": ("same-original.mp4", data, "video/mp4")}
+                )
+            assert denied.status_code == 403, (role, denied.status_code, denied.text)
+            assert denied.json().get("detail", {}).get("code") == expected_code, (role, denied.text)
+            assert counts(state["taskId"], state["tenantId"], state["projectId"]) == before_actor_denials
+        print(json.dumps({
+            "phase": "g71_owner_self_and_admin_role_denial",
+            "fakeOnly": True,
+            "nonRequesterOwnerDenied": True,
+            "adminRoleDenied": True,
+            "taskUnchanged": True,
+        }), flush=True)
+
         absent = client.get(check_url)
         assert absent.status_code == 503
         assert absent.json().get("detail", {}).get("code") == "ORIGINAL_MEDIA_LOOKUP_UNAVAILABLE"
-        retry_url = f"/projects/{state['projectId']}/generation-tasks/{state['taskId']}/fake-recovery-upload-retry"
 
         # Wrong bytes with the original length must fail before any Sidecar write.
         before_negative = counts(state["taskId"], state["tenantId"], state["projectId"])
