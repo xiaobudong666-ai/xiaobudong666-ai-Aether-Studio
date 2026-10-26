@@ -137,7 +137,15 @@ def prepare(state_path: Path = STATE):
             reservation_key=f"generation:{task_id}", config_version_id=None, created_at=now)
         tenant = db.get(DBTenant, tenant_id)
         storage_before = tenant.used_storage_bytes
-        db.add_all([source, rights, task, attempt, reserved])
+        # Flush parent rows before PostgreSQL enforces each dependent FK.
+        db.add(source)
+        db.flush()
+        db.add(rights)
+        db.add(task)
+        db.flush()
+        db.add(attempt)
+        db.flush()
+        db.add(reserved)
         db.commit()
 
     # Inject the failure at the final business-asset INSERT within the artifact-intake transaction.
