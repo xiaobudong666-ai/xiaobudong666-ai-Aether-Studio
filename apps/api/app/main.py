@@ -1379,6 +1379,7 @@ def create_app(
         db.add(task)
         db.flush()
         db.add(attempt)
+        db.flush()
         add_usage_entry(
             db, task=task, attempt=attempt, kind="RESERVED",
             request_units=1, generated_seconds=0,
