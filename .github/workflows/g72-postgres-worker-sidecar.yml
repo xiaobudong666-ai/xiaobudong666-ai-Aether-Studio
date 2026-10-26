@@ -1,4 +1,4 @@
-name: G72 PostgreSQL Worker Sidecar FAKE-only integration
+name: G72 + G70 PostgreSQL Worker Sidecar FAKE-only integration
 
 on:
   push:
