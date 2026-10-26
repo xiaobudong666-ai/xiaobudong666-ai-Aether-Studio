@@ -208,6 +208,7 @@ jobs:
             "apps/api/.ssh" "apps/api/.aws"
           )
           created_dirs=()
+          created_files=()
           for dir in "${candidate_dirs[@]}"; do
             if [ ! -d "$dir" ]; then created_dirs+=("$dir"); fi
           done
@@ -216,8 +217,12 @@ jobs:
           cleanup() {
             if [ -n "$container_id" ]; then docker rm -f "$container_id" >/dev/null 2>&1 || true; fi
             rm -f "$archive"
-            for file in "${probe_files[@]}"; do rm -f -- "$file"; done
-            for ((i=${#created_dirs[@]}-1; i>=0; i--)); do rmdir -- "${created_dirs[$i]}" 2>/dev/null || true; done
+            if [ -n "${created_files[*]-}" ]; then
+              for file in "${created_files[@]}"; do rm -f -- "$file"; done
+            fi
+            if [ -n "${created_dirs[*]-}" ]; then
+              for ((i=${#created_dirs[@]}-1; i>=0; i--)); do rmdir -- "${created_dirs[$i]}" 2>/dev/null || true; done
+            fi
           }
           trap cleanup EXIT
           for file in "${probe_files[@]}"; do
