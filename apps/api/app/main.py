@@ -1968,7 +1968,9 @@ def create_app(
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
-            # G75: validate provider configuration and Worker attestation before\n            # changing circuit state or assigning a HALF_OPEN probe.\n            if candidate_mode == "moneyprinter":
+            # G75: validate provider configuration and Worker attestation before
+            # changing circuit state or assigning a HALF_OPEN probe.
+            if candidate_mode == "moneyprinter":
                 config = published_generation_config(db, candidate.tenant_id)
                 if (
                     config is None
