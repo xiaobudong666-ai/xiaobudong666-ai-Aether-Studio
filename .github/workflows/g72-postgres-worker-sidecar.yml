@@ -6,6 +6,7 @@ on:
       - test/fusion-m0-v704-current-g72-pg-20261026
     paths:
       - infra/docker/api.g72-postgres-ci.Dockerfile
+      - infra/docker/g72-browser-e2e.Dockerfile
       - infra/docker/docker-compose.g72-postgres-ci.override.yml
       - infra/docker/docker-compose.g72-fake-only.override.yml
       - infra/docker/g72-compose-network-smoke.py
@@ -95,7 +96,7 @@ jobs:
           assert pg["environment"]["POSTGRES_DB"] == "aether_g72_ci"
           assert set(api["networks"]) == {"aether-net"}
           assert set(web["networks"]) == {"aether-net"}
-          assert any(str(port.get("published")) == "18080" and port.get("host_ip") == "127.0.0.1" for port in web.get("ports", [])), "browser E2E must bind web only to loopback"
+          assert not web.get("ports"), "FAKE-only browser must not publish any host port; use the internal network"
           assert not api["environment"].get("HEYGEN_API_KEY")
           PY
 
@@ -168,35 +169,39 @@ jobs:
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py prepare-browser
 
-      - name: Set up Node.js 24 for current-SHA browser E2E
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: Install pnpm 10.30.3
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.30.3
-
-      - name: Install browser E2E dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Chromium and system dependencies
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Build isolated internal-network Playwright runner
+        run: docker build --file infra/docker/g72-browser-e2e.Dockerfile --tag aether-g72-browser-e2e:ci .
 
       - name: Verify G72 browser normal entry to FAKE-only API and live Workers
+        shell: bash
         env:
           AETHER_G72_BROWSER_E2E: "1"
-          AETHER_G72_E2E_URL: "http://127.0.0.1:18080"
+          AETHER_G72_E2E_URL: "http://web"
           AETHER_BOOTSTRAP_ADMIN_EMAIL: "admin@aether.local"
-        run: pnpm exec playwright test -c playwright.g72.config.ts
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/g72-browser-results"
+          network_name="$(docker network ls \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --filter "label=com.docker.compose.network=aether-net" \
+            --format '{{.Name}}' | head -n1)"
+          test -n "$network_name" || { echo "FAKE-only aether-net not found" >&2; exit 1; }
+          docker run --rm \
+            --network "$network_name" \
+            --name "${COMPOSE_PROJECT_NAME}-browser-e2e" \
+            -e AETHER_G72_BROWSER_E2E \
+            -e AETHER_G72_E2E_URL \
+            -e AETHER_BOOTSTRAP_ADMIN_EMAIL \
+            -e AETHER_BOOTSTRAP_ADMIN_PASSWORD \
+            -v "$RUNNER_TEMP/g72-browser-results:/app/test-results-g72" \
+            aether-g72-browser-e2e:ci
 
       - name: Upload G72 browser trace and screenshot evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: g72-browser-e2e-${{ github.run_id }}
-          path: test-results-g72/
+          path: ${{ runner.temp }}/g72-browser-results/
           if-no-files-found: ignore
 
       - name: Restart real Worker and Sidecar then verify immutable media and auth
