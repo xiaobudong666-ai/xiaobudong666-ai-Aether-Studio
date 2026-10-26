@@ -1373,7 +1373,12 @@ def create_app(
             id=str(uuid.uuid4()), generation_task_id=task_id, attempt_no=1,
             status="QUEUED", reconciliation_state="NOT_SUBMITTED", created_at=now,
         )
-        db.add_all([task, attempt])
+        # Flush the parent task before its FK-dependent attempt. PostgreSQL
+        # enforces this ordering strictly; relying on add_all mapper ordering
+        # can insert generation_attempts before generation_tasks.
+        db.add(task)
+        db.flush()
+        db.add(attempt)
         add_usage_entry(
             db, task=task, attempt=attempt, kind="RESERVED",
             request_units=1, generated_seconds=0,
