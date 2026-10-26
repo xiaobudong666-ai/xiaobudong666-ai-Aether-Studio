@@ -65,9 +65,12 @@ jobs:
           python - <<'PY'
           import json, os
           from pathlib import Path
-          services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-pg-config.json").read_text())["services"]
+          config = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-pg-config.json").read_text())
+          services = config["services"]
+          networks = config["networks"]
           api, worker, sidecar, pg = (services[n] for n in ("api", "worker", "video-use", "postgres-g72"))
           web = services["web"]
+          moneyprinter = services["moneyprinter-sidecar"]
           assert api["environment"]["DATABASE_URL"] == (
               "postgresql+psycopg://ci_g72:ci-only-postgres-password@postgres-g72:5432/aether_g72_ci"
           )
@@ -81,6 +84,12 @@ jobs:
           assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
           assert worker["environment"]["AETHER_GENERATION_CANARY_PROFILE"] == "disabled"
           assert sidecar["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          # The base Compose file starts MoneyPrinterTurbo as a Worker dependency.
+          # In this test-only overlay its provider-egress network must be internal,
+          # so the FAKE-only run has no route to external Provider endpoints.
+          assert networks["provider-egress"].get("internal") is True, "FAKE-only provider-egress must be isolated"
+          assert networks["provider-control"].get("internal") is True, "provider-control must remain internal"
+          assert not moneyprinter.get("ports"), "MoneyPrinterTurbo must not publish host ports in CI"
           assert not pg.get("ports") and set(pg["networks"]) == {"aether-net"}
           assert pg["environment"]["POSTGRES_DB"] == "aether_g72_ci"
           assert set(api["networks"]) == {"aether-net"}
