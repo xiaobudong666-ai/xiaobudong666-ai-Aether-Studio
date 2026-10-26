@@ -14,6 +14,12 @@ on:
       - infra/docker/g70-compose-recovery-smoke.py
       - infra/docker/g71-preack-manual-retry-smoke.py
       - infra/docker/g76-pg-circuit-probe-smoke.py
+      - e2e/g72-fake-only.spec.ts
+      - playwright.g72.config.ts
+      - package.json
+      - pnpm-lock.yaml
+      - apps/web/**
+      - infra/docker/web.Dockerfile
       - .github/workflows/g72-postgres-worker-sidecar.yml
       - apps/api/app/**
       - apps/worker/app/**
@@ -31,6 +37,8 @@ jobs:
       AETHER_COOKIE_SECURE: "false"
       AETHER_API_PORT: "18300"
       AETHER_WORKER_PORT: "18301"
+      AETHER_HTTP_BIND: "127.0.0.1"
+      AETHER_HTTP_PORT: "18080"
     steps:
       - name: Checkout exact isolated branch SHA
         uses: actions/checkout@v4
@@ -59,6 +67,7 @@ jobs:
           from pathlib import Path
           services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-pg-config.json").read_text())["services"]
           api, worker, sidecar, pg = (services[n] for n in ("api", "worker", "video-use", "postgres-g72"))
+          web = services["web"]
           assert api["environment"]["DATABASE_URL"] == (
               "postgresql+psycopg://ci_g72:ci-only-postgres-password@postgres-g72:5432/aether_g72_ci"
           )
@@ -75,6 +84,8 @@ jobs:
           assert not pg.get("ports") and set(pg["networks"]) == {"aether-net"}
           assert pg["environment"]["POSTGRES_DB"] == "aether_g72_ci"
           assert set(api["networks"]) == {"aether-net"}
+          assert set(web["networks"]) == {"aether-net"}
+          assert any(str(port.get("published")) == "18080" and port.get("host_ip") == "127.0.0.1" for port in web.get("ports", [])), "browser E2E must bind web only to loopback"
           assert not api["environment"].get("HEYGEN_API_KEY")
           PY
 
@@ -85,7 +96,7 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
-            up -d --build --wait --wait-timeout 420 --scale worker=2 api worker video-use
+            up -d --build --wait --wait-timeout 420 --scale worker=2 api worker video-use web
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
@@ -137,6 +148,47 @@ jobs:
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             -f infra/docker/docker-compose.g72-postgres-ci.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py prepare
+
+      - name: Prepare synthetic browser fixture for the normal G72 entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \\
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \\
+            -f infra/docker/docker-compose.g72-postgres-ci.override.yml \\
+            exec -T api python /tmp/g72-compose-network-smoke.py prepare-browser
+
+      - name: Set up Node.js 24 for current-SHA browser E2E
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm 10.30.3
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Install browser E2E dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium and system dependencies
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Verify G72 browser normal entry to FAKE-only API and live Workers
+        env:
+          AETHER_G72_BROWSER_E2E: "1"
+          AETHER_G72_E2E_URL: "http://127.0.0.1:18080"
+          AETHER_BOOTSTRAP_ADMIN_EMAIL: "admin@aether.local"
+          AETHER_BOOTSTRAP_ADMIN_PASSWORD: ${{ env.AETHER_BOOTSTRAP_ADMIN_PASSWORD }}
+        run: pnpm exec playwright test -c playwright.g72.config.ts
+
+      - name: Upload G72 browser trace and screenshot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g72-browser-e2e-${{ github.run_id }}
+          path: test-results-g72/
+          if-no-files-found: ignore
 
       - name: Restart real Worker and Sidecar then verify immutable media and auth
         shell: bash
