@@ -2470,6 +2470,18 @@ def create_app(
                 detail={"code": "ORIGINAL_MEDIA_LOOKUP_UNAVAILABLE", "message": "原媒资状态不明确，保持隔离且不重复上传"},
             ) from exc
 
+        # If the task already carries a media ID, the Sidecar object must match it.
+        # Reject before any physical write when the persisted ID conflicts with an
+        # absent or different Sidecar object; recovery remains fail-closed.
+        if task.media_id is not None and (
+            original is None or original.get("mediaId") != task.media_id
+        ):
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORIGINAL_MEDIA_ID_CONFLICT", "message": "持久媒体ID与Sidecar原媒资不一致，禁止重传"},
+            )
+
         upload_performed = False
         if original is None:
             try:
