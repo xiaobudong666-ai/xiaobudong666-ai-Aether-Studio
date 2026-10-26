@@ -61,7 +61,7 @@ def seed_test_image_and_remix_rights(project_id: str) -> str:
         assert project is not None
         asset = DBAssetVersion(
             id=str(uuid.uuid4()), tenant_id=project.tenant_id,
-            project_id=project.id, media_id=f"synthetic-g72-ci-image-{project_id[:8]}",
+            project_id=project.id, media_id="synthetic-g72-ci-image",
             version_no=1, sha256="a" * 64, media_type="image",
             content_type="image/png", size_bytes=100,
             probe_json={"image": {"width": 48, "height": 48}},
@@ -106,6 +106,14 @@ def check_asset_and_receipts(project_id: str, task_id: str,
             DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
         )).scalars().all()
         assert len(events) == 1, f"ingest events={len(events)}"
+        # With two independent real Worker replicas, exactly one claim must
+        # persist for this task. A second claim means lease/attempt fencing
+        # failed even when the final media happens to look correct.
+        claim_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one()
+        assert claim_events == 1, f"duplicate Worker claims={claim_events}"
         attempts = db.execute(select(func.count(DBGenerationAttempt.id)).where(
             DBGenerationAttempt.generation_task_id == task_id,
         )).scalar_one()
@@ -131,7 +139,7 @@ def check_asset_and_receipts(project_id: str, task_id: str,
         "taskId": task_id, "projectId": project_id, "mediaId": media_id,
         "sha256": digest, "bytes": len(data),
         "settledEntries": settled, "ingestEvents": len(events),
-        "attempts": attempts,
+        "claimedEvents": claim_events, "attempts": attempts,
     }
 
 
@@ -196,31 +204,6 @@ def prepare() -> None:
 
 
 
-def prepare_browser_fixture() -> None:
-    """Seed a synthetic image/right for the browser-driven FAKE-only UI test.
-
-    The fixture has no uploaded source bytes and is never production evidence.
-    The browser still performs the normal UI preflight/create flow through the
-    same-origin API and waits for the live disposable Worker to finish.
-    """
-    project_name = "FAKE G72 browser E2E " + uuid.uuid4().hex[:12]
-    with authenticate() as client:
-        response = client.post("/projects", json={"name": project_name})
-        assert response.status_code == 201, (
-            f"browser fixture project create={response.status_code}"
-        )
-        project = response.json()
-        asset_id = seed_test_image_and_remix_rights(project["id"])
-        print(json.dumps({
-            "phase": "browser_fixture_ready",
-            "fakeOnly": True,
-            "fixture": "SYNTHETIC_DB_IMAGE_AND_REMIX_RIGHTS_NO_SOURCE_BYTES",
-            "projectId": project["id"],
-            "projectName": project_name,
-            "assetVersionId": asset_id,
-        }), flush=True)
-
-
 def verify_foreign_tenant_denials(saved: dict, replay_request: dict) -> None:
     """Native nonproduction auth negative, independent of Owner's session.
 
@@ -261,16 +244,106 @@ def verify_foreign_tenant_denials(saved: dict, replay_request: dict) -> None:
         for target in (
             f"/projects/{saved['projectId']}",
             f"/projects/{saved['projectId']}/generation-tasks/{saved['taskId']}",
+            f"/projects/{saved['projectId']}/generation-tasks/{saved['taskId']}/fake-recovery-check",
+            f"/video-use/media/{saved['projectId']}/{saved['mediaId']}",
         ):
             reply = foreign.get(target)
             assert reply.status_code == 404, (
                 f"foreign tenant GET exposed original project or task: {target} {reply.status_code}"
             )
+        # Range requests must never bypass tenant isolation or leak MP4 bytes.
+        ranged = foreign.get(
+            f"/video-use/media/{saved['projectId']}/{saved['mediaId']}",
+            headers={"Range": "bytes=0-31"},
+        )
+        assert ranged.status_code == 404, (
+            f"foreign tenant ranged media exposed bytes: {ranged.status_code}"
+        )
     print(json.dumps({
         "phase": "foreign_tenant_owner_auth",
         "fakeOnly": True, "foreignCreateDenied": True,
         "foreignPreflightDenied": True, "foreignProjectReadDenied": True,
         "foreignTaskReadDenied": True,
+        "foreignMediaReadDenied": True,
+        "foreignRecoveryCheckDenied": True,
+        "foreignRangeReadDenied": True,
+    }), flush=True)
+
+
+
+def verify_same_tenant_actor_separation(saved: dict, replay_request: dict) -> None:
+    """Exercise native user-role isolation without inventing delegation policy.
+
+    Editor is the existing tenant role, NOT an authorized admin delegation.
+    This only verifies Owner request attribution, replay separation, and
+    denied privilege escalation. Real delegated-admin grants remain untested.
+    """
+    assert os.getenv("AETHER_FAKE_ONLY_NONPROD") == "true"
+    assert os.getenv("AETHER_RUNTIME_STAGE") == "nonproduction"
+    nonce = uuid.uuid4().hex
+    editor_email = f"ci-g72-editor-{nonce}@example.invalid"
+    viewer_email = f"ci-g72-viewer-{nonce}@example.invalid"
+    editor_password = "ci-" + uuid.uuid4().hex
+    viewer_password = "ci-" + uuid.uuid4().hex
+    with authenticate() as owner:
+        me = owner.get("/auth/me")
+        assert me.status_code == 200 and me.json()["role"] == "owner"
+        owner_id = me.json()["id"]
+        for email, password, role in (
+            (editor_email, editor_password, "editor"),
+            (viewer_email, viewer_password, "viewer"),
+        ):
+            created = owner.post("/admin/users", json={
+                "email": email,
+                "displayName": "Synthetic G72 " + role,
+                "password": password,
+                "role": role,
+            })
+            assert created.status_code == 201, (
+                f"Owner cannot seed {role} identity: {created.status_code}"
+            )
+    endpoint = f"/projects/{saved['projectId']}/talking-head/fake-generation-tasks"
+    with authenticate(email=editor_email, password_override=editor_password) as editor:
+        identity = editor.get("/auth/me")
+        assert identity.status_code == 200
+        assert identity.json()["role"] == "editor"
+        assert identity.json()["id"] != owner_id
+        # A same-tenant operator must not reuse an Owner-owned idempotency key.
+        replay = editor.post(endpoint, json=replay_request)
+        assert replay.status_code == 409, (
+            f"editor replayed Owner task: {replay.status_code}"
+        )
+        # The typed request is extra=forbid: actor identity cannot be forged.
+        forged = dict(replay_request)
+        forged["idempotencyKey"] = str(uuid.uuid4())
+        forged["requestedBy"] = owner_id
+        forge_result = editor.post(endpoint, json=forged)
+        assert forge_result.status_code == 422, (
+            f"untrusted actor override accepted: {forge_result.status_code}"
+        )
+        assert editor.get("/admin/users").status_code == 403, (
+            "editor received Owner-only user administration access"
+        )
+    with authenticate(email=viewer_email, password_override=viewer_password) as viewer:
+        for target in (endpoint + "/validate", endpoint):
+            denied = viewer.post(target, json=replay_request)
+            assert denied.status_code == 403, (
+                f"viewer may operate generation route {target}: {denied.status_code}"
+            )
+        assert viewer.get("/admin/users").status_code == 403
+    with SessionLocal() as db:
+        source = db.get(DBGenerationTask, saved["taskId"])
+        assert source is not None and source.requested_by == owner_id
+        assert db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.tenant_id == source.tenant_id,
+            DBGenerationTask.project_id == source.project_id,
+            DBGenerationTask.provider == "deterministic-fake-talking-head",
+        )).scalar_one() == 1, "denied identities changed the source project"
+    print(json.dumps({
+        "phase": "same_tenant_actor_isolation", "fakeOnly": True,
+        "ownerAttributed": True, "editorReusedOwnerKeyDenied": True,
+        "editorActorOverrideDenied": True, "editorAdminRouteDenied": True,
+        "viewerGenerationDenied": True, "delegatedAdminProof": "NOT_TESTED",
     }), flush=True)
 
 
@@ -299,6 +372,7 @@ def verify() -> None:
             f"cross-project task visibility={wrong.status_code}"
         )
         verify_foreign_tenant_denials(saved, state["replayRequest"])
+        verify_same_tenant_actor_separation(saved, state["replayRequest"])
         evidence = check_asset_and_receipts(
             saved["projectId"], saved["taskId"], saved["sha256"],
         )
@@ -316,11 +390,9 @@ def verify() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("prepare", "verify", "prepare-browser"))
+    parser.add_argument("phase", choices=("prepare", "verify"))
     args = parser.parse_args()
     if args.phase == "prepare":
         prepare()
-    elif args.phase == "verify":
-        verify()
     else:
-        prepare_browser_fixture()
+        verify()
