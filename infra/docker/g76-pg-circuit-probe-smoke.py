@@ -201,6 +201,73 @@ def finish(client, task_id: str, worker_id: str, suffix: str, media_bytes: bytes
     assert response.status_code == 201, response.text
 
 
+def verify_g73_keyset_fairness(
+    client, project_id: str, source_id: str, tenant_id: str, ineligible_count: int = 205
+):
+    """Real PostgreSQL proof that >2 pages of older wrong-mode rows cannot starve G72."""
+    eligible_id = create_task(client, project_id, source_id, "g73-pg-keyset-eligible")
+    fixture_ids = [str(uuid.uuid4()) for _ in range(ineligible_count)]
+    with SessionLocal() as db:
+        project = db.get(DBProject, project_id)
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert project is not None and eligible is not None
+        eligible_created_at = eligible.created_at
+        rows = []
+        for idx, fixture_id in enumerate(fixture_ids):
+            created_at = eligible_created_at - dt.timedelta(
+                seconds=ineligible_count - idx
+            )
+            rows.append(DBGenerationTask(
+                id=fixture_id, tenant_id=tenant_id, project_id=project_id,
+                requested_by=project.owner_id, provider="moneyprinter",
+                status="QUEUED", progress=0,
+                message="synthetic G73 wrong-mode queue row",
+                request_json={"syntheticFixtureOnly": True},
+                request_hash=f"g73-pg-fixture-{idx}-{fixture_id}",
+                capability_snapshot_json={"mode": "moneyprinter"},
+                capability_snapshot_hash="0" * 64,
+                idempotency_key=f"g73-pg-fixture-{fixture_id}",
+                attempts=1, max_attempts=1,
+                created_at=created_at, updated_at=created_at,
+            ))
+        db.add_all(rows)
+        db.commit()
+
+    response = client.post("/internal/generation-tasks/claim", headers={
+        "X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "g73-pg-keyset-worker",
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["taskId"] == eligible_id, body
+    assert body["providerMode"] == "talking-head-fake", body
+
+    with SessionLocal() as db:
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert eligible is not None and eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-pg-keyset-worker"
+        untouched = db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.id.in_(fixture_ids),
+            DBGenerationTask.status == "QUEUED",
+        )).scalar_one()
+        assert untouched == ineligible_count, {
+            "expectedIneligible": ineligible_count, "untouched": untouched,
+        }
+        for fixture_id in fixture_ids:
+            row = db.get(DBGenerationTask, fixture_id)
+            if row is not None:
+                db.delete(row)
+        db.commit()
+
+    print(json.dumps({
+        "phase": "g73_postgresql_keyset_fairness",
+        "database": "postgresql",
+        "ineligibleOlderWrongModeRows": ineligible_count,
+        "eligibleTaskClaimed": eligible_id,
+        "realProviderCalled": False,
+        "financialSettlementTrusted": False,
+    }), flush=True)
+
+
 def run():
     guard()
     media = INPUT.read_bytes()
@@ -217,6 +284,7 @@ def run():
         with SessionLocal() as db:
             tenant_id = db.get(DBProject, project_id).tenant_id
         set_circuit(tenant_id, "CLOSED")
+        verify_g73_keyset_fairness(client, project_id, source_id, tenant_id)
 
         # An older claimed task succeeding while the breaker is OPEN must not
         # clear the cooldown or emit a CLOSED event.
