@@ -923,15 +923,23 @@ def create_app(
 
     @created_app.get("/health")
     def health_check(db: Session = Depends(db_dependency)):
-        journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
-        return {
+        # The API may run on SQLite or PostgreSQL in nonproduction integration
+        # environments. Keep SQLite's WAL diagnostic, but never send SQLite-only
+        # PRAGMA statements to another SQL dialect.
+        database_dialect = db.get_bind().dialect.name
+        db.execute(text("SELECT 1")).scalar_one()
+        health = {
             "status": "healthy",
             "service": "api",
-            "database": "sqlite",
-            "journal_mode": journal_mode,
+            "database": database_dialect,
             "setupRequired": created_app.state.setup_required,
             "timestamp": iso_utc(utc_now()),
         }
+        if database_dialect == "sqlite":
+            health["journal_mode"] = db.execute(
+                text("PRAGMA journal_mode;")
+            ).scalar_one().upper()
+        return health
 
     @created_app.post("/auth/login")
     def login(req: LoginRequest, response: Response, db: Session = Depends(db_dependency)):
