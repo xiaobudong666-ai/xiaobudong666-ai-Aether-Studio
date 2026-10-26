@@ -12,6 +12,7 @@ on:
       - infra/docker/g72-pg-native-worker-lock-race-smoke.py
       - infra/docker/g72-midupload-revocation-smoke.py
       - infra/docker/g70-compose-recovery-smoke.py
+      - infra/docker/g71-preack-manual-retry-smoke.py
       - .github/workflows/g72-postgres-worker-sidecar.yml
       - apps/api/app/**
       - apps/worker/app/**
@@ -377,6 +378,39 @@ jobs:
           compose restart video-use api
           compose up -d --wait --wait-timeout 240 api video-use
           compose exec -e CI=true -T api python /tmp/g70-compose-recovery-smoke.py verify-revoke-race
+
+      - name: Prepare G71 synthetic original media and recovery smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          compose exec -T video-use ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc=size=320x240:rate=12 -t 3 \
+            -c:v mpeg4 -pix_fmt yuv420p -movflags +faststart \
+            /tmp/g71-preack-original.mp4
+          compose cp video-use:/tmp/g71-preack-original.mp4 \
+            api:/tmp/g71-preack-original.mp4
+          compose cp infra/docker/g71-preack-manual-retry-smoke.py \
+            api:/tmp/g71-preack-manual-retry-smoke.py
+
+      - name: G71 pre-ACK Sidecar outage and same-original-byte manual retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          compose exec -T api python /tmp/g71-preack-manual-retry-smoke.py prepare
+          compose stop video-use
+          compose exec -T api python /tmp/g71-preack-manual-retry-smoke.py inject-preack-failure
+          compose up -d --wait --wait-timeout 240 video-use
+          compose exec -T api python /tmp/g71-preack-manual-retry-smoke.py manual-retry
 
       - name: Nonsecret failure diagnostics
         if: failure()
