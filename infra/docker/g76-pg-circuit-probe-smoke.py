@@ -11,18 +11,26 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 sys.path.insert(0, "/app")
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from app.database import SessionLocal, engine, get_db
+from app.generation_tasks import (
+    MONEYPRINTER_ADAPTER_VERSION, MONEYPRINTER_UPSTREAM_PIN, sha256_json,
+)
 from app.main import create_app
 from app.models import (
-    DBAssetVersion, DBGenerationCircuitState, DBGenerationEvent,
-    DBGenerationProviderEvent, DBGenerationTask, DBGenerationUsageEntry,
-    DBProject, DBRightsSnapshot, DBTenant,
+    DBAssetVersion, DBGenerationAttempt, DBGenerationCircuitState,
+    DBGenerationEvent, DBGenerationProviderAttestation,
+    DBGenerationProviderConfigVersion, DBGenerationProviderEvent,
+    DBGenerationTask, DBGenerationUsageEntry, DBProject, DBRightsSnapshot,
+    DBTenant, DBUser,
 )
 from app.video_use_adapter import VideoUseAdapter
 
@@ -267,6 +275,305 @@ def verify_g73_keyset_fairness(
         "financialSettlementTrusted": False,
     }), flush=True)
 
+def seed_g75_moneyprinter_tenant(now: dt.datetime) -> dict:
+    """Create synthetic policy/attestation rows for claim-only G75 tests."""
+    suffix = uuid.uuid4().hex
+    tenant_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+    config_id = str(uuid.uuid4())
+    policy = {
+        "enabledIntent": True,
+        "concurrentTaskLimit": 1,
+        "monthlyRequestLimit": 1,
+        "monthlyGeneratedSecondsLimit": 10,
+        "maxClipDurationSeconds": 10,
+        "maxOutputs": 1,
+        "artifactPathPrefixes": ["/tasks/"],
+    }
+    policy_hash = sha256_json(policy)
+    with SessionLocal() as db:
+        db.add(DBTenant(
+            id=tenant_id, name="G75 synthetic tenant " + suffix[:8],
+            slug="g75-" + suffix, quota_period=now.strftime("%Y-%m"),
+            created_at=now, updated_at=now,
+        ))
+        db.flush()
+        db.add(DBUser(
+            id=user_id, tenant_id=tenant_id,
+            email="g75-" + suffix + "@example.invalid",
+            display_name="G75 synthetic owner",
+            password_hash="synthetic-ci-only-not-a-login-credential",
+            role="OWNER", is_active=True, created_at=now, updated_at=now,
+        ))
+        db.flush()
+        db.add(DBProject(
+            id=project_id, tenant_id=tenant_id, owner_id=user_id,
+            name="G75 synthetic claim-only project",
+            timeline={}, materials=[], revision=1,
+            created_at=now, updated_at=now,
+        ))
+        db.flush()
+        db.add(DBGenerationProviderConfigVersion(
+            id=config_id, tenant_id=tenant_id, provider="moneyprinter",
+            version=1, status="PUBLISHED", policy_json=policy,
+            policy_hash=policy_hash, created_by=user_id,
+            created_at=now, published_by=user_id, published_at=now,
+            supersedes_id=None,
+        ))
+        db.flush()
+        for worker_id in (
+            "g75-probe-worker", "g75-concurrent-a", "g75-concurrent-b",
+        ):
+            db.add(DBGenerationProviderAttestation(
+                id=str(uuid.uuid4()), tenant_id=tenant_id,
+                provider="moneyprinter", worker_id=worker_id,
+                operator_mode="moneyprinter", config_version_id=config_id,
+                policy_hash=policy_hash,
+                adapter_version=MONEYPRINTER_ADAPTER_VERSION,
+                upstream_pin=MONEYPRINTER_UPSTREAM_PIN, healthy=True,
+                capabilities_json={
+                    "credentialState": "PRESENT",
+                    "networkIsolation": "ENFORCED",
+                    "canaryProfile": "private-one-task-v1",
+                    "syntheticOnly": True,
+                },
+                reason_code="SYNTHETIC_G75_CLAIM_ONLY",
+                checked_at=now, expires_at=now + dt.timedelta(minutes=10),
+                created_at=now,
+            ))
+        db.commit()
+    return {
+        "tenant_id": tenant_id, "user_id": user_id,
+        "project_id": project_id, "config_id": config_id,
+        "policy_hash": policy_hash,
+    }
+
+
+def seed_g75_moneyprinter_task(
+    tenant_id: str, project_id: str, user_id: str,
+    config_id: str, policy_hash: str, key: str,
+    created_at: dt.datetime,
+) -> str:
+    task_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+    request_json = {"syntheticFixtureOnly": True, "scenario": key}
+    snapshot = {
+        "mode": "moneyprinter",
+        "configVersionId": config_id,
+        "policyHash": policy_hash,
+    }
+    with SessionLocal() as db:
+        db.add(DBGenerationTask(
+            id=task_id, tenant_id=tenant_id, project_id=project_id,
+            requested_by=user_id, provider="moneyprinter", status="QUEUED",
+            progress=0, message="Synthetic G75 claim-only fixture",
+            request_json=request_json, request_hash=sha256_json(request_json),
+            capability_snapshot_json=snapshot,
+            capability_snapshot_hash=sha256_json(snapshot),
+            idempotency_key="g75-" + key + "-" + uuid.uuid4().hex,
+            attempts=1, max_attempts=1, created_at=created_at,
+            updated_at=created_at,
+        ))
+        db.add(DBGenerationAttempt(
+            id=attempt_id, generation_task_id=task_id, attempt_no=1,
+            status="QUEUED", reconciliation_state="NOT_SUBMITTED",
+            created_at=created_at,
+        ))
+        db.commit()
+    return task_id
+
+
+def verify_g75_probe_binding_and_lock(
+    base_project_id: str, base_tenant_id: str,
+) -> None:
+    """Exercise claim-only eligibility ordering and PostgreSQL probe row locking."""
+    now = dt.datetime.now(dt.timezone.utc)
+    with SessionLocal() as db:
+        base_project = db.get(DBProject, base_project_id)
+        assert base_project is not None
+        base_user_id = base_project.owner_id
+
+    synthetic = seed_g75_moneyprinter_tenant(now)
+    invalid_task_id = seed_g75_moneyprinter_task(
+        base_tenant_id, base_project_id, base_user_id,
+        "g75-missing-published-config", "0" * 64, "ineligible-earlier",
+        now - dt.timedelta(seconds=20),
+    )
+    valid_task_id = seed_g75_moneyprinter_task(
+        synthetic["tenant_id"], synthetic["project_id"], synthetic["user_id"],
+        synthetic["config_id"], synthetic["policy_hash"], "eligible-other-tenant",
+        now - dt.timedelta(seconds=10),
+    )
+    expired_cooldown = now - dt.timedelta(seconds=1)
+    set_circuit(
+        base_tenant_id, "OPEN", half_open_task_id=None,
+        cooldown_until=expired_cooldown,
+    )
+    set_circuit(synthetic["tenant_id"], "CLOSED")
+
+    # This app is only an in-process claim endpoint harness. The workflow has
+    # stopped Worker daemons; all config/attestation values are synthetic.
+    # No Provider adapter call, credentials, network egress, or media dispatch.
+    claim_app = create_app(
+        app_engine=engine, db_dependency=get_db,
+        video_use_adapter=VideoUseAdapter(api_url=VIDEO_USE, max_retries=0),
+        worker_token=WORKER_TOKEN, cookie_secure=False, enforce_csrf=True,
+        generation_provider_mode="moneyprinter",
+    )
+    claim_client = TestClient(claim_app)
+    response = claim_client.post(
+        "/internal/generation-tasks/claim",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": "g75-probe-worker",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["taskId"] == valid_task_id, body
+    assert body["providerMode"] == "moneyprinter", body
+    invalid_circuit = circuit_snapshot(base_tenant_id)
+    assert invalid_circuit["state"] == "OPEN", invalid_circuit
+    assert invalid_circuit["halfOpenTaskId"] is None, invalid_circuit
+    set_circuit(base_tenant_id, "CLOSED")
+
+    # Put 101 eligible tasks behind a held circuit-row lock. The claim query
+    # locks its first 100 candidate rows, so a second concurrent claimant can
+    # reach the same circuit row using the 101st task. Both must wait for the
+    # same PostgreSQL row lock; only one may bind the HALF_OPEN probe.
+    concurrent_ids = []
+    seed_time = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)
+    for idx in range(101):
+        concurrent_ids.append(seed_g75_moneyprinter_task(
+            synthetic["tenant_id"], synthetic["project_id"], synthetic["user_id"],
+            synthetic["config_id"], synthetic["policy_hash"],
+            "concurrent-" + str(idx),
+            seed_time + dt.timedelta(microseconds=idx),
+        ))
+    set_circuit(
+        synthetic["tenant_id"], "HALF_OPEN", half_open_task_id=None,
+        cooldown_until=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=1),
+    )
+
+    clients = [TestClient(claim_app), TestClient(claim_app)]
+    gate = Barrier(3)
+    def post_claim(client, worker_id):
+        gate.wait(timeout=10)
+        return client.post(
+            "/internal/generation-tasks/claim",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+        )
+
+    lock_db = SessionLocal()
+    lock_db.execute(select(DBGenerationCircuitState).where(
+        DBGenerationCircuitState.tenant_id == synthetic["tenant_id"],
+        DBGenerationCircuitState.provider == "moneyprinter",
+    ).with_for_update()).scalar_one()
+    observed_two_waiters = False
+    responses = []
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(post_claim, clients[0], "g75-concurrent-a"),
+                pool.submit(post_claim, clients[1], "g75-concurrent-b"),
+            ]
+            gate.wait(timeout=10)
+            deadline = time.monotonic() + 12
+            max_waiters = 0
+            while time.monotonic() < deadline:
+                with SessionLocal() as monitor:
+                    waiters = monitor.execute(text("""
+                        SELECT count(*)::int
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND usename = current_user
+                          AND wait_event_type = 'Lock'
+                          AND query ILIKE '%generation_circuit_states%'
+                          AND pid <> pg_backend_pid()
+                    """)).scalar_one()
+                max_waiters = max(max_waiters, int(waiters))
+                if max_waiters >= 2:
+                    observed_two_waiters = True
+                    break
+                if all(future.done() for future in futures):
+                    break
+                time.sleep(0.1)
+            lock_db.commit()
+            responses = [future.result(timeout=20) for future in futures]
+    finally:
+        lock_db.rollback()
+        lock_db.close()
+
+    assert observed_two_waiters, {
+        "expectedTwoPostgreSQLCircuitLockWaiters": True,
+        "observed": observed_two_waiters,
+    }
+    successes = [item for item in responses if item.status_code == 200]
+    no_claim = [item for item in responses if item.status_code == 204]
+    assert len(successes) == 1 and len(no_claim) == 1, [
+        (item.status_code, item.text[:300]) for item in responses
+    ]
+    claimed_id = successes[0].json()["taskId"]
+    with SessionLocal() as db:
+        claimed_rows = list(db.execute(select(DBGenerationTask).where(
+            DBGenerationTask.id.in_(concurrent_ids),
+            DBGenerationTask.status == "SUBMITTING",
+        )).scalars())
+        assert len(claimed_rows) == 1, [row.id for row in claimed_rows]
+        assert claimed_rows[0].id == claimed_id
+        assert claimed_rows[0].lease_owner in {
+            "g75-concurrent-a", "g75-concurrent-b",
+        }
+    concurrent_circuit = circuit_snapshot(synthetic["tenant_id"])
+    assert concurrent_circuit["state"] == "HALF_OPEN", concurrent_circuit
+    assert concurrent_circuit["halfOpenTaskId"] == claimed_id, concurrent_circuit
+
+    set_circuit(synthetic["tenant_id"], "CLOSED")
+    with SessionLocal() as db:
+        fixture_ids = [invalid_task_id, valid_task_id, *concurrent_ids]
+        fixtures = list(db.execute(select(DBGenerationTask).where(
+            DBGenerationTask.id.in_(fixture_ids)
+        )).scalars())
+        cleanup_time = dt.datetime.now(dt.timezone.utc)
+        for task in fixtures:
+            task.status = "FAILED"
+            task.message = "Synthetic G75 fixture cleanup"
+            task.completed_at = cleanup_time
+            task.lease_owner = None
+            task.lease_expires_at = None
+            task.updated_at = cleanup_time
+        attempts = list(db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id.in_(fixture_ids)
+        )).scalars())
+        for attempt in attempts:
+            attempt.status = "FAILED"
+            attempt.error_code = "SYNTHETIC_TEST_CLEANUP"
+            attempt.error_message = "G75 claim-only fixture cleanup"
+            attempt.completed_at = cleanup_time
+        db.commit()
+
+    print(json.dumps({
+        "phase": "g75_ineligible_candidate_no_probe_bind",
+        "database": "postgresql",
+        "ineligibleTenantCircuitRemainedOpen": invalid_circuit["state"] == "OPEN",
+        "ineligibleTenantProbeStayedEmpty": invalid_circuit["halfOpenTaskId"] is None,
+        "eligibleOtherTenantTaskClaimed": valid_task_id,
+        "realProviderCalled": False,
+        "financialSettlementTrusted": False,
+    }), flush=True)
+    print(json.dumps({
+        "phase": "g75_half_open_probe_row_lock_concurrency",
+        "database": "postgresql",
+        "eligibleConcurrentTasks": len(concurrent_ids),
+        "twoCircuitLockWaitersObserved": observed_two_waiters,
+        "claimSuccesses": len(successes),
+        "claimNoContent": len(no_claim),
+        "boundProbeMatchesClaimedTask": concurrent_circuit["halfOpenTaskId"] == claimed_id,
+        "realProviderCalled": False,
+        "financialSettlementTrusted": False,
+    }), flush=True)
+
 
 def run():
     guard()
@@ -285,6 +592,7 @@ def run():
             tenant_id = db.get(DBProject, project_id).tenant_id
         set_circuit(tenant_id, "CLOSED")
         verify_g73_keyset_fairness(client, project_id, source_id, tenant_id)
+        verify_g75_probe_binding_and_lock(project_id, tenant_id)
 
         # An older claimed task succeeding while the breaker is OPEN must not
         # clear the cooldown or emit a CLOSED event.
