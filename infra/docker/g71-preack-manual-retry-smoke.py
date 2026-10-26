@@ -257,12 +257,74 @@ def manual_retry():
         assert absent.status_code == 503
         assert absent.json().get("detail", {}).get("code") == "ORIGINAL_MEDIA_LOOKUP_UNAVAILABLE"
         retry_url = f"/projects/{state['projectId']}/generation-tasks/{state['taskId']}/fake-recovery-upload-retry"
+
+        # Wrong bytes with the original length must fail before any Sidecar write.
+        before_negative = counts(state["taskId"], state["tenantId"], state["projectId"])
+        wrong_bytes = bytearray(data)
+        wrong_bytes[len(wrong_bytes) // 2] ^= 1
+        wrong = client.post(
+            retry_url, files={"file": ("wrong-original.mp4", bytes(wrong_bytes), "video/mp4")}
+        )
+        assert wrong.status_code == 409, wrong.text
+        assert wrong.json().get("detail", {}).get("code") == "ORIGINAL_MEDIA_SHA256_MISMATCH", wrong.text
+        assert counts(state["taskId"], state["tenantId"], state["projectId"]) == before_negative
+
+        # A persisted media ID with no matching Sidecar object must not cause an upload.
+        with SessionLocal() as db:
+            task = db.get(DBGenerationTask, state["taskId"])
+            assert task is not None and task.media_id is None
+            task.media_id = "g70-conflicting-media-id"
+            db.commit()
+        absent_conflict = client.post(
+            retry_url, files={"file": ("same-original.mp4", data, "video/mp4")}
+        )
+        assert absent_conflict.status_code == 409, absent_conflict.text
+        assert absent_conflict.json().get("detail", {}).get("code") == "ORIGINAL_MEDIA_ID_CONFLICT", absent_conflict.text
+        absent_object = httpx.get(
+            f"{VIDEO_USE}/media/{state['projectId']}/g70-conflicting-media-id",
+            timeout=30, trust_env=False,
+        )
+        assert absent_object.status_code == 404, absent_object.text
+        with SessionLocal() as db:
+            task = db.get(DBGenerationTask, state["taskId"])
+            assert task is not None
+            task.media_id = None
+            db.commit()
+        assert counts(state["taskId"], state["tenantId"], state["projectId"]) == before_negative
+
         first = client.post(retry_url, files={"file": ("same-original.mp4", data, "video/mp4")})
         assert first.status_code == 200, first.text
         first_body = first.json()
         assert first_body["recoveryState"] == "FOUND_UNBOUND"
         assert first_body["uploadPerformed"] is True and first_body["idempotent"] is False
         assert first_body["sha256"] == state["sha256"] and first_body["sizeBytes"] == state["sizeBytes"]
+
+        # If Sidecar already has the original but the durable task media ID conflicts,
+        # reject without another upload/audit; restore the synthetic row for normal retry.
+        with SessionLocal() as db:
+            task = db.get(DBGenerationTask, state["taskId"])
+            assert task is not None and task.media_id is None
+            task.media_id = "g70-conflicting-existing-media-id"
+            db.commit()
+        existing_conflict = client.post(
+            retry_url, files={"file": ("same-original.mp4", data, "video/mp4")}
+        )
+        assert existing_conflict.status_code == 409, existing_conflict.text
+        assert existing_conflict.json().get("detail", {}).get("code") == "ORIGINAL_MEDIA_ID_CONFLICT", existing_conflict.text
+        with SessionLocal() as db:
+            task = db.get(DBGenerationTask, state["taskId"])
+            assert task is not None
+            task.media_id = None
+            db.commit()
+        after_existing_conflict = counts(state["taskId"], state["tenantId"], state["projectId"])
+        assert after_existing_conflict["reuploadAudit"] == 1, after_existing_conflict
+        existing_object = httpx.get(
+            f"{VIDEO_USE}/media/{state['projectId']}/{first_body['mediaId']}",
+            timeout=30, trust_env=False,
+        )
+        assert existing_object.status_code == 200
+        assert hashlib.sha256(existing_object.content).hexdigest() == state["sha256"]
+
         second = client.post(retry_url, files={"file": ("same-original.mp4", data, "video/mp4")})
         assert second.status_code == 200, second.text
         second_body = second.json()
