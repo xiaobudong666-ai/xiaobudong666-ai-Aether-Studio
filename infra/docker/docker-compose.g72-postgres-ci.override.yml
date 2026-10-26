@@ -1,0 +1,38 @@
+# G72 ONLY: disposable PostgreSQL integration overlay.
+# Merge after docker-compose.g72-fake-only.override.yml, never in production.
+# No published DB ports, no real Provider keys, and no external persistence.
+services:
+  postgres-g72:
+    image: postgres:16.15
+    environment:
+      POSTGRES_USER: ci_g72
+      POSTGRES_PASSWORD: ci-only-postgres-password
+      POSTGRES_DB: aether_g72_ci
+    networks:
+      - aether-net
+    volumes:
+      - g72-postgres-ci-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ci_g72 -d aether_g72_ci"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  # FAKE-only: run TWO independent real Worker containers in this disposable
+  # PostgreSQL stack.  Their health servers share an internal port, so clear
+  # the base Compose host publication to allow replicas without port conflict.
+  # Docker Compose !reset requires a recent v2 plugin; the CI config gate
+  # deliberately fails closed if this override cannot be parsed.
+  worker:
+    ports: !reset []
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.g72-postgres-ci.Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://ci_g72:ci-only-postgres-password@postgres-g72:5432/aether_g72_ci
+    depends_on:
+      postgres-g72:
+        condition: service_healthy
+
+volumes:
+  g72-postgres-ci-data:
