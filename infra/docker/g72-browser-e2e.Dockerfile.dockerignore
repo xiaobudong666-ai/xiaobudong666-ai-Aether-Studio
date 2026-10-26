@@ -38,15 +38,53 @@ test-results-g72
 .env.*
 **/.env
 **/.env.*
+.envrc
+**/.envrc
 
+# Credential/config stores: never copy developer or CI auth state into the runner.
+.npmrc
+**/.npmrc
+.netrc
+**/.netrc
+.pypirc
+**/.pypirc
+.ssh/
+**/.ssh/**
+.aws/
+**/.aws/**
+.azure/
+**/.azure/**
+.config/gcloud/
+**/.config/gcloud/**
+.docker/config.json
+**/.docker/config.json
+.kube/
+**/.kube/**
+.vault-token
+**/.vault-token
+**/*credentials*.json
+**/*service-account*.json
+**/*service_account*.json
+**/*token*.json
+
+# Private keys, certificates, signing profiles, and keystores.
 secrets/
 **/secrets/**
 **/*.pem
 **/*.key
 **/*.p12
 **/*.pfx
+**/*.p8
+**/*.crt
+**/*.cer
+**/*.der
+**/*.jks
+**/*.keystore
+**/*.mobileprovision
 **/id_rsa*
 **/id_ed25519*
+
+# Provider canary inputs and evidence are never part of browser test images.
 *provider-canary*.toml
 *provider-canary*.env
 *provider-canary*.json
