@@ -13,6 +13,7 @@ on:
       - infra/docker/g72-midupload-revocation-smoke.py
       - infra/docker/g70-compose-recovery-smoke.py
       - infra/docker/g71-preack-manual-retry-smoke.py
+      - infra/docker/g76-pg-circuit-probe-smoke.py
       - .github/workflows/g72-postgres-worker-sidecar.yml
       - apps/api/app/**
       - apps/worker/app/**
@@ -413,6 +414,40 @@ jobs:
           compose exec -T api python /tmp/g71-preack-manual-retry-smoke.py inject-preack-failure
           compose up -d --wait --wait-timeout 240 video-use
           compose exec -T api python /tmp/g71-preack-manual-retry-smoke.py manual-retry
+
+      - name: Prepare G76 synthetic MP4 and PostgreSQL circuit smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          compose exec -T video-use ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc=size=320x240:rate=12 -t 3 \
+            -c:v mpeg4 -pix_fmt yuv420p -movflags +faststart \
+            /tmp/g76-circuit-original.mp4
+          compose cp video-use:/tmp/g76-circuit-original.mp4 \
+            "$RUNNER_TEMP/g76-circuit-original.mp4"
+          compose cp "$RUNNER_TEMP/g76-circuit-original.mp4" \
+            api:/tmp/g76-circuit-original.mp4
+          compose cp infra/docker/g76-pg-circuit-probe-smoke.py \
+            api:/tmp/g76-pg-circuit-probe-smoke.py
+
+      - name: G76 PostgreSQL late-success and HALF_OPEN probe ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              -f infra/docker/docker-compose.g72-postgres-ci.override.yml "$@"
+          }
+          # Prevent background daemon claims from racing this deterministic
+          # API-level probe-ownership test. API and Sidecar remain real.
+          compose stop worker
+          compose exec -T api python /tmp/g76-pg-circuit-probe-smoke.py
 
       - name: Nonsecret failure diagnostics
         if: failure()
