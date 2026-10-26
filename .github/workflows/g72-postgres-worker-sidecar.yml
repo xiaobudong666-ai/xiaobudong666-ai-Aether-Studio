@@ -232,6 +232,7 @@ jobs:
             fi
             mkdir -p "$(dirname "$file")"
             printf 'SYNTHETIC_G72_DOCKERIGNORE_CANARY_DO_NOT_USE\n' > "$file"
+            created_files+=("$file")
           done
           docker build --file infra/docker/g72-browser-e2e.Dockerfile --tag aether-g72-browser-e2e:ci .
           container_id="$(docker create aether-g72-browser-e2e:ci)"
