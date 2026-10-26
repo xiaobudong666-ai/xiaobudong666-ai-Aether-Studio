@@ -80,6 +80,27 @@ def seed_test_image_and_remix_rights(project_id: str) -> str:
         return asset.id
 
 
+def prepare_browser() -> None:
+    """Create a separate synthetic project for the current-SHA browser E2E."""
+    with authenticate() as client:
+        response = client.post("/projects", json={
+            "name": "FAKE G72 browser E2E " + uuid.uuid4().hex[:12],
+        })
+        assert response.status_code == 201, (
+            f"browser fixture project create={response.status_code}"
+        )
+        project = response.json()
+        asset_id = seed_test_image_and_remix_rights(project["id"])
+        print(json.dumps({
+            "phase": "browser_fixture_prepared",
+            "fakeOnly": True,
+            "synthetic": True,
+            "projectId": project["id"],
+            "sourceAssetId": asset_id,
+            "rightsEvidence": "SYNTHETIC_NONPRODUCTION_FIXTURE",
+        }), flush=True)
+
+
 def get_result(client: httpx.Client, project_id: str, task_id: str) -> dict:
     reply = client.get(f"/projects/{project_id}/generation-tasks/{task_id}")
     assert reply.status_code == 200, f"task read failed: {reply.status_code}"
@@ -390,9 +411,11 @@ def verify() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("prepare", "verify"))
+    parser.add_argument("phase", choices=("prepare", "prepare-browser", "verify"))
     args = parser.parse_args()
     if args.phase == "prepare":
         prepare()
+    elif args.phase == "prepare-browser":
+        prepare_browser()
     else:
         verify()
