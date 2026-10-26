@@ -87,6 +87,7 @@ jobs:
           # The base Compose file starts MoneyPrinterTurbo as a Worker dependency.
           # In this test-only overlay its provider-egress network must be internal,
           # so the FAKE-only run has no route to external Provider endpoints.
+          assert networks["aether-net"].get("internal") is True, "FAKE-only app network must have no external route"
           assert networks["provider-egress"].get("internal") is True, "FAKE-only provider-egress must be isolated"
           assert networks["provider-control"].get("internal") is True, "provider-control must remain internal"
           assert not moneyprinter.get("ports"), "MoneyPrinterTurbo must not publish host ports in CI"
