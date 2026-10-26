@@ -5,8 +5,9 @@ Owner-self relink is exercised; no paid generation, settlement, refund, release,
 from __future__ import annotations
 import argparse
 from contextlib import contextmanager
-from concurrent.futures import Barrier, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+from threading import Barrier
 import hashlib
 import io
 import json
