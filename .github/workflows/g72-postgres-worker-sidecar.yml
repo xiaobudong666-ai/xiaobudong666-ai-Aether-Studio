@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - test/fusion-m0-v704-current-g72-pg-20261026
+      - test/fusion-m0-g72-rights-terminal-20261028-0536
     paths:
       - infra/docker/api.g72-postgres-ci.Dockerfile
       - infra/docker/g72-browser-e2e.Dockerfile
