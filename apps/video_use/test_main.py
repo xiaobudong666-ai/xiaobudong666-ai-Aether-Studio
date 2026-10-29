@@ -38,6 +38,28 @@ def make_source(path: Path) -> None:
     )
 
 
+def make_image(path: Path) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=48x48",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            str(path),
+        ],
+        check=True,
+    )
+
+
 def make_fake_upstream(root: Path) -> None:
     helpers = root / "helpers"
     helpers.mkdir(parents=True)
@@ -116,6 +138,30 @@ def test_upload_probe_render_and_download_are_real(tmp_path):
         assert artifact.status_code == 200
         assert artifact.headers["content-type"] == "video/mp4"
         assert len(artifact.content) > 1_000
+
+
+def test_upload_probe_image_is_classified_and_stored_as_image(tmp_path):
+    upstream = tmp_path / "upstream"
+    make_fake_upstream(upstream)
+    image = tmp_path / "portrait.png"
+    make_image(image)
+
+    with TestClient(create_app(media_root=tmp_path / "media", upstream_root=upstream)) as client:
+        with image.open("rb") as stream:
+            upload = client.post(
+                "/media",
+                data={"projectId": "image-project"},
+                files={"file": ("portrait.png", stream, "image/png")},
+            )
+        assert upload.status_code == 201, upload.text
+        payload = upload.json()
+        assert payload["mediaType"] == "image"
+        assert payload["metadata"]["video"]["width"] == 48
+        assert payload["metadata"]["video"]["height"] == 48
+        assert payload["metadata"]["audio"] is None
+        stored = client.get(f"/media/image-project/{payload['mediaId']}")
+        assert stored.status_code == 200
+        assert stored.content == image.read_bytes()
 
 
 def test_render_rejects_unknown_media_and_unsafe_identifiers(tmp_path):

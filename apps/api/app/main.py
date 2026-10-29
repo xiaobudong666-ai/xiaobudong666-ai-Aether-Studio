@@ -2403,13 +2403,37 @@ def create_app(
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
             metadata = uploaded.get("metadata") or {}
             duration_seconds = float(metadata.get("durationSeconds") or 0)
-            media_type = "video" if metadata.get("video") else "audio"
+            suffix = os.path.splitext(file.filename or "")[1].lower()
+            image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+            if suffix in image_extensions:
+                video_probe = metadata.get("video") or {}
+                if (
+                    uploaded.get("mediaType") != "image"
+                    or not video_probe.get("width")
+                    or not video_probe.get("height")
+                    or metadata.get("audio") is not None
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": "IMAGE_PROBE_INVALID", "message": "图片未通过图像格式与尺寸校验"},
+                    )
+                media_type = "image"
+            else:
+                media_type = "video" if metadata.get("video") else "audio"
             media_id = uploaded["mediaId"]
+            fallback_content_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }.get(suffix, "video/mp4" if media_type == "video" else "audio/mpeg")
             material = {
                 "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,
                 "url": f"/api/video-use/media/{project_id}/{media_id}", "type": media_type,
-                "contentType": file.content_type or ("video/mp4" if media_type == "video" else "audio/mpeg"),
-                "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
+                "contentType": file.content_type or fallback_content_type,
+                "duration": None if media_type == "image" else {
+                    "value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000,
+                },
                 "sizeBytes": int(metadata.get("sizeBytes") or upload_size),
             }
             updated = apply_project_update(
