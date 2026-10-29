@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AssetVersionSchema } from "./schemas";
+import { AssetVersionSchema, TimelineSchema } from "./schemas";
 
 const validAssetVersion = {
   id: "asset-version-1",
@@ -31,4 +31,16 @@ describe("AssetVersionSchema on patched Zod", () => {
     });
     expect(parsed.success).toBe(false);
   });
+  it("keeps timeline output optional and normalizes legacy null", () => {
+    const omitted = TimelineSchema.parse({ version: "1.1", tracks: [] });
+    expect(omitted).not.toHaveProperty("output");
+
+    const legacyNull = TimelineSchema.parse({
+      version: "1.1",
+      output: null,
+      tracks: [],
+    });
+    expect(legacyNull.output).toBeUndefined();
+  });
+
 });
