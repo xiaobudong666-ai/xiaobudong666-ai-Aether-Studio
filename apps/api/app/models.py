@@ -136,6 +136,8 @@ class DBGenerationTask(Base):
     attempts = Column(Integer, default=1, nullable=False)
     max_attempts = Column(Integer, default=3, nullable=False)
     lease_owner = Column(String, nullable=True, index=True)
+    lease_epoch = Column(Integer, default=0, nullable=False)
+    circuit_probe_epoch = Column(Integer, nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
     error_code = Column(String, nullable=True)
@@ -280,6 +282,9 @@ class DBGenerationCircuitState(Base):
     opened_at = Column(DateTime(timezone=True), nullable=True)
     cooldown_until = Column(DateTime(timezone=True), nullable=True)
     half_open_task_id = Column(String, ForeignKey("generation_tasks.id"), nullable=True, index=True)
+    probe_epoch = Column(Integer, default=0, nullable=False)
+    half_open_lease_epoch = Column(Integer, nullable=True)
+    half_open_issuer = Column(String, nullable=True)
     disabled_reason_code = Column(String, nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
