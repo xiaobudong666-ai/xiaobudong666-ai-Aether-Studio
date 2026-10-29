@@ -378,6 +378,8 @@ describe("Aether Studio 中文工作台", () => {
       cancelRequested: false, rights: { allowed: false, code: "RIGHTS_MISSING" },
       results: [], createdAt: "2026-10-29T00:00:00Z", updatedAt: "2026-10-29T00:00:00Z",
     };
+    let activeCapabilities = capabilities;
+    let createAttempts = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
@@ -405,7 +407,7 @@ describe("Aether Studio 中文工作台", () => {
       }
       if (url.endsWith("/generation/providers/moneyprinter/capabilities")
         || url.endsWith("/generation/providers/moneyprinter/readiness")) {
-        return { ok: true, status: 200, json: async () => capabilities } as Response;
+        return { ok: true, status: 200, json: async () => activeCapabilities } as Response;
       }
       if (url.endsWith("/talking-head/fake-generation-tasks/validate")) {
         return {
@@ -413,12 +415,23 @@ describe("Aether Studio 中文工作台", () => {
           json: async () => ({
             allowed: true, status: "PREFLIGHT", fakeOnly: true,
             simulatedOutput: true, publishable: false,
-            capabilitySnapshotHash: capabilities.snapshotHash, projectRevision: 1,
+            capabilitySnapshotHash: activeCapabilities.snapshotHash, projectRevision: 1,
             quota: capabilities.quota,
           }),
         } as Response;
       }
       if (url.endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST") {
+        createAttempts += 1;
+        if (createAttempts === 1) {
+          activeCapabilities = { ...capabilities, snapshotHash: "b".repeat(64) };
+          return {
+            ok: false, status: 409,
+            json: async () => ({ detail: {
+              code: "CAPABILITY_SNAPSHOT_UNKNOWN",
+              message: "生成能力快照已变化，请重新预检",
+            } }),
+          } as Response;
+        }
         return { ok: true, status: 202, json: async () => task } as Response;
       }
       if (url.includes("/generation-tasks?pageSize=100")) {
@@ -440,11 +453,16 @@ describe("Aether Studio 中文工作台", () => {
     fireEvent.click(screen.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" }));
     expect(await screen.findByText(/FAKE-only 测试任务已入队/)).toBeTruthy();
 
-    const createCall = fetchMock.mock.calls.find(([input, init]) =>
+    const createCalls = fetchMock.mock.calls.filter(([input, init]) =>
       String(input).endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST"
     );
+    expect(createCalls).toHaveLength(2);
+    const createCall = createCalls[createCalls.length - 1];
     expect(createCall).toBeTruthy();
     const requestBody = JSON.parse(String(createCall?.[1]?.body));
+    const firstRequestBody = JSON.parse(String(createCalls[0]?.[1]?.body));
+    expect(firstRequestBody.idempotencyKey).toBe(requestBody.idempotencyKey);
+    expect(requestBody.capabilitySnapshotHash).toBe("b".repeat(64));
     expect(requestBody).toMatchObject({
       text: "这是一条合成测试文案",
       durationSeconds: 1,
@@ -453,16 +471,16 @@ describe("Aether Studio 中文工作台", () => {
       voiceId: "synthetic-seed",
       imageAssetVersionId: "image-version-1",
       expectedProjectRevision: 1,
-      capabilitySnapshotHash: capabilities.snapshotHash,
+      capabilitySnapshotHash: "b".repeat(64),
       confirmSyntheticTestOnly: true,
     });
     expect(createCall?.[1]?.headers).toMatchObject({
       "X-Aether-CSRF": "1",
       "Idempotency-Key": requestBody.idempotencyKey,
     });
-    expect(fetchMock.mock.calls.some(([input, init]) =>
+    expect(fetchMock.mock.calls.filter(([input, init]) =>
       String(input).endsWith("/talking-head/fake-generation-tasks/validate") && init?.method === "POST"
-    )).toBe(true);
+    )).toHaveLength(2);
     expect(fetchMock.mock.calls.some(([input, init]) =>
       String(input).endsWith("/generation-tasks") && init?.method === "POST"
     )).toBe(false);
