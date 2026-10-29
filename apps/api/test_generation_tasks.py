@@ -35,6 +35,35 @@ from sqlalchemy.orm import sessionmaker
 OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
 
+class LeaseAwareTestClient(TestClient):
+    """Test helper that mirrors the Worker lease-epoch header contract."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lease_epochs = {}
+
+    def post(self, url, *args, **kwargs):
+        path = str(url).split("?", 1)[0]
+        if path.endswith("/internal/generation-tasks/claim"):
+            response = super().post(url, *args, **kwargs)
+            if response.status_code == 200:
+                payload = response.json()
+                if isinstance(payload, dict) and "taskId" in payload and "leaseEpoch" in payload:
+                    self._lease_epochs[str(payload["taskId"])] = int(payload["leaseEpoch"])
+            return response
+
+        prefix = "/internal/generation-tasks/"
+        if path.startswith(prefix):
+            parts = path[len(prefix):].split("/")
+            if len(parts) >= 2 and parts[1] in {"heartbeat", "transition", "artifact-intake"}:
+                task_id = parts[0]
+                headers = dict(kwargs.get("headers") or {})
+                if "X-Worker-Lease-Epoch" not in headers and task_id in self._lease_epochs:
+                    headers["X-Worker-Lease-Epoch"] = str(self._lease_epochs[task_id])
+                kwargs["headers"] = headers
+        return super().post(url, *args, **kwargs)
+
+
 
 class FakeGeneratedMediaStore:
     def __init__(self):
@@ -91,7 +120,7 @@ def generation_context(tmp_path, monkeypatch):
         generation_provider_mode="deterministic-fake",
     )
     app.state.moneyprinter = MagicMock()
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         assert client.post("/auth/login", json={"email": "owner@example.com", "password": OWNER_PASSWORD}).status_code == 200
         client.headers.update({"X-Aether-CSRF": "1"})
         yield client, sessions, app, media_store
@@ -119,7 +148,7 @@ def provider_control_context(tmp_path):
         enforce_csrf=True,
         generation_provider_mode="moneyprinter",
     )
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         assert client.post(
             "/auth/login",
             json={"email": "provider-owner@example.com", "password": OWNER_PASSWORD},
@@ -345,7 +374,7 @@ def test_05_disabled_provider_blocks_without_writes(tmp_path):
         bootstrap_admin_password=OWNER_PASSWORD, bootstrap_admin_email="disabled@example.com",
         cookie_secure=False, enforce_csrf=True,
     )
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         client.post("/auth/login", json={"email": "disabled@example.com", "password": OWNER_PASSWORD})
         client.headers.update({"X-Aether-CSRF": "1"})
         project = create_project(client)
@@ -1707,7 +1736,7 @@ def g72_true_native_flow_context(tmp_path, monkeypatch):
         cookie_secure=False, enforce_csrf=True,
         generation_provider_mode="deterministic-fake",
     )
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         assert client.post(
             "/auth/login",
             json={"email": "owner@example.com", "password": OWNER_PASSWORD},
@@ -2172,6 +2201,106 @@ def _g76_finish_claimed_fake_task(client, task_id, worker_id, suffix):
     assert result.status_code == 201, result.text
 
 
+
+def test_g76_stale_lease_epoch_cannot_mutate_reclaimed_half_open_probe(generation_context):
+    """A stale completion from a recycled worker ID cannot impersonate the current probe."""
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "G76 stale lease epoch")
+    task = create_task(client, project, key="g76-stale-lease-epoch")
+    worker_id = "worker-g76-reused"
+    first = claim(client, worker_id).json()
+    assert first["taskId"] == task["taskId"]
+    stale_epoch = first["leaseEpoch"]
+
+    failed = transition(
+        client, task["taskId"], "FAILED", worker_id=worker_id,
+        errorCode="PROVIDER_TEST_FAILURE", errorMessage="synthetic failure",
+        retryable=True,
+    )
+    assert failed.status_code == 200, failed.text
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        circuit.state = "CLOSED"
+        circuit.failure_timestamps_json = []
+        circuit.opened_at = None
+        circuit.cooldown_until = None
+        circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        db.commit()
+    retried = client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry")
+    assert retried.status_code == 202, retried.text
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        circuit.state = "HALF_OPEN"
+        circuit.failure_timestamps_json = [now.isoformat()]
+        circuit.opened_at = now - datetime.timedelta(minutes=2)
+        circuit.cooldown_until = now - datetime.timedelta(seconds=1)
+        circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        circuit.probe_epoch = 7
+        circuit.updated_at = now
+        db.commit()
+
+    current = claim(client, worker_id).json()
+    assert current["taskId"] == task["taskId"]
+    current_epoch = current["leaseEpoch"]
+    assert current_epoch > stale_epoch
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.half_open_task_id == task["taskId"]
+        assert circuit.half_open_lease_epoch == current_epoch
+        assert circuit.half_open_issuer == worker_id
+        current_probe_epoch = circuit.probe_epoch
+        assert current["circuitProbeEpoch"] == current_probe_epoch
+
+    stale = client.post(
+        f"/internal/generation-tasks/{task['taskId']}/transition",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(stale_epoch),
+        },
+        json={
+            "status": "RUNNING", "progress": 100, "message": "stale completion",
+            "upstreamJobId": "g76-stale-upstream",
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "LEASE_EPOCH_MISMATCH"
+    with sessions() as db:
+        current_task = db.execute(
+            select(DBGenerationTask).where(DBGenerationTask.id == task["taskId"])
+        ).scalar_one()
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert current_task.status == "SUBMITTING"
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.probe_epoch == current_probe_epoch
+        assert circuit.half_open_lease_epoch == current_epoch
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 0
+
+    _g76_finish_claimed_fake_task(client, task["taskId"], worker_id, "current-epoch")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "CLOSED"
+        assert circuit.half_open_task_id is None
+        assert circuit.half_open_lease_epoch is None
+        assert circuit.half_open_issuer is None
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 1
+
+
 def test_g76_late_success_does_not_close_open_circuit(generation_context):
     """An older completion cannot heal OPEN or erase its cooldown."""
     client, sessions, _, _ = generation_context
@@ -2210,18 +2339,19 @@ def test_g76_half_open_only_current_probe_can_close(generation_context):
     old = create_task(client, project, key="g76-old-not-probe")
     probe = create_task(client, project, key="g76-current-probe")
     assert claim(client, "worker-g76-old").json()["taskId"] == old["taskId"]
-    assert claim(client, "worker-g76-probe").json()["taskId"] == probe["taskId"]
 
     now = datetime.datetime.now(datetime.timezone.utc)
     with sessions() as db:
         tenant_id = db.execute(select(DBTenant.id)).scalar_one()
         db.add(DBGenerationCircuitState(
             id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
-            state="HALF_OPEN", half_open_task_id=probe["taskId"],
+            state="HALF_OPEN", half_open_task_id=None, probe_epoch=0,
+            half_open_lease_epoch=None, half_open_issuer=None,
             failure_timestamps_json=[now.isoformat()],
             opened_at=now - datetime.timedelta(minutes=2), updated_at=now,
         ))
         db.commit()
+    assert claim(client, "worker-g76-probe").json()["taskId"] == probe["taskId"]
 
     _g76_finish_claimed_fake_task(client, old["taskId"], "worker-g76-old", "wrong-probe")
     with sessions() as db:
