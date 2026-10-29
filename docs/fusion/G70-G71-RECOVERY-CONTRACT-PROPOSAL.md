@@ -77,7 +77,25 @@ PR #60 的精确提交 CI Run #503 已通过；测试也验证了在上传流中
 
 每个用例必须记录精确 Git SHA、环境、命令、退出码、关键日志/数据库断言及 Provider 调用证据。只通过静态检查或离线单测不得关闭业务门禁。
 
-## 7. 仍待 Owner 决策的 8 项条件政策（原样保留）
+## 7. 既有精确提交 CI 的命令与结果（不是本提案的新测试）
+
+证据对象是 PR #60 的提交 `a73f76396ef9d210a4f293978cf0f7efeac1d827`，GitHub Actions Run #503（ID `40911128564`），结果 `completed / success`。本节保存该次 workflow 的命令范围；本次新增的是文档，不声称重新执行这些命令。
+
+Workflow 文件：`.github/workflows/ci.yml`，读取版本为 PR #60 head；其 Blob SHA 为 `c214752af40e91963b9c802954787c179c105141`。
+
+- Web/package：`pnpm test` — PASS。
+- API：环境 `PYTHONPATH=apps/api`；`python -m pytest apps/api/test_main.py apps/api/test_moneyprinter.py apps/api/test_generation_tasks.py apps/api/test_runtime_gates.py apps/api/test_detection_evidence.py -v` — PASS；PR #60 精确提交记录为 136 passed、1 warning。
+- FAKE-only private-canary：`bash -n infra/docker/provider-canary.sh` 和 `python infra/docker/provider-canary-smoke.py self-test` — PASS。
+- Node 生产依赖审计：`pnpm audit --prod` — PASS。
+- Python 依赖审计：`pip-audit -r apps/api/requirements.txt`、`pip-audit -r apps/worker/requirements.txt`、`pip-audit -r apps/video_use/requirements.txt` — PASS。
+- Worker 容器：workflow 将测试文件复制到临时路径后执行 `python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py /tmp/test_deterministic_fake_adapter.py /tmp/test_talking_head_provider_adapter.py /tmp/test_talking_head_runtime.py /tmp/test_talking_head_arm_disarm.py /tmp/test_talking_head_egress_proxy.py -v` — Docker Compose job PASS。
+- video-use 容器：`python -m pytest /tmp/test_main.py -v` — Docker Compose job PASS。
+- 浏览器流程：`pnpm e2e` — PASS；Docker 集成中的上传到下载浏览器用例 3 passed。
+- Docker Compose：构建并启动隔离服务，执行 Worker/video-use 测试、合成 FFmpeg 渲染、认证上传/持久队列/Worker/媒资处理/下载流程，并清理本次运行创建的容器、卷和网络 — PASS。
+
+Run #503 的六个必需 job 全部成功：Node production dependency audit、Core lint/build/API/unit、Python dependency audit、必需门禁聚合、Playwright workbench、Docker Compose integration。没有在此处把该 CI 扩展解释为 PostgreSQL 多 Worker 证明，也没有把它解释为恢复提交或 M11 结算已实现。
+
+## 8. 仍待 Owner 决策的 8 项条件政策（原样保留）
 
 1. M11 跨账期首次释放的归属。
 2. 口播 `outputCount=2..4` 的成片与计费语义。
@@ -90,7 +108,7 @@ PR #60 的精确提交 CI Run #503 已通过；测试也验证了在上传流中
 
 本提案不回答、不覆盖、不隐式批准上述任何决策。
 
-## 8. 关闭标准与当前审批状态
+## 9. 关闭标准与当前审批状态
 
 G70/G71 只有在以下全部满足后才可按 Owner 统一清单申请正式关闭：恢复来源/绑定契约获批；恢复提交实现经过代码评审；M11 规则获批且事务一致性有证据；Owner/委托管理员/跨租户负例通过；并发、幂等、重启和故障注入测试通过；精确提交的完整非生产 CI 通过；证据已关联至统一验收清单。
 
