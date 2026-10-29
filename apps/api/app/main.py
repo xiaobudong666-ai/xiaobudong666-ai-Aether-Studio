@@ -542,14 +542,15 @@ def create_app(
         ).scalar_one_or_none()
 
     def generation_circuit(
-        db: Session, tenant_id: str, *, create: bool = False
+        db: Session, tenant_id: str, *, create: bool = False, for_update: bool = False
     ) -> DBGenerationCircuitState | None:
-        circuit = db.execute(
-            select(DBGenerationCircuitState).where(
-                DBGenerationCircuitState.tenant_id == tenant_id,
-                DBGenerationCircuitState.provider == "moneyprinter",
-            )
-        ).scalar_one_or_none()
+        statement = select(DBGenerationCircuitState).where(
+            DBGenerationCircuitState.tenant_id == tenant_id,
+            DBGenerationCircuitState.provider == "moneyprinter",
+        )
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        circuit = db.execute(statement).scalar_one_or_none()
         if circuit is None and create:
             circuit = DBGenerationCircuitState(
                 id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
@@ -564,7 +565,7 @@ def create_app(
         snapshot_time = now.replace(second=0, microsecond=0)
         mode = created_app.state.generation_provider_mode
         config = published_generation_config(db, tenant_id)
-        circuit = generation_circuit(db, tenant_id)
+        circuit = generation_circuit(db, tenant_id, for_update=True)
         circuit_state = circuit.state if circuit is not None else "CLOSED"
         policy = config.policy_json if config is not None else DEFAULT_FAKE_POLICY
         reason_code: str | None = None
@@ -631,6 +632,8 @@ def create_app(
             if cooldown_until is not None and now >= cooldown_until:
                 circuit.state = "HALF_OPEN"
                 circuit.half_open_task_id = None
+                circuit.half_open_lease_epoch = None
+                circuit.half_open_issuer = None
                 circuit.updated_at = now
                 circuit_state = "HALF_OPEN"
                 add_provider_event(
@@ -849,7 +852,7 @@ def create_app(
         window_seconds = max(10, int(policy.get("failureWindow", 300)))
         threshold = max(1, int(policy.get("failureThreshold", 5)))
         cooldown_seconds = max(10, int(policy.get("cooldownSeconds", 60)))
-        circuit = generation_circuit(db, task.tenant_id, create=True)
+        circuit = generation_circuit(db, task.tenant_id, create=True, for_update=True)
         if circuit.state == "DISABLED":
             return
         cutoff = now - datetime.timedelta(seconds=window_seconds)
@@ -870,6 +873,8 @@ def create_app(
             circuit.opened_at = now
             circuit.cooldown_until = now + datetime.timedelta(seconds=cooldown_seconds)
             circuit.half_open_task_id = None
+            circuit.half_open_lease_epoch = None
+            circuit.half_open_issuer = None
             if previous != "OPEN":
                 add_provider_event(
                     db, tenant_id=task.tenant_id, event_type="GENERATION_CIRCUIT_OPENED",
@@ -879,15 +884,18 @@ def create_app(
         circuit.updated_at = now
 
     def record_generation_success(
-        db: Session, task: DBGenerationTask, *, now: datetime.datetime
+        db: Session, task: DBGenerationTask, *, issuer_id: str, now: datetime.datetime
     ) -> None:
-        circuit = generation_circuit(db, task.tenant_id)
-        # Only the current HALF_OPEN probe may close the breaker.  A success
-        # from an older task cannot heal OPEN, DISABLED, or another probe.
+        circuit = generation_circuit(db, task.tenant_id, for_update=True)
+        # Close only for the exact durable probe lease: task, monotonic epoch,
+        # and worker issuer must all match the currently persisted probe.
         if (
             circuit is None
             or circuit.state != "HALF_OPEN"
             or circuit.half_open_task_id != task.id
+            or circuit.half_open_lease_epoch != task.lease_epoch
+            or circuit.half_open_issuer != issuer_id
+            or circuit.probe_epoch != task.circuit_probe_epoch
         ):
             return
         previous = circuit.state
@@ -896,11 +904,17 @@ def create_app(
         circuit.opened_at = None
         circuit.cooldown_until = None
         circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
         circuit.updated_at = now
         add_provider_event(
             db, tenant_id=task.tenant_id, event_type="GENERATION_CIRCUIT_CLOSED",
             actor_type="SYSTEM", actor_id="api",
-            metadata={"fromState": previous, "taskId": task.id}, now=now,
+            metadata={
+                "fromState": previous, "taskId": task.id,
+                "probeEpoch": circuit.probe_epoch, "leaseEpoch": task.lease_epoch,
+                "issuer": issuer_id,
+            }, now=now,
         )
 
     @created_app.get("/health")
@@ -1134,7 +1148,7 @@ def create_app(
         require_roles(context, "owner")
         begin_serialized_write(db)
         now = utc_now()
-        circuit = generation_circuit(db, context.tenant_id, create=True)
+        circuit = generation_circuit(db, context.tenant_id, create=True, for_update=True)
         previous = circuit.state
         circuit.state = "DISABLED" if req.disabled else "CLOSED"
         circuit.disabled_reason_code = req.reasonCode if req.disabled else None
@@ -1142,6 +1156,8 @@ def create_app(
         circuit.opened_at = None if not req.disabled else circuit.opened_at
         circuit.cooldown_until = None if not req.disabled else circuit.cooldown_until
         circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
         circuit.updated_at = now
         add_provider_event(
             db, tenant_id=context.tenant_id,
@@ -1725,13 +1741,15 @@ def create_app(
             release_generation_reservation(
                 db, task, attempt, reason_code="TASK_CANCELED", now=now
             )
-            task_circuit = generation_circuit(db, task.tenant_id)
+            task_circuit = generation_circuit(db, task.tenant_id, for_update=True)
             if (
                 task_circuit is not None
                 and task_circuit.state == "HALF_OPEN"
                 and task_circuit.half_open_task_id == task.id
             ):
                 task_circuit.half_open_task_id = None
+                task_circuit.half_open_lease_epoch = None
+                task_circuit.half_open_issuer = None
                 task_circuit.updated_at = now
             db.commit()
         return generation_task_response(
@@ -1891,7 +1909,7 @@ def create_app(
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
-            candidate_circuit = generation_circuit(db, candidate.tenant_id)
+            candidate_circuit = generation_circuit(db, candidate.tenant_id, for_update=True)
             if candidate_circuit is not None:
                 if candidate_circuit.state == "DISABLED":
                     continue
@@ -1901,6 +1919,8 @@ def create_app(
                         continue
                     candidate_circuit.state = "HALF_OPEN"
                     candidate_circuit.half_open_task_id = None
+                    candidate_circuit.half_open_lease_epoch = None
+                    candidate_circuit.half_open_issuer = None
                     candidate_circuit.updated_at = now
                     add_provider_event(
                         db, tenant_id=candidate.tenant_id,
@@ -1910,8 +1930,6 @@ def create_app(
                 if candidate_circuit.state == "HALF_OPEN":
                     if candidate_circuit.half_open_task_id not in {None, candidate.id}:
                         continue
-                    candidate_circuit.half_open_task_id = candidate.id
-                    candidate_circuit.updated_at = now
             if candidate_mode == "moneyprinter":
                 config = published_generation_config(db, candidate.tenant_id)
                 if (
@@ -1958,6 +1976,23 @@ def create_app(
             db.rollback()
             response.status_code = 204
             return response
+
+        # Every claim gets a durable, monotonically increasing lease epoch.
+        # A recycled worker ID cannot authorize a stale response from an older claim.
+        task.lease_epoch = int(task.lease_epoch or 0) + 1
+        task.circuit_probe_epoch = None
+        task_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+        if task_circuit is not None and task_circuit.state == "HALF_OPEN":
+            if task_circuit.half_open_task_id not in {None, task.id}:
+                db.rollback()
+                response.status_code = 204
+                return response
+            task_circuit.probe_epoch = int(task_circuit.probe_epoch or 0) + 1
+            task_circuit.half_open_task_id = task.id
+            task_circuit.half_open_lease_epoch = task.lease_epoch
+            task_circuit.half_open_issuer = x_worker_id
+            task.circuit_probe_epoch = task_circuit.probe_epoch
+
         previous = task.status
         attempt = current_generation_attempt(db, task)
         submission_consumed = (
@@ -2013,6 +2048,8 @@ def create_app(
                 "canaryProfile": attestation_canary_proof(claim_attestation)[2],
             },
             "leaseSeconds": lease_seconds,
+            "leaseEpoch": task.lease_epoch,
+            "circuitProbeEpoch": task.circuit_probe_epoch,
         }
 
     @created_app.post("/internal/generation-tasks/{task_id}/heartbeat")
@@ -2021,6 +2058,7 @@ def create_app(
         _req: GenerationWorkerHeartbeatRequest,
         x_worker_token: str | None = Header(default=None),
         x_worker_id: str = Header(default="worker"),
+        x_worker_lease_epoch: int | None = Header(default=None, alias="X-Worker-Lease-Epoch"),
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
@@ -2031,6 +2069,8 @@ def create_app(
         now = utc_now()
         if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
             raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
         task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
@@ -2044,6 +2084,7 @@ def create_app(
         req: GenerationWorkerTransitionRequest,
         x_worker_token: str | None = Header(default=None),
         x_worker_id: str = Header(default="worker"),
+        x_worker_lease_epoch: int | None = Header(default=None, alias="X-Worker-Lease-Epoch"),
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
@@ -2054,6 +2095,8 @@ def create_app(
         now = utc_now()
         if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.cancel_requested_at is not None or task.status == "CANCELED":
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到响应已隔离"})
         if req.status != task.status and req.status not in WORKER_TRANSITIONS.get(task.status, set()):
@@ -2121,6 +2164,7 @@ def create_app(
         file: UploadFile = File(...),
         x_worker_token: str | None = Header(default=None),
         x_worker_id: str = Header(default="worker"),
+        x_worker_lease_epoch: int | None = Header(default=None, alias="X-Worker-Lease-Epoch"),
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
@@ -2165,6 +2209,8 @@ def create_app(
         now = utc_now()
         if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.cancel_requested_at is not None or task.status == "CANCELED":
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
         if task.status not in {"RUNNING", "INGESTING"}:
@@ -2277,7 +2323,7 @@ def create_app(
                 config_version_id=task.capability_snapshot_json.get("configVersionId"),
                 now=now,
             )
-            record_generation_success(db, task, now=now)
+            record_generation_success(db, task, issuer_id=x_worker_id, now=now)
             add_generation_event(
                 db, task, attempt=attempt, event_type="ARTIFACT_INGESTED",
                 actor_type="WORKER", actor_id=x_worker_id,
