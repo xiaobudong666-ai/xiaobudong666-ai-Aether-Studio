@@ -744,26 +744,77 @@ def test_39_non_retryable_provider_4xx_cannot_be_retried(generation_context):
 
 
 def test_40_stream_interruption_compensates_quota_and_records_failure(generation_context):
-    client, sessions, _, media_store = generation_context
+    client, sessions, app, media_store = generation_context
     project = create_project(client)
     task = create_task(client, project)
+    task_id = task["taskId"]
     claim(client)
-    transition(client, task["taskId"], "RUNNING", upstreamJobId="upstream")
-    transition(client, task["taskId"], "INGESTING", upstreamJobId="upstream", providerArtifactId="artifact")
+    transition(client, task_id, "RUNNING", upstreamJobId="upstream")
+    transition(client, task_id, "INGESTING", upstreamJobId="upstream", providerArtifactId="artifact")
     media_store.interrupt = True
     with pytest.raises(RuntimeError, match="stream interrupted"):
         client.post(
-            f"/internal/generation-tasks/{task['taskId']}/artifact-intake",
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
             headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
             data={"providerArtifactId": "artifact"},
             files={"file": ("artifact.mp4", b"video", "video/mp4")},
         )
     with sessions() as db:
         tenant = db.execute(select(DBTenant)).scalar_one()
-        stored = db.get(DBGenerationTask, task["taskId"])
+        stored = db.get(DBGenerationTask, task_id)
         assert tenant.used_storage_bytes == 0
         assert stored.status == "FAILED"
-        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        # The upload stream failed before video-use issued a media ID. Preserve the
+        # original upstream/artifact binding and do not pretend an orphan is recoverable.
+        assert stored.media_id is None
+        assert stored.asset_version_id is None
+        assert stored.upstream_job_id == "upstream"
+        assert stored.provider_artifact_id == "artifact"
+        attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        settled_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        assert attempts_before == 1
+        assert settled_before == 0
+
+    # Manual retry must not resubmit generation when no recoverable sidecar ID exists.
+    blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    blocked_again = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked_again.status_code == 409
+    assert blocked_again.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+    with sessions() as db:
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        stored = db.get(DBGenerationTask, task_id)
+        assert tenant.used_storage_bytes == 0
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.media_id is None
+        assert stored.asset_version_id is None
+        assert stored.upstream_job_id == "upstream"
+        assert stored.provider_artifact_id == "artifact"
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == attempts_before == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one() == usage_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == settled_before == 0
+    app.state.moneyprinter.assert_not_called()
 
 
 
@@ -1570,3 +1621,211 @@ def test_p0_runtime_bridge_revision_conflict_is_fail_closed(generation_context):
     )
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
+
+
+
+def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(generation_context):
+    """Preflight verifies an existing sidecar object but never recovers or settles it."""
+    import hashlib
+    from contextlib import contextmanager
+
+    import httpx
+
+    client, sessions, _, media_store = generation_context
+    project = create_project(client, "g70-recovery-preflight")
+    task = create_task(client, project, key="g70-recovery-preflight")
+    task_id = task["taskId"]
+    media_id = "generated-media-77"
+    payload = b"synthetic-original-artifact"
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        stored.status = "FAILED"
+        stored.error_code = "ARTIFACT_INGEST_FAILED"
+        stored.error_message = "生成产物入库失败"
+        stored.media_id = media_id
+        stored.provider_artifact_id = "original-provider-artifact-77"
+        stored.upstream_job_id = "original-upstream-job-77"
+        stored.asset_version_id = None
+        stored.lease_owner = None
+        stored.lease_expires_at = None
+        stored.completed_at = now
+        stored.updated_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_id=None,
+            event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING",
+            to_status="FAILED",
+            actor_type="SYSTEM",
+            actor_id="api",
+            metadata_json={
+                "compensatedQuotaBytes": len(payload),
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": expected_sha256,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": {
+                    "durationSeconds": 1.0,
+                    "sizeBytes": len(payload),
+                    "video": {"codec": "h264", "width": 320, "height": 240},
+                    "audio": None,
+                },
+                "originalProviderArtifactId": "original-provider-artifact-77",
+                "originalUpstreamJobId": "original-upstream-job-77",
+            },
+            created_at=now,
+        ))
+        db.commit()
+
+    def fake_stream(content):
+        def stream(path, headers=None):
+            assert path == f"/media/{project['id']}/{media_id}"
+            @contextmanager
+            def response_context():
+                yield httpx.Response(200, content=content)
+            return response_context()
+        return stream
+
+    media_store.stream = fake_stream(payload)
+    with sessions() as db:
+        before_task = db.get(DBGenerationTask, task_id)
+        before_state = (before_task.status, before_task.error_code, before_task.media_id, before_task.asset_version_id)
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        before_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        before_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        before_storage_bytes = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}/artifact-recovery-preflight"
+    verified = client.get(path)
+    assert verified.status_code == 200, verified.text
+    assert verified.json()["preflightStatus"] == "VERIFIED_NOT_RECOVERED"
+    assert verified.json()["recoveryPerformed"] is False
+    assert verified.json()["quotaMutationPerformed"] is False
+    assert verified.json()["settlementPerformed"] is False
+    assert verified.json()["sha256"] == expected_sha256
+    assert verified.json()["sizeBytes"] == len(payload)
+
+    # A byte mismatch must fail closed and still leave business state unchanged.
+    media_store.stream = fake_stream(b"tampered-original-artifact")
+    mismatch = client.get(path)
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"]["code"] == "ARTIFACT_RECOVERY_EVIDENCE_MISMATCH"
+
+    # An unavailable sidecar must fail closed without changing business state.
+    def unavailable_stream(path, headers=None):
+        raise RuntimeError("synthetic sidecar unavailable")
+
+    media_store.stream = unavailable_stream
+    unavailable = client.get(path)
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"]["code"] == "ARTIFACT_RECOVERY_SOURCE_UNAVAILABLE"
+
+    with sessions() as db:
+        after_task = db.get(DBGenerationTask, task_id)
+        after_state = (after_task.status, after_task.error_code, after_task.media_id, after_task.asset_version_id)
+        after_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        after_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        after_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        after_storage_bytes = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    assert after_state == before_state
+    assert after_events == before_events
+    assert after_assets == before_assets == 0
+    assert after_usage == before_usage
+    assert after_settled == before_settled == 0
+    assert after_storage_bytes == before_storage_bytes
+
+
+
+def test_g70_artifact_recovery_preflight_rejects_non_owner(generation_context):
+    client, _, _, _ = generation_context
+    project = create_project(client, "g70-preflight-non-owner")
+    task = create_task(client, project, key="g70-preflight-non-owner")
+    password = secrets.token_urlsafe(24)
+    created = client.post("/admin/users", json={
+        "email": "preflight-viewer@example.com",
+        "displayName": "Preflight Viewer",
+        "password": password,
+        "role": "viewer",
+    })
+    assert created.status_code == 201
+    client.post("/auth/logout")
+    assert client.post(
+        "/auth/login",
+        json={"email": "preflight-viewer@example.com", "password": password},
+    ).status_code == 200
+
+    response = client.get(
+        f"/projects/{project['id']}/generation-tasks/{task['taskId']}/artifact-recovery-preflight"
+    )
+    assert response.status_code == 403
+
+
+def test_g70_artifact_recovery_preflight_hides_foreign_tenant_task(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "g70-preflight-tenant-scope")
+    task = create_task(client, project, key="g70-preflight-tenant-scope")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    password = secrets.token_urlsafe(24)
+
+    with sessions() as db:
+        tenant = DBTenant(
+            id="tenant-preflight-foreign",
+            name="Preflight Foreign",
+            slug="preflight-foreign",
+            project_quota=50,
+            storage_quota_bytes=1024**3,
+            used_storage_bytes=0,
+            concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600,
+            render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"),
+            created_at=now,
+            updated_at=now,
+        )
+        user = DBUser(
+            id="user-preflight-foreign",
+            tenant_id=tenant.id,
+            email="preflight-foreign@example.com",
+            display_name="Preflight Foreign",
+            password_hash=hash_password(password),
+            role="owner",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([tenant, user])
+        db.commit()
+
+    client.post("/auth/logout")
+    assert client.post(
+        "/auth/login",
+        json={"email": "preflight-foreign@example.com", "password": password},
+    ).status_code == 200
+    response = client.get(
+        f"/projects/{project['id']}/generation-tasks/{task['taskId']}/artifact-recovery-preflight"
+    )
+    assert response.status_code == 404
