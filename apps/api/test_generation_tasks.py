@@ -1629,7 +1629,6 @@ def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(g
         ))
         db.commit()
 
-    @contextmanager
     def fake_stream(content):
         def stream(path, headers=None):
             assert path == f"/media/{project['id']}/{media_id}"
