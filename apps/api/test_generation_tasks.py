@@ -2442,3 +2442,71 @@ def test_g72_revocation_after_unknown_ack_preserves_unknown_and_reserved_usage(g
     assert before_reserved == after_reserved == 1
     assert before_settled == after_settled == 0
     assert before_storage == after_storage
+
+
+def test_g72_admin_without_explicit_delegation_cannot_create_owner_talking_head_task(generation_context):
+    """No implicit admin-as-owner behavior: delegated operation needs an explicit grant."""
+    client, sessions, _app, _media = generation_context
+    project = create_project(client, "G72 admin delegation boundary")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-admin-no-delegation"
+    )
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # Seed an admin identity directly: the Owner-only user-management route
+    # must not be used to grant itself broader permissions.
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBUser(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            email="g72-admin-no-delegation@example.com",
+            display_name="G72 Admin Without Delegation",
+            password_hash=hash_password(password),
+            role="admin",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        ))
+        db.commit()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        before_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        before_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+
+    client.post("/auth/logout")
+    login = client.post(
+        "/auth/login",
+        json={
+            "email": "g72-admin-no-delegation@example.com",
+            "password": password,
+        },
+    )
+    assert login.status_code == 200, login.text
+
+    # An admin identity is not implicitly authorized to submit work as Owner.
+    response = client.post(path, json=payload)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"]["code"] == "PERMISSION_DENIED"
+
+    with sessions() as db:
+        after_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        after_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        after_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+        reused_key = db.execute(
+            select(DBGenerationTask.id).where(
+                DBGenerationTask.idempotency_key == "g72-admin-no-delegation"
+            )
+        ).scalar_one_or_none()
+
+    assert after_tasks == before_tasks
+    assert after_events == before_events
+    assert after_usage == before_usage
+    assert reused_key is None
+
