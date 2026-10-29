@@ -1649,7 +1649,7 @@ def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(g
             DBAssetVersion.project_id == project["id"]
         )).scalar_one()
         before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.generation_task_id == task_id
+            DBGenerationUsageEntry.task_id == task_id
         )).scalar_one()
 
     path = f"/projects/{project['id']}/generation-tasks/{task_id}/artifact-recovery-preflight"
@@ -1678,7 +1678,7 @@ def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(g
             DBAssetVersion.project_id == project["id"]
         )).scalar_one()
         after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.generation_task_id == task_id
+            DBGenerationUsageEntry.task_id == task_id
         )).scalar_one()
 
     assert after_state == before_state
