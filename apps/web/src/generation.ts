@@ -409,6 +409,30 @@ export interface ServerGenerationRequest {
   confirmExternalGeneration: true;
 }
 
+export interface FakeTalkingHeadGenerationRequest {
+  text: string;
+  durationSeconds: number;
+  aspectRatio: "9:16";
+  resolution: "720p" | "1080p";
+  voiceId: "synthetic-seed";
+  imageAssetVersionId: string;
+  idempotencyKey: string;
+  expectedProjectRevision: number;
+  capabilitySnapshotHash: string;
+  confirmSyntheticTestOnly: true;
+}
+
+export interface FakeTalkingHeadPreflight {
+  allowed: true;
+  status: "PREFLIGHT";
+  fakeOnly: true;
+  simulatedOutput: true;
+  publishable: false;
+  capabilitySnapshotHash: string;
+  projectRevision: number;
+  quota: GenerationCapabilitySnapshot["quota"];
+}
+
 export interface ServerGenerationResult {
   assetVersionId: string;
   mediaId: string;
@@ -488,6 +512,42 @@ export class GenerationApiClient {
       },
       body: JSON.stringify(body),
     });
+  }
+
+  talkingHeadCapabilities(): Promise<GenerationCapabilitySnapshot> {
+    return this.json("/generation/providers/moneyprinter/capabilities");
+  }
+
+  validateFakeTalkingHead(
+    projectId: string,
+    body: FakeTalkingHeadGenerationRequest,
+  ): Promise<FakeTalkingHeadPreflight> {
+    return this.json(
+      `/projects/${encodeURIComponent(projectId)}/talking-head/fake-generation-tasks/validate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Aether-CSRF": "1" },
+        body: JSON.stringify(body),
+      },
+    );
+  }
+
+  createFakeTalkingHead(
+    projectId: string,
+    body: FakeTalkingHeadGenerationRequest,
+  ): Promise<ServerGenerationTask> {
+    return this.json(
+      `/projects/${encodeURIComponent(projectId)}/talking-head/fake-generation-tasks`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Aether-CSRF": "1",
+          "Idempotency-Key": body.idempotencyKey,
+        },
+        body: JSON.stringify(body),
+      },
+    );
   }
 
   async list(projectId: string): Promise<ServerGenerationTask[]> {

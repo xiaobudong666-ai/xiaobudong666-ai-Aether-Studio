@@ -342,6 +342,132 @@ describe("Aether Studio 中文工作台", () => {
     expect(adoptionKeys[0]).toBe(adoptionKeys[1]);
   });
 
+  test("G72 normal oral-broadcast entry validates and enqueues only FAKE-only work", async () => {
+    const projectWithImage = {
+      ...createdProject,
+      materials: [{
+        id: "media-image-1", name: "portrait.png", url: "/api/media/media-image-1",
+        type: "image", contentType: "image/png", sizeBytes: 100,
+      }],
+    };
+    const imageVersion = {
+      id: "image-version-1", projectId: "project-1", mediaId: "media-image-1",
+      versionNo: 1, sha256: "c".repeat(64), mediaType: "image",
+      contentType: "image/png", sizeBytes: 100, probe: { image: { width: 48, height: 48 } },
+      createdBy: "owner-1", createdAt: "2026-10-29T00:00:00Z",
+    };
+    const capabilities = {
+      provider: "moneyprinter", mode: "deterministic-fake", enabled: true, healthy: true,
+      sourceVersion: "g72-fake-only-test", issuedAt: "2026-10-29T00:00:00Z",
+      expiresAt: "2026-10-29T00:05:00Z", videoAspects: ["9:16"],
+      videoConcatModes: ["sequential"], clipDurationSeconds: { min: 1, max: 10 },
+      maxOutputs: 1, voices: ["synthetic-seed"], snapshotHash: "a".repeat(64),
+      operatorMode: "deterministic-fake", ownerPolicy: { published: false, enabledIntent: true },
+      workerProof: { present: true, fresh: true },
+      quota: {
+        concurrentLimit: 1, concurrentRemaining: 1,
+        monthlyRequestLimit: 10, monthlyRequestRemaining: 10,
+        monthlyGeneratedSecondsLimit: 60, monthlyGeneratedSecondsRemaining: 60,
+      },
+      circuit: { state: "CLOSED" }, killSwitch: { disabled: false, reasonCode: null },
+    };
+    const task = {
+      taskId: "g72-fake-task-1", projectId: "project-1",
+      provider: "deterministic-fake-talking-head", status: "QUEUED", storedStatus: "QUEUED",
+      progress: 0, message: "FAKE-only test task", attempt: 1, maxAttempts: 1,
+      cancelRequested: false, rights: { allowed: false, code: "RIGHTS_MISSING" },
+      results: [], createdAt: "2026-10-29T00:00:00Z", updatedAt: "2026-10-29T00:00:00Z",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            id: "owner-1", email: "owner@example.com", displayName: "Owner", role: "owner",
+            tenant: { id: "tenant-1", name: "Aether Test", slug: "aether-test" },
+            quotas: {
+              projects: 50, storageBytes: 1000, storageBytesUsed: 100,
+              concurrentRenders: 2, monthlyRenderSeconds: 1000,
+              monthlyRenderSecondsUsed: 0, period: "2026-10",
+            },
+          }),
+        } as Response;
+      }
+      if (url.endsWith("/projects") && (!init?.method || init.method === "GET")) {
+        return { ok: true, status: 200, json: async () => [projectWithImage] } as Response;
+      }
+      if (url.endsWith("/projects/project-1/asset-versions")) {
+        return { ok: true, status: 200, json: async () => [imageVersion] } as Response;
+      }
+      if (url.endsWith("/projects/project-1")) {
+        return { ok: true, status: 200, json: async () => projectWithImage } as Response;
+      }
+      if (url.endsWith("/generation/providers/moneyprinter/capabilities")
+        || url.endsWith("/generation/providers/moneyprinter/readiness")) {
+        return { ok: true, status: 200, json: async () => capabilities } as Response;
+      }
+      if (url.endsWith("/talking-head/fake-generation-tasks/validate")) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            allowed: true, status: "PREFLIGHT", fakeOnly: true,
+            simulatedOutput: true, publishable: false,
+            capabilitySnapshotHash: capabilities.snapshotHash, projectRevision: 1,
+            quota: capabilities.quota,
+          }),
+        } as Response;
+      }
+      if (url.endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST") {
+        return { ok: true, status: 202, json: async () => task } as Response;
+      }
+      if (url.includes("/generation-tasks?pageSize=100")) {
+        return { ok: true, status: 200, json: async () => ({ items: [] }) } as Response;
+      }
+      if (url.endsWith("/events")) {
+        return { ok: true, status: 200, json: async () => ({}) } as Response;
+      }
+      return { ok: true, status: 200, json: async () => [] } as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    expect(await screen.findByRole("option", { name: "发布预告片（版本 1）" })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("口播文案"), { target: { value: "这是一条合成测试文案" } });
+    fireEvent.click(screen.getByRole("button", { name: "从项目素材选择人物照片" }));
+    expect(await screen.findByRole("option", { name: /portrait\.png/ })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("选择人物图片素材"), { target: { value: "image-version-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" }));
+    expect(await screen.findByText(/FAKE-only 测试任务已入队/)).toBeTruthy();
+
+    const createCall = fetchMock.mock.calls.find(([input, init]) =>
+      String(input).endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST"
+    );
+    expect(createCall).toBeTruthy();
+    const requestBody = JSON.parse(String(createCall?.[1]?.body));
+    expect(requestBody).toMatchObject({
+      text: "这是一条合成测试文案",
+      durationSeconds: 1,
+      aspectRatio: "9:16",
+      resolution: "720p",
+      voiceId: "synthetic-seed",
+      imageAssetVersionId: "image-version-1",
+      expectedProjectRevision: 1,
+      capabilitySnapshotHash: capabilities.snapshotHash,
+      confirmSyntheticTestOnly: true,
+    });
+    expect(createCall?.[1]?.headers).toMatchObject({
+      "X-Aether-CSRF": "1",
+      "Idempotency-Key": requestBody.idempotencyKey,
+    });
+    expect(fetchMock.mock.calls.some(([input, init]) =>
+      String(input).endsWith("/talking-head/fake-generation-tasks/validate") && init?.method === "POST"
+    )).toBe(true);
+    expect(fetchMock.mock.calls.some(([input, init]) =>
+      String(input).endsWith("/generation-tasks") && init?.method === "POST"
+    )).toBe(false);
+  });
+
   test("keeps governance and timeline writes disabled for viewers", async () => {
     const material = {
       id: "media-viewer",

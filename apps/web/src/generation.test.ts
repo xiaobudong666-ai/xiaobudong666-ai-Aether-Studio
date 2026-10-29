@@ -261,6 +261,65 @@ describe("IM12–IM14 generation API client", () => {
     });
   });
 
+  test("G72 FAKE-only talking-head uses explicit validation and idempotent create routes", async () => {
+    const task = {
+      taskId: "g72-fake-task", projectId: "project-1",
+      provider: "deterministic-fake-talking-head", status: "QUEUED", storedStatus: "QUEUED",
+      progress: 0, message: "FAKE-only test task", attempt: 1, maxAttempts: 1,
+      cancelRequested: false, rights: { allowed: false, code: "RIGHTS_MISSING" },
+      results: [], createdAt: "2026-10-29T00:00:00Z", updatedAt: "2026-10-29T00:00:00Z",
+    };
+    const preflight = {
+      allowed: true, status: "PREFLIGHT", fakeOnly: true,
+      simulatedOutput: true, publishable: false,
+      capabilitySnapshotHash: "a".repeat(64), projectRevision: 3,
+      quota: {
+        concurrentLimit: 1, concurrentRemaining: 1,
+        monthlyRequestLimit: 10, monthlyRequestRemaining: 10,
+        monthlyGeneratedSecondsLimit: 60, monthlyGeneratedSecondsRemaining: 60,
+      },
+    };
+    const request = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => ({
+      ok: true,
+      status: _init?.method === "POST" ? 202 : 200,
+      json: async () => _init?.body && String(_input).endsWith("/validate") ? preflight : task,
+    } as Response));
+    const client = new GenerationApiClient("/api", request);
+    const body = {
+      text: "仅用于合成测试",
+      durationSeconds: 1,
+      aspectRatio: "9:16" as const,
+      resolution: "720p" as const,
+      voiceId: "synthetic-seed" as const,
+      imageAssetVersionId: "image-version-1",
+      idempotencyKey: "00000000-0000-4000-8000-000000000072",
+      expectedProjectRevision: 3,
+      capabilitySnapshotHash: "a".repeat(64),
+      confirmSyntheticTestOnly: true as const,
+    };
+    expect(await client.validateFakeTalkingHead("project-1", body)).toMatchObject({
+      allowed: true, fakeOnly: true, simulatedOutput: true, publishable: false,
+    });
+    expect(request.mock.calls[0][0]).toBe(
+      "/api/projects/project-1/talking-head/fake-generation-tasks/validate",
+    );
+    expect(await client.createFakeTalkingHead("project-1", body)).toMatchObject({
+      taskId: "g72-fake-task", provider: "deterministic-fake-talking-head",
+    });
+    expect(request.mock.calls[1][0]).toBe(
+      "/api/projects/project-1/talking-head/fake-generation-tasks",
+    );
+    expect(request.mock.calls[1][1]?.headers).toMatchObject({
+      "X-Aether-CSRF": "1",
+      "Idempotency-Key": body.idempotencyKey,
+    });
+    expect(JSON.parse(String(request.mock.calls[1][1]?.body))).toMatchObject({
+      imageAssetVersionId: "image-version-1",
+      confirmSyntheticTestOnly: true,
+      voiceId: "synthetic-seed",
+    });
+  });
+
   test("server list is the authoritative task source", async () => {
     const request = vi.fn(async () => ({
       ok: true, status: 200, json: async () => ({ items: [task] }),
