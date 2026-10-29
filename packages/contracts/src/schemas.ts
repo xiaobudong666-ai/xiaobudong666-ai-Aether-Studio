@@ -42,7 +42,7 @@ export const TimelineOutputSchema = z.object({
 // normalize that boundary value back to undefined so callers keep the optional contract.
 export const TimelineSchema = z.object({
   version: z.literal("1.1"),
-  output: TimelineOutputSchema.nullish().transform((value) => value ?? undefined),
+  output: TimelineOutputSchema.nullish().transform((value) => value ?? undefined).optional(),
   tracks: z.array(TrackSchema),
 });
 
