@@ -1651,6 +1651,11 @@ def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(g
         before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id
         )).scalar_one()
+        before_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        before_storage_bytes = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
 
     path = f"/projects/{project['id']}/generation-tasks/{task_id}/artifact-recovery-preflight"
     verified = client.get(path)
@@ -1680,8 +1685,15 @@ def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(g
         after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id
         )).scalar_one()
+        after_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        after_storage_bytes = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
 
     assert after_state == before_state
     assert after_events == before_events
     assert after_assets == before_assets == 0
-    assert after_usage == before_usage == 0
+    assert after_usage == before_usage
+    assert after_settled == before_settled == 0
+    assert after_storage_bytes == before_storage_bytes
