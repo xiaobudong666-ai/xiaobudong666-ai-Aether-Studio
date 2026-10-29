@@ -846,11 +846,7 @@ def test_g70_failed_db_commit_preserves_orphaned_sidecar_evidence(generation_con
         return result
 
     def fail_asset_commit(session):
-        if (
-            state["uploaded"]
-            and not state["failed"]
-            and any(isinstance(row, DBAssetVersion) for row in session.new)
-        ):
+        if state["uploaded"] and not state["failed"]:
             state["failed"] = True
             raise RuntimeError("synthetic DB commit failure after sidecar upload")
         return original_commit(session)
@@ -860,7 +856,7 @@ def test_g70_failed_db_commit_preserves_orphaned_sidecar_evidence(generation_con
     with pytest.raises(RuntimeError, match="synthetic DB commit failure"):
         client.post(
             f"/internal/generation-tasks/{task_id}/artifact-intake",
-            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-g70"},
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
             data={"providerArtifactId": "g70-artifact"},
             files={"file": ("artifact.mp4", b"video", "video/mp4")},
         )
@@ -914,11 +910,7 @@ def test_g70_lost_commit_ack_does_not_mark_durable_ingest_failed(generation_cont
         return result
 
     def commit_then_lose_ack(session):
-        if (
-            state["uploaded"]
-            and not state["raised"]
-            and any(isinstance(row, DBAssetVersion) for row in session.new)
-        ):
+        if state["uploaded"] and not state["raised"]:
             state["raised"] = True
             original_commit(session)
             raise RuntimeError("synthetic lost DB commit acknowledgement")
@@ -928,7 +920,7 @@ def test_g70_lost_commit_ack_does_not_mark_durable_ingest_failed(generation_cont
     monkeypatch.setattr(SQLAlchemySession, "commit", commit_then_lose_ack)
     response = client.post(
         f"/internal/generation-tasks/{task_id}/artifact-intake",
-        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-g70-ack"},
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
         data={"providerArtifactId": "g70-artifact-ack"},
         files={"file": ("artifact.mp4", b"video", "video/mp4")},
     )
