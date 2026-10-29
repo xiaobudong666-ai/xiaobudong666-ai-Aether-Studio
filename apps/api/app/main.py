@@ -2352,6 +2352,7 @@ def create_app(
                     and uploaded_duration > 0
                     and uploaded_size == upload_size
                     and failed_task.provider_artifact_id == providerArtifactId
+                    and failed_task.upstream_job_id
                     and not failed_task.media_id
                 ):
                     recoverable_media = {
