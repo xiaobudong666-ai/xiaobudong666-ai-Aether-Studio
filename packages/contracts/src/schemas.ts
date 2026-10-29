@@ -119,7 +119,7 @@ export const AssetVersionSchema = z.object({
   mediaType: z.enum(["video", "audio", "image"]),
   contentType: z.string().nullable(),
   sizeBytes: z.number().int().nonnegative(),
-  probe: z.record(z.unknown()),
+  probe: z.record(z.string(), z.unknown()),
   createdBy: z.string().min(1),
   createdAt: z.string().min(1),
 });
