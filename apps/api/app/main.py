@@ -1541,6 +1541,15 @@ def create_app(
     ):
         require_roles(context, "owner", "editor")
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        # G70/G71: reconcile the original output; never blindly resubmit a paid generation.
+        if task.error_code == "ARTIFACT_INGEST_FAILED":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_REQUIRED",
+                    "message": "生成结果转存状态未确认，必须先核对原始产物，禁止重新生成",
+                },
+            )
         if task.status not in RETRYABLE_GENERATION_STATES or (task.error_code or "").startswith("NON_RETRYABLE_"):
             raise HTTPException(
                 status_code=409,
@@ -1911,6 +1920,7 @@ def create_app(
             db.rollback()
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
+        uploaded = None
         try:
             uploaded = created_app.state.video_use.upload_media(
                 task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
@@ -2008,16 +2018,90 @@ def create_app(
             db.commit()
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
-            failed_task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one()
+            failed_task = db.execute(
+                select(DBGenerationTask).where(DBGenerationTask.id == task_id)
+            ).scalar_one()
+            durable_completion = db.execute(
+                select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == failed_task.id,
+                    DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+                    DBGenerationEvent.actor_id == x_worker_id,
+                )
+            ).scalar_one_or_none()
+            if (
+                failed_task.asset_version_id
+                and failed_task.provider_artifact_id == providerArtifactId
+                and durable_completion is not None
+                and (durable_completion.metadata_json or {}).get("assetVersionId")
+                == failed_task.asset_version_id
+            ):
+                # The database may have committed successfully even if the client
+                # lost the commit acknowledgement. Never compensate quota or mark
+                # a durable, settled task as failed in that ambiguous case.
+                return generation_task_response(
+                    db, failed_task,
+                    rights=generation_rights(db, failed_task),
+                    include_history=True,
+                )
+            db.execute(
+                update(DBTenant)
+                .where(DBTenant.id == task.tenant_id)
+                .values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size))
+            )
             failed_attempt = current_generation_attempt(db, failed_task)
             failed_task.status = "FAILED"
-            failed_task.error_code = "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED" if isinstance(exc, ValueError) else "ARTIFACT_INGEST_FAILED"
-            failed_task.error_message = "生成产物未通过受治理媒体校验" if isinstance(exc, ValueError) else "生成产物入库失败"
+            failed_task.error_code = (
+                "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED"
+                if isinstance(exc, ValueError)
+                else "ARTIFACT_INGEST_FAILED"
+            )
+            failed_task.error_message = (
+                "生成产物未通过受治理媒体校验"
+                if isinstance(exc, ValueError)
+                else "生成产物入库失败"
+            )
             failed_task.completed_at = utc_now()
             failed_task.updated_at = failed_task.completed_at
             failed_task.lease_owner = None
             failed_task.lease_expires_at = None
+            failure_metadata = {"compensatedQuotaBytes": upload_size}
+            if uploaded is not None and not isinstance(exc, ValueError):
+                uploaded_metadata = uploaded.get("metadata") or {}
+                uploaded_media_id = str(uploaded.get("mediaId") or "")
+                try:
+                    uploaded_duration = float(uploaded_metadata.get("durationSeconds") or 0)
+                    uploaded_size = int(uploaded_metadata.get("sizeBytes") or upload_size)
+                except (TypeError, ValueError):
+                    uploaded_duration = 0
+                    uploaded_size = upload_size
+                if (
+                    uploaded.get("projectId") == failed_task.project_id
+                    and uploaded_media_id
+                    and isinstance(uploaded_metadata.get("video"), dict)
+                    and uploaded_duration > 0
+                    and uploaded_size == upload_size
+                    and failed_task.provider_artifact_id == providerArtifactId
+                    and failed_task.upstream_job_id
+                    and not failed_task.media_id
+                ):
+                    recoverable_media = {
+                        "mediaId": uploaded_media_id,
+                        "durationSeconds": uploaded_duration,
+                        "sizeBytes": uploaded_size,
+                        "video": uploaded_metadata["video"],
+                        "audio": uploaded_metadata.get("audio")
+                        if isinstance(uploaded_metadata.get("audio"), dict)
+                        else None,
+                    }
+                    failed_task.media_id = uploaded_media_id
+                    failure_metadata.update({
+                        "orphanedMediaId": uploaded_media_id,
+                        "orphanedMediaSha256": digest.hexdigest(),
+                        "orphanedMediaSizeBytes": upload_size,
+                        "orphanedMediaMetadata": recoverable_media,
+                        "originalProviderArtifactId": providerArtifactId,
+                        "originalUpstreamJobId": failed_task.upstream_job_id,
+                    })
             failed_attempt.status = "FAILED"
             failed_attempt.error_code = failed_task.error_code
             failed_attempt.error_message = failed_task.error_message
@@ -2025,7 +2109,7 @@ def create_app(
             add_generation_event(
                 db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
                 actor_type="SYSTEM", actor_id="api", from_status=task.status,
-                to_status="FAILED", metadata={"compensatedQuotaBytes": upload_size}, now=failed_task.completed_at,
+                to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
             )
             release_generation_reservation(
                 db, failed_task, failed_attempt,
