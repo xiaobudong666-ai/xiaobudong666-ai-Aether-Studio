@@ -1566,7 +1566,64 @@ def test_g72_native_fake_rights_revoke_after_enqueue_blocks_claim(generation_con
             captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1),
         ))
         db.commit()
+    # Revocation before claim must fail closed without consuming the task,
+    # creating an attempt, releasing the reservation, or settling usage.
+    with sessions() as db:
+        before_task = db.get(DBGenerationTask, created.json()["taskId"])
+        assert before_task is not None
+        before_state = (
+            before_task.status,
+            before_task.error_code,
+            before_task.asset_version_id,
+            before_task.attempts,
+        )
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == before_task.id
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == before_task.id
+        )).scalar_one()
+        before_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == before_task.id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        before_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == before_task.id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+
     assert claim(client).status_code == 204
+
+    with sessions() as db:
+        after_task = db.get(DBGenerationTask, created.json()["taskId"])
+        assert after_task is not None
+        after_state = (
+            after_task.status,
+            after_task.error_code,
+            after_task.asset_version_id,
+            after_task.attempts,
+        )
+        after_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == after_task.id
+        )).scalar_one()
+        after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == after_task.id
+        )).scalar_one()
+        after_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == after_task.id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        after_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == after_task.id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+
+    assert before_state == after_state
+    assert after_state[0] == "QUEUED"
+    assert before_events == after_events
+    assert before_usage == after_usage
+    assert before_reserved == after_reserved == 1
+    assert before_settled == after_settled == 0
 
 
 def test_g72_native_fake_revoked_input_rejected_at_artifact_intake(generation_context):
