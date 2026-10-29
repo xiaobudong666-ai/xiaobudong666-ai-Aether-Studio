@@ -2510,3 +2510,74 @@ def test_g72_admin_without_explicit_delegation_cannot_create_owner_talking_head_
     assert after_usage == before_usage
     assert reused_key is None
 
+def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_context):
+    """Foreign-tenant admin is denied without project disclosure or task side effects."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client, "G72 foreign-tenant admin isolation")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-foreign-admin-isolated"
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    password = secrets.token_urlsafe(24)
+    with sessions() as db:
+        tenant = DBTenant(
+            id="g72-foreign-admin-tenant", name="G72 Foreign Admin",
+            slug="g72-foreign-admin", project_quota=50,
+            storage_quota_bytes=1024**3, used_storage_bytes=0,
+            concurrent_render_quota=2, monthly_render_seconds_quota=3600,
+            render_seconds_used=0, quota_period=now.strftime("%Y-%m"),
+            created_at=now, updated_at=now,
+        )
+        user = DBUser(
+            id="g72-foreign-admin", tenant_id=tenant.id,
+            email="g72-foreign-admin@example.com",
+            display_name="Foreign Tenant Admin",
+            password_hash=hash_password(password), role="admin",
+            is_active=True, created_at=now, updated_at=now,
+        )
+        db.add_all([tenant, user])
+        db.commit()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        before_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        before_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+        before_assets = db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one()
+
+    assert client.post("/auth/logout").status_code == 204
+    login = client.post(
+        "/auth/login",
+        json={"email": "g72-foreign-admin@example.com", "password": password},
+    )
+    assert login.status_code == 200, login.text
+
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for endpoint in (base + "/validate", base):
+        response = client.post(endpoint, json=payload)
+        assert response.status_code == 403, response.text
+        assert response.json()["detail"]["code"] == "PERMISSION_DENIED"
+    assert client.get(f"/projects/{project['id']}").status_code == 404
+
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == before_tasks
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == before_events
+        assert db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one() == before_usage
+        assert db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one() == before_assets
+        assert db.execute(
+            select(DBGenerationTask.id).where(
+                DBGenerationTask.idempotency_key == "g72-foreign-admin-isolated"
+            )
+        ).scalar_one_or_none() is None
+    assert media.uploads == 0
+
