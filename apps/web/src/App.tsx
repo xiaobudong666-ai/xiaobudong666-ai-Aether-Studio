@@ -443,27 +443,44 @@ export default function App() {
     setFakeTalkingHeadTaskId(null);
     try {
       const api = new GenerationApiClient(API_BASE);
-      const capabilities = await api.talkingHeadCapabilities();
-      if (capabilities.mode !== "deterministic-fake" || !capabilities.enabled) {
-        throw new Error("TALKING_HEAD_FAKE_DISABLED: 当前环境未显式启用隔离 FAKE-only 模式，未创建任务。");
-      }
       const idempotencyKey = globalThis.crypto?.randomUUID
         ? globalThis.crypto.randomUUID()
         : `00000000-0000-4000-8000-${Math.random().toString(16).slice(2).padEnd(12, "0").slice(0, 12)}`;
-      const body: FakeTalkingHeadGenerationRequest = {
-        text: scriptText.trim(),
-        durationSeconds: 1,
-        aspectRatio: "9:16",
-        resolution: "720p",
-        voiceId: "synthetic-seed",
-        imageAssetVersionId: imageAsset.id,
-        idempotencyKey,
-        expectedProjectRevision: currentProject.revision,
-        capabilitySnapshotHash: capabilities.snapshotHash,
-        confirmSyntheticTestOnly: true,
-      };
-      await api.validateFakeTalkingHead(currentProject.id, body);
-      const task = await api.createFakeTalkingHead(currentProject.id, body);
+      let task: Awaited<ReturnType<GenerationApiClient["createFakeTalkingHead"]>> | null = null;
+
+      // Capability snapshots are time-bucketed. If a minute boundary makes the
+      // preflight/create snapshot stale, refresh and retry once with the same
+      // idempotency key. No retry is attempted for uncertain network failures.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const capabilities = await api.talkingHeadCapabilities();
+          if (capabilities.mode !== "deterministic-fake" || !capabilities.enabled) {
+            throw new Error("TALKING_HEAD_FAKE_DISABLED: 当前环境未显式启用隔离 FAKE-only 模式，未创建任务。");
+          }
+          const body: FakeTalkingHeadGenerationRequest = {
+            text: scriptText.trim(),
+            durationSeconds: 1,
+            aspectRatio: "9:16",
+            resolution: "720p",
+            voiceId: "synthetic-seed",
+            imageAssetVersionId: imageAsset.id,
+            idempotencyKey,
+            expectedProjectRevision: currentProject.revision,
+            capabilitySnapshotHash: capabilities.snapshotHash,
+            confirmSyntheticTestOnly: true,
+          };
+          const preflight = await api.validateFakeTalkingHead(currentProject.id, body);
+          body.capabilitySnapshotHash = preflight.capabilitySnapshotHash;
+          task = await api.createFakeTalkingHead(currentProject.id, body);
+          break;
+        } catch (error) {
+          const staleSnapshot = error instanceof Error
+            && /^(CAPABILITY_SNAPSHOT_UNKNOWN|CAPABILITY_SNAPSHOT_EXPIRED):/.test(error.message);
+          if (attempt === 0 && staleSnapshot) continue;
+          throw error;
+        }
+      }
+      if (!task) throw new Error("口播 FAKE-only 任务未能完成预检并入队。");
       setFakeTalkingHeadTaskId(task.taskId);
       setActionMessage(
         `FAKE-only 测试任务已入队：${task.taskId}。当前只生成合成模拟样片，不是真实数字人口播，不可发布；可在“高级编辑”中的生成任务查看服务端状态。`,
