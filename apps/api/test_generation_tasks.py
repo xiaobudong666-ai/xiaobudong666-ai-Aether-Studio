@@ -1570,3 +1570,119 @@ def test_p0_runtime_bridge_revision_conflict_is_fail_closed(generation_context):
     )
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
+
+
+
+def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(generation_context):
+    """Preflight verifies an existing sidecar object but never recovers or settles it."""
+    import hashlib
+    from contextlib import contextmanager
+
+    import httpx
+
+    client, sessions, _, media_store = generation_context
+    project = create_project(client, "g70-recovery-preflight")
+    task = create_task(client, project, key="g70-recovery-preflight")
+    task_id = task["taskId"]
+    media_id = "generated-media-77"
+    payload = b"synthetic-original-artifact"
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        stored.status = "FAILED"
+        stored.error_code = "ARTIFACT_INGEST_FAILED"
+        stored.error_message = "生成产物入库失败"
+        stored.media_id = media_id
+        stored.provider_artifact_id = "original-provider-artifact-77"
+        stored.upstream_job_id = "original-upstream-job-77"
+        stored.asset_version_id = None
+        stored.lease_owner = None
+        stored.lease_expires_at = None
+        stored.completed_at = now
+        stored.updated_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_id=None,
+            event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING",
+            to_status="FAILED",
+            actor_type="SYSTEM",
+            actor_id="api",
+            metadata_json={
+                "compensatedQuotaBytes": len(payload),
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": expected_sha256,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": {
+                    "durationSeconds": 1.0,
+                    "sizeBytes": len(payload),
+                    "video": {"codec": "h264", "width": 320, "height": 240},
+                    "audio": None,
+                },
+                "originalProviderArtifactId": "original-provider-artifact-77",
+                "originalUpstreamJobId": "original-upstream-job-77",
+            },
+            created_at=now,
+        ))
+        db.commit()
+
+    @contextmanager
+    def fake_stream(content):
+        def stream(path, headers=None):
+            assert path == f"/media/{project['id']}/{media_id}"
+            @contextmanager
+            def response_context():
+                yield httpx.Response(200, content=content)
+            return response_context()
+        return stream
+
+    media_store.stream = fake_stream(payload)
+    with sessions() as db:
+        before_task = db.get(DBGenerationTask, task_id)
+        before_state = (before_task.status, before_task.error_code, before_task.media_id, before_task.asset_version_id)
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        before_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.generation_task_id == task_id
+        )).scalar_one()
+
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}/artifact-recovery-preflight"
+    verified = client.get(path)
+    assert verified.status_code == 200, verified.text
+    assert verified.json()["preflightStatus"] == "VERIFIED_NOT_RECOVERED"
+    assert verified.json()["recoveryPerformed"] is False
+    assert verified.json()["quotaMutationPerformed"] is False
+    assert verified.json()["settlementPerformed"] is False
+    assert verified.json()["sha256"] == expected_sha256
+    assert verified.json()["sizeBytes"] == len(payload)
+
+    # A byte mismatch must fail closed and still leave business state unchanged.
+    media_store.stream = fake_stream(b"tampered-original-artifact")
+    mismatch = client.get(path)
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"]["code"] == "ARTIFACT_RECOVERY_EVIDENCE_MISMATCH"
+
+    with sessions() as db:
+        after_task = db.get(DBGenerationTask, task_id)
+        after_state = (after_task.status, after_task.error_code, after_task.media_id, after_task.asset_version_id)
+        after_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        after_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.generation_task_id == task_id
+        )).scalar_one()
+
+    assert after_state == before_state
+    assert after_events == before_events
+    assert after_assets == before_assets == 0
+    assert after_usage == before_usage == 0

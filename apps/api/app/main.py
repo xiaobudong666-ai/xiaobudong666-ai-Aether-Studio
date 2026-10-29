@@ -1859,6 +1859,175 @@ def create_app(
         db.commit()
         return {"taskId": task.id, "status": task.status, "progress": task.progress}
 
+    @created_app.get("/projects/{project_id}/generation-tasks/{task_id}/artifact-recovery-preflight")
+    def preflight_generation_artifact_recovery(
+        project_id: str,
+        task_id: str,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        # Phase 1 is read-only and owner-only. It verifies preserved orphan evidence;
+        # it does not re-associate the asset, change quota, settle usage, or call a Provider.
+        require_roles(context, "owner")
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        if (
+            task.status != "FAILED"
+            or task.error_code != "ARTIFACT_INGEST_FAILED"
+            or task.asset_version_id is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_NOT_ELIGIBLE",
+                    "message": "任务当前不满足孤立产物核验条件",
+                },
+            )
+
+        failure = db.execute(
+            select(DBGenerationEvent)
+            .where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+            )
+            .order_by(DBGenerationEvent.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        evidence = failure.metadata_json if failure is not None else {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+
+        media_id = evidence.get("orphanedMediaId")
+        expected_sha256 = evidence.get("orphanedMediaSha256")
+        expected_size = evidence.get("orphanedMediaSizeBytes")
+        original_artifact_id = evidence.get("originalProviderArtifactId")
+        original_upstream_id = evidence.get("originalUpstreamJobId")
+        probe = evidence.get("orphanedMediaMetadata")
+
+        valid_media_id = (
+            isinstance(media_id, str)
+            and 1 <= len(media_id) <= 128
+            and all(ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in media_id)
+        )
+        valid_sha256 = (
+            isinstance(expected_sha256, str)
+            and len(expected_sha256) == 64
+            and all(ch in "0123456789abcdef" for ch in expected_sha256.lower())
+        )
+        valid_size = isinstance(expected_size, int) and not isinstance(expected_size, bool) and expected_size > 0
+        try:
+            probe_duration = float(probe.get("durationSeconds") or 0) if isinstance(probe, dict) else 0
+            probe_size = int(probe.get("sizeBytes") or 0) if isinstance(probe, dict) else 0
+        except (TypeError, ValueError):
+            probe_duration = 0
+            probe_size = 0
+
+        if (
+            not valid_media_id
+            or not valid_sha256
+            or not valid_size
+            or not isinstance(probe, dict)
+            or not isinstance(probe.get("video"), dict)
+            or probe_duration <= 0
+            or probe_size != expected_size
+            or not isinstance(original_artifact_id, str)
+            or not original_artifact_id
+            or not isinstance(original_upstream_id, str)
+            or not original_upstream_id
+            or task.media_id != media_id
+            or task.provider_artifact_id != original_artifact_id
+            or task.upstream_job_id != original_upstream_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_EVIDENCE_INVALID",
+                    "message": "原始产物证据不完整或与任务绑定不一致",
+                },
+            )
+
+        project = db.execute(
+            select(DBProject).where(
+                DBProject.id == project_id,
+                DBProject.tenant_id == context.tenant_id,
+            )
+        ).scalar_one_or_none()
+        if project is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "PROJECT_NOT_FOUND", "message": "未找到该项目"},
+            )
+        materials = project.materials if isinstance(project.materials, list) else []
+        if any(isinstance(item, dict) and item.get("id") == media_id for item in materials):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_ALREADY_ASSOCIATED",
+                    "message": "该媒资已存在于项目素材清单中",
+                },
+            )
+        existing_asset = db.execute(
+            select(DBAssetVersion.id)
+            .where(
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.media_id == media_id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if existing_asset is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_ALREADY_ASSOCIATED",
+                    "message": "该媒资已有资产版本记录",
+                },
+            )
+
+        digest = hashlib.sha256()
+        observed_size = 0
+        try:
+            with created_app.state.video_use.stream(
+                f"/media/{task.project_id}/{media_id}"
+            ) as response:
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    observed_size += len(chunk)
+                    digest.update(chunk)
+        except Exception as exc:
+            logger.warning(
+                "artifact recovery preflight source unavailable for task %s",
+                task.id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_SOURCE_UNAVAILABLE",
+                    "message": "原始媒资暂时无法核验；任务与配额状态未改变",
+                },
+            ) from exc
+
+        if observed_size != expected_size or digest.hexdigest() != expected_sha256.lower():
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_EVIDENCE_MISMATCH",
+                    "message": "媒资字节数或 SHA-256 与失败事件记录不一致",
+                },
+            )
+
+        return {
+            "taskId": task.id,
+            "projectId": task.project_id,
+            "preflightStatus": "VERIFIED_NOT_RECOVERED",
+            "recoveryPerformed": False,
+            "mediaId": media_id,
+            "sha256": digest.hexdigest(),
+            "sizeBytes": observed_size,
+            "originalProviderArtifactId": original_artifact_id,
+            "originalUpstreamJobId": original_upstream_id,
+            "quotaMutationPerformed": False,
+            "settlementPerformed": False,
+            "nextGate": "M11_TRUSTED_SETTLEMENT_AND_OWNER_APPROVED_RECOVERY_COMMIT",
+        }
+
     @created_app.post("/internal/generation-tasks/{task_id}/artifact-intake", status_code=201)
     def intake_generation_artifact(
         task_id: str,
