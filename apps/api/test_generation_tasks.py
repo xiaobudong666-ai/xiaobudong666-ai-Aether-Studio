@@ -2335,3 +2335,110 @@ def test_g73_keyset_claim_scans_past_ineligible_queue_pages(
         )).scalar_one()
         assert claimed_events == 1
     assert media.uploads == 0
+
+
+def test_g72_revocation_after_unknown_ack_preserves_unknown_and_reserved_usage(generation_context):
+    """FAKE-only characterization: revoke after ambiguous ACK must not fabricate recovery."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-revoke-after-unknown-ack")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(path, json=payload)
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+
+    claimed = claim(client, worker_id="worker-a")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "UNKNOWN", worker_id="worker-a",
+        upstreamJobId="synthetic-upstream-ack",
+        errorCode="ACK_UNCERTAIN",
+        errorMessage="synthetic ambiguous acknowledgement",
+    ).status_code == 200
+
+    with sessions() as db:
+        old = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=old.tenant_id, project_id=old.project_id,
+            asset_version_id=asset_id, status="REVOKED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="test-revoked-after-unknown-ack", captured_by=old.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+
+    with sessions() as db:
+        before_task = db.get(DBGenerationTask, task_id)
+        assert before_task is not None
+        before_state = (
+            before_task.status, before_task.error_code, before_task.asset_version_id,
+            before_task.media_id, before_task.attempts, before_task.upstream_job_id,
+        )
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        before_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        before_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        before_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        before_storage = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "synthetic-late-artifact"},
+        files={"file": ("synthetic.mp4", b"synthetic-late-artifact-bytes", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    assert media.uploads == 0
+
+    with sessions() as db:
+        after_task = db.get(DBGenerationTask, task_id)
+        assert after_task is not None
+        after_state = (
+            after_task.status, after_task.error_code, after_task.asset_version_id,
+            after_task.media_id, after_task.attempts, after_task.upstream_job_id,
+        )
+        after_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        after_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        after_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        after_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        after_storage = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    assert before_state == after_state
+    assert after_state[0] == "UNKNOWN"
+    assert after_state[5] == "synthetic-upstream-ack"
+    assert before_events == after_events
+    assert before_assets == after_assets == 0
+    assert before_usage == after_usage
+    assert before_reserved == after_reserved == 1
+    assert before_settled == after_settled == 0
+    assert before_storage == after_storage
