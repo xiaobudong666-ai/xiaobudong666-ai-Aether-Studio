@@ -744,26 +744,77 @@ def test_39_non_retryable_provider_4xx_cannot_be_retried(generation_context):
 
 
 def test_40_stream_interruption_compensates_quota_and_records_failure(generation_context):
-    client, sessions, _, media_store = generation_context
+    client, sessions, app, media_store = generation_context
     project = create_project(client)
     task = create_task(client, project)
+    task_id = task["taskId"]
     claim(client)
-    transition(client, task["taskId"], "RUNNING", upstreamJobId="upstream")
-    transition(client, task["taskId"], "INGESTING", upstreamJobId="upstream", providerArtifactId="artifact")
+    transition(client, task_id, "RUNNING", upstreamJobId="upstream")
+    transition(client, task_id, "INGESTING", upstreamJobId="upstream", providerArtifactId="artifact")
     media_store.interrupt = True
     with pytest.raises(RuntimeError, match="stream interrupted"):
         client.post(
-            f"/internal/generation-tasks/{task['taskId']}/artifact-intake",
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
             headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
             data={"providerArtifactId": "artifact"},
             files={"file": ("artifact.mp4", b"video", "video/mp4")},
         )
     with sessions() as db:
         tenant = db.execute(select(DBTenant)).scalar_one()
-        stored = db.get(DBGenerationTask, task["taskId"])
+        stored = db.get(DBGenerationTask, task_id)
         assert tenant.used_storage_bytes == 0
         assert stored.status == "FAILED"
-        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        # The upload stream failed before video-use issued a media ID. Preserve the
+        # original upstream/artifact binding and do not pretend an orphan is recoverable.
+        assert stored.media_id is None
+        assert stored.asset_version_id is None
+        assert stored.upstream_job_id == "upstream"
+        assert stored.provider_artifact_id == "artifact"
+        attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        settled_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        assert attempts_before == 1
+        assert settled_before == 0
+
+    # Manual retry must not resubmit generation when no recoverable sidecar ID exists.
+    blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    blocked_again = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked_again.status_code == 409
+    assert blocked_again.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+    with sessions() as db:
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        stored = db.get(DBGenerationTask, task_id)
+        assert tenant.used_storage_bytes == 0
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.media_id is None
+        assert stored.asset_version_id is None
+        assert stored.upstream_job_id == "upstream"
+        assert stored.provider_artifact_id == "artifact"
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == attempts_before == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one() == usage_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == settled_before == 0
+    app.state.moneyprinter.assert_not_called()
 
 
 
