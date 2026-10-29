@@ -1,4 +1,5 @@
 -- Draft-only PostgreSQL additive migration for G76 durable probe epoch/issuer.
+-- PostgreSQL only; SQLite is migrated by ensure_schema().
 -- Do not apply to production without explicit Owner approval.
 ALTER TABLE generation_tasks
     ADD COLUMN IF NOT EXISTS lease_epoch INTEGER NOT NULL DEFAULT 0;
