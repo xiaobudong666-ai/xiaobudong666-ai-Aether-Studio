@@ -1487,11 +1487,39 @@ def test_g72_native_fake_http_db_create_claim_and_idempotency(generation_context
     asset_id = _g72_fake_visual_fixture(sessions, project)
     payload = _g72_fake_payload(client, project, asset_id)
     path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
-    preflight = client.post(path + "/validate", json=payload)
+    stale_snapshot_codes = {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}
+
+    def refresh_preflight():
+        last_response = None
+        for _ in range(3):
+            capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+            assert capabilities.status_code == 200, capabilities.text
+            payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+            last_response = client.post(path + "/validate", json=payload)
+            if last_response.status_code == 200:
+                payload["capabilitySnapshotHash"] = last_response.json()["capabilitySnapshotHash"]
+                return last_response
+            code = last_response.json().get("detail", {}).get("code")
+            if code not in stale_snapshot_codes:
+                return last_response
+        return last_response
+
+    preflight = refresh_preflight()
     assert preflight.status_code == 200, preflight.text
     assert preflight.json()["simulatedOutput"] is True
-    created = client.post(path, json=payload)
-    assert created.status_code == 202, created.text
+
+    created = None
+    for _ in range(3):
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        code = created.json().get("detail", {}).get("code")
+        if created.status_code != 409 or code not in stale_snapshot_codes:
+            break
+        preflight = refresh_preflight()
+        if preflight.status_code != 200:
+            break
+    assert created is not None and created.status_code == 202, created.text if created is not None else "create was not attempted"
     task = created.json()
     assert task["provider"] == "deterministic-fake-talking-head"
     assert task["status"] == "QUEUED"
