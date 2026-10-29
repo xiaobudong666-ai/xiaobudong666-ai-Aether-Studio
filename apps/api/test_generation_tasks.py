@@ -1673,6 +1673,15 @@ def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(g
     assert mismatch.status_code == 409
     assert mismatch.json()["detail"]["code"] == "ARTIFACT_RECOVERY_EVIDENCE_MISMATCH"
 
+    # An unavailable sidecar must fail closed without changing business state.
+    def unavailable_stream(path, headers=None):
+        raise RuntimeError("synthetic sidecar unavailable")
+
+    media_store.stream = unavailable_stream
+    unavailable = client.get(path)
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"]["code"] == "ARTIFACT_RECOVERY_SOURCE_UNAVAILABLE"
+
     with sessions() as db:
         after_task = db.get(DBGenerationTask, task_id)
         after_state = (after_task.status, after_task.error_code, after_task.media_id, after_task.asset_version_id)
@@ -1697,3 +1706,75 @@ def test_g70_artifact_recovery_preflight_is_read_only_and_verifies_exact_bytes(g
     assert after_usage == before_usage
     assert after_settled == before_settled == 0
     assert after_storage_bytes == before_storage_bytes
+
+
+
+def test_g70_artifact_recovery_preflight_rejects_non_owner(generation_context):
+    client, _, _, _ = generation_context
+    project = create_project(client, "g70-preflight-non-owner")
+    task = create_task(client, project, key="g70-preflight-non-owner")
+    password = secrets.token_urlsafe(24)
+    created = client.post("/admin/users", json={
+        "email": "preflight-viewer@example.com",
+        "displayName": "Preflight Viewer",
+        "password": password,
+        "role": "viewer",
+    })
+    assert created.status_code == 201
+    client.post("/auth/logout")
+    assert client.post(
+        "/auth/login",
+        json={"email": "preflight-viewer@example.com", "password": password},
+    ).status_code == 200
+
+    response = client.get(
+        f"/projects/{project['id']}/generation-tasks/{task['taskId']}/artifact-recovery-preflight"
+    )
+    assert response.status_code == 403
+
+
+def test_g70_artifact_recovery_preflight_hides_foreign_tenant_task(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "g70-preflight-tenant-scope")
+    task = create_task(client, project, key="g70-preflight-tenant-scope")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    password = secrets.token_urlsafe(24)
+
+    with sessions() as db:
+        tenant = DBTenant(
+            id="tenant-preflight-foreign",
+            name="Preflight Foreign",
+            slug="preflight-foreign",
+            project_quota=50,
+            storage_quota_bytes=1024**3,
+            used_storage_bytes=0,
+            concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600,
+            render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"),
+            created_at=now,
+            updated_at=now,
+        )
+        user = DBUser(
+            id="user-preflight-foreign",
+            tenant_id=tenant.id,
+            email="preflight-foreign@example.com",
+            display_name="Preflight Foreign",
+            password_hash=hash_password(password),
+            role="owner",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([tenant, user])
+        db.commit()
+
+    client.post("/auth/logout")
+    assert client.post(
+        "/auth/login",
+        json={"email": "preflight-foreign@example.com", "password": password},
+    ).status_code == 200
+    response = client.get(
+        f"/projects/{project['id']}/generation-tasks/{task['taskId']}/artifact-recovery-preflight"
+    )
+    assert response.status_code == 404
