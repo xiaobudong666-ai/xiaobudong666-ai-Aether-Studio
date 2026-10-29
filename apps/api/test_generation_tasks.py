@@ -826,6 +826,144 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
     app.state.moneyprinter.assert_not_called()
 
 
+
+def test_g70_failed_db_commit_preserves_orphaned_sidecar_evidence(generation_context, monkeypatch):
+    """A sidecar upload followed by DB failure must retain a safe recovery reference."""
+    import hashlib
+    from sqlalchemy.orm import Session as SQLAlchemySession
+
+    client, sessions, _, media_store = generation_context
+    project = create_project(client, "g70-orphan-evidence")
+    task = create_task(client, project, key="g70-orphan-evidence")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="g70-upstream").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="g70-upstream", providerArtifactId="g70-artifact",
+    ).status_code == 200
+
+    original_commit = SQLAlchemySession.commit
+    original_upload = media_store.upload_media
+    state = {"uploaded": False, "failed": False}
+
+    def tracked_upload(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        state["uploaded"] = True
+        return result
+
+    def fail_asset_commit(session):
+        if (
+            state["uploaded"]
+            and not state["failed"]
+            and any(isinstance(row, DBAssetVersion) for row in session.new)
+        ):
+            state["failed"] = True
+            raise RuntimeError("synthetic DB commit failure after sidecar upload")
+        return original_commit(session)
+
+    monkeypatch.setattr(media_store, "upload_media", tracked_upload)
+    monkeypatch.setattr(SQLAlchemySession, "commit", fail_asset_commit)
+    with pytest.raises(RuntimeError, match="synthetic DB commit failure"):
+        client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-g70"},
+            data={"providerArtifactId": "g70-artifact"},
+            files={"file": ("artifact.mp4", b"video", "video/mp4")},
+        )
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        failure = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one()
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.media_id == "generated-media-1"
+        assert stored.asset_version_id is None
+        assert tenant.used_storage_bytes == 0
+        assert failure.metadata_json["orphanedMediaId"] == "generated-media-1"
+        assert failure.metadata_json["orphanedMediaSha256"] == hashlib.sha256(b"video").hexdigest()
+        assert failure.metadata_json["orphanedMediaSizeBytes"] == 5
+        assert failure.metadata_json["originalProviderArtifactId"] == "g70-artifact"
+        assert failure.metadata_json["originalUpstreamJobId"] == "g70-upstream"
+        assert failure.metadata_json["orphanedMediaMetadata"]["video"]["codec"] == "h264"
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+
+
+def test_g70_lost_commit_ack_does_not_mark_durable_ingest_failed(generation_context, monkeypatch):
+    """If commit succeeded but its acknowledgement was lost, do not compensate it."""
+    from sqlalchemy.orm import Session as SQLAlchemySession
+
+    client, sessions, _, media_store = generation_context
+    project = create_project(client, "g70-lost-commit-ack")
+    task = create_task(client, project, key="g70-lost-commit-ack")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="g70-upstream-ack").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING",
+        upstreamJobId="g70-upstream-ack", providerArtifactId="g70-artifact-ack",
+    ).status_code == 200
+
+    original_commit = SQLAlchemySession.commit
+    original_upload = media_store.upload_media
+    state = {"uploaded": False, "raised": False}
+
+    def tracked_upload(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        state["uploaded"] = True
+        return result
+
+    def commit_then_lose_ack(session):
+        if (
+            state["uploaded"]
+            and not state["raised"]
+            and any(isinstance(row, DBAssetVersion) for row in session.new)
+        ):
+            state["raised"] = True
+            original_commit(session)
+            raise RuntimeError("synthetic lost DB commit acknowledgement")
+        return original_commit(session)
+
+    monkeypatch.setattr(media_store, "upload_media", tracked_upload)
+    monkeypatch.setattr(SQLAlchemySession, "commit", commit_then_lose_ack)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-g70-ack"},
+        data={"providerArtifactId": "g70-artifact-ack"},
+        files={"file": ("artifact.mp4", b"video", "video/mp4")},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "RIGHTS_BLOCKED"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        assert stored.status == "RIGHTS_BLOCKED"
+        assert stored.asset_version_id
+        assert stored.media_id == "generated-media-1"
+        assert tenant.used_storage_bytes == 5
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 0
+
+
 def test_im15_01_new_environment_is_disabled_without_provider_calls(provider_control_context):
     client, sessions, app, _ = provider_control_context
     readiness = client.get("/generation/providers/moneyprinter/readiness").json()
