@@ -817,6 +817,18 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.kind == "SETTLED"
         )).scalar_one() == 0
+    # Repeated manual retries must remain idempotently blocked; no new attempt or usage row.
+    blocked_again = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked_again.status_code == 409
+    assert blocked_again.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "FAILED"
+        assert row.attempts == 1
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "SETTLED"
+        )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
 
