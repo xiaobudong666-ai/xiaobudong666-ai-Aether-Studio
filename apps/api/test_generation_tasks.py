@@ -2437,7 +2437,7 @@ def test_g72_revocation_after_unknown_ack_preserves_unknown_and_reserved_usage(g
     assert after_state[0] == "UNKNOWN"
     assert after_state[5] == "synthetic-upstream-ack"
     assert before_events == after_events
-    assert before_assets == after_assets == 0
+    assert before_assets == after_assets == 1  # source image remains; no generated asset was created
     assert before_usage == after_usage
     assert before_reserved == after_reserved == 1
     assert before_settled == after_settled == 0
