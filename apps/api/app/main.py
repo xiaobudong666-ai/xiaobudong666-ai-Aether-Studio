@@ -1990,7 +1990,17 @@ def create_app(
             ) as response:
                 for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                     observed_size += len(chunk)
+                    if observed_size > expected_size:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "ARTIFACT_RECOVERY_EVIDENCE_MISMATCH",
+                                "message": "媒资字节数超过失败事件记录",
+                            },
+                        )
                     digest.update(chunk)
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.warning(
                 "artifact recovery preflight source unavailable for task %s",
