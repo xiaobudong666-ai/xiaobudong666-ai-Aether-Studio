@@ -14,12 +14,12 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Event, get_ident
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, build_engine
@@ -1021,6 +1021,166 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
             DBAssetVersion.media_id == "g76-orphan-after-kill-switch",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+
+def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(postgres_context):
+    """A missing circuit row must not leave an unlocked window before artifact commit."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id = task.tenant_id
+        project_id = task.project_id
+        assert db.execute(
+            select(func.count(DBGenerationCircuitState.id)).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one() == 0
+
+    worker_id = "worker-g76-missing-circuit-race"
+    upstream_id = "g76-missing-circuit-race-upstream"
+    artifact_id = "g76-missing-circuit-race-artifact"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    epoch = claimed.json()["leaseEpoch"]
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(epoch),
+    }
+    running = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={"status": "RUNNING", "progress": 10, "message": "synthetic running", "upstreamJobId": upstream_id},
+    )
+    assert running.status_code == 200, running.text
+    ingesting = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING", "progress": 95, "message": "synthetic ingesting",
+            "upstreamJobId": upstream_id, "providerArtifactId": artifact_id,
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
+
+    payload = b"g76-postgres-missing-circuit-race-artifact"
+    upload_started = Event()
+    release_upload = Event()
+    circuit_select_finished = Event()
+    release_circuit_select = Event()
+    worker_thread = {"ident": None}
+
+    def blocked_upload(_project_id, filename, content_type, stream):
+        observed = stream.read()
+        assert observed == payload
+        worker_thread["ident"] = get_ident()
+        upload_started.set()
+        if not release_upload.wait(timeout=12):
+            raise RuntimeError("synthetic blocked upload timed out")
+        return {
+            "mediaId": "g76-orphan-after-missing-circuit-race",
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": 1.0,
+                "sizeBytes": len(observed),
+                "video": {"codec": "h264", "width": 320, "height": 240},
+            },
+        }
+
+    def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        if (
+            worker_thread["ident"] == get_ident()
+            and "generation_circuit_states" in statement.lower()
+            and "for update" in statement.lower()
+        ):
+            circuit_select_finished.set()
+            if not release_circuit_select.wait(timeout=12):
+                raise RuntimeError("synthetic circuit-select barrier timed out")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", blocked_upload)
+    engine = sessions.kw["bind"]
+    event.listen(engine, "after_cursor_execute", after_cursor_execute)
+
+    def send_artifact_intake():
+        with TestClient(app) as worker_client:
+            return worker_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers=worker_headers,
+                data={"providerArtifactId": artifact_id},
+                files={"file": ("synthetic.mp4", payload, "video/mp4")},
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(send_artifact_intake)
+            assert upload_started.wait(timeout=10), "artifact upload did not reach the sidecar"
+            release_upload.set()
+            assert circuit_select_finished.wait(timeout=10), "final circuit SELECT FOR UPDATE was not observed"
+
+            # The final SELECT has executed and found no row. The Owner now creates
+            # and commits DISABLED while the artifact transaction is paused.
+            stopped = client.post(
+                "/generation/providers/moneyprinter/kill-switch",
+                json={"disabled": True, "reasonCode": "G76_TEST_MISSING_CIRCUIT_RACE"},
+            )
+            assert stopped.status_code == 200, stopped.text
+            release_circuit_select.set()
+            response = future.result(timeout=15)
+    finally:
+        release_upload.set()
+        release_circuit_select.set()
+        event.remove(engine, "after_cursor_execute", after_cursor_execute)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "PROVIDER_EMERGENCY_STOPPED"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, tenant_id)
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        assert circuit.state == "DISABLED"
+        assert stored.status == "INGESTING"
+        assert stored.asset_version_id is None
+        assert tenant.used_storage_bytes == 0
+        orphan_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one()
+        assert orphan_event.metadata_json["reasonCode"] == "PROVIDER_EMERGENCY_STOPPED"
+        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-missing-circuit-race"
+        assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
+        assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
+        assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+            DBAssetVersion.media_id == "g76-orphan-after-missing-circuit-race",
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
