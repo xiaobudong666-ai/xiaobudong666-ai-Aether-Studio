@@ -243,6 +243,39 @@ def test_generation_queue_requires_worker_token():
         client.claim()
 
 
+def test_generation_queue_uses_latest_claim_epoch_for_heartbeat(monkeypatch):
+    claim_one = httpx.Response(
+        200,
+        json={"taskId": "task", "leaseEpoch": 4},
+        request=httpx.Request("POST", "http://api/internal/generation-tasks/claim"),
+    )
+    claim_two = httpx.Response(
+        200,
+        json={"taskId": "task", "leaseEpoch": 5},
+        request=httpx.Request("POST", "http://api/internal/generation-tasks/claim"),
+    )
+    heartbeat = httpx.Response(
+        200,
+        json={"taskId": "task", "leaseExpiresAt": "later"},
+        request=httpx.Request("POST", "http://api/internal/generation-tasks/task/heartbeat"),
+    )
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    client.request.side_effect = [claim_one, claim_two, heartbeat]
+    monkeypatch.setattr("app.generation_queue.httpx.Client", lambda **_kwargs: client)
+
+    queue_client = GenerationQueueClient(
+        backend_url="http://api", worker_token="token", worker_id="worker",
+    )
+    assert queue_client.claim()["leaseEpoch"] == 4
+    assert queue_client.claim()["leaseEpoch"] == 5
+    queue_client.heartbeat("task")
+
+    heartbeat_call = client.request.call_args_list[2]
+    assert heartbeat_call.kwargs["headers"]["X-Worker-Lease-Epoch"] == "5"
+
+
 def test_generation_queue_preserves_governance_rejection_code(monkeypatch):
     response = httpx.Response(
         409,
