@@ -1374,7 +1374,12 @@ def create_app(
             id=str(uuid.uuid4()), generation_task_id=task_id, attempt_no=1,
             status="QUEUED", reconciliation_state="NOT_SUBMITTED", created_at=now,
         )
-        db.add_all([task, attempt])
+        # PostgreSQL enforces the attempt -> task FK immediately; persist the
+        # parent row before adding the first attempt (SQLite previously masked
+        # this ordering defect in the FAKE-only integration suite).
+        db.add(task)
+        db.flush()
+        db.add(attempt)
         add_usage_entry(
             db, task=task, attempt=attempt, kind="RESERVED",
             request_units=1, generated_seconds=0,
@@ -1503,7 +1508,12 @@ def create_app(
             reconciliation_state="NOT_SUBMITTED",
             created_at=now,
         )
-        db.add_all([task, attempt])
+        # PostgreSQL enforces the attempt -> task FK immediately; persist the
+        # parent row before adding the first attempt (SQLite previously masked
+        # this ordering defect in the FAKE-only integration suite).
+        db.add(task)
+        db.flush()
+        db.add(attempt)
         add_usage_entry(
             db, task=task, attempt=attempt, kind="RESERVED",
             request_units=1, generated_seconds=0,
