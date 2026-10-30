@@ -11,6 +11,7 @@ import pytest
 from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import create_app
+from app.video_use_adapter import VideoUseError
 from app.models import (
     DBAdoption,
     DBAssetVersion,
@@ -563,6 +564,71 @@ def test_29_probe_failure_compensates_quota_and_creates_no_asset(generation_cont
         tenant = db.execute(select(DBTenant)).scalar_one()
         assert tenant.used_storage_bytes == 0
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+
+
+def test_g72_upload_failure_compensates_storage_with_portable_case(generation_context, monkeypatch):
+    """A sidecar upload failure releases only the committed storage reservation."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G72 storage compensation")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-storage-compensation")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(path, json=payload)
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+
+    claimed = claim(client, worker_id="worker-g72-compensation")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", worker_id="worker-g72-compensation",
+        upstreamJobId="g72-compensation-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", worker_id="worker-g72-compensation",
+        upstreamJobId="g72-compensation-upstream",
+        providerArtifactId="g72-compensation-artifact",
+    ).status_code == 200
+
+    def fail_upload(*_args, **_kwargs):
+        raise VideoUseError("synthetic sidecar upload failure")
+
+    monkeypatch.setattr(media_store, "upload_media", fail_upload)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": "worker-g72-compensation",
+        },
+        data={"providerArtifactId": "g72-compensation-artifact"},
+        files={"file": ("synthetic.mp4", b"synthetic-g72-bytes", "video/mp4")},
+    )
+    assert response.status_code == 502, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORE_FAILED"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert task.status == "FAILED"
+        assert task.error_code == "ARTIFACT_INGEST_FAILED"
+        assert tenant.used_storage_bytes == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+            DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
 
 
 def test_30_success_creates_one_material_and_immutable_asset_with_provenance(generation_context):
