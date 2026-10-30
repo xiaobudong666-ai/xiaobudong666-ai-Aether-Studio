@@ -26,6 +26,8 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -507,19 +509,30 @@ def create_app(
             utc_now(),
         )
 
+    def generation_task_by_id(
+        db: Session, task_id: str, *, for_update: bool = False
+    ) -> DBGenerationTask | None:
+        statement = select(DBGenerationTask).where(DBGenerationTask.id == task_id)
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        return db.execute(statement).scalar_one_or_none()
+
     def generation_task_for_tenant(
         db: Session,
         project_id: str,
         task_id: str,
         context: AuthContext,
+        *,
+        for_update: bool = False,
     ) -> DBGenerationTask:
-        task = db.execute(
-            select(DBGenerationTask).where(
-                DBGenerationTask.id == task_id,
-                DBGenerationTask.project_id == project_id,
-                DBGenerationTask.tenant_id == context.tenant_id,
-            )
-        ).scalar_one_or_none()
+        statement = select(DBGenerationTask).where(
+            DBGenerationTask.id == task_id,
+            DBGenerationTask.project_id == project_id,
+            DBGenerationTask.tenant_id == context.tenant_id,
+        )
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        task = db.execute(statement).scalar_one_or_none()
         if task is None:
             raise HTTPException(
                 status_code=404,
@@ -542,29 +555,68 @@ def create_app(
         ).scalar_one_or_none()
 
     def generation_circuit(
-        db: Session, tenant_id: str, *, create: bool = False
+        db: Session, tenant_id: str, *, create: bool = False, for_update: bool = False
     ) -> DBGenerationCircuitState | None:
-        circuit = db.execute(
-            select(DBGenerationCircuitState).where(
-                DBGenerationCircuitState.tenant_id == tenant_id,
-                DBGenerationCircuitState.provider == "moneyprinter",
-            )
-        ).scalar_one_or_none()
-        if circuit is None and create:
-            circuit = DBGenerationCircuitState(
-                id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
-                state="CLOSED", failure_timestamps_json=[], updated_at=utc_now(),
-            )
-            db.add(circuit)
-            db.flush()
-        return circuit
+        # A SELECT FOR UPDATE cannot lock a row that does not exist. Circuit
+        # creation therefore uses a unique-key upsert on PostgreSQL/SQLite
+        # before the locking read. Concurrent Owner stop and artifact finalization
+        # then serialize on the same durable tenant/provider row.
+        if create:
+            values = {
+                "id": str(uuid.uuid4()),
+                "tenant_id": tenant_id,
+                "provider": "moneyprinter",
+                "state": "CLOSED",
+                "failure_timestamps_json": [],
+                "updated_at": utc_now(),
+            }
+            if app_engine.dialect.name == "postgresql":
+                db.execute(
+                    pg_insert(DBGenerationCircuitState)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            DBGenerationCircuitState.tenant_id,
+                            DBGenerationCircuitState.provider,
+                        ]
+                    )
+                )
+            elif app_engine.dialect.name == "sqlite":
+                db.execute(
+                    sqlite_insert(DBGenerationCircuitState)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            DBGenerationCircuitState.tenant_id,
+                            DBGenerationCircuitState.provider,
+                        ]
+                    )
+                )
+            else:
+                existing = db.execute(
+                    select(DBGenerationCircuitState).where(
+                        DBGenerationCircuitState.tenant_id == tenant_id,
+                        DBGenerationCircuitState.provider == "moneyprinter",
+                    )
+                ).scalar_one_or_none()
+                if existing is None:
+                    db.add(DBGenerationCircuitState(**values))
+                    db.flush()
+
+        statement = select(DBGenerationCircuitState).where(
+            DBGenerationCircuitState.tenant_id == tenant_id,
+            DBGenerationCircuitState.provider == "moneyprinter",
+        )
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        return db.execute(statement).scalar_one_or_none()
 
     def current_generation_capabilities(db: Session, tenant_id: str) -> dict:
         now = utc_now()
         snapshot_time = now.replace(second=0, microsecond=0)
         mode = created_app.state.generation_provider_mode
         config = published_generation_config(db, tenant_id)
-        circuit = generation_circuit(db, tenant_id)
+        circuit = generation_circuit(db, tenant_id, for_update=True)
         circuit_state = circuit.state if circuit is not None else "CLOSED"
         policy = config.policy_json if config is not None else DEFAULT_FAKE_POLICY
         reason_code: str | None = None
@@ -631,6 +683,8 @@ def create_app(
             if cooldown_until is not None and now >= cooldown_until:
                 circuit.state = "HALF_OPEN"
                 circuit.half_open_task_id = None
+                circuit.half_open_lease_epoch = None
+                circuit.half_open_issuer = None
                 circuit.updated_at = now
                 circuit_state = "HALF_OPEN"
                 add_provider_event(
@@ -849,7 +903,7 @@ def create_app(
         window_seconds = max(10, int(policy.get("failureWindow", 300)))
         threshold = max(1, int(policy.get("failureThreshold", 5)))
         cooldown_seconds = max(10, int(policy.get("cooldownSeconds", 60)))
-        circuit = generation_circuit(db, task.tenant_id, create=True)
+        circuit = generation_circuit(db, task.tenant_id, create=True, for_update=True)
         if circuit.state == "DISABLED":
             return
         cutoff = now - datetime.timedelta(seconds=window_seconds)
@@ -870,6 +924,8 @@ def create_app(
             circuit.opened_at = now
             circuit.cooldown_until = now + datetime.timedelta(seconds=cooldown_seconds)
             circuit.half_open_task_id = None
+            circuit.half_open_lease_epoch = None
+            circuit.half_open_issuer = None
             if previous != "OPEN":
                 add_provider_event(
                     db, tenant_id=task.tenant_id, event_type="GENERATION_CIRCUIT_OPENED",
@@ -879,15 +935,18 @@ def create_app(
         circuit.updated_at = now
 
     def record_generation_success(
-        db: Session, task: DBGenerationTask, *, now: datetime.datetime
+        db: Session, task: DBGenerationTask, *, issuer_id: str, now: datetime.datetime
     ) -> None:
-        circuit = generation_circuit(db, task.tenant_id)
-        # Only the current HALF_OPEN probe may close the breaker.  A success
-        # from an older task cannot heal OPEN, DISABLED, or another probe.
+        circuit = generation_circuit(db, task.tenant_id, for_update=True)
+        # Close only for the exact durable probe lease: task, monotonic epoch,
+        # and worker issuer must all match the currently persisted probe.
         if (
             circuit is None
             or circuit.state != "HALF_OPEN"
             or circuit.half_open_task_id != task.id
+            or circuit.half_open_lease_epoch != task.lease_epoch
+            or circuit.half_open_issuer != issuer_id
+            or circuit.probe_epoch != task.circuit_probe_epoch
         ):
             return
         previous = circuit.state
@@ -896,11 +955,17 @@ def create_app(
         circuit.opened_at = None
         circuit.cooldown_until = None
         circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
         circuit.updated_at = now
         add_provider_event(
             db, tenant_id=task.tenant_id, event_type="GENERATION_CIRCUIT_CLOSED",
             actor_type="SYSTEM", actor_id="api",
-            metadata={"fromState": previous, "taskId": task.id}, now=now,
+            metadata={
+                "fromState": previous, "taskId": task.id,
+                "probeEpoch": circuit.probe_epoch, "leaseEpoch": task.lease_epoch,
+                "issuer": issuer_id,
+            }, now=now,
         )
 
     @created_app.get("/health")
@@ -1134,7 +1199,7 @@ def create_app(
         require_roles(context, "owner")
         begin_serialized_write(db)
         now = utc_now()
-        circuit = generation_circuit(db, context.tenant_id, create=True)
+        circuit = generation_circuit(db, context.tenant_id, create=True, for_update=True)
         previous = circuit.state
         circuit.state = "DISABLED" if req.disabled else "CLOSED"
         circuit.disabled_reason_code = req.reasonCode if req.disabled else None
@@ -1142,6 +1207,8 @@ def create_app(
         circuit.opened_at = None if not req.disabled else circuit.opened_at
         circuit.cooldown_until = None if not req.disabled else circuit.cooldown_until
         circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
         circuit.updated_at = now
         add_provider_event(
             db, tenant_id=context.tenant_id,
@@ -1347,7 +1414,12 @@ def create_app(
             id=str(uuid.uuid4()), generation_task_id=task_id, attempt_no=1,
             status="QUEUED", reconciliation_state="NOT_SUBMITTED", created_at=now,
         )
-        db.add_all([task, attempt])
+        # PostgreSQL enforces the attempt -> task FK immediately; persist the
+        # parent row before adding the first attempt (SQLite previously masked
+        # this ordering defect in the FAKE-only integration suite).
+        db.add(task)
+        db.flush()
+        db.add(attempt)
         add_usage_entry(
             db, task=task, attempt=attempt, kind="RESERVED",
             request_units=1, generated_seconds=0,
@@ -1476,7 +1548,12 @@ def create_app(
             reconciliation_state="NOT_SUBMITTED",
             created_at=now,
         )
-        db.add_all([task, attempt])
+        # PostgreSQL enforces the attempt -> task FK immediately; persist the
+        # parent row before adding the first attempt (SQLite previously masked
+        # this ordering defect in the FAKE-only integration suite).
+        db.add(task)
+        db.flush()
+        db.add(attempt)
         add_usage_entry(
             db, task=task, attempt=attempt, kind="RESERVED",
             request_units=1, generated_seconds=0,
@@ -1703,7 +1780,9 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_roles(context, "owner", "editor")
-        task = generation_task_for_tenant(db, project_id, task_id, context)
+        task = generation_task_for_tenant(
+            db, project_id, task_id, context, for_update=True
+        )
         if task.cancel_requested_at is None and task.status not in TERMINAL_GENERATION_STATES:
             now = utc_now()
             previous = task.status
@@ -1725,13 +1804,15 @@ def create_app(
             release_generation_reservation(
                 db, task, attempt, reason_code="TASK_CANCELED", now=now
             )
-            task_circuit = generation_circuit(db, task.tenant_id)
+            task_circuit = generation_circuit(db, task.tenant_id, for_update=True)
             if (
                 task_circuit is not None
                 and task_circuit.state == "HALF_OPEN"
                 and task_circuit.half_open_task_id == task.id
             ):
                 task_circuit.half_open_task_id = None
+                task_circuit.half_open_lease_epoch = None
+                task_circuit.half_open_issuer = None
                 task_circuit.updated_at = now
             db.commit()
         return generation_task_response(
@@ -1746,7 +1827,9 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_roles(context, "owner", "editor")
-        task = generation_task_for_tenant(db, project_id, task_id, context)
+        task = generation_task_for_tenant(
+            db, project_id, task_id, context, for_update=True
+        )
         # G70/G71: a completed upstream job may already have produced billable output.
         # A failed media transfer requires reconciliation of the ORIGINAL artifact,
         # not another generation attempt with a new upstream job and possible charge.
@@ -1891,7 +1974,7 @@ def create_app(
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
-            candidate_circuit = generation_circuit(db, candidate.tenant_id)
+            candidate_circuit = generation_circuit(db, candidate.tenant_id, create=True, for_update=True)
             if candidate_circuit is not None:
                 if candidate_circuit.state == "DISABLED":
                     continue
@@ -1901,6 +1984,8 @@ def create_app(
                         continue
                     candidate_circuit.state = "HALF_OPEN"
                     candidate_circuit.half_open_task_id = None
+                    candidate_circuit.half_open_lease_epoch = None
+                    candidate_circuit.half_open_issuer = None
                     candidate_circuit.updated_at = now
                     add_provider_event(
                         db, tenant_id=candidate.tenant_id,
@@ -1910,8 +1995,6 @@ def create_app(
                 if candidate_circuit.state == "HALF_OPEN":
                     if candidate_circuit.half_open_task_id not in {None, candidate.id}:
                         continue
-                    candidate_circuit.half_open_task_id = candidate.id
-                    candidate_circuit.updated_at = now
             if candidate_mode == "moneyprinter":
                 config = published_generation_config(db, candidate.tenant_id)
                 if (
@@ -1958,6 +2041,23 @@ def create_app(
             db.rollback()
             response.status_code = 204
             return response
+
+        # Every claim gets a durable, monotonically increasing lease epoch.
+        # A recycled worker ID cannot authorize a stale response from an older claim.
+        task.lease_epoch = int(task.lease_epoch or 0) + 1
+        task.circuit_probe_epoch = None
+        task_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+        if task_circuit is not None and task_circuit.state == "HALF_OPEN":
+            if task_circuit.half_open_task_id not in {None, task.id}:
+                db.rollback()
+                response.status_code = 204
+                return response
+            task_circuit.probe_epoch = int(task_circuit.probe_epoch or 0) + 1
+            task_circuit.half_open_task_id = task.id
+            task_circuit.half_open_lease_epoch = task.lease_epoch
+            task_circuit.half_open_issuer = x_worker_id
+            task.circuit_probe_epoch = task_circuit.probe_epoch
+
         previous = task.status
         attempt = current_generation_attempt(db, task)
         submission_consumed = (
@@ -2013,6 +2113,8 @@ def create_app(
                 "canaryProfile": attestation_canary_proof(claim_attestation)[2],
             },
             "leaseSeconds": lease_seconds,
+            "leaseEpoch": task.lease_epoch,
+            "circuitProbeEpoch": task.circuit_probe_epoch,
         }
 
     @created_app.post("/internal/generation-tasks/{task_id}/heartbeat")
@@ -2021,16 +2123,19 @@ def create_app(
         _req: GenerationWorkerHeartbeatRequest,
         x_worker_token: str | None = Header(default=None),
         x_worker_id: str = Header(default="worker"),
+        x_worker_lease_epoch: int | None = Header(default=None, alias="X-Worker-Lease-Epoch"),
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
         begin_serialized_write(db)
-        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        task = generation_task_by_id(db, task_id, for_update=True)
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         now = utc_now()
         if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
             raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
         task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
@@ -2044,22 +2149,30 @@ def create_app(
         req: GenerationWorkerTransitionRequest,
         x_worker_token: str | None = Header(default=None),
         x_worker_id: str = Header(default="worker"),
+        x_worker_lease_epoch: int | None = Header(default=None, alias="X-Worker-Lease-Epoch"),
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
         begin_serialized_write(db)
-        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        task = generation_task_by_id(db, task_id, for_update=True)
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         now = utc_now()
         if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.cancel_requested_at is not None or task.status == "CANCELED":
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到响应已隔离"})
         if req.status != task.status and req.status not in WORKER_TRANSITIONS.get(task.status, set()):
             raise HTTPException(status_code=409, detail={"code": "ILLEGAL_GENERATION_TRANSITION", "message": "生成任务状态迁移不合法"})
         if req.upstreamJobId and task.upstream_job_id and req.upstreamJobId != task.upstream_job_id:
             raise HTTPException(status_code=409, detail={"code": "UPSTREAM_ID_IMMUTABLE", "message": "上游任务编号不可替换"})
+        if req.providerArtifactId and task.provider_artifact_id and req.providerArtifactId != task.provider_artifact_id:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROVIDER_ARTIFACT_ID_IMMUTABLE", "message": "上游产物编号不可替换"},
+            )
         previous = task.status
         attempt = current_generation_attempt(db, task)
         if req.upstreamJobId:
@@ -2121,12 +2234,13 @@ def create_app(
         file: UploadFile = File(...),
         x_worker_token: str | None = Header(default=None),
         x_worker_id: str = Header(default="worker"),
+        x_worker_lease_epoch: int | None = Header(default=None, alias="X-Worker-Lease-Epoch"),
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
         if any(marker in providerArtifactId for marker in ("://", "..", "\\", "/")):
             raise HTTPException(status_code=422, detail={"code": "ARTIFACT_ID_INVALID", "message": "产物编号格式不安全"})
-        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        task = generation_task_by_id(db, task_id, for_update=True)
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         if task.provider == "deterministic-fake-talking-head":
@@ -2165,10 +2279,14 @@ def create_app(
         now = utc_now()
         if task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去任务租约"})
+        if x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.cancel_requested_at is not None or task.status == "CANCELED":
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
         if task.status not in {"RUNNING", "INGESTING"}:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_INTAKE_NOT_ALLOWED", "message": "当前状态不允许接收产物"})
+        if task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
+            raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ID_MISMATCH", "message": "产物编号与当前任务回执不一致"})
         if file.content_type != "video/mp4":
             raise HTTPException(status_code=415, detail={"code": "ARTIFACT_CONTENT_TYPE_INVALID", "message": "仅接受受信任的 MP4 字节流"})
         file.file.seek(0, os.SEEK_END)
@@ -2182,25 +2300,124 @@ def create_app(
         while chunk := file.file.read(1024 * 1024):
             digest.update(chunk)
         file.file.seek(0)
+
+        task_project_id = task.project_id
+        task_tenant_id = task.tenant_id
         reservation = db.execute(
             update(DBTenant)
-            .where(DBTenant.id == task.tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
+            .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
             .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
         )
         if reservation.rowcount != 1:
             db.rollback()
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
+
+        uploaded = None
+        media_id = None
+        metadata = {}
         try:
             uploaded = created_app.state.video_use.upload_media(
-                task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
+                task_project_id, f"generation-{task_id}.mp4", "video/mp4", file.file
             )
             metadata = uploaded.get("metadata") or {}
-            if not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
-                raise ValueError("generated artifact did not pass media probe")
             media_id = str(uploaded.get("mediaId") or "")
+
+            # The storage reservation commit above intentionally ends the first task
+            # lock before the network call. Re-open a serialized transaction after
+            # upload and re-read the current task before any asset/SETTLED write.
+            db.rollback()
+            begin_serialized_write(db)
+            current_statement = (
+                select(DBGenerationTask)
+                .where(DBGenerationTask.id == task_id)
+                .execution_options(populate_existing=True)
+            )
+            if app_engine.dialect.name != "sqlite":
+                current_statement = current_statement.with_for_update()
+            task = db.execute(current_statement).scalar_one_or_none()
+            if task is None:
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == task_tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                db.commit()
+                raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+
+            now = utc_now()
+            invalid_code = None
+            invalid_message = None
+            # Serialize the final artifact commit with the Owner emergency stop.
+            # The kill-switch can be activated while the sidecar upload is in flight.
+            final_circuit = generation_circuit(db, task.tenant_id, create=True, for_update=True)
+            if final_circuit is not None and final_circuit.state == "DISABLED":
+                invalid_code = "PROVIDER_EMERGENCY_STOPPED"
+                invalid_message = "紧急停机期间迟到产物已隔离"
+            elif task.cancel_requested_at is not None or task.status == "CANCELED":
+                invalid_code = "TASK_CANCELED"
+                invalid_message = "任务已取消，迟到产物已隔离"
+            elif task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
+                invalid_code = "LEASE_LOST"
+                invalid_message = "上传期间工作节点已失去任务租约"
+            elif x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+                invalid_code = "LEASE_EPOCH_MISMATCH"
+                invalid_message = "上传期间任务租约版本已更新"
+            elif task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
+                invalid_code = "ARTIFACT_ID_MISMATCH"
+                invalid_message = "上传期间任务关联的上游产物编号已改变"
+            elif task.status not in {"RUNNING", "INGESTING"}:
+                invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
+                invalid_message = "上传期间任务状态已改变"
+
+            if invalid_code:
+                attempt = current_generation_attempt(db, task)
+                orphan_size = int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size
+                orphan_evidence = {
+                    "reasonCode": invalid_code,
+                    "workerId": x_worker_id,
+                    "leaseEpoch": x_worker_lease_epoch,
+                    "reservedStorageBytes": upload_size,
+                }
+                if media_id and uploaded.get("projectId") == task_project_id:
+                    orphan_evidence.update({
+                        "orphanedMediaId": media_id,
+                        "orphanedMediaSha256": digest.hexdigest(),
+                        "orphanedMediaSizeBytes": orphan_size,
+                        "originalProviderArtifactId": providerArtifactId,
+                        "currentTaskProviderArtifactId": task.provider_artifact_id,
+                        "originalUpstreamJobId": task.upstream_job_id or "",
+                        "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                    })
+                    if invalid_code == "TASK_CANCELED" and task.media_id is None:
+                        task.media_id = media_id
+                        task.provider_artifact_id = task.provider_artifact_id or providerArtifactId
+                        task.updated_at = now
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == task.tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                add_generation_event(
+                    db, task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
+                    actor_type="SYSTEM", actor_id="api",
+                    from_status=task.status, to_status=task.status,
+                    metadata=orphan_evidence, now=now,
+                )
+                db.commit()
+                raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message})
+
             if not media_id or uploaded.get("projectId") != task.project_id:
                 raise ValueError("generated artifact returned invalid media scope")
+            if not isinstance(metadata, dict) or not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
+                raise ValueError("generated artifact did not pass media probe")
+
             project = db.execute(select(DBProject).where(DBProject.id == task.project_id, DBProject.tenant_id == task.tenant_id)).scalar_one()
             provenance = {
                 "provider": task.provider,
@@ -2277,7 +2494,7 @@ def create_app(
                 config_version_id=task.capability_snapshot_json.get("configVersionId"),
                 now=now,
             )
-            record_generation_success(db, task, now=now)
+            record_generation_success(db, task, issuer_id=x_worker_id, now=now)
             add_generation_event(
                 db, task, attempt=attempt, event_type="ARTIFACT_INGESTED",
                 actor_type="WORKER", actor_id=x_worker_id,
@@ -2286,26 +2503,140 @@ def create_app(
                           "sizeBytes": size_bytes, "generatedSeconds": generated_seconds}, now=now,
             )
             db.commit()
+        except HTTPException:
+            raise
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=case((DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size), else_=0)))
-            failed_task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one()
+            begin_serialized_write(db)
+            failed_statement = (
+                select(DBGenerationTask)
+                .where(DBGenerationTask.id == task_id)
+                .execution_options(populate_existing=True)
+            )
+            if app_engine.dialect.name != "sqlite":
+                failed_statement = failed_statement.with_for_update()
+            failed_task = db.execute(failed_statement).scalar_one_or_none()
+            if failed_task is None:
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == task_tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                db.commit()
+                raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
+
+            # A commit can succeed while its ACK is lost. Query the durable row and
+            # ARTIFACT_INGESTED receipt before attempting any compensation.
+            if failed_task.asset_version_id is not None:
+                completion = db.execute(
+                    select(DBGenerationEvent).where(
+                        DBGenerationEvent.generation_task_id == failed_task.id,
+                        DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+                        DBGenerationEvent.actor_id == x_worker_id,
+                    )
+                ).scalar_one_or_none()
+                if failed_task.provider_artifact_id == providerArtifactId and completion is not None:
+                    db.rollback()
+                    return generation_task_response(db, failed_task, rights=generation_rights(db, failed_task), include_history=True)
+
+            now = utc_now()
+            invalid_code = None
+            invalid_message = None
+            if failed_task.cancel_requested_at is not None or failed_task.status == "CANCELED":
+                invalid_code = "TASK_CANCELED"
+                invalid_message = "任务已取消，迟到产物已隔离"
+            elif failed_task.lease_owner != x_worker_id or failed_task.lease_expires_at is None or _as_utc(failed_task.lease_expires_at) < now:
+                invalid_code = "LEASE_LOST"
+                invalid_message = "上传期间工作节点已失去任务租约"
+            elif x_worker_lease_epoch is None or x_worker_lease_epoch != failed_task.lease_epoch:
+                invalid_code = "LEASE_EPOCH_MISMATCH"
+                invalid_message = "上传期间任务租约版本已更新"
+            elif failed_task.provider_artifact_id and failed_task.provider_artifact_id != providerArtifactId:
+                invalid_code = "ARTIFACT_ID_MISMATCH"
+                invalid_message = "上传期间任务关联的上游产物编号已改变"
+            elif failed_task.status not in {"RUNNING", "INGESTING"}:
+                invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
+                invalid_message = "上传期间任务状态已改变"
+
+            if invalid_code:
+                attempt = current_generation_attempt(db, failed_task)
+                failure_metadata = {
+                    "reasonCode": invalid_code,
+                    "workerId": x_worker_id,
+                    "leaseEpoch": x_worker_lease_epoch,
+                    "reservedStorageBytes": upload_size,
+                }
+                if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
+                    failure_metadata.update({
+                        "orphanedMediaId": media_id,
+                        "orphanedMediaSha256": digest.hexdigest(),
+                        "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
+                        "originalProviderArtifactId": providerArtifactId,
+                        "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
+                        "originalUpstreamJobId": failed_task.upstream_job_id or "",
+                        "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                    })
+                    if invalid_code == "TASK_CANCELED" and failed_task.media_id is None:
+                        failed_task.media_id = media_id
+                        failed_task.provider_artifact_id = failed_task.provider_artifact_id or providerArtifactId
+                        failed_task.updated_at = now
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == failed_task.tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                add_generation_event(
+                    db, failed_task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
+                    actor_type="SYSTEM", actor_id="api",
+                    from_status=failed_task.status, to_status=failed_task.status,
+                    metadata=failure_metadata, now=now,
+                )
+                db.commit()
+                raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message}) from exc
+
+            previous_status = failed_task.status
             failed_attempt = current_generation_attempt(db, failed_task)
             failed_task.status = "FAILED"
             failed_task.error_code = "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED" if isinstance(exc, ValueError) else "ARTIFACT_INGEST_FAILED"
             failed_task.error_message = "生成产物未通过受治理媒体校验" if isinstance(exc, ValueError) else "生成产物入库失败"
-            failed_task.completed_at = utc_now()
-            failed_task.updated_at = failed_task.completed_at
+            failed_task.completed_at = now
+            failed_task.updated_at = now
             failed_task.lease_owner = None
             failed_task.lease_expires_at = None
             failed_attempt.status = "FAILED"
             failed_attempt.error_code = failed_task.error_code
             failed_attempt.error_message = failed_task.error_message
             failed_attempt.completed_at = failed_task.completed_at
+            failure_metadata = {"compensatedQuotaBytes": upload_size}
+            if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
+                failed_task.media_id = media_id
+                failure_metadata.update({
+                    "orphanedMediaId": media_id,
+                    "orphanedMediaSha256": digest.hexdigest(),
+                    "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
+                    "originalProviderArtifactId": providerArtifactId,
+                        "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
+                    "originalUpstreamJobId": failed_task.upstream_job_id or "",
+                    "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                })
+            db.execute(
+                update(DBTenant)
+                .where(DBTenant.id == failed_task.tenant_id)
+                .values(used_storage_bytes=case(
+                    (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                    else_=0,
+                ))
+            )
             add_generation_event(
                 db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
-                actor_type="SYSTEM", actor_id="api", from_status=task.status,
-                to_status="FAILED", metadata={"compensatedQuotaBytes": upload_size}, now=failed_task.completed_at,
+                actor_type="SYSTEM", actor_id="api", from_status=previous_status,
+                to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
             )
             release_generation_reservation(
                 db, failed_task, failed_attempt,

@@ -112,13 +112,14 @@ jobs:
           pip-audit -r apps/video_use/requirements.txt
 
   build-and-test:
-    # Preserve the existing required check name. This gate fails if core tests or
-    # either dependency audit fails, while independent test jobs can still run.
+# Preserve the required aggregate check; include the real PostgreSQL lease/circuit concurrency gate.
+# Core tests, both dependency audits, and G76 PostgreSQL concurrency must pass.
     name: Lint, build, and unit tests
     needs:
       - core-tests
       - node-production-dependency-audit
       - python-dependency-audit
+      - g76-postgresql-concurrency
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -127,12 +128,14 @@ jobs:
           CORE_TEST_RESULT: ${{ needs.core-tests.result }}
           NODE_AUDIT_RESULT: ${{ needs.node-production-dependency-audit.result }}
           PYTHON_AUDIT_RESULT: ${{ needs.python-dependency-audit.result }}
+          G76_POSTGRES_RESULT: ${{ needs.g76-postgresql-concurrency.result }}
         run: |
-          printf 'core tests: %s\nNode audit: %s\nPython audit: %s\n' \
-            "$CORE_TEST_RESULT" "$NODE_AUDIT_RESULT" "$PYTHON_AUDIT_RESULT"
+          printf 'core tests: %s\nNode audit: %s\nPython audit: %s\nG76 PostgreSQL: %s\n' \
+            "$CORE_TEST_RESULT" "$NODE_AUDIT_RESULT" "$PYTHON_AUDIT_RESULT" "$G76_POSTGRES_RESULT"
           test "$CORE_TEST_RESULT" = "success"
           test "$NODE_AUDIT_RESULT" = "success"
           test "$PYTHON_AUDIT_RESULT" = "success"
+          test "$G76_POSTGRES_RESULT" = "success"
   g72-fake-runtime-native:
     # Independent source-level runtime contract proof, NOT a waiver of Node audit
     # and NOT an independent release gate. Full G72 Compose E2E stays OPEN.
@@ -585,3 +588,43 @@ jobs:
               -f infra/docker/docker-compose.g72-fake-only.override.yml \
               down --volumes --remove-orphans || true
           fi
+
+  g76-postgresql-concurrency:
+    name: G76 PostgreSQL lease-lock concurrency (FAKE-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16.6
+        env:
+          POSTGRES_USER: aether_ci
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: aether_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aether_ci -d aether_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PYTHONPATH: apps/api
+      AETHER_TEST_POSTGRES_URL: postgresql+psycopg://aether_ci:ci-only-password@localhost:5432/aether_ci
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API and test-only PostgreSQL dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/api/requirements.txt -r apps/api/requirements-postgres-test.txt
+
+      - name: Prove G76 PostgreSQL lease, circuit, and Owner-cancel lock invariants (FAKE-only)
+        run: |
+          python -m pytest apps/api/test_g76_postgres_concurrency.py -v
+          AETHER_POSTGRES_TEST_DATABASE_URL="$AETHER_TEST_POSTGRES_URL" python -m pytest apps/api/test_generation_tasks.py -k "g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel" -v

@@ -12,12 +12,27 @@ def ensure_schema(engine: Engine) -> None:
     if engine.dialect.name != "sqlite":
         return
 
-    columns = {column["name"] for column in inspect(engine).get_columns("projects")}
     statements: list[str] = []
-    if "tenant_id" not in columns:
+    project_columns = {column["name"] for column in inspect(engine).get_columns("projects")}
+    if "tenant_id" not in project_columns:
         statements.append("ALTER TABLE projects ADD COLUMN tenant_id VARCHAR")
-    if "owner_id" not in columns:
+    if "owner_id" not in project_columns:
         statements.append("ALTER TABLE projects ADD COLUMN owner_id VARCHAR")
+
+    task_columns = {column["name"] for column in inspect(engine).get_columns("generation_tasks")}
+    if "lease_epoch" not in task_columns:
+        statements.append("ALTER TABLE generation_tasks ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0")
+    if "circuit_probe_epoch" not in task_columns:
+        statements.append("ALTER TABLE generation_tasks ADD COLUMN circuit_probe_epoch INTEGER")
+
+    circuit_columns = {column["name"] for column in inspect(engine).get_columns("generation_circuit_states")}
+    if "probe_epoch" not in circuit_columns:
+        statements.append("ALTER TABLE generation_circuit_states ADD COLUMN probe_epoch INTEGER NOT NULL DEFAULT 0")
+    if "half_open_lease_epoch" not in circuit_columns:
+        statements.append("ALTER TABLE generation_circuit_states ADD COLUMN half_open_lease_epoch INTEGER")
+    if "half_open_issuer" not in circuit_columns:
+        statements.append("ALTER TABLE generation_circuit_states ADD COLUMN half_open_issuer VARCHAR")
+
     if not statements:
         return
     with engine.begin() as connection:

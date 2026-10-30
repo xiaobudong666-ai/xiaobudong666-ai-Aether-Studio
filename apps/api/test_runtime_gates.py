@@ -21,6 +21,7 @@ from test_generation_tasks import (
     OWNER_PASSWORD as GEN_OWNER_PASSWORD,
     WORKER_TOKEN as GEN_WORKER_TOKEN,
     FakeGeneratedMediaStore,
+    LeaseAwareTestClient,
     claim,
     create_project as create_generation_project,
     create_task,
@@ -174,7 +175,7 @@ def governed_generation_context(tmp_path, monkeypatch):
         generation_provider_mode="deterministic-fake",
         governance_gates=True,
     )
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         assert client.post(
             "/auth/login",
             json={"email": "owner@example.com", "password": GEN_OWNER_PASSWORD},

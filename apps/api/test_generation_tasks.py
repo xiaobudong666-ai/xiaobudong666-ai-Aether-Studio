@@ -1,5 +1,7 @@
 import datetime
 import inspect
+import os
+import threading
 import json
 import secrets
 import uuid
@@ -30,11 +32,40 @@ from app.models import (
     DBUser,
 )
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.orm import sessionmaker
 
 OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
+
+class LeaseAwareTestClient(TestClient):
+    """Test helper that mirrors the Worker lease-epoch header contract."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lease_epochs = {}
+
+    def post(self, url, *args, **kwargs):
+        path = str(url).split("?", 1)[0]
+        if path.endswith("/internal/generation-tasks/claim"):
+            response = super().post(url, *args, **kwargs)
+            if response.status_code == 200:
+                payload = response.json()
+                if isinstance(payload, dict) and "taskId" in payload and "leaseEpoch" in payload:
+                    self._lease_epochs[str(payload["taskId"])] = int(payload["leaseEpoch"])
+            return response
+
+        prefix = "/internal/generation-tasks/"
+        if path.startswith(prefix):
+            parts = path[len(prefix):].split("/")
+            if len(parts) >= 2 and parts[1] in {"heartbeat", "transition", "artifact-intake"}:
+                task_id = parts[0]
+                headers = dict(kwargs.get("headers") or {})
+                if "X-Worker-Lease-Epoch" not in headers and task_id in self._lease_epochs:
+                    headers["X-Worker-Lease-Epoch"] = str(self._lease_epochs[task_id])
+                kwargs["headers"] = headers
+        return super().post(url, *args, **kwargs)
+
 
 
 class FakeGeneratedMediaStore:
@@ -92,7 +123,7 @@ def generation_context(tmp_path, monkeypatch):
         generation_provider_mode="deterministic-fake",
     )
     app.state.moneyprinter = MagicMock()
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         assert client.post("/auth/login", json={"email": "owner@example.com", "password": OWNER_PASSWORD}).status_code == 200
         client.headers.update({"X-Aether-CSRF": "1"})
         yield client, sessions, app, media_store
@@ -120,7 +151,7 @@ def provider_control_context(tmp_path):
         enforce_csrf=True,
         generation_provider_mode="moneyprinter",
     )
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         assert client.post(
             "/auth/login",
             json={"email": "provider-owner@example.com", "password": OWNER_PASSWORD},
@@ -346,7 +377,7 @@ def test_05_disabled_provider_blocks_without_writes(tmp_path):
         bootstrap_admin_password=OWNER_PASSWORD, bootstrap_admin_email="disabled@example.com",
         cookie_secure=False, enforce_csrf=True,
     )
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         client.post("/auth/login", json={"email": "disabled@example.com", "password": OWNER_PASSWORD})
         client.headers.update({"X-Aether-CSRF": "1"})
         project = create_project(client)
@@ -566,6 +597,7 @@ def test_29_probe_failure_compensates_quota_and_creates_no_asset(generation_cont
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
 
 
+
 def test_g72_upload_failure_compensates_storage_with_portable_case(generation_context, monkeypatch):
     """A sidecar upload failure releases only the committed storage reservation."""
     client, sessions, app, media_store = generation_context
@@ -629,7 +661,6 @@ def test_g72_upload_failure_compensates_storage_with_portable_case(generation_co
             DBGenerationUsageEntry.kind == "RELEASED",
         )).scalar_one() == 1
     app.state.moneyprinter.assert_not_called()
-
 
 def test_30_success_creates_one_material_and_immutable_asset_with_provenance(generation_context):
     client, sessions, _, _ = generation_context
@@ -1773,7 +1804,7 @@ def g72_true_native_flow_context(tmp_path, monkeypatch):
         cookie_secure=False, enforce_csrf=True,
         generation_provider_mode="deterministic-fake",
     )
-    with TestClient(app) as client:
+    with LeaseAwareTestClient(app) as client:
         assert client.post(
             "/auth/login",
             json={"email": "owner@example.com", "password": OWNER_PASSWORD},
@@ -2238,6 +2269,106 @@ def _g76_finish_claimed_fake_task(client, task_id, worker_id, suffix):
     assert result.status_code == 201, result.text
 
 
+
+def test_g76_stale_lease_epoch_cannot_mutate_reclaimed_half_open_probe(generation_context):
+    """A stale completion from a recycled worker ID cannot impersonate the current probe."""
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "G76 stale lease epoch")
+    task = create_task(client, project, key="g76-stale-lease-epoch")
+    worker_id = "worker-g76-reused"
+    first = claim(client, worker_id).json()
+    assert first["taskId"] == task["taskId"]
+    stale_epoch = first["leaseEpoch"]
+
+    failed = transition(
+        client, task["taskId"], "FAILED", worker_id=worker_id,
+        errorCode="PROVIDER_TEST_FAILURE", errorMessage="synthetic failure",
+        retryable=True,
+    )
+    assert failed.status_code == 200, failed.text
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        circuit.state = "CLOSED"
+        circuit.failure_timestamps_json = []
+        circuit.opened_at = None
+        circuit.cooldown_until = None
+        circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        db.commit()
+    retried = client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry")
+    assert retried.status_code == 202, retried.text
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        circuit.state = "HALF_OPEN"
+        circuit.failure_timestamps_json = [now.isoformat()]
+        circuit.opened_at = now - datetime.timedelta(minutes=2)
+        circuit.cooldown_until = now - datetime.timedelta(seconds=1)
+        circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        circuit.probe_epoch = 7
+        circuit.updated_at = now
+        db.commit()
+
+    current = claim(client, worker_id).json()
+    assert current["taskId"] == task["taskId"]
+    current_epoch = current["leaseEpoch"]
+    assert current_epoch > stale_epoch
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.half_open_task_id == task["taskId"]
+        assert circuit.half_open_lease_epoch == current_epoch
+        assert circuit.half_open_issuer == worker_id
+        current_probe_epoch = circuit.probe_epoch
+        assert current["circuitProbeEpoch"] == current_probe_epoch
+
+    stale = client.post(
+        f"/internal/generation-tasks/{task['taskId']}/transition",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(stale_epoch),
+        },
+        json={
+            "status": "RUNNING", "progress": 100, "message": "stale completion",
+            "upstreamJobId": "g76-stale-upstream",
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "LEASE_EPOCH_MISMATCH"
+    with sessions() as db:
+        current_task = db.execute(
+            select(DBGenerationTask).where(DBGenerationTask.id == task["taskId"])
+        ).scalar_one()
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert current_task.status == "SUBMITTING"
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.probe_epoch == current_probe_epoch
+        assert circuit.half_open_lease_epoch == current_epoch
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 0
+
+    _g76_finish_claimed_fake_task(client, task["taskId"], worker_id, "current-epoch")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "CLOSED"
+        assert circuit.half_open_task_id is None
+        assert circuit.half_open_lease_epoch is None
+        assert circuit.half_open_issuer is None
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 1
+
+
 def test_g76_late_success_does_not_close_open_circuit(generation_context):
     """An older completion cannot heal OPEN or erase its cooldown."""
     client, sessions, _, _ = generation_context
@@ -2248,11 +2379,20 @@ def test_g76_late_success_does_not_close_open_circuit(generation_context):
     now = datetime.datetime.now(datetime.timezone.utc)
     with sessions() as db:
         tenant_id = db.execute(select(DBTenant.id)).scalar_one()
-        db.add(DBGenerationCircuitState(
-            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
-            state="OPEN", failure_timestamps_json=[now.isoformat()], opened_at=now,
-            cooldown_until=now + datetime.timedelta(minutes=2), updated_at=now,
-        ))
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        circuit.state = "OPEN"
+        circuit.failure_timestamps_json = [now.isoformat()]
+        circuit.opened_at = now
+        circuit.cooldown_until = now + datetime.timedelta(minutes=2)
+        circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        circuit.updated_at = now
         db.commit()
 
     _g76_finish_claimed_fake_task(client, task["taskId"], "worker-g76-old", "late-open")
@@ -2276,18 +2416,27 @@ def test_g76_half_open_only_current_probe_can_close(generation_context):
     old = create_task(client, project, key="g76-old-not-probe")
     probe = create_task(client, project, key="g76-current-probe")
     assert claim(client, "worker-g76-old").json()["taskId"] == old["taskId"]
-    assert claim(client, "worker-g76-probe").json()["taskId"] == probe["taskId"]
 
     now = datetime.datetime.now(datetime.timezone.utc)
     with sessions() as db:
         tenant_id = db.execute(select(DBTenant.id)).scalar_one()
-        db.add(DBGenerationCircuitState(
-            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
-            state="HALF_OPEN", half_open_task_id=probe["taskId"],
-            failure_timestamps_json=[now.isoformat()],
-            opened_at=now - datetime.timedelta(minutes=2), updated_at=now,
-        ))
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        circuit.state = "HALF_OPEN"
+        circuit.half_open_task_id = None
+        circuit.probe_epoch = 0
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        circuit.failure_timestamps_json = [now.isoformat()]
+        circuit.opened_at = now - datetime.timedelta(minutes=2)
+        circuit.cooldown_until = None
+        circuit.updated_at = now
         db.commit()
+    assert claim(client, "worker-g76-probe").json()["taskId"] == probe["taskId"]
 
     _g76_finish_claimed_fake_task(client, old["taskId"], "worker-g76-old", "wrong-probe")
     with sessions() as db:
@@ -2647,3 +2796,362 @@ def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_con
         ).scalar_one_or_none() is None
     assert media.uploads == 0
 
+
+
+@pytest.fixture()
+def postgres_generation_context():
+    database_url = (
+        os.environ.get("AETHER_POSTGRES_TEST_DATABASE_URL")
+        or os.environ.get("AETHER_TEST_POSTGRES_URL")
+    )
+    if not database_url:
+        pytest.skip("AETHER_POSTGRES_TEST_DATABASE_URL is not configured")
+
+    engine = build_engine(database_url)
+    Base.metadata.drop_all(bind=engine)
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def get_db():
+        with sessions() as db:
+            yield db
+
+    app = create_app(
+        app_engine=engine,
+        db_dependency=get_db,
+        video_use_adapter=FakeGeneratedMediaStore(),
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="g76-postgres-owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False,
+        enforce_csrf=True,
+        generation_provider_mode="deterministic-fake",
+    )
+    app.state.moneyprinter = MagicMock()
+    try:
+        with LeaseAwareTestClient(app) as client:
+            assert client.post(
+                "/auth/login",
+                json={"email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD},
+            ).status_code == 200
+            client.headers.update({"X-Aether-CSRF": "1"})
+            yield client, sessions, engine
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+def test_g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel(
+    postgres_generation_context,
+):
+    """Real PostgreSQL row locks must serialize Worker heartbeat with Owner cancellation."""
+    client, sessions, engine = postgres_generation_context
+    project = create_project(client, "G76 PostgreSQL row-lock race")
+    task = create_task(client, project, key="g76-postgres-row-lock-race")
+    worker_id = "worker-g76-postgres"
+    claimed = claim(client, worker_id)
+    assert claimed.status_code == 200, claimed.text
+    task_id = claimed.json()["taskId"]
+
+    blocker = sessions()
+    blocker.execute(
+        select(DBGenerationTask)
+        .where(DBGenerationTask.id == task_id)
+        .with_for_update()
+    ).scalar_one()
+
+    locked_task_queries = []
+    query_lock = threading.Lock()
+    both_routes_waiting_on_row_lock = threading.Event()
+
+    def observe_task_row_lock(_conn, _cursor, statement, _parameters, _context, _executemany):
+        normalized = statement.lower()
+        if "from generation_tasks" in normalized and "for update" in normalized:
+            with query_lock:
+                locked_task_queries.append(statement)
+                if len(locked_task_queries) >= 2:
+                    both_routes_waiting_on_row_lock.set()
+
+    event.listen(engine, "before_cursor_execute", observe_task_row_lock)
+    pool = ThreadPoolExecutor(max_workers=2)
+    heartbeat_future = None
+    cancel_future = None
+    try:
+        heartbeat_future = pool.submit(
+            client.post,
+            f"/internal/generation-tasks/{task_id}/heartbeat",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+            json={},
+        )
+        cancel_future = pool.submit(
+            client.post,
+            f"/projects/{project['id']}/generation-tasks/{task_id}/cancel",
+        )
+
+        assert both_routes_waiting_on_row_lock.wait(10), (
+            "heartbeat and Owner cancel did not both issue SELECT ... FOR UPDATE "
+            f"against generation_tasks; observed={locked_task_queries}"
+        )
+        assert not heartbeat_future.done(), "heartbeat did not wait for the held PostgreSQL row lock"
+        assert not cancel_future.done(), "Owner cancel did not wait for the held PostgreSQL row lock"
+
+        blocker.commit()
+        heartbeat_response = heartbeat_future.result(timeout=15)
+        cancel_response = cancel_future.result(timeout=15)
+    finally:
+        if blocker.in_transaction():
+            blocker.rollback()
+        event.remove(engine, "before_cursor_execute", observe_task_row_lock)
+        pool.shutdown(wait=True, cancel_futures=True)
+        blocker.close()
+
+    assert cancel_response.status_code == 200, cancel_response.text
+    assert heartbeat_response.status_code in {200, 409}, heartbeat_response.text
+    with sessions() as db:
+        persisted = db.execute(
+            select(DBGenerationTask).where(DBGenerationTask.id == task_id)
+        ).scalar_one()
+        assert persisted.status == "CANCELED"
+        assert persisted.cancel_requested_at is not None
+        assert persisted.lease_owner is None
+        assert persisted.lease_expires_at is None
+
+def test_g75_ineligible_provider_candidate_does_not_pin_half_open_probe(provider_control_context):
+    """An ineligible FIFO candidate must not consume the tenant's HALF_OPEN probe."""
+    client, sessions, app, _ = provider_control_context
+    # Synthetic config/attestation only; no Provider adapter call is allowed.
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+
+    project = create_project(client, "G75 half-open queue candidates")
+    first = create_task(client, project, key="g75-stale-config")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    eligible_task_id = str(uuid.uuid4())
+    eligible_created_at = now - datetime.timedelta(seconds=1)
+
+    with sessions() as db:
+        stale_task = db.get(DBGenerationTask, first["taskId"])
+        assert stale_task is not None
+        assert stale_task.provider == "moneyprinter"
+        assert stale_task.capability_snapshot_json["mode"] == "moneyprinter"
+        assert stale_task.capability_snapshot_json["configVersionId"] == config["id"]
+
+        # Keep the private one-task canary quota intact: seed the second queued
+        # candidate directly as a synthetic scheduler fixture, not a second API
+        # submission or an additional reservation.
+        eligible_snapshot = dict(stale_task.capability_snapshot_json)
+        stale_snapshot = dict(eligible_snapshot)
+        stale_snapshot["configVersionId"] = "superseded-config-version"
+        stale_task.capability_snapshot_json = stale_snapshot
+        stale_task.created_at = now - datetime.timedelta(seconds=2)
+
+        eligible_task = DBGenerationTask(
+            id=eligible_task_id,
+            tenant_id=stale_task.tenant_id,
+            project_id=project["id"],
+            requested_by=stale_task.requested_by,
+            provider=stale_task.provider,
+            status="QUEUED",
+            progress=0,
+            message="Synthetic eligible G75 queue candidate",
+            request_json=dict(stale_task.request_json),
+            request_hash=stale_task.request_hash,
+            capability_snapshot_json=eligible_snapshot,
+            capability_snapshot_hash=stale_task.capability_snapshot_hash,
+            idempotency_key=idempotency_uuid("g75-eligible-synthetic-row"),
+            upstream_job_id=None,
+            provider_artifact_id=None,
+            media_id=None,
+            asset_version_id=None,
+            attempts=1,
+            max_attempts=stale_task.max_attempts,
+            lease_owner=None,
+            lease_epoch=0,
+            circuit_probe_epoch=None,
+            lease_expires_at=None,
+            cancel_requested_at=None,
+            error_code=None,
+            error_message=None,
+            created_at=eligible_created_at,
+            updated_at=eligible_created_at,
+            started_at=None,
+            completed_at=None,
+        )
+        db.add(eligible_task)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()),
+            generation_task_id=eligible_task_id,
+            attempt_no=1,
+            status="QUEUED",
+            submission_started_at=None,
+            upstream_job_id=None,
+            reconciliation_state="NOT_SUBMITTED",
+            error_code=None,
+            error_message=None,
+            created_at=eligible_created_at,
+            completed_at=None,
+        ))
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()),
+            tenant_id=stale_task.tenant_id,
+            provider="moneyprinter",
+            state="HALF_OPEN",
+            failure_timestamps_json=[],
+            opened_at=now - datetime.timedelta(minutes=2),
+            cooldown_until=now - datetime.timedelta(seconds=1),
+            half_open_task_id=None,
+            probe_epoch=7,
+            half_open_lease_epoch=None,
+            half_open_issuer=None,
+            disabled_reason_code=None,
+            updated_at=now,
+        ))
+        db.commit()
+
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible_task_id
+    assert claimed.json()["leaseEpoch"] == 1
+
+    with sessions() as db:
+        stale_task = db.get(DBGenerationTask, first["taskId"])
+        eligible_task = db.get(DBGenerationTask, eligible_task_id)
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == eligible_task.tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        assert stale_task.lease_owner is None
+        assert int(stale_task.lease_epoch or 0) == 0
+        assert eligible_task.lease_owner == "worker-proof"
+        assert eligible_task.lease_epoch == 1
+        assert eligible_task.circuit_probe_epoch == 8
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.probe_epoch == 8
+        assert circuit.half_open_task_id == eligible_task.id
+        assert circuit.half_open_lease_epoch == eligible_task.lease_epoch
+        assert circuit.half_open_issuer == "worker-proof"
+
+    app.state.moneyprinter.assert_not_called()
+
+def test_g73_keyset_claim_scans_past_foreign_tenant_ineligible_queue_rows(generation_context):
+    """A foreign tenant's older wrong-mode backlog must not starve an eligible FAKE task."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client, "G73 eligible tenant queue")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(client, project, asset_id, key="g73-cross-tenant-eligible")
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    eligible_id = created.json()["taskId"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    foreign_password = secrets.token_urlsafe(24)
+
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert eligible is not None
+        current_tenant_id = eligible.tenant_id
+        first_created = eligible.created_at - datetime.timedelta(days=1)
+
+        foreign_tenant = DBTenant(
+            id="g73-foreign-tenant",
+            name="G73 Foreign Tenant",
+            slug="g73-foreign-tenant",
+            project_quota=50,
+            storage_quota_bytes=1024**3,
+            used_storage_bytes=0,
+            concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600,
+            render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"),
+            created_at=now,
+            updated_at=now,
+        )
+        foreign_owner = DBUser(
+            id="g73-foreign-owner",
+            tenant_id=foreign_tenant.id,
+            email="g73-foreign-owner@example.com",
+            display_name="G73 Foreign Tenant Owner",
+            password_hash=hash_password(foreign_password),
+            role="owner",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        foreign_project = DBProject(
+            id="g73-foreign-project",
+            tenant_id=foreign_tenant.id,
+            owner_id=foreign_owner.id,
+            name="G73 foreign tenant ineligible backlog",
+            timeline={"version": "1.1", "output": None, "tracks": []},
+            materials=[],
+            revision=1,
+            created_at=now,
+            updated_at=now,
+        )
+        old_rows = []
+        for idx in range(205):
+            created_at = first_created + datetime.timedelta(microseconds=idx)
+            old_rows.append(DBGenerationTask(
+                id=str(uuid.uuid4()),
+                tenant_id=foreign_tenant.id,
+                project_id=foreign_project.id,
+                requested_by=foreign_owner.id,
+                provider="moneyprinter",
+                status="QUEUED",
+                progress=0,
+                message="synthetic foreign-tenant wrong-mode queue row",
+                request_json={"syntheticFixtureOnly": True},
+                request_hash=f"g73-foreign-fixture-{idx}",
+                capability_snapshot_json={"mode": "moneyprinter"},
+                capability_snapshot_hash="0" * 64,
+                idempotency_key=f"g73-foreign-idempotency-{idx}",
+                attempts=1,
+                max_attempts=1,
+                lease_owner=None,
+                lease_epoch=0,
+                circuit_probe_epoch=None,
+                lease_expires_at=None,
+                cancel_requested_at=None,
+                error_code=None,
+                error_message=None,
+                created_at=created_at,
+                updated_at=created_at,
+            ))
+        db.add_all([foreign_tenant, foreign_owner, foreign_project, *old_rows])
+        db.commit()
+
+    claimed = claim(client, worker_id="g73-cross-tenant-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible_id
+    assert claimed.json()["providerMode"] == "talking-head-fake"
+
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert eligible.tenant_id == current_tenant_id
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-cross-tenant-safe-worker"
+        foreign_queued = db.execute(
+            select(func.count(DBGenerationTask.id)).where(
+                DBGenerationTask.tenant_id == "g73-foreign-tenant",
+                DBGenerationTask.status == "QUEUED",
+                DBGenerationTask.lease_owner.is_(None),
+            )
+        ).scalar_one()
+        assert foreign_queued == 205
+        foreign_claim_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id.in_(
+                    select(DBGenerationTask.id).where(
+                        DBGenerationTask.tenant_id == "g73-foreign-tenant"
+                    )
+                ),
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one()
+        assert foreign_claim_events == 0
+
+    assert media.uploads == 0
