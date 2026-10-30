@@ -25,6 +25,8 @@ from app.main import create_app
 from app.models import (
     DBAssetVersion,
     DBGenerationAttempt,
+    DBGenerationCircuitState,
+    DBGenerationProviderEvent,
     DBGenerationTask,
     DBProject,
     DBRightsSnapshot,
@@ -49,7 +51,11 @@ class FakeMediaStore:
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
-            "metadata": {"durationSeconds": 1.0, "sizeBytes": len(payload)},
+            "metadata": {
+                "durationSeconds": 1.0,
+                "sizeBytes": len(payload),
+                "video": {"codec": "h264", "width": 320, "height": 240},
+            },
         }
 
 
@@ -132,7 +138,9 @@ def _create_task(client: TestClient) -> str:
     return response.json()["taskId"]
 
 
-def _wait_until_postgres_reports_lock_wait(sessions, timeout_seconds: float = 8.0) -> bool:
+def _wait_until_postgres_reports_lock_wait(
+    sessions, table_name: str = "generation_tasks", timeout_seconds: float = 8.0
+) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with sessions() as observer:
@@ -144,9 +152,10 @@ def _wait_until_postgres_reports_lock_wait(sessions, timeout_seconds: float = 8.
                     WHERE datname = current_database()
                       AND pid <> pg_backend_pid()
                       AND wait_event_type = 'Lock'
-                      AND query ILIKE '%generation_tasks%'
+                      AND query ILIKE :table_pattern
                     """
-                )
+                ),
+                {"table_pattern": f"%{table_name}%"},
             ).scalar_one()
         if waiting:
             return True
@@ -261,6 +270,130 @@ def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context
             ).scalars()
         )
         assert len(attempts) == 1
+
+
+def test_g76_postgres_artifact_success_waits_for_circuit_lock_and_preserves_reopen(postgres_context):
+    """Artifact success must re-read a circuit changed by another PostgreSQL transaction."""
+    owner_client, sessions, app = postgres_context
+    task_id = _create_task(owner_client)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        db.add(
+            DBGenerationCircuitState(
+                id=str(uuid.uuid4()),
+                tenant_id=task.tenant_id,
+                provider="moneyprinter",
+                state="HALF_OPEN",
+                failure_timestamps_json=[now.isoformat()],
+                opened_at=now - datetime.timedelta(minutes=2),
+                cooldown_until=now - datetime.timedelta(seconds=1),
+                half_open_task_id=None,
+                probe_epoch=0,
+                half_open_lease_epoch=None,
+                half_open_issuer=None,
+                updated_at=now,
+            )
+        )
+        db.commit()
+
+    worker_id = "worker-g76-circuit-lock"
+    claimed = owner_client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    lease_epoch = claimed.json()["leaseEpoch"]
+    probe_epoch = claimed.json()["circuitProbeEpoch"]
+    assert probe_epoch is not None
+
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(lease_epoch),
+    }
+    running = owner_client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={"status": "RUNNING", "progress": 10, "message": "synthetic running",
+              "upstreamJobId": "g76-pg-upstream"},
+    )
+    assert running.status_code == 200, running.text
+    ingesting = owner_client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={"status": "INGESTING", "progress": 95, "message": "synthetic ingest",
+              "upstreamJobId": "g76-pg-upstream", "providerArtifactId": "g76-pg-artifact"},
+    )
+    assert ingesting.status_code == 200, ingesting.text
+
+    locker = sessions()
+    try:
+        circuit = locker.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == claimed.json()["tenantId"],
+                DBGenerationCircuitState.provider == "moneyprinter",
+            ).with_for_update()
+        ).scalar_one()
+
+        def ingest_artifact():
+            with TestClient(app) as worker_client:
+                return worker_client.post(
+                    f"/internal/generation-tasks/{task_id}/artifact-intake",
+                    headers=worker_headers,
+                    data={"providerArtifactId": "g76-pg-artifact"},
+                    files={"file": ("g76-postgres-fake.mp4", b"synthetic-fake-video", "video/mp4")},
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(ingest_artifact)
+            try:
+                assert _wait_until_postgres_reports_lock_wait(
+                    sessions, table_name="generation_circuit_states"
+                ), "artifact intake did not wait on the PostgreSQL circuit-state row lock"
+
+                circuit.state = "OPEN"
+                circuit.opened_at = datetime.datetime.now(datetime.timezone.utc)
+                circuit.cooldown_until = (
+                    datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=2)
+                )
+                circuit.half_open_task_id = None
+                circuit.half_open_lease_epoch = None
+                circuit.half_open_issuer = None
+                circuit.probe_epoch += 1
+                circuit.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                locker.commit()
+            finally:
+                if locker.in_transaction():
+                    locker.rollback()
+
+            response = future.result(timeout=10)
+
+        assert response.status_code == 201, response.text
+        with sessions() as verify:
+            final_circuit = verify.execute(
+                select(DBGenerationCircuitState).where(
+                    DBGenerationCircuitState.tenant_id == claimed.json()["tenantId"],
+                    DBGenerationCircuitState.provider == "moneyprinter",
+                )
+            ).scalar_one()
+            closed_events = verify.execute(
+                select(DBGenerationProviderEvent.id).where(
+                    DBGenerationProviderEvent.tenant_id == claimed.json()["tenantId"],
+                    DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED",
+                )
+            ).all()
+            assert final_circuit.state == "OPEN"
+            assert final_circuit.half_open_task_id is None
+            assert final_circuit.half_open_lease_epoch is None
+            assert final_circuit.half_open_issuer is None
+            assert len(closed_events) == 0
+    finally:
+        locker.rollback()
+        locker.close()
 
 
 def test_g76_postgres_heartbeat_waits_for_task_lock_and_rechecks_new_lease(postgres_context):
