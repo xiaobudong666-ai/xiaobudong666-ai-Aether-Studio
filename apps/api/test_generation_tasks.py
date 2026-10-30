@@ -1,5 +1,7 @@
 import datetime
 import inspect
+import os
+import threading
 import json
 import secrets
 import uuid
@@ -29,7 +31,7 @@ from app.models import (
     DBUser,
 )
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.orm import sessionmaker
 
 OWNER_PASSWORD = secrets.token_urlsafe(24)
@@ -2711,3 +2713,118 @@ def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_con
         ).scalar_one_or_none() is None
     assert media.uploads == 0
 
+
+
+@pytest.fixture()
+def postgres_generation_context():
+    database_url = os.environ.get("AETHER_POSTGRES_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("AETHER_POSTGRES_TEST_DATABASE_URL is not configured")
+
+    engine = build_engine(database_url)
+    Base.metadata.drop_all(bind=engine)
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def get_db():
+        with sessions() as db:
+            yield db
+
+    app = create_app(
+        app_engine=engine,
+        db_dependency=get_db,
+        video_use_adapter=FakeGeneratedMediaStore(),
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="g76-postgres-owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False,
+        enforce_csrf=True,
+        generation_provider_mode="deterministic-fake",
+    )
+    app.state.moneyprinter = MagicMock()
+    try:
+        with LeaseAwareTestClient(app) as client:
+            assert client.post(
+                "/auth/login",
+                json={"email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD},
+            ).status_code == 200
+            client.headers.update({"X-Aether-CSRF": "1"})
+            yield client, sessions, engine
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+def test_g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel(
+    postgres_generation_context,
+):
+    """Real PostgreSQL row locks must serialize Worker heartbeat with Owner cancellation."""
+    client, sessions, engine = postgres_generation_context
+    project = create_project(client, "G76 PostgreSQL row-lock race")
+    task = create_task(client, project, key="g76-postgres-row-lock-race")
+    worker_id = "worker-g76-postgres"
+    claimed = claim(client, worker_id)
+    assert claimed.status_code == 200, claimed.text
+    task_id = claimed.json()["taskId"]
+
+    blocker = sessions()
+    blocker.execute(
+        select(DBGenerationTask)
+        .where(DBGenerationTask.id == task_id)
+        .with_for_update()
+    ).scalar_one()
+
+    locked_task_queries = []
+    query_lock = threading.Lock()
+    both_routes_waiting_on_row_lock = threading.Event()
+
+    def observe_task_row_lock(_conn, _cursor, statement, _parameters, _context, _executemany):
+        normalized = statement.lower()
+        if "from generation_tasks" in normalized and "for update" in normalized:
+            with query_lock:
+                locked_task_queries.append(statement)
+                if len(locked_task_queries) >= 2:
+                    both_routes_waiting_on_row_lock.set()
+
+    event.listen(engine, "before_cursor_execute", observe_task_row_lock)
+    pool = ThreadPoolExecutor(max_workers=2)
+    heartbeat_future = None
+    cancel_future = None
+    try:
+        heartbeat_future = pool.submit(
+            client.post,
+            f"/internal/generation-tasks/{task_id}/heartbeat",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+            json={},
+        )
+        cancel_future = pool.submit(
+            client.post,
+            f"/projects/{project['id']}/generation-tasks/{task_id}/cancel",
+        )
+
+        assert both_routes_waiting_on_row_lock.wait(10), (
+            "heartbeat and Owner cancel did not both issue SELECT ... FOR UPDATE "
+            f"against generation_tasks; observed={locked_task_queries}"
+        )
+        assert not heartbeat_future.done(), "heartbeat did not wait for the held PostgreSQL row lock"
+        assert not cancel_future.done(), "Owner cancel did not wait for the held PostgreSQL row lock"
+
+        blocker.commit()
+        heartbeat_response = heartbeat_future.result(timeout=15)
+        cancel_response = cancel_future.result(timeout=15)
+    finally:
+        if blocker.in_transaction():
+            blocker.rollback()
+        event.remove(engine, "before_cursor_execute", observe_task_row_lock)
+        pool.shutdown(wait=True, cancel_futures=True)
+        blocker.close()
+
+    assert cancel_response.status_code == 200, cancel_response.text
+    assert heartbeat_response.status_code in {200, 409}, heartbeat_response.text
+    with sessions() as db:
+        persisted = db.execute(
+            select(DBGenerationTask).where(DBGenerationTask.id == task_id)
+        ).scalar_one()
+        assert persisted.status == "CANCELED"
+        assert persisted.cancel_requested_at is not None
+        assert persisted.lease_owner is None
+        assert persisted.lease_expires_at is None
