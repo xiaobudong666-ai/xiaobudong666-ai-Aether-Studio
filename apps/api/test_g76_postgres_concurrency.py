@@ -476,9 +476,14 @@ def test_g76_postgres_additive_migration_is_idempotent_and_preserves_legacy_rows
 
     schema = f"g76_migration_{uuid.uuid4().hex[:12]}"
     migration_path = Path(__file__).parent / "migrations" / "20261030_g76_probe_epoch_issuer.sql"
+    migration_sql = "\n".join(
+        line
+        for line in migration_path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("--")
+    )
     statements = [
         statement.strip()
-        for statement in migration_path.read_text(encoding="utf-8").split(";")
+        for statement in migration_sql.split(";")
         if statement.strip()
     ]
     assert len(statements) == 5
