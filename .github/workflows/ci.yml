@@ -111,6 +111,43 @@ jobs:
           pip-audit -r apps/worker/requirements.txt
           pip-audit -r apps/video_use/requirements.txt
 
+  g76-postgres-concurrency:
+    name: G76 PostgreSQL lease/cancel row-lock concurrency
+    if: github.ref == 'refs/heads/feat/g76-durable-probe-epoch-issuer' || (github.event_name == 'pull_request' && github.head_ref == 'feat/g76-durable-probe-epoch-issuer')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aether
+          POSTGRES_PASSWORD: aether-ci-only
+          POSTGRES_DB: aether_g76
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aether -d aether_g76"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install API test dependencies and ephemeral PostgreSQL driver
+        run: |
+          pip install -r apps/api/requirements.txt
+          pip install "psycopg[binary]==3.2.9"
+      - name: Run G76 PostgreSQL heartbeat/cancel row-lock race (FAKE-only)
+        env:
+          PYTHONPATH: apps/api
+          AETHER_POSTGRES_TEST_DATABASE_URL: postgresql+psycopg://aether:aether-ci-only@127.0.0.1:5432/aether_g76
+        run: |
+          python -m pytest apps/api/test_generation_tasks.py -k "g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel" -v
+
   build-and-test:
     # Preserve the existing required check name. This gate fails if core tests or
     # either dependency audit fails, while independent test jobs can still run.
@@ -119,6 +156,7 @@ jobs:
       - core-tests
       - node-production-dependency-audit
       - python-dependency-audit
+      - g76-postgres-concurrency
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -127,12 +165,14 @@ jobs:
           CORE_TEST_RESULT: ${{ needs.core-tests.result }}
           NODE_AUDIT_RESULT: ${{ needs.node-production-dependency-audit.result }}
           PYTHON_AUDIT_RESULT: ${{ needs.python-dependency-audit.result }}
+          G76_POSTGRES_RESULT: ${{ needs.g76-postgres-concurrency.result }}
         run: |
-          printf 'core tests: %s\nNode audit: %s\nPython audit: %s\n' \
-            "$CORE_TEST_RESULT" "$NODE_AUDIT_RESULT" "$PYTHON_AUDIT_RESULT"
+          printf 'core tests: %s\nNode audit: %s\nPython audit: %s\nG76 PostgreSQL: %s\n' \
+            "$CORE_TEST_RESULT" "$NODE_AUDIT_RESULT" "$PYTHON_AUDIT_RESULT" "$G76_POSTGRES_RESULT"
           test "$CORE_TEST_RESULT" = "success"
           test "$NODE_AUDIT_RESULT" = "success"
           test "$PYTHON_AUDIT_RESULT" = "success"
+          test "$G76_POSTGRES_RESULT" = "success" -o "$G76_POSTGRES_RESULT" = "skipped"
   g72-fake-runtime-native:
     # Independent source-level runtime contract proof, NOT a waiver of Node audit
     # and NOT an independent release gate. Full G72 Compose E2E stays OPEN.
