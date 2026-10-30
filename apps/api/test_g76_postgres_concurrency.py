@@ -1492,7 +1492,7 @@ def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_m
         event.remove(engine, "after_cursor_execute", after_cursor_execute)
 
     assert stopped.status_code == 200, stopped.text
-    assert stopped.json()["disabled"] is True
+    assert stopped.json()["killSwitch"]["disabled"] is True
     assert claimed.status_code == 204, claimed.text
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
