@@ -22,7 +22,13 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, build_engine
 from app.main import create_app
-from app.models import DBGenerationTask
+from app.models import (
+    DBAssetVersion,
+    DBGenerationAttempt,
+    DBGenerationTask,
+    DBProject,
+    DBRightsSnapshot,
+)
 
 
 OWNER_PASSWORD = secrets.token_urlsafe(24)
@@ -146,6 +152,114 @@ def _wait_until_postgres_reports_lock_wait(sessions, timeout_seconds: float = 8.
             return True
         time.sleep(0.05)
     return False
+
+
+def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context):
+    """The normal G72 FAKE entry creates its task/attempt and reaches the Worker queue on PostgreSQL."""
+    client, sessions, _app = postgres_context
+    project_response = client.post("/projects", json={"name": "G72 PostgreSQL FAKE route"})
+    assert project_response.status_code == 201, project_response.text
+    project = project_response.json()
+
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        assert project_row is not None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        asset = DBAssetVersion(
+            id=str(uuid.uuid4()),
+            tenant_id=project_row.tenant_id,
+            project_id=project_row.id,
+            media_id="g72-postgres-synthetic-image",
+            version_no=1,
+            sha256="a" * 64,
+            media_type="image",
+            content_type="image/png",
+            size_bytes=100,
+            probe_json={"image": {"width": 48, "height": 48}},
+            created_by=project_row.owner_id,
+            created_at=now,
+        )
+        rights = DBRightsSnapshot(
+            id=str(uuid.uuid4()),
+            tenant_id=project_row.tenant_id,
+            project_id=project_row.id,
+            asset_version_id=asset.id,
+            status="ALLOWED",
+            purpose="REMIX",
+            territory="TEST",
+            valid_from=None,
+            valid_until=None,
+            evidence_ref="synthetic-postgres-test-evidence",
+            captured_by=project_row.owner_id,
+            captured_at=now,
+        )
+        db.add_all([asset, rights])
+        db.commit()
+
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    key = str(uuid.uuid5(uuid.NAMESPACE_URL, "g72-postgres-fake-entry"))
+    payload = {
+        "text": "synthetic offline voice-over",
+        "durationSeconds": 1,
+        "aspectRatio": "9:16",
+        "resolution": "720p",
+        "voiceId": "synthetic-seed",
+        "imageAssetVersionId": asset.id,
+        "idempotencyKey": key,
+        "expectedProjectRevision": project["revision"],
+        "confirmSyntheticTestOnly": True,
+    }
+
+    created = None
+    stale_codes = {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}
+    for _ in range(3):
+        capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+        assert capabilities.status_code == 200, capabilities.text
+        payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+        preflight = client.post(path + "/validate", json=payload)
+        if preflight.status_code != 200:
+            code = preflight.json().get("detail", {}).get("code")
+            if code in stale_codes:
+                continue
+            pytest.fail(f"G72 PostgreSQL preflight failed: {preflight.text}")
+        payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        code = created.json().get("detail", {}).get("code")
+        if code not in stale_codes:
+            break
+
+    assert created is not None and created.status_code == 202, (
+        created.text if created is not None else "G72 create was not attempted"
+    )
+    task_id = created.json()["taskId"]
+
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-g72-postgres"},
+    )
+    assert claimed.status_code == 200, claimed.text
+    body = claimed.json()
+    assert body["taskId"] == task_id
+    assert body["providerMode"] == "talking-head-fake"
+    assert body["request"]["imageAssetId"] == asset.id
+    assert body["request"]["fakeTaskType"] == "talking-head"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        assert stored is not None
+        assert stored.provider == "deterministic-fake-talking-head"
+        assert stored.lease_owner == "worker-g72-postgres"
+        assert stored.lease_epoch == 1
+        attempts = list(
+            db.execute(
+                select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id
+                )
+            ).scalars()
+        )
+        assert len(attempts) == 1
 
 
 def test_g76_postgres_heartbeat_waits_for_task_lock_and_rechecks_new_lease(postgres_context):
