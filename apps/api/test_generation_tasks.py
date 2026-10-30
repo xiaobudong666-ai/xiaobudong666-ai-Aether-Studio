@@ -357,6 +357,10 @@ def test_04_viewer_is_read_only_with_zero_writes(generation_context):
     }).status_code == 201
     client.post("/auth/logout")
     assert client.post("/auth/login", json={"email": "viewer@example.com", "password": password}).status_code == 200
+    assert client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset"},
+    ).status_code == 200
     response = client.post(
         f"/projects/{project['id']}/generation-tasks",
         json=generation_request(client, project),
@@ -567,6 +571,14 @@ def test_g72_keyset_cursor_is_stable_after_insert_and_bound_to_query_scope(gener
     )
     assert changed_filter.status_code == 409
     assert changed_filter.json()["detail"]["code"] == "GENERATION_CURSOR_SCOPE_MISMATCH"
+
+    other_project = create_project(client, "g72-keyset-other-project")
+    changed_project = client.get(
+        f"/projects/{other_project['id']}/generation-tasks",
+        params={"pagination": "keyset", "after": cursor},
+    )
+    assert changed_project.status_code == 409
+    assert changed_project.json()["detail"]["code"] == "GENERATION_CURSOR_SCOPE_MISMATCH"
 
     malformed = client.get(
         f"/projects/{project['id']}/generation-tasks",
@@ -956,6 +968,10 @@ def test_37_tenant_scope_hides_foreign_task(generation_context):
     client.post("/auth/logout")
     client.post("/auth/login", json={"email": "foreign@example.com", "password": password})
     assert client.get(f"/projects/{project['id']}/generation-tasks/{task['taskId']}").status_code == 404
+    assert client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset"},
+    ).status_code == 404
 
 
 def test_38_storage_quota_rejects_before_media_store(generation_context):
