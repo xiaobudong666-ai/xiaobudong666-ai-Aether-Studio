@@ -26,6 +26,8 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -555,21 +557,59 @@ def create_app(
     def generation_circuit(
         db: Session, tenant_id: str, *, create: bool = False, for_update: bool = False
     ) -> DBGenerationCircuitState | None:
+        # A SELECT FOR UPDATE cannot lock a row that does not exist. Circuit
+        # creation therefore uses a unique-key upsert on PostgreSQL/SQLite
+        # before the locking read. Concurrent Owner stop and artifact finalization
+        # then serialize on the same durable tenant/provider row.
+        if create:
+            values = {
+                "id": str(uuid.uuid4()),
+                "tenant_id": tenant_id,
+                "provider": "moneyprinter",
+                "state": "CLOSED",
+                "failure_timestamps_json": [],
+                "updated_at": utc_now(),
+            }
+            if app_engine.dialect.name == "postgresql":
+                db.execute(
+                    pg_insert(DBGenerationCircuitState)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            DBGenerationCircuitState.tenant_id,
+                            DBGenerationCircuitState.provider,
+                        ]
+                    )
+                )
+            elif app_engine.dialect.name == "sqlite":
+                db.execute(
+                    sqlite_insert(DBGenerationCircuitState)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            DBGenerationCircuitState.tenant_id,
+                            DBGenerationCircuitState.provider,
+                        ]
+                    )
+                )
+            else:
+                existing = db.execute(
+                    select(DBGenerationCircuitState).where(
+                        DBGenerationCircuitState.tenant_id == tenant_id,
+                        DBGenerationCircuitState.provider == "moneyprinter",
+                    )
+                ).scalar_one_or_none()
+                if existing is None:
+                    db.add(DBGenerationCircuitState(**values))
+                    db.flush()
+
         statement = select(DBGenerationCircuitState).where(
             DBGenerationCircuitState.tenant_id == tenant_id,
             DBGenerationCircuitState.provider == "moneyprinter",
         )
         if for_update and app_engine.dialect.name != "sqlite":
             statement = statement.with_for_update()
-        circuit = db.execute(statement).scalar_one_or_none()
-        if circuit is None and create:
-            circuit = DBGenerationCircuitState(
-                id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
-                state="CLOSED", failure_timestamps_json=[], updated_at=utc_now(),
-            )
-            db.add(circuit)
-            db.flush()
-        return circuit
+        return db.execute(statement).scalar_one_or_none()
 
     def current_generation_capabilities(db: Session, tenant_id: str) -> dict:
         now = utc_now()
@@ -2313,7 +2353,7 @@ def create_app(
             invalid_message = None
             # Serialize the final artifact commit with the Owner emergency stop.
             # The kill-switch can be activated while the sidecar upload is in flight.
-            final_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+            final_circuit = generation_circuit(db, task.tenant_id, create=True, for_update=True)
             if final_circuit is not None and final_circuit.state == "DISABLED":
                 invalid_code = "PROVIDER_EMERGENCY_STOPPED"
                 invalid_message = "紧急停机期间迟到产物已隔离"
