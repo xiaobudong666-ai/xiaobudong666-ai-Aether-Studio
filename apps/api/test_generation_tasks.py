@@ -2951,3 +2951,124 @@ def test_g75_ineligible_provider_candidate_does_not_pin_half_open_probe(provider
         assert circuit.half_open_issuer == "worker-proof"
 
     app.state.moneyprinter.assert_not_called()
+
+def test_g73_keyset_claim_scans_past_foreign_tenant_ineligible_queue_rows(generation_context):
+    """A foreign tenant's older wrong-mode backlog must not starve an eligible FAKE task."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client, "G73 eligible tenant queue")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(client, project, asset_id, key="g73-cross-tenant-eligible")
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    eligible_id = created.json()["taskId"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    foreign_password = secrets.token_urlsafe(24)
+
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert eligible is not None
+        current_tenant_id = eligible.tenant_id
+        first_created = eligible.created_at - datetime.timedelta(days=1)
+
+        foreign_tenant = DBTenant(
+            id="g73-foreign-tenant",
+            name="G73 Foreign Tenant",
+            slug="g73-foreign-tenant",
+            project_quota=50,
+            storage_quota_bytes=1024**3,
+            used_storage_bytes=0,
+            concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600,
+            render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"),
+            created_at=now,
+            updated_at=now,
+        )
+        foreign_owner = DBUser(
+            id="g73-foreign-owner",
+            tenant_id=foreign_tenant.id,
+            email="g73-foreign-owner@example.com",
+            display_name="G73 Foreign Tenant Owner",
+            password_hash=hash_password(foreign_password),
+            role="owner",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        foreign_project = DBProject(
+            id="g73-foreign-project",
+            tenant_id=foreign_tenant.id,
+            owner_id=foreign_owner.id,
+            name="G73 foreign tenant ineligible backlog",
+            timeline={"version": "1.1", "output": None, "tracks": []},
+            materials=[],
+            revision=1,
+            created_at=now,
+            updated_at=now,
+        )
+        old_rows = []
+        for idx in range(205):
+            created_at = first_created + datetime.timedelta(microseconds=idx)
+            old_rows.append(DBGenerationTask(
+                id=str(uuid.uuid4()),
+                tenant_id=foreign_tenant.id,
+                project_id=foreign_project.id,
+                requested_by=foreign_owner.id,
+                provider="moneyprinter",
+                status="QUEUED",
+                progress=0,
+                message="synthetic foreign-tenant wrong-mode queue row",
+                request_json={"syntheticFixtureOnly": True},
+                request_hash=f"g73-foreign-fixture-{idx}",
+                capability_snapshot_json={"mode": "moneyprinter"},
+                capability_snapshot_hash="0" * 64,
+                idempotency_key=f"g73-foreign-idempotency-{idx}",
+                attempts=1,
+                max_attempts=1,
+                lease_owner=None,
+                lease_epoch=0,
+                circuit_probe_epoch=None,
+                lease_expires_at=None,
+                cancel_requested_at=None,
+                error_code=None,
+                error_message=None,
+                created_at=created_at,
+                updated_at=created_at,
+            ))
+        db.add_all([foreign_tenant, foreign_owner, foreign_project, *old_rows])
+        db.commit()
+
+    claimed = claim(client, worker_id="g73-cross-tenant-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible_id
+    assert claimed.json()["providerMode"] == "talking-head-fake"
+
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert eligible.tenant_id == current_tenant_id
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-cross-tenant-safe-worker"
+        foreign_queued = db.execute(
+            select(func.count(DBGenerationTask.id)).where(
+                DBGenerationTask.tenant_id == "g73-foreign-tenant",
+                DBGenerationTask.status == "QUEUED",
+                DBGenerationTask.lease_owner.is_(None),
+            )
+        ).scalar_one()
+        assert foreign_queued == 205
+        foreign_claim_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id.in_(
+                    select(DBGenerationTask.id).where(
+                        DBGenerationTask.tenant_id == "g73-foreign-tenant"
+                    )
+                ),
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one()
+        assert foreign_claim_events == 0
+
+    assert media.uploads == 0
