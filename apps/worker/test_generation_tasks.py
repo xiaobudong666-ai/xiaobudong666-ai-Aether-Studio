@@ -255,10 +255,15 @@ def test_generation_queue_preserves_governance_rejection_code(monkeypatch):
     client.request.return_value = response
     monkeypatch.setattr("app.generation_queue.httpx.Client", lambda **_kwargs: client)
 
+    queue_client = GenerationQueueClient(
+        backend_url="http://api", worker_token="token", worker_id="worker",
+    )
+    # This unit test exercises HTTP governance-error propagation after a valid
+    # claim. Seed the lease epoch so the request reaches the mocked 409 response.
+    queue_client._lease_epochs["task"] = 1
+
     with pytest.raises(GenerationQueueError) as caught:
-        GenerationQueueClient(
-            backend_url="http://api", worker_token="token", worker_id="worker",
-        ).heartbeat("task")
+        queue_client.heartbeat("task")
 
     assert caught.value.status_code == 409
     assert caught.value.code == "TASK_CANCELED"
