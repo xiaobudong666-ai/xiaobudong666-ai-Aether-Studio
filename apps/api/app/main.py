@@ -1974,7 +1974,7 @@ def create_app(
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
-            candidate_circuit = generation_circuit(db, candidate.tenant_id, for_update=True)
+            candidate_circuit = generation_circuit(db, candidate.tenant_id, create=True, for_update=True)
             if candidate_circuit is not None:
                 if candidate_circuit.state == "DISABLED":
                     continue
