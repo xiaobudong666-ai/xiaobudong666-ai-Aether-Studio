@@ -910,3 +910,128 @@ def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_
         )).scalar_one() == 1
     app.state.moneyprinter.assert_not_called()
 
+
+
+def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_artifact(postgres_context, monkeypatch):
+    """Owner emergency stop committed during upload must quarantine the late artifact."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id = task.project_id
+        tenant_id = task.tenant_id
+
+    worker_id = "worker-g76-kill-switch-race"
+    upstream_id = "g76-kill-switch-race-upstream"
+    artifact_id = "g76-kill-switch-race-artifact"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    epoch = claimed.json()["leaseEpoch"]
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(epoch),
+    }
+    running = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={"status": "RUNNING", "progress": 10, "message": "synthetic running", "upstreamJobId": upstream_id},
+    )
+    assert running.status_code == 200, running.text
+    ingesting = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING", "progress": 95, "message": "synthetic ingesting",
+            "upstreamJobId": upstream_id, "providerArtifactId": artifact_id,
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
+
+    payload = b"g76-postgres-kill-switch-race-artifact"
+    upload_started = Event()
+    release_upload = Event()
+
+    def blocked_upload(_project_id, filename, content_type, stream):
+        observed = stream.read()
+        assert observed == payload
+        upload_started.set()
+        if not release_upload.wait(timeout=12):
+            raise RuntimeError("synthetic blocked upload timed out")
+        return {
+            "mediaId": "g76-orphan-after-kill-switch",
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": 1.0,
+                "sizeBytes": len(observed),
+                "video": {"codec": "h264", "width": 320, "height": 240},
+            },
+        }
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", blocked_upload)
+
+    def send_artifact_intake():
+        with TestClient(app) as worker_client:
+            return worker_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers=worker_headers,
+                data={"providerArtifactId": artifact_id},
+                files={"file": ("synthetic.mp4", payload, "video/mp4")},
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(send_artifact_intake)
+        try:
+            assert upload_started.wait(timeout=10), "artifact upload did not reach the sidecar"
+            stopped = client.post(
+                "/generation/providers/moneyprinter/kill-switch",
+                json={"disabled": True, "reasonCode": "G76_TEST_KILL_SWITCH"},
+            )
+            assert stopped.status_code == 200, stopped.text
+        finally:
+            release_upload.set()
+        response = future.result(timeout=15)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "PROVIDER_EMERGENCY_STOPPED"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, tenant_id)
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "DISABLED"
+        assert stored.status == "INGESTING"
+        assert stored.asset_version_id is None
+        assert tenant.used_storage_bytes == 0
+        orphan_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one()
+        assert orphan_event.metadata_json["reasonCode"] == "PROVIDER_EMERGENCY_STOPPED"
+        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-kill-switch"
+        assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
+        assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
+        assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
+        assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+            DBAssetVersion.media_id == "g76-orphan-after-kill-switch",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
