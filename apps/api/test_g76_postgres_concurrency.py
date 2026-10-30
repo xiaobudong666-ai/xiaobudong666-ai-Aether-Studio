@@ -14,7 +14,7 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Barrier, Event, get_ident
 from unittest.mock import MagicMock
 
 import pytest
