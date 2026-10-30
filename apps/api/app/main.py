@@ -25,7 +25,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -2240,6 +2240,8 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
         if task.status not in {"RUNNING", "INGESTING"}:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_INTAKE_NOT_ALLOWED", "message": "当前状态不允许接收产物"})
+        if task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
+            raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ID_MISMATCH", "message": "产物编号与当前任务回执不一致"})
         if file.content_type != "video/mp4":
             raise HTTPException(status_code=415, detail={"code": "ARTIFACT_CONTENT_TYPE_INVALID", "message": "仅接受受信任的 MP4 字节流"})
         file.file.seek(0, os.SEEK_END)
@@ -2253,25 +2255,114 @@ def create_app(
         while chunk := file.file.read(1024 * 1024):
             digest.update(chunk)
         file.file.seek(0)
+
+        task_project_id = task.project_id
+        task_tenant_id = task.tenant_id
         reservation = db.execute(
             update(DBTenant)
-            .where(DBTenant.id == task.tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
+            .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
             .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
         )
         if reservation.rowcount != 1:
             db.rollback()
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
+
+        uploaded = None
+        media_id = None
+        metadata = {}
         try:
             uploaded = created_app.state.video_use.upload_media(
-                task.project_id, f"generation-{task.id}.mp4", "video/mp4", file.file
+                task_project_id, f"generation-{task_id}.mp4", "video/mp4", file.file
             )
             metadata = uploaded.get("metadata") or {}
-            if not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
-                raise ValueError("generated artifact did not pass media probe")
             media_id = str(uploaded.get("mediaId") or "")
+
+            # The storage reservation commit above intentionally ends the first task
+            # lock before the network call. Re-open a serialized transaction after
+            # upload and re-read the current task before any asset/SETTLED write.
+            db.rollback()
+            begin_serialized_write(db)
+            current_statement = (
+                select(DBGenerationTask)
+                .where(DBGenerationTask.id == task_id)
+                .execution_options(populate_existing=True)
+            )
+            if app_engine.dialect.name != "sqlite":
+                current_statement = current_statement.with_for_update()
+            task = db.execute(current_statement).scalar_one_or_none()
+            if task is None:
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == task_tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                db.commit()
+                raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+
+            now = utc_now()
+            invalid_code = None
+            invalid_message = None
+            if task.cancel_requested_at is not None or task.status == "CANCELED":
+                invalid_code = "TASK_CANCELED"
+                invalid_message = "任务已取消，迟到产物已隔离"
+            elif task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
+                invalid_code = "LEASE_LOST"
+                invalid_message = "上传期间工作节点已失去任务租约"
+            elif x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+                invalid_code = "LEASE_EPOCH_MISMATCH"
+                invalid_message = "上传期间任务租约版本已更新"
+            elif task.status not in {"RUNNING", "INGESTING"}:
+                invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
+                invalid_message = "上传期间任务状态已改变"
+
+            if invalid_code:
+                attempt = current_generation_attempt(db, task)
+                orphan_size = int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size
+                orphan_evidence = {
+                    "reasonCode": invalid_code,
+                    "workerId": x_worker_id,
+                    "leaseEpoch": x_worker_lease_epoch,
+                    "reservedStorageBytes": upload_size,
+                }
+                if media_id and uploaded.get("projectId") == task_project_id:
+                    orphan_evidence.update({
+                        "orphanedMediaId": media_id,
+                        "orphanedMediaSha256": digest.hexdigest(),
+                        "orphanedMediaSizeBytes": orphan_size,
+                        "originalProviderArtifactId": task.provider_artifact_id or providerArtifactId,
+                        "originalUpstreamJobId": task.upstream_job_id or "",
+                        "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                    })
+                    if invalid_code == "TASK_CANCELED" and task.media_id is None:
+                        task.media_id = media_id
+                        task.provider_artifact_id = task.provider_artifact_id or providerArtifactId
+                        task.updated_at = now
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == task.tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                add_generation_event(
+                    db, task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
+                    actor_type="SYSTEM", actor_id="api",
+                    from_status=task.status, to_status=task.status,
+                    metadata=orphan_evidence, now=now,
+                )
+                db.commit()
+                raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message})
+
             if not media_id or uploaded.get("projectId") != task.project_id:
                 raise ValueError("generated artifact returned invalid media scope")
+            if not isinstance(metadata, dict) or not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
+                raise ValueError("generated artifact did not pass media probe")
+
             project = db.execute(select(DBProject).where(DBProject.id == task.project_id, DBProject.tenant_id == task.tenant_id)).scalar_one()
             provenance = {
                 "provider": task.provider,
@@ -2357,26 +2448,134 @@ def create_app(
                           "sizeBytes": size_bytes, "generatedSeconds": generated_seconds}, now=now,
             )
             db.commit()
+        except HTTPException:
+            raise
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
-            failed_task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one()
+            begin_serialized_write(db)
+            failed_statement = (
+                select(DBGenerationTask)
+                .where(DBGenerationTask.id == task_id)
+                .execution_options(populate_existing=True)
+            )
+            if app_engine.dialect.name != "sqlite":
+                failed_statement = failed_statement.with_for_update()
+            failed_task = db.execute(failed_statement).scalar_one_or_none()
+            if failed_task is None:
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == task_tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                db.commit()
+                raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
+
+            # A commit can succeed while its ACK is lost. Query the durable row and
+            # ARTIFACT_INGESTED receipt before attempting any compensation.
+            if failed_task.asset_version_id is not None:
+                completion = db.execute(
+                    select(DBGenerationEvent).where(
+                        DBGenerationEvent.generation_task_id == failed_task.id,
+                        DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+                        DBGenerationEvent.actor_id == x_worker_id,
+                    )
+                ).scalar_one_or_none()
+                if failed_task.provider_artifact_id == providerArtifactId and completion is not None:
+                    db.rollback()
+                    return generation_task_response(db, failed_task, rights=generation_rights(db, failed_task), include_history=True)
+
+            now = utc_now()
+            invalid_code = None
+            invalid_message = None
+            if failed_task.cancel_requested_at is not None or failed_task.status == "CANCELED":
+                invalid_code = "TASK_CANCELED"
+                invalid_message = "任务已取消，迟到产物已隔离"
+            elif failed_task.lease_owner != x_worker_id or failed_task.lease_expires_at is None or _as_utc(failed_task.lease_expires_at) < now:
+                invalid_code = "LEASE_LOST"
+                invalid_message = "上传期间工作节点已失去任务租约"
+            elif x_worker_lease_epoch is None or x_worker_lease_epoch != failed_task.lease_epoch:
+                invalid_code = "LEASE_EPOCH_MISMATCH"
+                invalid_message = "上传期间任务租约版本已更新"
+            elif failed_task.status not in {"RUNNING", "INGESTING"}:
+                invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
+                invalid_message = "上传期间任务状态已改变"
+
+            if invalid_code:
+                attempt = current_generation_attempt(db, failed_task)
+                failure_metadata = {
+                    "reasonCode": invalid_code,
+                    "workerId": x_worker_id,
+                    "leaseEpoch": x_worker_lease_epoch,
+                    "reservedStorageBytes": upload_size,
+                }
+                if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
+                    failure_metadata.update({
+                        "orphanedMediaId": media_id,
+                        "orphanedMediaSha256": digest.hexdigest(),
+                        "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
+                        "originalProviderArtifactId": failed_task.provider_artifact_id or providerArtifactId,
+                        "originalUpstreamJobId": failed_task.upstream_job_id or "",
+                        "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                    })
+                    if invalid_code == "TASK_CANCELED" and failed_task.media_id is None:
+                        failed_task.media_id = media_id
+                        failed_task.provider_artifact_id = failed_task.provider_artifact_id or providerArtifactId
+                        failed_task.updated_at = now
+                db.execute(
+                    update(DBTenant)
+                    .where(DBTenant.id == failed_task.tenant_id)
+                    .values(used_storage_bytes=case(
+                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                        else_=0,
+                    ))
+                )
+                add_generation_event(
+                    db, failed_task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
+                    actor_type="SYSTEM", actor_id="api",
+                    from_status=failed_task.status, to_status=failed_task.status,
+                    metadata=failure_metadata, now=now,
+                )
+                db.commit()
+                raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message}) from exc
+
             failed_attempt = current_generation_attempt(db, failed_task)
             failed_task.status = "FAILED"
             failed_task.error_code = "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED" if isinstance(exc, ValueError) else "ARTIFACT_INGEST_FAILED"
             failed_task.error_message = "生成产物未通过受治理媒体校验" if isinstance(exc, ValueError) else "生成产物入库失败"
-            failed_task.completed_at = utc_now()
-            failed_task.updated_at = failed_task.completed_at
+            failed_task.completed_at = now
+            failed_task.updated_at = now
             failed_task.lease_owner = None
             failed_task.lease_expires_at = None
             failed_attempt.status = "FAILED"
             failed_attempt.error_code = failed_task.error_code
             failed_attempt.error_message = failed_task.error_message
             failed_attempt.completed_at = failed_task.completed_at
+            failure_metadata = {"compensatedQuotaBytes": upload_size}
+            if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
+                failed_task.media_id = media_id
+                failure_metadata.update({
+                    "orphanedMediaId": media_id,
+                    "orphanedMediaSha256": digest.hexdigest(),
+                    "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
+                    "originalProviderArtifactId": failed_task.provider_artifact_id or providerArtifactId,
+                    "originalUpstreamJobId": failed_task.upstream_job_id or "",
+                    "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                })
+            db.execute(
+                update(DBTenant)
+                .where(DBTenant.id == failed_task.tenant_id)
+                .values(used_storage_bytes=case(
+                    (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                    else_=0,
+                ))
+            )
             add_generation_event(
                 db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
-                actor_type="SYSTEM", actor_id="api", from_status=task.status,
-                to_status="FAILED", metadata={"compensatedQuotaBytes": upload_size}, now=failed_task.completed_at,
+                actor_type="SYSTEM", actor_id="api", from_status=failed_task.status,
+                to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
             )
             release_generation_reservation(
                 db, failed_task, failed_attempt,
@@ -2540,7 +2739,7 @@ def create_app(
             db.refresh(asset_version)
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
+            db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=case((DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size), else_=0)))
             db.commit()
             if isinstance(exc, VideoUseError):
                 logger.exception("video-use media upload failed")
