@@ -1038,7 +1038,7 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
 
 
 
-def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(postgres_context):
+def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(postgres_context, monkeypatch):
     """A missing circuit row must not leave an unlocked window before artifact commit."""
     client, sessions, app = postgres_context
     task_id = _create_task(client)
