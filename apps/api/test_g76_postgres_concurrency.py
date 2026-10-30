@@ -14,23 +14,28 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, build_engine
 from app.main import create_app
+from app.video_use_adapter import VideoUseError
 from app.models import (
     DBAssetVersion,
     DBGenerationAttempt,
     DBGenerationCircuitState,
+    DBGenerationEvent,
     DBGenerationProviderEvent,
     DBGenerationTask,
+    DBGenerationUsageEntry,
     DBProject,
     DBRightsSnapshot,
+    DBTenant,
 )
 
 
@@ -564,3 +569,206 @@ def test_g76_postgres_additive_migration_is_idempotent_and_preserves_legacy_rows
         assert circuit_row.half_open_issuer is None
 
         connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_context, monkeypatch):
+    """A real disposable PostgreSQL transaction executes the upload-failure CASE compensation."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id = task.project_id
+        tenant_id = task.tenant_id
+
+    worker_id = "worker-g72-pg-upload-failure"
+    upstream_id = "g72-pg-upload-failure-upstream"
+    artifact_id = "g72-pg-upload-failure-artifact"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    epoch = claimed.json()["leaseEpoch"]
+    assert claimed.json()["taskId"] == task_id
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(epoch),
+    }
+    running = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={"status": "RUNNING", "progress": 10, "message": "synthetic running", "upstreamJobId": upstream_id},
+    )
+    assert running.status_code == 200, running.text
+    ingesting = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING", "progress": 95, "message": "synthetic ingesting",
+            "upstreamJobId": upstream_id, "providerArtifactId": artifact_id,
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
+
+    def fail_upload(*_args, **_kwargs):
+        raise VideoUseError("synthetic PostgreSQL sidecar upload failure")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", fail_upload)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers=worker_headers,
+        data={"providerArtifactId": artifact_id},
+        files={"file": ("synthetic.mp4", b"g72-postgres-failure-bytes", "video/mp4")},
+    )
+    assert response.status_code == 502, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORE_FAILED"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, tenant_id)
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert tenant.used_storage_bytes == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+            DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(postgres_context, monkeypatch):
+    """Owner cancel commits while sidecar upload is blocked; late intake must not overwrite CANCELED."""
+    owner_client, sessions, app = postgres_context
+    task_id = _create_task(owner_client)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id = task.project_id
+        tenant_id = task.tenant_id
+
+    worker_id = "worker-g76-cancel-race"
+    upstream_id = "g76-cancel-race-upstream"
+    artifact_id = "g76-cancel-race-artifact"
+    claimed = owner_client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    epoch = claimed.json()["leaseEpoch"]
+    assert claimed.json()["taskId"] == task_id
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(epoch),
+    }
+    running = owner_client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={"status": "RUNNING", "progress": 10, "message": "synthetic running", "upstreamJobId": upstream_id},
+    )
+    assert running.status_code == 200, running.text
+    ingesting = owner_client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING", "progress": 95, "message": "synthetic ingesting",
+            "upstreamJobId": upstream_id, "providerArtifactId": artifact_id,
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
+
+    payload = b"g76-postgres-cancel-race-artifact"
+    upload_started = Event()
+    release_upload = Event()
+
+    def blocked_upload(_project_id, filename, content_type, stream):
+        observed = stream.read()
+        assert observed == payload
+        upload_started.set()
+        if not release_upload.wait(timeout=12):
+            raise RuntimeError("synthetic blocked upload timed out")
+        return {
+            "mediaId": "g76-orphan-after-owner-cancel",
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": 1.0,
+                "sizeBytes": len(observed),
+                "video": {"codec": "h264", "width": 320, "height": 240},
+            },
+        }
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", blocked_upload)
+
+    def send_artifact_intake():
+        with TestClient(app) as worker_client:
+            return worker_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers=worker_headers,
+                data={"providerArtifactId": artifact_id},
+                files={"file": ("synthetic.mp4", payload, "video/mp4")},
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(send_artifact_intake)
+        try:
+            assert upload_started.wait(timeout=10), "artifact upload did not reach the sidecar"
+            canceled = owner_client.post(
+                f"/projects/{project_id}/generation-tasks/{task_id}/cancel"
+            )
+            assert canceled.status_code == 200, canceled.text
+            assert canceled.json()["status"] == "CANCELED"
+        finally:
+            release_upload.set()
+        response = future.result(timeout=15)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "TASK_CANCELED"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, tenant_id)
+        assert stored.status == "CANCELED"
+        assert stored.cancel_requested_at is not None
+        assert stored.lease_owner is None
+        assert stored.lease_expires_at is None
+        assert stored.media_id == "g76-orphan-after-owner-cancel"
+        assert stored.asset_version_id is None
+        assert tenant.used_storage_bytes == 0
+        orphan_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one()
+        assert orphan_event.metadata_json["reasonCode"] == "TASK_CANCELED"
+        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-owner-cancel"
+        assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
+        assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
+        assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
+        assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+            DBAssetVersion.media_id == "g76-orphan-after-owner-cancel",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
+
