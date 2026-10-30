@@ -1280,7 +1280,15 @@ def test_g73_postgres_keyset_claim_scans_past_205_foreign_wrong_mode_rows(postgr
                 created_at=created_at,
                 updated_at=created_at,
             ))
-        db.add_all([foreign_tenant, foreign_owner, foreign_project, *ineligible_rows])
+        # Persist synthetic FK parents in dependency order before the 205 task rows.
+        # Scalar FK values alone do not give SQLAlchemy's unit of work relationship ordering.
+        db.add(foreign_tenant)
+        db.flush()
+        db.add(foreign_owner)
+        db.flush()
+        db.add(foreign_project)
+        db.flush()
+        db.add_all(ineligible_rows)
         db.commit()
 
     worker_id = "g73-pg-keyset-worker"
