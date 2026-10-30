@@ -112,8 +112,8 @@ jobs:
           pip-audit -r apps/video_use/requirements.txt
 
   build-and-test:
-    # Preserve the existing required check name. This gate fails if core tests or
-    # either dependency audit fails, while independent test jobs can still run.
+# Preserve the required aggregate check; include the real PostgreSQL lease/circuit concurrency gate.
+# Core tests, both dependency audits, and G76 PostgreSQL concurrency must pass.
     name: Lint, build, and unit tests
     needs:
       - core-tests
@@ -130,7 +130,7 @@ jobs:
           PYTHON_AUDIT_RESULT: ${{ needs.python-dependency-audit.result }}
           G76_POSTGRES_RESULT: ${{ needs.g76-postgresql-concurrency.result }}
         run: |
-          printf 'core tests: %s\\nNode audit: %s\\nPython audit: %s\\nG76 PostgreSQL: %s\\n' \\
+          printf 'core tests: %s\nNode audit: %s\nPython audit: %s\nG76 PostgreSQL: %s\n' \
             "$CORE_TEST_RESULT" "$NODE_AUDIT_RESULT" "$PYTHON_AUDIT_RESULT" "$G76_POSTGRES_RESULT"
           test "$CORE_TEST_RESULT" = "success"
           test "$NODE_AUDIT_RESULT" = "success"
