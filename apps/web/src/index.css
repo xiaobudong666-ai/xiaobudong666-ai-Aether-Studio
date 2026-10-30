@@ -1025,6 +1025,40 @@ button.text-button {
   .quick-create-grid > :last-child { grid-column: 1 / -1; }
 }
 
+.avatar-asset-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  color: #d4d4d8;
+  font-size: 13px;
+}
+
+.avatar-asset-picker select {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid #3f3f46;
+  border-radius: 8px;
+  background: #1b1b20;
+  color: #f4f4f5;
+}
+
+.fake-only-task-id {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: #a5f3fc;
+  font-size: 12px;
+}
+
+.fake-only-task-id code {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 720px) {
   .app-body { grid-template-columns: 1fr; }
   .oral-broadcast-main { padding: 24px 20px 32px; max-width: none; }

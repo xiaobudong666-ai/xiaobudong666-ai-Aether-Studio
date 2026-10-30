@@ -1,0 +1,17 @@
+# Explicit FAKE-only integration override. NEVER include in production Compose.
+# Disposable nonproduction environment only; does not grant provider credentials.
+# docker compose -f infra/docker/docker-compose.yml \
+#   -f infra/docker/docker-compose.g72-fake-only.override.yml config
+services:
+  api:
+    environment:
+      AETHER_GENERATION_PROVIDER_MODE: deterministic-fake
+      AETHER_FAKE_ONLY_NONPROD: "true"
+      AETHER_RUNTIME_STAGE: nonproduction
+  worker:
+    environment:
+      AETHER_GENERATION_PROVIDER_MODE: deterministic-fake
+      AETHER_TALKING_HEAD_MODE: disabled
+      AETHER_GENERATION_CREDENTIAL_STATE: ABSENT
+      AETHER_GENERATION_CANARY_PROFILE: disabled
+      AETHER_GENERATION_NETWORK_ISOLATION: NOT_ENFORCED

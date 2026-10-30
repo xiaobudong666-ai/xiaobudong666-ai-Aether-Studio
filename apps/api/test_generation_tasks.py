@@ -11,6 +11,7 @@ import pytest
 from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import create_app
+from app.video_use_adapter import VideoUseError
 from app.models import (
     DBAdoption,
     DBAssetVersion,
@@ -22,6 +23,7 @@ from app.models import (
     DBGenerationProviderConfigVersion,
     DBGenerationProviderEvent,
     DBGenerationTask,
+    DBRightsSnapshot,
     DBGenerationUsageEntry,
     DBProject,
     DBTenant,
@@ -564,6 +566,71 @@ def test_29_probe_failure_compensates_quota_and_creates_no_asset(generation_cont
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
 
 
+def test_g72_upload_failure_compensates_storage_with_portable_case(generation_context, monkeypatch):
+    """A sidecar upload failure releases only the committed storage reservation."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G72 storage compensation")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-storage-compensation")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(path, json=payload)
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+
+    claimed = claim(client, worker_id="worker-g72-compensation")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", worker_id="worker-g72-compensation",
+        upstreamJobId="g72-compensation-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", worker_id="worker-g72-compensation",
+        upstreamJobId="g72-compensation-upstream",
+        providerArtifactId="g72-compensation-artifact",
+    ).status_code == 200
+
+    def fail_upload(*_args, **_kwargs):
+        raise VideoUseError("synthetic sidecar upload failure")
+
+    monkeypatch.setattr(media_store, "upload_media", fail_upload)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": "worker-g72-compensation",
+        },
+        data={"providerArtifactId": "g72-compensation-artifact"},
+        files={"file": ("synthetic.mp4", b"synthetic-g72-bytes", "video/mp4")},
+    )
+    assert response.status_code == 502, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORE_FAILED"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert task.status == "FAILED"
+        assert task.error_code == "ARTIFACT_INGEST_FAILED"
+        assert tenant.used_storage_bytes == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+            DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_30_success_creates_one_material_and_immutable_asset_with_provenance(generation_context):
     client, sessions, _, _ = generation_context
     project = create_project(client)
@@ -764,6 +831,65 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
         assert tenant.used_storage_bytes == 0
         assert stored.status == "FAILED"
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+
+
+
+
+def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(generation_context):
+    """G70/G71: original upstream output must be reconciled, never regenerated blindly.
+
+    FAKE-only fixture: temporarily model the 3-attempt paid-provider retry policy.
+    No external provider, credentials or paid call is involved.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g71-no-double-generation")
+    task = create_task(client, project, key="g71-ingest-ambiguous")
+    task_id = task["taskId"]
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        stored.max_attempts = 3
+        db.commit()
+
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="original-paid-job").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", upstreamJobId="original-paid-job",
+        providerArtifactId="original-paid-artifact",
+    ).status_code == 200
+    media_store.interrupt = True
+    with pytest.raises(RuntimeError, match="stream interrupted"):
+        client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "original-paid-artifact"},
+            files={"file": ("artifact.mp4", b"synthetic-bytes", "video/mp4")},
+        )
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "FAILED"
+        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
+        events_before = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+
+    blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == "FAILED"
+        assert row.attempts == 1
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == attempts_before == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.kind == "SETTLED"
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
 
 
 def test_im15_01_new_environment_is_disabled_without_provider_calls(provider_control_context):
@@ -1375,3 +1501,1149 @@ def test_p0_runtime_bridge_revision_conflict_is_fail_closed(generation_context):
     )
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
+
+
+
+def _g72_fake_visual_fixture(sessions, project, allowed=True):
+    """Native SQLite image + REMIX rights fixture; never production evidence."""
+    with sessions() as db:
+        record = db.get(DBProject, project["id"])
+        assert record is not None
+        created = datetime.datetime.now(datetime.timezone.utc)
+        asset = DBAssetVersion(
+            id=str(uuid.uuid4()), tenant_id=record.tenant_id, project_id=record.id,
+            media_id="synthetic-fixture-image", version_no=1,
+            sha256="a" * 64, media_type="image", content_type="image/png",
+            size_bytes=100, probe_json={"image": {"width": 48, "height": 48}},
+            created_by=record.owner_id, created_at=created,
+        )
+        db.add(asset)
+        snapshot = DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=record.tenant_id,
+            project_id=record.id, asset_version_id=asset.id,
+            status="ALLOWED" if allowed else "DENIED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="synthetic-test-evidence", captured_by=record.owner_id,
+            captured_at=created,
+        )
+        db.add(snapshot)
+        db.commit()
+        return asset.id
+
+
+def _g72_fake_payload(client, project, asset_id, key="g72-fake-task"):
+    caps = client.get("/generation/providers/moneyprinter/capabilities").json()
+    return {
+        "text": "synthetic offline voice-over",
+        "durationSeconds": 1,
+        "aspectRatio": "9:16",
+        "resolution": "720p",
+        "voiceId": "synthetic-seed",
+        "imageAssetVersionId": asset_id,
+        "idempotencyKey": idempotency_uuid(key),
+        "expectedProjectRevision": project["revision"],
+        "capabilitySnapshotHash": caps["snapshotHash"],
+        "confirmSyntheticTestOnly": True,
+    }
+
+
+def test_g72_native_fake_http_db_create_claim_and_idempotency(generation_context):
+    client, sessions, _app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    stale_snapshot_codes = {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}
+
+    def refresh_preflight():
+        last_response = None
+        for _ in range(3):
+            capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+            assert capabilities.status_code == 200, capabilities.text
+            payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+            last_response = client.post(path + "/validate", json=payload)
+            if last_response.status_code == 200:
+                payload["capabilitySnapshotHash"] = last_response.json()["capabilitySnapshotHash"]
+                return last_response
+            code = last_response.json().get("detail", {}).get("code")
+            if code not in stale_snapshot_codes:
+                return last_response
+        return last_response
+
+    preflight = refresh_preflight()
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["simulatedOutput"] is True
+
+    created = None
+    for _ in range(3):
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        code = created.json().get("detail", {}).get("code")
+        if created.status_code != 409 or code not in stale_snapshot_codes:
+            break
+        preflight = refresh_preflight()
+        if preflight.status_code != 200:
+            break
+    assert created is not None and created.status_code == 202, created.text if created is not None else "create was not attempted"
+    task = created.json()
+    assert task["provider"] == "deterministic-fake-talking-head"
+    assert task["status"] == "QUEUED"
+    duplicate = client.post(path, json=payload)
+    assert duplicate.status_code == 202, duplicate.text
+    assert duplicate.json()["taskId"] == task["taskId"]
+    claimed = claim(client)
+    assert claimed.status_code == 200, claimed.text
+    body = claimed.json()
+    assert body["providerMode"] == "talking-head-fake"
+    assert body["taskId"] == task["taskId"]
+    assert body["request"]["imageAssetId"] == asset_id
+    assert body["request"]["fakeTaskType"] == "talking-head"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task["taskId"])
+        assert stored is not None and stored.requested_by is not None
+        assert stored.max_attempts == 1
+        assert len(list(db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == stored.id
+        )).scalars())) == 1
+
+
+def test_g72_native_fake_missing_asset_or_missing_rights_fail_closed(generation_context):
+    client, sessions, _app, _ = generation_context
+    project = create_project(client)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    unknown = _g72_fake_payload(client, project, "nonexistent-asset", key="g72-bad-asset")
+    response = client.post(path, json=unknown)
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "ASSET_VERSION_NOT_FOUND"
+    denied_id = _g72_fake_visual_fixture(sessions, project, allowed=False)
+    denied = _g72_fake_payload(client, project, denied_id, key="g72-no-rights")
+    response = client.post(path, json=denied)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "FAKE_VISUAL_RIGHTS_BLOCKED"
+    assert claim(client).status_code == 204
+
+
+def test_g72_native_fake_owner_session_only_and_default_off(generation_context):
+    client, sessions, app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-overrides")
+    malicious = {**payload, "requestedBy": "another-user", "tenantId": "another-tenant"}
+    assert client.post(path, json=malicious).status_code == 422
+    assert client.post(path, json={**payload, "confirmSyntheticTestOnly": False}).status_code == 422
+    app.state.generation_provider_mode = "disabled"
+    response = client.post(path, json=payload)
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "TALKING_HEAD_FAKE_DISABLED"
+    assert claim(client).status_code == 204
+
+
+def test_g72_native_fake_rights_revoke_after_enqueue_blocks_claim(generation_context):
+    client, sessions, _app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-revoke-before-claim")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(path, json=payload)
+    assert created.status_code == 202, created.text
+    with sessions() as db:
+        old = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=old.tenant_id, project_id=old.project_id,
+            asset_version_id=asset_id, status="DENIED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="test-revoked", captured_by=old.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+    # Revocation before claim must fail closed without consuming the task,
+    # creating an attempt, releasing the reservation, or settling usage.
+    with sessions() as db:
+        before_task = db.get(DBGenerationTask, created.json()["taskId"])
+        assert before_task is not None
+        before_state = (
+            before_task.status,
+            before_task.error_code,
+            before_task.asset_version_id,
+            before_task.attempts,
+        )
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == before_task.id
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == before_task.id
+        )).scalar_one()
+        before_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == before_task.id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        before_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == before_task.id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+
+    assert claim(client).status_code == 204
+
+    with sessions() as db:
+        after_task = db.get(DBGenerationTask, created.json()["taskId"])
+        assert after_task is not None
+        after_state = (
+            after_task.status,
+            after_task.error_code,
+            after_task.asset_version_id,
+            after_task.attempts,
+        )
+        after_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == after_task.id
+        )).scalar_one()
+        after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == after_task.id
+        )).scalar_one()
+        after_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == after_task.id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        after_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == after_task.id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+
+    assert before_state == after_state
+    assert after_state[0] == "QUEUED"
+    assert before_events == after_events
+    assert before_usage == after_usage
+    assert before_reserved == after_reserved == 1
+    assert before_settled == after_settled == 0
+
+
+def test_g72_native_fake_revoked_input_rejected_at_artifact_intake(generation_context):
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-revoke-at-intake")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    response = client.post(path, json=payload)
+    assert response.status_code == 202
+    task_id = response.json()["taskId"]
+    assert claim(client).status_code == 200
+    with sessions() as db:
+        old = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=old.tenant_id, project_id=old.project_id,
+            asset_version_id=asset_id, status="REVOKED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="test-revoked", captured_by=old.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "synthetic-job-id"},
+        files={"file": ("synthetic.mp4", b"synthetic-mp4-bytes", "video/mp4")},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    assert media.uploads == 0
+
+
+@pytest.fixture()
+def g72_true_native_flow_context(tmp_path, monkeypatch):
+    """FAKE-only HTTP+SQLite+native Worker with local FFmpeg; mock media store only."""
+    monkeypatch.setenv("AETHER_MAX_UPLOAD_BYTES", str(16 * 1024 * 1024))
+    engine = build_engine(f"sqlite:///{tmp_path / 'g72-real-worker.db'}")
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def get_db():
+        with sessions() as db:
+            yield db
+
+    media_store = FakeGeneratedMediaStore()
+    app = create_app(
+        app_engine=engine, db_dependency=get_db, video_use_adapter=media_store,
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False, enforce_csrf=True,
+        generation_provider_mode="deterministic-fake",
+    )
+    with TestClient(app) as client:
+        assert client.post(
+            "/auth/login",
+            json={"email": "owner@example.com", "password": OWNER_PASSWORD},
+        ).status_code == 200
+        client.headers.update({"X-Aether-CSRF": "1"})
+        yield client, sessions, media_store
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+
+
+def test_g72_native_worker_fastapi_sqlite_fake_flow(
+    g72_true_native_flow_context, monkeypatch,
+):
+    """Execute native API -> SQLite -> Worker -> offline mock-store intake.
+
+    Only where FFmpeg exists does the native fake encoder render MP4.
+    CI lint runners lack FFmpeg, and replace ONLY the encoder's media bytes.
+    Neither path substitutes for full Compose/PostgreSQL/video-use evidence.
+    """
+    import importlib
+    import importlib.util
+    import shutil
+    import sys
+
+    # Hosted CI lint runners do not include FFmpeg; the Docker Worker image does.
+    # In this runner we still exercise real API, SQLite and Worker dispatch;
+    # only the local encoder's binary media output is substituted by a fixture.
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+    client, sessions, media_store = g72_true_native_flow_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-native-full-fake-flow")
+    base_path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    create = client.post(base_path, json=payload)
+    assert create.status_code == 202, create.text
+    task_id = create.json()["taskId"]
+
+    # Load the actual Worker package under a separate package name. The API
+    # already owns the 'app' module name in this test Python process.
+    worker_pkg_dir = Path(__file__).resolve().parents[1] / "worker" / "app"
+    package_name = "_aether_g72_native_worker"
+    package_spec = importlib.util.spec_from_file_location(
+        package_name, worker_pkg_dir / "__init__.py",
+        submodule_search_locations=[str(worker_pkg_dir)],
+    )
+    assert package_spec is not None and package_spec.loader is not None
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[package_name] = package
+    package_spec.loader.exec_module(package)
+    worker = importlib.import_module(f"{package_name}.main")
+    fake_module = importlib.import_module(f"{package_name}.deterministic_fake_adapter")
+    fake_bridge = importlib.import_module(
+        f"{package_name}.deterministic_fake_talking_head_adapter"
+    )
+    # Keep the real encoder fast. Synthesized output remains a true MP4 with
+    # H.264/AAC, but its visual size is reduced in this test only.
+    monkeypatch.setitem(fake_module._ASPECT_DIMENSIONS, "9:16", (320, 568))
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "deterministic-fake")
+
+    class NativeApiTestQueue:
+        """HTTP-equivalent TestClient transport; no external network or credentials."""
+        def __init__(self, test_client):
+            self.test_client = test_client
+            self.worker_headers = {
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "worker-g72-native",
+            }
+
+        def claim(self):
+            response = self.test_client.post(
+                "/internal/generation-tasks/claim",
+                headers=self.worker_headers,
+            )
+            assert response.status_code in {200, 204}, response.text
+            return response.json() if response.status_code == 200 else None
+
+        def heartbeat(self, task_id):
+            response = self.test_client.post(
+                f"/internal/generation-tasks/{task_id}/heartbeat",
+                headers=self.worker_headers, json={},
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        def transition(self, task_id, **values):
+            data = {
+                "status": values.get("status"),
+                "progress": values.get("progress"),
+                "message": values.get("message"),
+                "upstreamJobId": values.get("upstream_job_id"),
+                "providerArtifactId": values.get("provider_artifact_id"),
+                "errorCode": values.get("error_code"),
+                "errorMessage": values.get("error_message"),
+                "retryable": values.get("retryable", False),
+            }
+            response = self.test_client.post(
+                f"/internal/generation-tasks/{task_id}/transition",
+                headers=self.worker_headers, json=data,
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        def artifact_intake(self, task_id, provider_artifact_id, stream):
+            response = self.test_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers=self.worker_headers,
+                data={"providerArtifactId": provider_artifact_id},
+                files={"file": ("synthetic.mp4", stream, "video/mp4")},
+            )
+            assert response.status_code == 201, response.text
+            return response.json()
+
+    queue = NativeApiTestQueue(client)
+    claimed = queue.claim()
+    assert claimed is not None and claimed["taskId"] == task_id
+    assert claimed["providerMode"] == "talking-head-fake"
+    local_native = fake_module.DeterministicFakeAdapter()
+    if not has_ffmpeg:
+        monkeypatch.setattr(
+            local_native, "_render",
+            lambda _job: b"synthetic-fixture-not-real-media",
+        )
+    bridge = fake_bridge.DeterministicFakeTalkingHeadAdapter(local_native)
+    runtime = worker.WorkerComponents(
+        ffmpeg=None, ai=None, recovery=None, moneyprinter=None, video_use=None,
+        generation_queue=queue, talking_head=None, talking_head_fake=bridge,
+    )
+    outcome = worker.process_generation_task(runtime, claimed, poll_interval=0)
+    assert outcome["storedStatus"] == "RIGHTS_BLOCKED", outcome
+    assert media_store.uploads == 1
+    assert queue.claim() is None
+    with sessions() as db:
+        persisted = db.get(DBGenerationTask, task_id)
+        assert persisted is not None
+        assert persisted.status == "RIGHTS_BLOCKED"
+        assert persisted.upstream_job_id is not None
+        assert persisted.asset_version_id is not None
+        output_asset = db.get(DBAssetVersion, persisted.asset_version_id)
+        assert output_asset is not None
+        assert output_asset.sha256 and len(output_asset.sha256) == 64
+        assert output_asset.media_type == "video"
+        assert output_asset.probe_json["provenance"]["generationTaskId"] == task_id
+        events = list(db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalars())
+        assert len(events) == 1
+
+
+def test_g72_viewer_rejected_without_generation_side_effects(generation_context):
+    """Native HTTP role gate must reject viewer before writing FAKE reservations."""
+    client, sessions, _app, _media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-viewer-role")
+    password = secrets.token_urlsafe(24)
+    registered = client.post("/admin/users", json={
+        "email": "g72-viewer@example.com", "displayName": "G72 Viewer",
+        "password": password, "role": "viewer",
+    })
+    assert registered.status_code == 201, registered.text
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "g72-viewer@example.com", "password": password,
+    }).status_code == 200
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for endpoint in (path + "/validate", path):
+        rejected = client.post(endpoint, json=payload)
+        assert rejected.status_code == 403, rejected.text
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 0
+
+
+def test_g72_changed_payload_same_idempotency_key_is_rejected(generation_context):
+    """The same authenticated owner cannot reuse a key with altered content."""
+    client, sessions, _app, _media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-body-mutation")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    first = client.post(path, json=payload)
+    assert first.status_code == 202, first.text
+    changed = {**payload, "text": "different FAKE-only narration, same request key"}
+    second = client.post(path, json=changed)
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+    with sessions() as db:
+        tasks = list(db.execute(select(DBGenerationTask)).scalars())
+        assert len(tasks) == 1 and tasks[0].id == first.json()["taskId"]
+        assert len(list(db.execute(select(DBGenerationAttempt)).scalars())) == 1
+        assert len(list(db.execute(select(DBGenerationUsageEntry)).scalars())) == 1
+
+
+def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
+    g72_true_native_flow_context, monkeypatch, tmp_path,
+):
+    """FAKE-only API -> SQLite -> Worker -> actual FFmpeg -> temporary disk -> DB audit.
+
+    Deliberately NOT a video-use adapter / PostgreSQL / production E2E test.
+    """
+    import hashlib
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("Dedicated G72 offline integration requires FFmpeg and FFprobe")
+
+    _client, sessions, media_store = g72_true_native_flow_context
+    durable_dir = tmp_path / "g72-durable-media"
+    durable_dir.mkdir()
+    saved_files = []
+
+    def offline_durable_upload(project_id, filename, content_type, stream):
+        assert content_type == "video/mp4"
+        assert filename.endswith(".mp4")
+        media_id = f"g72-disk-{uuid.uuid4().hex}"
+        path = durable_dir / f"{media_id}.mp4"
+        path.write_bytes(stream.read())
+        saved_files.append(path)
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration:stream=codec_type,codec_name,width,height",
+                "-of", "json", str(path),
+            ],
+            check=True, capture_output=True, text=True, timeout=20,
+        )
+        probed = json.loads(result.stdout)
+        tracks = probed.get("streams") or []
+        videos = [track for track in tracks if track.get("codec_type") == "video"]
+        audios = [track for track in tracks if track.get("codec_type") == "audio"]
+        assert len(videos) == 1 and videos[0].get("codec_name") == "h264"
+        assert len(audios) == 1 and audios[0].get("codec_name") == "aac"
+        assert int(videos[0].get("width") or 0) > 0
+        assert int(videos[0].get("height") or 0) > 0
+        duration = float((probed.get("format") or {}).get("duration") or 0)
+        assert 0.5 <= duration <= 3.0
+        media_store.uploads += 1
+        return {
+            "mediaId": media_id,
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": duration,
+                "sizeBytes": path.stat().st_size,
+                "video": {
+                    "codec": "h264",
+                    "width": int(videos[0]["width"]),
+                    "height": int(videos[0]["height"]),
+                },
+                "audio": {"codec": "aac"},
+            },
+        }
+
+    # Only the test video-use replacement writes to local temporary storage;
+    # the API, SQLite, Worker routing, FAKE adapter, FFmpeg and audit are native.
+    monkeypatch.setattr(media_store, "upload_media", offline_durable_upload)
+    test_g72_native_worker_fastapi_sqlite_fake_flow(
+        g72_true_native_flow_context, monkeypatch,
+    )
+    assert len(saved_files) == 1
+    raw = saved_files[0].read_bytes()
+    assert len(raw) > 1024 and raw[4:8] == b"ftyp"
+    with sessions() as db:
+        task = db.execute(select(DBGenerationTask)).scalar_one()
+        assert task.status == "RIGHTS_BLOCKED"
+        assert task.media_id == saved_files[0].stem
+        asset = db.get(DBAssetVersion, task.asset_version_id)
+        assert asset is not None
+        assert asset.sha256 == hashlib.sha256(raw).hexdigest()
+        assert asset.size_bytes == len(raw)
+        assert asset.probe_json["provenance"]["generationTaskId"] == task.id
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task.id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task.id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 1
+
+
+def test_g72_native_video_use_http_store_survives_sidecar_restart(
+    g72_true_native_flow_context, monkeypatch, tmp_path,
+):
+    """Native FAKE API/SQLite/Worker -> actual video-use HTTP -> disk -> restart.
+
+    In a CI runner without FFmpeg/FFprobe ONLY encoder bytes and sidecar media
+    probe are test doubles. API authorization, claim, Worker dispatch, HTTP
+    upload, on-disk storage, output SHA and DB audit use native components.
+    This is in-process nonproduction validation, not Compose/PG E2E.
+    """
+    import hashlib
+    import importlib.util
+    import shutil
+    import sys
+
+    _, sessions, media_store = g72_true_native_flow_context
+    sidecar_path = Path(__file__).resolve().parents[1] / "video_use" / "app" / "main.py"
+    module_name = f"_aether_g72_native_video_use_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, sidecar_path)
+    assert spec is not None and spec.loader is not None
+    sidecar_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = sidecar_module
+    spec.loader.exec_module(sidecar_module)
+
+    # The API-unit runner does not guarantee native encoders. Missing tooling
+    # is explicitly modeled; the Docker media job validates genuine FFmpeg.
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        def fixture_probe(path):
+            return {
+                "durationSeconds": 1.0, "sizeBytes": path.stat().st_size,
+                "video": {"codec": "h264", "width": 320, "height": 568},
+                "audio": {"codec": "aac"},
+            }
+        monkeypatch.setattr(sidecar_module, "probe", fixture_probe)
+
+    media_root = tmp_path / "g72-native-video-use-media"
+    sidecar_app = sidecar_module.create_app(media_root=media_root)
+    with TestClient(sidecar_app) as sidecar_client:
+        def native_video_use_upload(project_id, filename, content_type, stream):
+            response = sidecar_client.post(
+                "/media", data={"projectId": project_id},
+                files={"file": (filename, stream, content_type)},
+            )
+            assert response.status_code == 201, response.text
+            media_store.uploads += 1
+            return response.json()
+
+        monkeypatch.setattr(media_store, "upload_media", native_video_use_upload)
+        test_g72_native_worker_fastapi_sqlite_fake_flow(
+            g72_true_native_flow_context, monkeypatch,
+        )
+        with sessions() as db:
+            task = db.execute(select(DBGenerationTask)).scalar_one()
+            assert task.status == "RIGHTS_BLOCKED"
+            assert task.media_id and task.asset_version_id
+            project_id, media_id = task.project_id, task.media_id
+            asset = db.get(DBAssetVersion, task.asset_version_id)
+            assert asset is not None
+            sha256, size_bytes = asset.sha256, asset.size_bytes
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+            )).scalar_one() == 1
+        saved_file = media_root / "projects" / project_id / "media" / f"{media_id}.mp4"
+        assert saved_file.is_file()
+        payload = saved_file.read_bytes()
+        assert payload and sha256 == hashlib.sha256(payload).hexdigest()
+        assert size_bytes == len(payload)
+        first_read = sidecar_client.get(f"/media/{project_id}/{media_id}")
+        assert first_read.status_code == 200
+        assert first_read.content == payload
+
+    # Fresh service instance opens the existing persisted media directory.
+    with TestClient(sidecar_module.create_app(media_root=media_root)) as restarted:
+        response = restarted.get(f"/media/{project_id}/{media_id}")
+        assert response.status_code == 200
+        assert response.content == payload
+        assert restarted.get(
+            f"/media/{project_id}/{uuid.uuid4()}"
+        ).status_code == 404
+
+
+def test_g72_foreign_tenant_owner_cannot_preflight_create_or_read(generation_context):
+    """Real auth/SQLite: even another tenant's owner cannot operate G72."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-foreign-tenant-isolated")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    password = secrets.token_urlsafe(24)
+    with sessions() as db:
+        tenant = DBTenant(
+            id="g72-foreign-tenant", name="G72 Foreign", slug="g72-foreign",
+            project_quota=50, storage_quota_bytes=1024**3,
+            used_storage_bytes=0, concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600, render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"), created_at=now, updated_at=now,
+        )
+        user = DBUser(
+            id="g72-foreign-owner", tenant_id=tenant.id,
+            email="g72-foreign-owner@example.com", display_name="Other Tenant Owner",
+            password_hash=hash_password(password), role="owner", is_active=True,
+            created_at=now, updated_at=now,
+        )
+        db.add_all([tenant, user])
+        db.commit()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "g72-foreign-owner@example.com", "password": password,
+    }).status_code == 200
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for endpoint in (base + "/validate", base):
+        response = client.post(endpoint, json=payload)
+        assert response.status_code == 404, response.text
+    assert client.get(f"/projects/{project['id']}").status_code == 404
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 0
+    assert media.uploads == 0
+
+
+def test_g72_wrong_worker_cannot_ingest_claimed_artifact(generation_context):
+    """Real FAKE API/SQLite lease guard: rejected intake has zero media side effect."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-wrong-lease-owner")
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(base, json=payload)
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    assert claim(client, worker_id="worker-a").status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="fake-job-a").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-job-a", providerArtifactId="fake-artifact-a",
+    ).status_code == 200
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-b"},
+        data={"providerArtifactId": "fake-artifact-a"},
+        files={"file": ("fake.mp4", b"synthetic-fake-media", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "LEASE_LOST"
+    assert media.uploads == 0
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "INGESTING" and task.asset_version_id is None
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+
+
+# G76 safety regression: probe-only circuit closure (FAKE-only, native HTTP+SQLite).
+# Keep the G76 gap OPEN until durable epoch/issuer and concurrency gates pass.
+def _g76_finish_claimed_fake_task(client, task_id, worker_id, suffix):
+    upstream = f"g76-upstream-{suffix}"
+    artifact = f"g76-artifact-{suffix}"
+    assert transition(
+        client, task_id, "RUNNING", worker_id=worker_id, upstreamJobId=upstream
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", worker_id=worker_id,
+        upstreamJobId=upstream, providerArtifactId=artifact,
+    ).status_code == 200
+    result = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+        data={"providerArtifactId": artifact},
+        files={"file": (f"{suffix}.mp4", b"g76-offline-test-video", "video/mp4")},
+    )
+    assert result.status_code == 201, result.text
+
+
+def test_g76_late_success_does_not_close_open_circuit(generation_context):
+    """An older completion cannot heal OPEN or erase its cooldown."""
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "G76 stale success during open")
+    task = create_task(client, project, key="g76-late-success-open")
+    assert claim(client, "worker-g76-old").json()["taskId"] == task["taskId"]
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
+            state="OPEN", failure_timestamps_json=[now.isoformat()], opened_at=now,
+            cooldown_until=now + datetime.timedelta(minutes=2), updated_at=now,
+        ))
+        db.commit()
+
+    _g76_finish_claimed_fake_task(client, task["taskId"], "worker-g76-old", "late-open")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        closed_events = db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one()
+        assert circuit.state == "OPEN"
+        assert circuit.cooldown_until is not None
+        assert circuit.half_open_task_id is None
+        assert closed_events == 0
+
+
+def test_g76_half_open_only_current_probe_can_close(generation_context):
+    """Wrong task cannot close HALF_OPEN; current probe closes exactly once."""
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "G76 wrong probe")
+    old = create_task(client, project, key="g76-old-not-probe")
+    probe = create_task(client, project, key="g76-current-probe")
+    assert claim(client, "worker-g76-old").json()["taskId"] == old["taskId"]
+    assert claim(client, "worker-g76-probe").json()["taskId"] == probe["taskId"]
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
+            state="HALF_OPEN", half_open_task_id=probe["taskId"],
+            failure_timestamps_json=[now.isoformat()],
+            opened_at=now - datetime.timedelta(minutes=2), updated_at=now,
+        ))
+        db.commit()
+
+    _g76_finish_claimed_fake_task(client, old["taskId"], "worker-g76-old", "wrong-probe")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.half_open_task_id == probe["taskId"]
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 0
+
+    _g76_finish_claimed_fake_task(client, probe["taskId"], "worker-g76-probe", "right-probe")
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert circuit.state == "CLOSED"
+        assert circuit.half_open_task_id is None
+        assert db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED"
+            )
+        ).scalar_one() == 1
+
+@pytest.mark.parametrize(
+    ("requested", "sandbox_opt_in", "runtime_stage", "expected"),
+    [
+        ("deterministic-fake", "true", "nonproduction", "deterministic-fake"),
+        ("deterministic-fake", "false", "nonproduction", "disabled"),
+        ("deterministic-fake", "true", "production", "disabled"),
+        ("deterministic-fake", "true", "", "disabled"),
+        ("disabled", "true", "nonproduction", "disabled"),
+        ("moneyprinter", "false", "nonproduction", "moneyprinter"),
+    ],
+)
+def test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates(
+    monkeypatch, requested, sandbox_opt_in, runtime_stage, expected
+):
+    """A real API process must fail closed unless FAKE-only sandbox is explicit."""
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", requested)
+    monkeypatch.setenv("AETHER_FAKE_ONLY_NONPROD", sandbox_opt_in)
+    if runtime_stage:
+        monkeypatch.setenv("AETHER_RUNTIME_STAGE", runtime_stage)
+    else:
+        monkeypatch.delenv("AETHER_RUNTIME_STAGE", raising=False)
+    application = create_app()
+    assert application.state.generation_provider_mode == expected
+
+@pytest.mark.parametrize("ineligible_count", [101, 205])
+def test_g73_keyset_claim_scans_past_ineligible_queue_pages(
+    generation_context, ineligible_count
+):
+    """Native API/SQLite FAKE-only: older, wrong-mode queue rows must not starve G72.
+
+    All extra queued records are synthetic local DB fixtures.  They never
+    contact an external Provider or consume a trusted billing source.
+    """
+    client, sessions, _app, media = generation_context
+    project = create_project(client, "G73 keyset scan synthetic queue")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, asset_id, key=f"g73-keyset-{ineligible_count}"
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    eligible_id = created.json()["taskId"]
+
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert project_row is not None and eligible is not None
+        first_created = eligible.created_at - datetime.timedelta(days=1)
+        old_rows = []
+        for idx in range(ineligible_count):
+            created_at = first_created + datetime.timedelta(microseconds=idx)
+            old_rows.append(DBGenerationTask(
+                id=str(uuid.uuid4()), tenant_id=project_row.tenant_id,
+                project_id=project_row.id, requested_by=project_row.owner_id,
+                provider="moneyprinter", status="QUEUED", progress=0,
+                message="synthetic older wrong-mode record",
+                request_json={"syntheticFixtureOnly": True},
+                request_hash=f"g73-fixture-{idx}",
+                capability_snapshot_json={"mode": "moneyprinter"},
+                capability_snapshot_hash="0" * 64,
+                idempotency_key=f"g73-fixture-{ineligible_count}-{idx}",
+                attempts=1, max_attempts=1,
+                created_at=created_at, updated_at=created_at,
+            ))
+        db.add_all(old_rows)
+        db.commit()
+
+    claimed = claim(client, worker_id="g73-safe-fake-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible_id
+    assert claimed.json()["providerMode"] == "talking-head-fake"
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_id)
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-safe-fake-worker"
+        untouched = db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.provider == "moneyprinter",
+            DBGenerationTask.status == "QUEUED",
+            DBGenerationTask.project_id == project["id"],
+        )).scalar_one()
+        assert untouched == ineligible_count
+        claimed_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == eligible_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one()
+        assert claimed_events == 1
+    assert media.uploads == 0
+
+
+def test_g72_revocation_after_unknown_ack_preserves_unknown_and_reserved_usage(generation_context):
+    """FAKE-only characterization: revoke after ambiguous ACK must not fabricate recovery."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, asset_id, key="g72-revoke-after-unknown-ack")
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = client.post(path, json=payload)
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+
+    claimed = claim(client, worker_id="worker-a")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "UNKNOWN", worker_id="worker-a",
+        upstreamJobId="synthetic-upstream-ack",
+        errorCode="ACK_UNCERTAIN",
+        errorMessage="synthetic ambiguous acknowledgement",
+    ).status_code == 200
+
+    with sessions() as db:
+        old = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=old.tenant_id, project_id=old.project_id,
+            asset_version_id=asset_id, status="REVOKED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="test-revoked-after-unknown-ack", captured_by=old.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+
+    with sessions() as db:
+        before_task = db.get(DBGenerationTask, task_id)
+        assert before_task is not None
+        before_state = (
+            before_task.status, before_task.error_code, before_task.asset_version_id,
+            before_task.media_id, before_task.attempts, before_task.upstream_job_id,
+        )
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        before_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        before_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        before_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        before_storage = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "synthetic-late-artifact"},
+        files={"file": ("synthetic.mp4", b"synthetic-late-artifact-bytes", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    assert media.uploads == 0
+
+    with sessions() as db:
+        after_task = db.get(DBGenerationTask, task_id)
+        assert after_task is not None
+        after_state = (
+            after_task.status, after_task.error_code, after_task.asset_version_id,
+            after_task.media_id, after_task.attempts, after_task.upstream_job_id,
+        )
+        after_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        after_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        after_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        after_reserved = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        after_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        after_storage = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    assert before_state == after_state
+    assert after_state[0] == "UNKNOWN"
+    assert after_state[5] == "synthetic-upstream-ack"
+    assert before_events == after_events
+    assert before_assets == after_assets == 1  # source image remains; no generated asset was created
+    assert before_usage == after_usage
+    assert before_reserved == after_reserved == 1
+    assert before_settled == after_settled == 0
+    assert before_storage == after_storage
+
+
+def test_g72_admin_without_explicit_delegation_cannot_create_owner_talking_head_task(generation_context):
+    """No implicit admin-as-owner behavior: delegated operation needs an explicit grant."""
+    client, sessions, _app, _media = generation_context
+    project = create_project(client, "G72 admin delegation boundary")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-admin-no-delegation"
+    )
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # Seed an admin identity directly: the Owner-only user-management route
+    # must not be used to grant itself broader permissions.
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        db.add(DBUser(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            email="g72-admin-no-delegation@example.com",
+            display_name="G72 Admin Without Delegation",
+            password_hash=hash_password(password),
+            role="admin",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        ))
+        db.commit()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        before_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        before_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+
+    client.post("/auth/logout")
+    login = client.post(
+        "/auth/login",
+        json={
+            "email": "g72-admin-no-delegation@example.com",
+            "password": password,
+        },
+    )
+    assert login.status_code == 200, login.text
+
+    # An admin identity is not implicitly authorized to submit work as Owner.
+    response = client.post(path, json=payload)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"]["code"] == "PERMISSION_DENIED"
+
+    with sessions() as db:
+        after_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        after_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        after_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+        reused_key = db.execute(
+            select(DBGenerationTask.id).where(
+                DBGenerationTask.idempotency_key == "g72-admin-no-delegation"
+            )
+        ).scalar_one_or_none()
+
+    assert after_tasks == before_tasks
+    assert after_events == before_events
+    assert after_usage == before_usage
+    assert reused_key is None
+
+def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_context):
+    """Foreign-tenant admin is denied without project disclosure or task side effects."""
+    client, sessions, _app, media = generation_context
+    project = create_project(client, "G72 foreign-tenant admin isolation")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-foreign-admin-isolated"
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    password = secrets.token_urlsafe(24)
+    with sessions() as db:
+        tenant = DBTenant(
+            id="g72-foreign-admin-tenant", name="G72 Foreign Admin",
+            slug="g72-foreign-admin", project_quota=50,
+            storage_quota_bytes=1024**3, used_storage_bytes=0,
+            concurrent_render_quota=2, monthly_render_seconds_quota=3600,
+            render_seconds_used=0, quota_period=now.strftime("%Y-%m"),
+            created_at=now, updated_at=now,
+        )
+        user = DBUser(
+            id="g72-foreign-admin", tenant_id=tenant.id,
+            email="g72-foreign-admin@example.com",
+            display_name="Foreign Tenant Admin",
+            password_hash=hash_password(password), role="admin",
+            is_active=True, created_at=now, updated_at=now,
+        )
+        db.add_all([tenant, user])
+        db.commit()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        before_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+        before_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+        before_assets = db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one()
+
+    assert client.post("/auth/logout").status_code == 204
+    login = client.post(
+        "/auth/login",
+        json={"email": "g72-foreign-admin@example.com", "password": password},
+    )
+    assert login.status_code == 200, login.text
+
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for endpoint in (base + "/validate", base):
+        response = client.post(endpoint, json=payload)
+        assert response.status_code == 403, response.text
+        assert response.json()["detail"]["code"] == "PERMISSION_DENIED"
+    assert client.get(f"/projects/{project['id']}").status_code == 404
+
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == before_tasks
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == before_events
+        assert db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one() == before_usage
+        assert db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one() == before_assets
+        assert db.execute(
+            select(DBGenerationTask.id).where(
+                DBGenerationTask.idempotency_key == "g72-foreign-admin-isolated"
+            )
+        ).scalar_one_or_none() is None
+    assert media.uploads == 0
+

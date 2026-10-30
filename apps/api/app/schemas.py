@@ -114,6 +114,34 @@ class GenerationTaskRequest(BaseModel):
         return value
 
 
+class TalkingHeadFakeGenerationRequest(BaseModel):
+    """Typed, explicit, nonproduction-only synthetic talking-head generation.
+
+    Never accepts arbitrary operator identity, provider, URL or secret fields.
+    No real lip-sync, audio model or charged Provider is involved.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=500)
+    durationSeconds: int = Field(default=1, ge=1, le=10)
+    aspectRatio: Literal["9:16"] = "9:16"
+    resolution: Literal["720p", "1080p"] = "720p"
+    voiceId: Literal["synthetic-seed"] = "synthetic-seed"
+    imageAssetVersionId: str = Field(..., min_length=1, max_length=128)
+    idempotencyKey: UUID
+    expectedProjectRevision: int = Field(..., ge=0)
+    capabilitySnapshotHash: str = Field(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    confirmSyntheticTestOnly: Literal[True]
+
+    @field_validator("text", "imageAssetVersionId")
+    @classmethod
+    def reject_blank_fake_input(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("synthetic task fields must not be blank")
+        return stripped
+
+
 class TalkingHeadSubtitleCueRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

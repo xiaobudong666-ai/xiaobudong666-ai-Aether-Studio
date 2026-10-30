@@ -17,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Lint, build, and unit tests
+  core-tests:
+    name: Core lint, build, API and unit tests
     runs-on: ubuntu-latest
 
     steps:
@@ -47,9 +47,6 @@ jobs:
       - name: Run web and package tests
         run: pnpm test
 
-      - name: Audit Node production dependencies
-        run: pnpm audit --prod
-
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -58,16 +55,9 @@ jobs:
       - name: Install Python test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pip-audit==2.10.0
           pip install -r apps/api/requirements.txt
           pip install -r apps/worker/requirements.txt
           pip install -r apps/video_use/requirements.txt
-
-      - name: Audit Python dependencies
-        run: |
-          pip-audit -r apps/api/requirements.txt
-          pip-audit -r apps/worker/requirements.txt
-          pip-audit -r apps/video_use/requirements.txt
 
       - name: Run API tests
         env:
@@ -79,9 +69,98 @@ jobs:
           bash -n infra/docker/provider-canary.sh
           python infra/docker/provider-canary-smoke.py self-test
 
+  node-production-dependency-audit:
+    name: Node production dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install pnpm 10.30.3
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+      - name: Install locked Node dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Audit Node production dependencies
+        run: pnpm audit --prod
+
+  python-dependency-audit:
+    name: Python dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python audit and project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit==2.10.0
+          pip install -r apps/api/requirements.txt
+          pip install -r apps/worker/requirements.txt
+          pip install -r apps/video_use/requirements.txt
+      - name: Audit Python dependencies
+        run: |
+          pip-audit -r apps/api/requirements.txt
+          pip-audit -r apps/worker/requirements.txt
+          pip-audit -r apps/video_use/requirements.txt
+
+  build-and-test:
+    # Preserve the existing required check name. This gate fails if core tests or
+    # either dependency audit fails, while independent test jobs can still run.
+    name: Lint, build, and unit tests
+    needs:
+      - core-tests
+      - node-production-dependency-audit
+      - python-dependency-audit
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce required test and security results
+        env:
+          CORE_TEST_RESULT: ${{ needs.core-tests.result }}
+          NODE_AUDIT_RESULT: ${{ needs.node-production-dependency-audit.result }}
+          PYTHON_AUDIT_RESULT: ${{ needs.python-dependency-audit.result }}
+        run: |
+          printf 'core tests: %s\nNode audit: %s\nPython audit: %s\n' \
+            "$CORE_TEST_RESULT" "$NODE_AUDIT_RESULT" "$PYTHON_AUDIT_RESULT"
+          test "$CORE_TEST_RESULT" = "success"
+          test "$NODE_AUDIT_RESULT" = "success"
+          test "$PYTHON_AUDIT_RESULT" = "success"
+  g72-fake-runtime-native:
+    # Independent source-level runtime contract proof, NOT a waiver of Node audit
+    # and NOT an independent release gate. Full G72 Compose E2E stays OPEN.
+    name: FAKE-only API safety G72/G73 (full security audit still required)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API test dependencies
+        run: pip install -r apps/api/requirements.txt
+
+      - name: Run G72 mode gates and G73 keyset claim regressions (FAKE-only)
+        env:
+          PYTHONPATH: apps/api
+        run: |
+          python -m pytest apps/api/test_generation_tasks.py -v \
+            -k "test_g72_compose_fake_mode_requires_two_explicit_nonproduction_gates or test_g73_keyset_claim_scans_past_ineligible_queue_pages"
+
+
   playwright:
     name: Playwright workbench flow
-    needs: build-and-test
+    needs: core-tests
     runs-on: ubuntu-latest
 
     steps:
@@ -134,7 +213,7 @@ jobs:
 
   docker-integration:
     name: Docker Compose integration
-    needs: build-and-test
+    needs: core-tests
     runs-on: ubuntu-latest
     env:
       # Isolate disposable CI resources from local/production Compose projects.
@@ -311,13 +390,14 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_moneyprinter.py worker:/tmp/test_moneyprinter.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_generation_tasks.py worker:/tmp/test_generation_tasks.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_deterministic_fake_adapter.py worker:/tmp/test_deterministic_fake_adapter.py
+          docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_deterministic_fake_talking_head_adapter_g72.py worker:/tmp/test_deterministic_fake_talking_head_adapter_g72.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_talking_head_provider_adapter.py worker:/tmp/test_talking_head_provider_adapter.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_talking_head_runtime.py worker:/tmp/test_talking_head_runtime.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_talking_head_arm_disarm.py worker:/tmp/test_talking_head_arm_disarm.py
           docker compose -f infra/docker/docker-compose.yml cp apps/worker/test_talking_head_egress_proxy.py worker:/tmp/test_talking_head_egress_proxy.py
           docker compose -f infra/docker/docker-compose.yml exec -T \
             -e PYTHONPATH=/app worker \
-            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py /tmp/test_deterministic_fake_adapter.py /tmp/test_talking_head_provider_adapter.py /tmp/test_talking_head_runtime.py /tmp/test_talking_head_arm_disarm.py /tmp/test_talking_head_egress_proxy.py -v
+            python -m pytest /tmp/test_worker.py /tmp/test_moneyprinter.py /tmp/test_generation_tasks.py /tmp/test_deterministic_fake_adapter.py /tmp/test_deterministic_fake_talking_head_adapter_g72.py /tmp/test_talking_head_provider_adapter.py /tmp/test_talking_head_runtime.py /tmp/test_talking_head_arm_disarm.py /tmp/test_talking_head_egress_proxy.py -v
 
       - name: Run video-use sidecar tests in FFmpeg container
         run: |
@@ -403,3 +483,105 @@ jobs:
         if: always()
         # --volumes is safe only because COMPOSE_PROJECT_NAME is unique to this CI run.
         run: docker compose -f infra/docker/docker-compose.yml down --volumes
+
+  g72-fake-compose-network:
+    # Independent nonproduction evidence only. The primary Node/Python security
+    # audit remains the mandatory release gate; do not treat this as a waiver.
+    name: G72 FAKE-ONLY independent Compose network smoke (not a release gate)
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route') || (github.event_name == 'pull_request' && github.head_ref == 'feat/fusion-m0-g72-fake-only-route')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      AETHER_COOKIE_SECURE: "false"
+      AETHER_API_PORT: "18100"
+      AETHER_WORKER_PORT: "18101"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare unique disposable stack and ephemeral credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "COMPOSE_PROJECT_NAME=aether-g72-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          password="ci-$(openssl rand -hex 24)"
+          worker_token="ci-$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
+          echo "::add-mask::$worker_token"
+          echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+
+      - name: Confirm merged isolated FAKE-only network contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            config --format json > "$RUNNER_TEMP/g72-merged.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-merged.json").read_text())["services"]
+          api, worker = services["api"], services["worker"]
+          assert api["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert api["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
+          assert api["environment"]["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
+          assert worker["environment"]["AETHER_TALKING_HEAD_MODE"] == "disabled"
+          assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          assert set(api["networks"]) == {"aether-net"}
+          assert "aether-net" in worker["networks"]
+          assert set(services["video-use"]["networks"]) == {"aether-net"}
+          PY
+
+      - name: Start disposable API, Worker and video-use containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            up -d --build --wait --wait-timeout 300 api worker video-use
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
+
+      - name: Prove real Worker network, FFmpeg, sidecar persistence and audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py prepare
+
+      - name: Prove sidecar and Worker restart preserve exact asset and receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            restart video-use worker
+          sleep 12
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g72-compose-network-smoke.py verify
+
+      - name: Capture failure diagnostics without credentials
+        if: failure()
+        shell: bash
+        run: |
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            ps || true
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            logs --tail=75 api worker video-use || true
+
+      - name: Destroy only this CI run's disposable FAKE-only volumes
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+            docker compose -f infra/docker/docker-compose.yml \
+              -f infra/docker/docker-compose.g72-fake-only.override.yml \
+              down --volumes --remove-orphans || true
+          fi

@@ -1,6 +1,7 @@
 import json
 import io
 import datetime
+import hashlib
 import logging
 import os
 import threading
@@ -12,6 +13,7 @@ from .ai_provider import AIProviderInterface
 from .ffmpeg_adapter import FFmpegAdapter
 from .generation_queue import GenerationQueueClient, GenerationQueueError
 from .deterministic_fake_adapter import DeterministicFakeAdapter
+from .deterministic_fake_talking_head_adapter import DeterministicFakeTalkingHeadAdapter
 from .moneyprinter_adapter import (
     ADAPTER_VERSION,
     UPSTREAM_PIN,
@@ -91,6 +93,7 @@ class WorkerComponents:
     queue: TaskQueueClient | None = None
     generation_queue: GenerationQueueClient | None = None
     talking_head: object | None = None
+    talking_head_fake: object | None = None
 
 
 class DisabledMoneyPrinterAdapter:
@@ -169,6 +172,11 @@ def initialize_worker() -> WorkerComponents:
         queue=queue,
         generation_queue=generation_queue,
         talking_head=talking_head_adapter,
+        talking_head_fake=(
+            DeterministicFakeTalkingHeadAdapter(moneyprinter_adapter)
+            if isinstance(moneyprinter_adapter, DeterministicFakeAdapter)
+            else None
+        ),
     )
 
 
@@ -265,6 +273,42 @@ def process_generation_task(
     provider_mode = task.get("providerMode")
     if provider_mode == "talking-head":
         return _process_talking_head_generation_task(components, task, poll_interval)
+    if provider_mode == "talking-head-fake":
+        # This route never touches the real talking-head adapter or Provider.
+        # API must issue a typed FAKE-only claim after its own tenant/asset checks.
+        fake_adapter = components.talking_head_fake
+        request = task.get("request") or {}
+        if (
+            operator_generation_mode() != "deterministic-fake"
+            or not isinstance(fake_adapter, DeterministicFakeTalkingHeadAdapter)
+            or request.get("fakeTaskType") != "talking-head"
+            or not request.get("imageAssetId")
+            or not task.get("projectId")
+            or not task.get("taskId")
+        ):
+            return queue.transition(
+                task_id, status="FAILED", progress=0,
+                message="仅允许可信非生产口播FAKE任务进入本地路由",
+                error_code="FAKE_TALKING_HEAD_SCOPE_INVALID",
+                error_message="FAKE-only talking-head route rejected",
+                retryable=False,
+            )
+        # The local generator derives its job ID from the voice seed, not the
+        # asset or task scope. Salt this *synthetic* seed with trusted claim IDs
+        # so two tenants/tasks cannot collide on identical content.
+        scope = "|".join((
+            str(task["taskId"]), str(task["projectId"]),
+            str(request["imageAssetId"]), str(task.get("attempt", 1)),
+        ))
+        scoped_request = dict(request)
+        scoped_request["voiceId"] = (
+            f"{request.get('voiceId', 'synthetic-seed')}:"
+            f"{hashlib.sha256(scope.encode('utf-8')).hexdigest()}"
+        )
+        scoped_task = {**task, "request": scoped_request}
+        return _process_talking_head_generation_task(
+            components, scoped_task, poll_interval, adapter_override=fake_adapter,
+        )
     if provider_mode == "moneyprinter":
         proof = task.get("workerProof") or {}
         provider_policy = task.get("providerPolicy") or {}
@@ -533,6 +577,8 @@ def _process_talking_head_generation_task(
     components: WorkerComponents,
     task: dict,
     poll_interval: float = 0.5,
+    *,
+    adapter_override: TalkingHeadProviderAdapter | None = None,
 ) -> dict:
     """Governed talking-head path: 1 submission / 1 attempt / 0 retry / 0 fallback.
 
@@ -545,7 +591,7 @@ def _process_talking_head_generation_task(
         raise GenerationQueueError("Generation queue is not configured")
     task_id = str(task["taskId"])
     upstream_job_id = task.get("upstreamJobId")
-    adapter = components.talking_head
+    adapter = adapter_override if adapter_override is not None else components.talking_head
     if not isinstance(adapter, TalkingHeadProviderAdapter) or not getattr(adapter, "enabled", False):
         return queue.transition(
             task_id, status="FAILED", progress=0,

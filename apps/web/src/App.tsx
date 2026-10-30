@@ -22,6 +22,7 @@ import {
   QuickUploadResult,
 } from "./components/QuickCreatePanel";
 import { Timeline } from "./components/Timeline";
+import { FakeTalkingHeadGenerationRequest, GenerationApiClient } from "./generation";
 import {
   apiErrorMessage,
   formatBytes,
@@ -103,7 +104,10 @@ export default function App() {
   const [isSavingProject, setIsSavingProject] = useState(false);
   const [scriptText, setScriptText] = useState("");
   const [selectedAvatar, setSelectedAvatar] = useState<string | null>(null);
-  const [selectedVoice, setSelectedVoice] = useState<string | null>(null);
+  const [selectedAvatarAssetId, setSelectedAvatarAssetId] = useState("");
+  const [selectedVoice, setSelectedVoice] = useState<string | null>("synthetic");
+  const [isCreatingFakeTalkingHead, setIsCreatingFakeTalkingHead] = useState(false);
+  const [fakeTalkingHeadTaskId, setFakeTalkingHeadTaskId] = useState<string | null>(null);
   const savingProjectRef = useRef(false);
   const selectedProjectIdRef = useRef<string | null>(null);
   const projectDetailRequestIdRef = useRef(0);
@@ -120,6 +124,8 @@ export default function App() {
     setProjects([]);
     setCurrentProject(null);
     setAssetVersions([]);
+    setSelectedAvatarAssetId("");
+    setFakeTalkingHeadTaskId(null);
     selectedProjectIdRef.current = null;
     projectDetailRequestIdRef.current += 1;
     setLoginError("登录已过期，请重新登录。");
@@ -216,6 +222,8 @@ export default function App() {
     setProjects([]);
     setCurrentProject(null);
     setAssetVersions([]);
+    setSelectedAvatarAssetId("");
+    setFakeTalkingHeadTaskId(null);
     selectedProjectIdRef.current = null;
     projectDetailRequestIdRef.current += 1;
   };
@@ -228,6 +236,8 @@ export default function App() {
       && selectedProjectIdRef.current === id
     );
     setAssetVersions([]);
+    setSelectedAvatarAssetId("");
+    setFakeTalkingHeadTaskId(null);
     setSelectedClip(null);
     try {
       const res = await fetch(`${API_BASE}/projects/${id}`);
@@ -284,6 +294,8 @@ export default function App() {
         projectDetailRequestIdRef.current += 1;
         setCurrentProject(newProj);
         setAssetVersions([]);
+        setSelectedAvatarAssetId("");
+        setFakeTalkingHeadTaskId(null);
         setNewProjectName("");
         setSelectedClip(null);
         setActionMessage(`项目“${newProj.name}”已创建。`);
@@ -392,8 +404,92 @@ export default function App() {
         ...previous.filter((version) => version.id !== parsedAssetVersion.data.id),
         parsedAssetVersion.data,
       ]);
+      if (parsedAssetVersion.data.mediaType === "image") {
+        setSelectedAvatarAssetId(parsedAssetVersion.data.id);
+        setSelectedAvatar("upload");
+      }
     }
     setActionMessage(`素材“${file.name}”已上传并完成媒体信息检测。`);
+  };
+
+  const handleCreateFakeTalkingHead = async () => {
+    if (!canEdit) {
+      setActionMessage("当前账号为只读权限，不能创建口播任务。");
+      return;
+    }
+    if (!currentProject) {
+      setActionMessage("请先创建或选择一个项目。");
+      return;
+    }
+    if (selectedAvatar !== "upload") {
+      setActionMessage("请先选择“从项目素材选择人物照片”。");
+      return;
+    }
+    if (!scriptText.trim()) {
+      setActionMessage("请先填写口播文案。");
+      return;
+    }
+    const imageAsset = assetVersions.find((asset) =>
+      asset.id === selectedAvatarAssetId
+      && asset.projectId === currentProject.id
+      && asset.mediaType === "image"
+    );
+    if (!imageAsset) {
+      setActionMessage("请先在当前项目上传并选择一张图片素材。服务端还会重新核验 REMIX 使用授权。");
+      return;
+    }
+
+    setIsCreatingFakeTalkingHead(true);
+    setFakeTalkingHeadTaskId(null);
+    try {
+      const api = new GenerationApiClient(API_BASE);
+      const idempotencyKey = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `00000000-0000-4000-8000-${Math.random().toString(16).slice(2).padEnd(12, "0").slice(0, 12)}`;
+      let task: Awaited<ReturnType<GenerationApiClient["createFakeTalkingHead"]>> | null = null;
+
+      // Capability snapshots are time-bucketed. If a minute boundary makes the
+      // preflight/create snapshot stale, refresh and retry once with the same
+      // idempotency key. No retry is attempted for uncertain network failures.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const capabilities = await api.talkingHeadCapabilities();
+          if (capabilities.mode !== "deterministic-fake" || !capabilities.enabled) {
+            throw new Error("TALKING_HEAD_FAKE_DISABLED: 当前环境未显式启用隔离 FAKE-only 模式，未创建任务。");
+          }
+          const body: FakeTalkingHeadGenerationRequest = {
+            text: scriptText.trim(),
+            durationSeconds: 1,
+            aspectRatio: "9:16",
+            resolution: "720p",
+            voiceId: "synthetic-seed",
+            imageAssetVersionId: imageAsset.id,
+            idempotencyKey,
+            expectedProjectRevision: currentProject.revision,
+            capabilitySnapshotHash: capabilities.snapshotHash,
+            confirmSyntheticTestOnly: true,
+          };
+          const preflight = await api.validateFakeTalkingHead(currentProject.id, body);
+          body.capabilitySnapshotHash = preflight.capabilitySnapshotHash;
+          task = await api.createFakeTalkingHead(currentProject.id, body);
+          break;
+        } catch (error) {
+          const staleSnapshot = error instanceof Error
+            && /^(CAPABILITY_SNAPSHOT_UNKNOWN|CAPABILITY_SNAPSHOT_EXPIRED):/.test(error.message);
+          if (attempt === 0 && staleSnapshot) continue;
+          throw error;
+        }
+      }
+      if (!task) throw new Error("口播 FAKE-only 任务未能完成预检并入队。");
+      setFakeTalkingHeadTaskId(task.taskId);
+      setActionMessage(
+        `FAKE-only 测试任务已入队：${task.taskId}。当前只生成合成模拟样片，不是真实数字人口播，不可发布；可在“高级编辑”中的生成任务查看服务端状态。`,
+      );
+    } catch (error) {
+      setActionMessage(safeErrorMessage(error, "口播 FAKE-only 任务提交失败。"));
+    } finally {
+      setIsCreatingFakeTalkingHead(false);
+    }
   };
 
   // 5. Place material on timeline as a clip
@@ -704,6 +800,9 @@ export default function App() {
   const previewMaterial = currentProject?.materials.find(
     (material) => material.id === selectedClip?.materialId,
   ) || currentProject?.materials.find((material) => material.type === "video") || null;
+  const imageAssetVersions = assetVersions.filter(
+    (asset) => asset.projectId === currentProject?.id && asset.mediaType === "image",
+  );
 
   if (authLoading) {
     return <div className="auth-screen"><div className="auth-card">正在加载闪电智能新媒体…</div></div>;
@@ -832,34 +931,59 @@ export default function App() {
                   className={selectedAvatar === "upload" ? "choice-card selected" : "choice-card"}
                   onClick={() => setSelectedAvatar("upload")}
                 >
-                  上传人物照片
+                  从项目素材选择人物照片
                 </button>
                 <button type="button" className="choice-card" disabled>
-                  我的数字人<span className="coming-soon">即将开放</span>
+                  我的数字人<span className="coming-soon">待授权接入</span>
                 </button>
               </div>
+              {selectedAvatar === "upload" && (
+                <label className="avatar-asset-picker">
+                  <span>选择本项目已入库图片</span>
+                  <select
+                    aria-label="选择人物图片素材"
+                    value={selectedAvatarAssetId}
+                    onChange={(event) => setSelectedAvatarAssetId(event.target.value)}
+                    disabled={!canEdit || imageAssetVersions.length === 0}
+                  >
+                    <option value="">
+                      {imageAssetVersions.length ? "请选择图片素材" : "请先在右侧素材库上传图片"}
+                    </option>
+                    {imageAssetVersions.map((asset) => {
+                      const material = currentProject?.materials.find((item) => item.id === asset.mediaId);
+                      return (
+                        <option key={asset.id} value={asset.id}>
+                          {material?.name || asset.mediaId} · v{asset.versionNo} · {asset.id.slice(0, 8)}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </label>
+              )}
             </div>
             <div className="choice-block">
               <h3>声音</h3>
               <div className="choice-cards">
                 <button
                   type="button"
-                  className={selectedVoice === "female" ? "choice-card selected" : "choice-card"}
-                  onClick={() => setSelectedVoice("female")}
+                  className={selectedVoice === "synthetic" ? "choice-card selected" : "choice-card"}
+                  onClick={() => setSelectedVoice("synthetic")}
                 >
-                  自然女声
-                </button>
-                <button
-                  type="button"
-                  className={selectedVoice === "male" ? "choice-card selected" : "choice-card"}
-                  onClick={() => setSelectedVoice("male")}
-                >
-                  自然男声
+                  合成测试音（FAKE-ONLY）
                 </button>
                 <button type="button" className="choice-card" disabled>
-                  我的声音<span className="coming-soon">即将开放</span>
+                  自然女声<span className="coming-soon">待授权接入</span>
+                </button>
+                <button type="button" className="choice-card" disabled>
+                  自然男声<span className="coming-soon">待授权接入</span>
+                </button>
+                <button type="button" className="choice-card" disabled>
+                  我的声音<span className="coming-soon">待授权接入</span>
                 </button>
               </div>
+              <p className="generate-hint">
+                当前仅使用合成测试音；不会调用真实口播、配音或数字人 Provider。
+              </p>
             </div>
           </section>
 
@@ -871,11 +995,24 @@ export default function App() {
             <button
               type="button"
               className="primary-cta"
-              onClick={() => setActionMessage("口播视频生成即将开放，当前可先使用高级编辑完成视频制作。")}
+              onClick={handleCreateFakeTalkingHead}
+              disabled={
+                !canEdit || !currentProject || !scriptText.trim()
+                || selectedAvatar !== "upload" || !selectedAvatarAssetId
+                || isCreatingFakeTalkingHead
+              }
             >
-              生成口播视频
+              {isCreatingFakeTalkingHead ? "正在预检并入队…" : "生成口播测试样片（FAKE-ONLY）"}
             </button>
-            <p className="generate-hint">9:16 · 高清竖屏 · 生成后先预览，不会自动发布</p>
+            <p className="generate-hint">
+              仅 1 秒、9:16、720p 合成测试样片；服务端重新核验图片 REMIX 授权。
+              输出标记为模拟素材，不可发布，不会自动采纳或写入时间线。
+            </p>
+            {fakeTalkingHeadTaskId && (
+              <p className="fake-only-task-id">
+                最近提交的任务：<code>{fakeTalkingHeadTaskId}</code>
+              </p>
+            )}
           </section>
 
           {actionMessage && (

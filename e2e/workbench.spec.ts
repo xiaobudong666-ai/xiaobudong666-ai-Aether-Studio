@@ -21,7 +21,7 @@ test("中文登录、项目创建和兼容文件导出均可操作", async ({ pa
 
   await signIn(page);
   await expect(page.getByText("视频预览", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "生成口播视频" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" })).toBeVisible();
   await page.getByText("高级编辑", { exact: false }).click();
   await expect(page.getByText("属性与任务", { exact: true })).toBeVisible();
   await expect(page.getByText(/时间线轨道（标准格式 v1\.1）/)).toBeVisible();

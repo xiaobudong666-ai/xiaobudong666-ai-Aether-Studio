@@ -37,7 +37,13 @@ ALLOWED_EXTENSIONS = {
     ".wav",
     ".m4a",
     ".aac",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
 }
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_FORMATS = {"image2", "image2pipe", "png_pipe", "jpeg_pipe", "webp_pipe"}
 MAX_UPLOAD_BYTES = int(os.environ.get("VIDEO_USE_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
 
 
@@ -692,6 +698,22 @@ def create_app(
                         raise HTTPException(status_code=413, detail="媒体文件过大")
                     output.write(chunk)
             metadata = probe(destination)
+            if suffix in IMAGE_EXTENSIONS:
+                video = metadata.get("video") or {}
+                formats = set(str(metadata.get("format") or "").split(","))
+                if (
+                    not video.get("width")
+                    or not video.get("height")
+                    or metadata.get("audio") is not None
+                    or not formats.intersection(IMAGE_FORMATS)
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="图片文件未通过图像格式与尺寸校验",
+                    )
+                media_type = "image"
+            else:
+                media_type = "video" if metadata.get("video") else "audio"
         except Exception:
             destination.unlink(missing_ok=True)
             raise
@@ -703,6 +725,7 @@ def create_app(
             "projectId": projectId,
             "fileName": Path(file.filename or destination.name).name,
             "contentType": file.content_type,
+            "mediaType": media_type,
             "metadata": metadata,
         }
 

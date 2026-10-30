@@ -25,7 +25,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -95,6 +95,7 @@ from .schemas import (
     CreateRightsSnapshotRequest,
     CreateUserRequest,
     GenerationTaskRequest,
+    TalkingHeadFakeGenerationRequest,
     GenerationProviderAttestationRequest,
     GenerationProviderKillSwitchRequest,
     GenerationProviderPolicyRequest,
@@ -366,7 +367,17 @@ def create_app(
         resolved_generation_provider_mode = os.environ.get(
             "AETHER_GENERATION_PROVIDER_MODE", "disabled"
         )
-        if resolved_generation_provider_mode not in {"disabled", "moneyprinter"}:
+        # FAKE-only routing is opt-in for disposable nonproduction Compose tests.
+        # A stray provider-mode environment variable must remain fail-closed.
+        if resolved_generation_provider_mode == "deterministic-fake":
+            if (
+                os.environ.get("AETHER_FAKE_ONLY_NONPROD", "").lower() == "true"
+                and os.environ.get("AETHER_RUNTIME_STAGE", "").lower() == "nonproduction"
+            ):
+                pass
+            else:
+                resolved_generation_provider_mode = "disabled"
+        elif resolved_generation_provider_mode not in {"disabled", "moneyprinter"}:
             resolved_generation_provider_mode = "disabled"
     else:
         resolved_generation_provider_mode = generation_provider_mode
@@ -738,6 +749,49 @@ def create_app(
                 )
         return snapshot
 
+    def validate_fake_talking_head_request(
+        db: Session,
+        project: DBProject,
+        req: TalkingHeadFakeGenerationRequest,
+        context: AuthContext,
+    ) -> tuple[dict, DBAssetVersion]:
+        # The real production/default mode is always disabled here.
+        if created_app.state.generation_provider_mode != "deterministic-fake":
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "TALKING_HEAD_FAKE_DISABLED", "message": "仅允许隔离测试口播FAKE模式"},
+            )
+        if project.revision != req.expectedProjectRevision:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROJECT_REVISION_CONFLICT", "message": "项目版本已变化，请重新预检"},
+            )
+        snapshot = current_generation_capabilities(db, context.tenant_id)
+        if snapshot.get("mode") != "deterministic-fake" or not snapshot.get("enabled"):
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "TALKING_HEAD_FAKE_UNAVAILABLE", "message": "隔离测试环境生成服务不可用"},
+            )
+        valid, code = capability_snapshot_valid(snapshot, req.capabilitySnapshotHash, utc_now())
+        if not valid:
+            raise HTTPException(
+                status_code=409 if code in {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"} else 503,
+                detail={"code": code, "message": "生成能力快照无效，请重新预检"},
+            )
+        asset = asset_for_tenant(db, project.id, req.imageAssetVersionId, context)
+        if asset.media_type != "image" or not asset.sha256:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "FAKE_VISUAL_ASSET_INVALID", "message": "需提供本租户本项目不可变图片资产版本"},
+            )
+        remix_rights = rights_decision(latest_rights_snapshot(db, asset.id, "REMIX"), utc_now())
+        if not remix_rights["allowed"]:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_VISUAL_RIGHTS_BLOCKED", "message": "口播输入图片的使用授权不可用"},
+            )
+        return snapshot, asset
+
     def refresh_quota_period(db: Session, tenant: DBTenant) -> bool:
         period = utc_now().strftime("%Y-%m")
         if tenant.quota_period != period:
@@ -828,7 +882,13 @@ def create_app(
         db: Session, task: DBGenerationTask, *, now: datetime.datetime
     ) -> None:
         circuit = generation_circuit(db, task.tenant_id)
-        if circuit is None or circuit.state not in {"HALF_OPEN", "OPEN"}:
+        # Only the current HALF_OPEN probe may close the breaker.  A success
+        # from an older task cannot heal OPEN, DISABLED, or another probe.
+        if (
+            circuit is None
+            or circuit.state != "HALF_OPEN"
+            or circuit.half_open_task_id != task.id
+        ):
             return
         previous = circuit.state
         circuit.state = "CLOSED"
@@ -1182,6 +1242,152 @@ def create_app(
             },
             "quota": snapshot["quota"],
         }
+
+    @created_app.post("/projects/{project_id}/talking-head/fake-generation-tasks/validate")
+    def validate_fake_talking_head_task(
+        project_id: str,
+        req: TalkingHeadFakeGenerationRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        project = project_for_tenant(db, project_id, context)
+        snapshot, _asset = validate_fake_talking_head_request(db, project, req, context)
+        return {
+            "allowed": True, "status": "PREFLIGHT", "fakeOnly": True,
+            "simulatedOutput": True, "publishable": False,
+            "capabilitySnapshotHash": snapshot["snapshotHash"],
+            "projectRevision": project.revision,
+            "quota": snapshot["quota"],
+        }
+
+    @created_app.post("/projects/{project_id}/talking-head/fake-generation-tasks", status_code=202)
+    def create_fake_talking_head_task(
+        project_id: str,
+        req: TalkingHeadFakeGenerationRequest,
+        idempotency_key_header: str | None = Header(
+            default=None, alias="Idempotency-Key", min_length=8, max_length=128
+        ),
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        require_roles(context, "owner", "editor")
+        begin_serialized_write(db)
+        project = project_for_tenant(db, project_id, context)
+        key = str(req.idempotencyKey)
+        if idempotency_key_header is not None and idempotency_key_header != key:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "IDEMPOTENCY_KEY_MISMATCH", "message": "请求体与请求头幂等键不一致"},
+            )
+        user_payload = req.model_dump(mode="json")
+        payload_hash = generation_request_hash(user_payload)
+        existing = db.execute(select(DBGenerationTask).where(
+            DBGenerationTask.tenant_id == context.tenant_id,
+            DBGenerationTask.idempotency_key == key,
+        )).scalar_one_or_none()
+        if existing is not None:
+            if (
+                existing.project_id != project_id
+                or existing.provider != "deterministic-fake-talking-head"
+                or existing.requested_by != context.user_id
+                or existing.request_hash != payload_hash
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "IDEMPOTENCY_KEY_REUSED", "message": "幂等键已用于其他任务"},
+                )
+            return generation_task_response(
+                db, existing, rights=generation_rights(db, existing), include_history=True
+            )
+        snapshot, asset = validate_fake_talking_head_request(db, project, req, context)
+        quota = snapshot["quota"]
+        if (
+            int(quota["concurrentRemaining"]) < 1
+            or int(quota["monthlyRequestRemaining"]) < 1
+            or int(quota["monthlyGeneratedSecondsRemaining"]) < req.durationSeconds
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "FAKE_TALKING_HEAD_QUOTA_EXCEEDED", "message": "测试生成额度不足"},
+            )
+        if req.durationSeconds > int(snapshot["clipDurationSeconds"]["max"]) or int(snapshot["maxOutputs"]) != 1:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "FAKE_TALKING_HEAD_CAPABILITY_MISMATCH", "message": "合成输出参数与测试能力不一致"},
+            )
+        now = utc_now()
+        task_id = str(uuid.uuid4())
+        # Actor/tenant/project are always bound to the authenticated API session.
+        # Only the nonproduction Worker can read this internal typed FAKE marker.
+        payload = {
+            **user_payload,
+            "fakeTaskType": "talking-head",
+            "videoSubject": req.text,
+            "videoAspect": "9:16",
+            "videoClipDuration": req.durationSeconds,
+            "outputCount": 1,
+            "inputAssetVersionIds": [asset.id],
+            "imageAssetId": asset.id,
+            "sourceAssetSha256": asset.sha256,
+            "voiceId": "synthetic-seed",
+            "simulatedOutput": True,
+            "publishable": False,
+        }
+        task = DBGenerationTask(
+            id=task_id, tenant_id=context.tenant_id, project_id=project.id,
+            requested_by=context.user_id, provider="deterministic-fake-talking-head",
+            status="QUEUED", progress=0, message="已排队（FAKE-ONLY模拟口播，非真实合成）",
+            request_json=payload, request_hash=payload_hash,
+            capability_snapshot_json=snapshot, capability_snapshot_hash=snapshot["snapshotHash"],
+            idempotency_key=key, attempts=1, max_attempts=1,
+            created_at=now, updated_at=now,
+        )
+        attempt = DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id, attempt_no=1,
+            status="QUEUED", reconciliation_state="NOT_SUBMITTED", created_at=now,
+        )
+        db.add_all([task, attempt])
+        add_usage_entry(
+            db, task=task, attempt=attempt, kind="RESERVED",
+            request_units=1, generated_seconds=0,
+            reservation_key=f"generation:{task.id}",
+            config_version_id=snapshot.get("configVersionId"), now=now,
+        )
+        add_generation_event(
+            db, task, attempt=attempt, event_type="TASK_CREATED",
+            actor_type="USER", actor_id=context.user_id, to_status="QUEUED",
+            metadata={
+                "fakeOnly": True, "simulatedOutput": True, "actorRole": context.role,
+                "inputAssetVersionId": asset.id, "sourceAssetSha256": asset.sha256,
+                "usageReserved": True,
+            }, now=now,
+        )
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            concurrent = db.execute(select(DBGenerationTask).where(
+                DBGenerationTask.tenant_id == context.tenant_id,
+                DBGenerationTask.idempotency_key == key,
+            )).scalar_one_or_none()
+            if (
+                concurrent is not None
+                and concurrent.project_id == project_id
+                and concurrent.provider == "deterministic-fake-talking-head"
+                and concurrent.requested_by == context.user_id
+                and concurrent.request_hash == payload_hash
+            ):
+                return generation_task_response(
+                    db, concurrent, rights=generation_rights(db, concurrent), include_history=True
+                )
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_TALKING_HEAD_CREATE_CONFLICT", "message": "合成测试任务发生并发冲突"},
+            ) from exc
+        return generation_task_response(
+            db, task, rights=generation_rights(db, task), include_history=True
+        )
 
     @created_app.post("/projects/{project_id}/generation-tasks", status_code=202)
     def create_generation_task(
@@ -1541,6 +1747,17 @@ def create_app(
     ):
         require_roles(context, "owner", "editor")
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        # G70/G71: a completed upstream job may already have produced billable output.
+        # A failed media transfer requires reconciliation of the ORIGINAL artifact,
+        # not another generation attempt with a new upstream job and possible charge.
+        if task.error_code == "ARTIFACT_INGEST_FAILED":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_REQUIRED",
+                    "message": "生成结果转存状态未确认，必须先核对原始产物，禁止重新生成",
+                },
+            )
         if task.status not in RETRYABLE_GENERATION_STATES or (task.error_code or "").startswith("NON_RETRYABLE_"):
             raise HTTPException(
                 status_code=409,
@@ -1611,25 +1828,69 @@ def create_app(
         require_internal_token(x_worker_token)
         now = utc_now()
         begin_serialized_write(db)
-        claim_query = (
-            select(DBGenerationTask)
-            .where(
-                DBGenerationTask.status.in_(ACTIVE_GENERATION_STATES),
-                or_(DBGenerationTask.lease_expires_at.is_(None), DBGenerationTask.lease_expires_at < now),
-                DBGenerationTask.cancel_requested_at.is_(None),
-            )
-            .order_by(DBGenerationTask.created_at.asc(), DBGenerationTask.id.asc())
-            .limit(100)
-        )
-        if app_engine.dialect.name != "sqlite":
-            claim_query = claim_query.with_for_update(skip_locked=True)
-        candidates = list(db.execute(claim_query).scalars())
+        # G73: keyset-page beyond the first 100 queued rows.  A fixed
+        # top-100 scan can starve an eligible task indefinitely when older
+        # rows have a different provider mode or revoked rights.
+        # Keep the existing FIFO order, lease checks and SKIP LOCKED semantics.
+        def iter_claim_candidates() -> Generator[DBGenerationTask, None, None]:
+            cursor_created: datetime.datetime | None = None
+            cursor_id: str | None = None
+            while True:
+                claim_query = (
+                    select(DBGenerationTask)
+                    .where(
+                        DBGenerationTask.status.in_(ACTIVE_GENERATION_STATES),
+                        or_(
+                            DBGenerationTask.lease_expires_at.is_(None),
+                            DBGenerationTask.lease_expires_at < now,
+                        ),
+                        DBGenerationTask.cancel_requested_at.is_(None),
+                    )
+                    .order_by(DBGenerationTask.created_at.asc(), DBGenerationTask.id.asc())
+                    .limit(100)
+                )
+                if cursor_created is not None and cursor_id is not None:
+                    claim_query = claim_query.where(
+                        or_(
+                            DBGenerationTask.created_at > cursor_created,
+                            (
+                                (DBGenerationTask.created_at == cursor_created)
+                                & (DBGenerationTask.id > cursor_id)
+                            ),
+                        )
+                    )
+                if app_engine.dialect.name != "sqlite":
+                    claim_query = claim_query.with_for_update(skip_locked=True)
+                page = list(db.execute(claim_query).scalars())
+                if not page:
+                    return
+                cursor_created, cursor_id = page[-1].created_at, page[-1].id
+                yield from page
+                if len(page) < 100:
+                    return
         task: DBGenerationTask | None = None
         claim_attestation: DBGenerationProviderAttestation | None = None
-        for candidate in candidates:
+        for candidate in iter_claim_candidates():
             candidate_mode = candidate.capability_snapshot_json.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
+            if candidate.provider == "deterministic-fake-talking-head":
+                # Recheck the immutable image version and latest REMIX rights
+                # when a Worker claims a FAKE-only task; NEVER allow a real mode.
+                stored = candidate.request_json or {}
+                if candidate_mode != "deterministic-fake" or stored.get("fakeTaskType") != "talking-head":
+                    continue
+                source = db.execute(select(DBAssetVersion).where(
+                    DBAssetVersion.id == stored.get("imageAssetId"),
+                    DBAssetVersion.project_id == candidate.project_id,
+                    DBAssetVersion.tenant_id == candidate.tenant_id,
+                )).scalar_one_or_none()
+                if (
+                    source is None or source.media_type != "image"
+                    or source.sha256 != stored.get("sourceAssetSha256")
+                    or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
+                ):
+                    continue
             candidate_circuit = generation_circuit(db, candidate.tenant_id)
             if candidate_circuit is not None:
                 if candidate_circuit.state == "DISABLED":
@@ -1735,7 +1996,10 @@ def create_app(
             "upstreamJobId": task.upstream_job_id,
             "submissionConsumed": submission_consumed,
             "providerArtifactId": task.provider_artifact_id,
-            "providerMode": task.capability_snapshot_json.get("mode"),
+            "providerMode": (
+                "talking-head-fake" if task.provider == "deterministic-fake-talking-head"
+                else task.capability_snapshot_json.get("mode")
+            ),
             "configVersionId": task.capability_snapshot_json.get("configVersionId"),
             "policyHash": task.capability_snapshot_json.get("policyHash"),
             "providerPolicy": task.capability_snapshot_json.get("providerPolicy"),
@@ -1865,6 +2129,22 @@ def create_app(
         task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+        if task.provider == "deterministic-fake-talking-head":
+            source_id = (task.request_json or {}).get("imageAssetId")
+            source = db.execute(select(DBAssetVersion).where(
+                DBAssetVersion.id == source_id,
+                DBAssetVersion.tenant_id == task.tenant_id,
+                DBAssetVersion.project_id == task.project_id,
+            )).scalar_one_or_none()
+            if (
+                source is None or source.media_type != "image"
+                or source.sha256 != (task.request_json or {}).get("sourceAssetSha256")
+                or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), utc_now())["allowed"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "FAKE_TALKING_HEAD_SOURCE_REVOKED", "message": "输入图片授权或版本已失效，模拟产物隔离"},
+                )
         if task.asset_version_id:
             completion = db.execute(
                 select(DBGenerationEvent).where(
@@ -2008,7 +2288,7 @@ def create_app(
             db.commit()
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
+            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=case((DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size), else_=0)))
             failed_task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one()
             failed_attempt = current_generation_attempt(db, failed_task)
             failed_task.status = "FAILED"
@@ -2123,13 +2403,37 @@ def create_app(
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
             metadata = uploaded.get("metadata") or {}
             duration_seconds = float(metadata.get("durationSeconds") or 0)
-            media_type = "video" if metadata.get("video") else "audio"
+            suffix = os.path.splitext(file.filename or "")[1].lower()
+            image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+            if suffix in image_extensions:
+                video_probe = metadata.get("video") or {}
+                if (
+                    uploaded.get("mediaType") != "image"
+                    or not video_probe.get("width")
+                    or not video_probe.get("height")
+                    or metadata.get("audio") is not None
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": "IMAGE_PROBE_INVALID", "message": "图片未通过图像格式与尺寸校验"},
+                    )
+                media_type = "image"
+            else:
+                media_type = "video" if metadata.get("video") else "audio"
             media_id = uploaded["mediaId"]
+            fallback_content_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }.get(suffix, "video/mp4" if media_type == "video" else "audio/mpeg")
             material = {
                 "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,
                 "url": f"/api/video-use/media/{project_id}/{media_id}", "type": media_type,
-                "contentType": file.content_type or ("video/mp4" if media_type == "video" else "audio/mpeg"),
-                "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
+                "contentType": file.content_type or fallback_content_type,
+                "duration": None if media_type == "image" else {
+                    "value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000,
+                },
                 "sizeBytes": int(metadata.get("sizeBytes") or upload_size),
             }
             updated = apply_project_update(
@@ -2165,7 +2469,7 @@ def create_app(
             db.refresh(asset_version)
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
+            db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=case((DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size), else_=0)))
             db.commit()
             if isinstance(exc, VideoUseError):
                 logger.exception("video-use media upload failed")

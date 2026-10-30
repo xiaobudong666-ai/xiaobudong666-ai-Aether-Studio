@@ -37,14 +37,33 @@ class FakeVideoUseAdapter:
         return {"render": True, "commit": "92c2b34e44c205cbc2acae7f6ca7c1c219d5dd66"}
 
     def upload_media(self, project_id, filename, content_type, stream):
-        assert stream.read()
+        payload = stream.read()
+        assert payload
+        if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            return {
+                "mediaId": "media-1",
+                "projectId": project_id,
+                "fileName": filename,
+                "contentType": content_type,
+                "mediaType": "image",
+                "metadata": {
+                    "durationSeconds": None,
+                    "sizeBytes": len(payload),
+                    "format": "png_pipe",
+                    "video": {"codec": "png", "width": 48, "height": 48},
+                    "audio": None,
+                },
+            }
         return {
             "mediaId": "media-1",
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
+            "mediaType": "video",
             "metadata": {
                 "durationSeconds": 1.0,
+                "sizeBytes": len(payload),
+                "format": "mov,mp4,m4a,3gp,3g2,mj2",
                 "video": {"codec": "h264", "width": 320, "height": 240},
                 "audio": {"codec": "aac", "sampleRate": 48000},
             },
@@ -692,6 +711,26 @@ def _complete_render_candidate(client: TestClient, project: dict) -> tuple[dict,
     assert len(candidates) == 1
     assert candidates[0]["status"] == "READY"
     return upload, candidates[0]
+
+
+def test_upload_image_creates_image_asset_without_fake_video_duration(api_context):
+    client, _ = api_context
+    project = create_project(client, "Talking-head image input")
+    payload = b"test-image-bytes"
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": "1"},
+        files={"file": ("portrait.png", payload, "image/png")},
+    )
+    assert response.status_code == 201, response.text
+    result = response.json()
+    assert result["material"]["type"] == "image"
+    assert result["material"]["contentType"] == "image/png"
+    assert result["material"]["duration"] is None
+    assert result["assetVersion"]["mediaType"] == "image"
+    assert result["assetVersion"]["sizeBytes"] == len(payload)
+    assert result["assetVersion"]["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert result["project"]["materials"][0]["type"] == "image"
 
 
 def test_candidate_adoption_rights_idempotency_and_canonical_status(api_context):
