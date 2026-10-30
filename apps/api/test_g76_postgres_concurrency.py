@@ -1420,3 +1420,104 @@ def test_g75_postgres_half_open_probe_is_single_claim_under_two_workers(postgres
         assert claimed_events == 1
 
     app.state.moneyprinter.assert_not_called()
+
+def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_missing(postgres_context):
+    """A missing circuit row must not let a Worker claim race past Owner emergency stop."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id = task.tenant_id
+        assert db.execute(
+            select(func.count(DBGenerationCircuitState.id)).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one() == 0
+
+    owner_insert_finished = Event()
+    release_owner_insert = Event()
+    owner_thread = {"ident": None}
+
+    def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        if (
+            owner_thread["ident"] == get_ident()
+            and "insert into generation_circuit_states" in statement.lower()
+        ):
+            owner_insert_finished.set()
+            if not release_owner_insert.wait(timeout=12):
+                raise RuntimeError("synthetic Owner circuit insert barrier timed out")
+
+    def send_owner_stop():
+        with TestClient(app) as owner_client:
+            login = owner_client.post(
+                "/auth/login",
+                json={"email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD},
+            )
+            assert login.status_code == 200, login.text
+            owner_client.headers.update({"X-Aether-CSRF": "1"})
+            owner_thread["ident"] = get_ident()
+            return owner_client.post(
+                "/generation/providers/moneyprinter/kill-switch",
+                json={"disabled": True, "reasonCode": "G76_TEST_MISSING_CIRCUIT_CLAIM_RACE"},
+            )
+
+    def send_claim():
+        with TestClient(app) as worker_client:
+            return worker_client.post(
+                "/internal/generation-tasks/claim",
+                headers={
+                    "X-Worker-Token": WORKER_TOKEN,
+                    "X-Worker-Id": "worker-g76-missing-circuit-claim-race",
+                },
+            )
+
+    engine = sessions.kw["bind"]
+    event.listen(engine, "after_cursor_execute", after_cursor_execute)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            owner_future = pool.submit(send_owner_stop)
+            assert owner_insert_finished.wait(timeout=10), "Owner circuit row was not created"
+            claim_future = pool.submit(send_claim)
+            assert _wait_until_postgres_reports_lock_wait(
+                sessions, table_name="generation_circuit_states", timeout_seconds=8.0
+            ), "Worker claim did not serialize on the missing-row upsert"
+            assert not claim_future.done(), "Worker claim escaped while Owner stop held the circuit row"
+            release_owner_insert.set()
+            stopped = owner_future.result(timeout=15)
+            claimed = claim_future.result(timeout=15)
+    finally:
+        release_owner_insert.set()
+        event.remove(engine, "after_cursor_execute", after_cursor_execute)
+
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["disabled"] is True
+    assert claimed.status_code == 204, claimed.text
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        assert circuit.state == "DISABLED"
+        assert stored.status == "QUEUED"
+        assert stored.lease_owner is None
+        assert stored.lease_expires_at is None
+        assert stored.lease_epoch == 0
+        assert db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one() == 0
+        assert db.execute(
+            select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )
+        ).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
