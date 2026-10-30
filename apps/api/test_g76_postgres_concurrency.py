@@ -281,6 +281,7 @@ def test_g76_postgres_artifact_success_waits_for_circuit_lock_and_preserves_reop
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
+        tenant_id = task.tenant_id
         db.add(
             DBGenerationCircuitState(
                 id=str(uuid.uuid4()),
@@ -334,7 +335,7 @@ def test_g76_postgres_artifact_success_waits_for_circuit_lock_and_preserves_reop
     try:
         circuit = locker.execute(
             select(DBGenerationCircuitState).where(
-                DBGenerationCircuitState.tenant_id == claimed.json()["tenantId"],
+                DBGenerationCircuitState.tenant_id == tenant_id,
                 DBGenerationCircuitState.provider == "moneyprinter",
             ).with_for_update()
         ).scalar_one()
@@ -376,13 +377,13 @@ def test_g76_postgres_artifact_success_waits_for_circuit_lock_and_preserves_reop
         with sessions() as verify:
             final_circuit = verify.execute(
                 select(DBGenerationCircuitState).where(
-                    DBGenerationCircuitState.tenant_id == claimed.json()["tenantId"],
+                    DBGenerationCircuitState.tenant_id == tenant_id,
                     DBGenerationCircuitState.provider == "moneyprinter",
                 )
             ).scalar_one()
             closed_events = verify.execute(
                 select(DBGenerationProviderEvent.id).where(
-                    DBGenerationProviderEvent.tenant_id == claimed.json()["tenantId"],
+                    DBGenerationProviderEvent.tenant_id == tenant_id,
                     DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_CLOSED",
                 )
             ).all()
