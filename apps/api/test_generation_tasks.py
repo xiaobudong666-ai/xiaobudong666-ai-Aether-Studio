@@ -2831,3 +2831,78 @@ def test_g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel(
         assert persisted.cancel_requested_at is not None
         assert persisted.lease_owner is None
         assert persisted.lease_expires_at is None
+
+def test_g75_ineligible_provider_candidate_does_not_pin_half_open_probe(provider_control_context):
+    """An ineligible FIFO candidate must not consume the tenant's HALF_OPEN probe."""
+    client, sessions, app, _ = provider_control_context
+    # The test uses synthetic config/attestation only; no Provider adapter call is allowed.
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+
+    first_project = create_project(client, "G75 stale-config candidate")
+    second_project = create_project(client, "G75 eligible candidate")
+    first = create_task(client, first_project, key="g75-stale-config")
+    second = create_task(client, second_project, key="g75-eligible")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        first_task = db.get(DBGenerationTask, first["taskId"])
+        second_task = db.get(DBGenerationTask, second["taskId"])
+        assert first_task is not None and second_task is not None
+        assert first_task.tenant_id == second_task.tenant_id
+        assert first_task.provider == second_task.provider == "moneyprinter"
+        assert first_task.capability_snapshot_json["mode"] == "moneyprinter"
+        assert second_task.capability_snapshot_json["configVersionId"] == config["id"]
+
+        # Make the older FIFO candidate ineligible only at the post-circuit
+        # provider-config gate. The following task remains fully eligible.
+        stale_snapshot = dict(first_task.capability_snapshot_json)
+        stale_snapshot["configVersionId"] = "superseded-config-version"
+        first_task.capability_snapshot_json = stale_snapshot
+        first_task.created_at = now - datetime.timedelta(seconds=2)
+        second_task.created_at = now - datetime.timedelta(seconds=1)
+
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()),
+            tenant_id=first_task.tenant_id,
+            provider="moneyprinter",
+            state="HALF_OPEN",
+            failure_timestamps_json=[],
+            opened_at=now - datetime.timedelta(minutes=2),
+            cooldown_until=now - datetime.timedelta(seconds=1),
+            half_open_task_id=None,
+            probe_epoch=7,
+            half_open_lease_epoch=None,
+            half_open_issuer=None,
+            disabled_reason_code=None,
+            updated_at=now,
+        ))
+        db.commit()
+
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == second["taskId"]
+    assert claimed.json()["leaseEpoch"] == 1
+
+    with sessions() as db:
+        stale_task = db.get(DBGenerationTask, first["taskId"])
+        eligible_task = db.get(DBGenerationTask, second["taskId"])
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == eligible_task.tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        assert stale_task.lease_owner is None
+        assert int(stale_task.lease_epoch or 0) == 0
+        assert eligible_task.lease_owner == "worker-proof"
+        assert eligible_task.lease_epoch == 1
+        assert eligible_task.circuit_probe_epoch == 8
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.probe_epoch == 8
+        assert circuit.half_open_task_id == eligible_task.id
+        assert circuit.half_open_lease_epoch == eligible_task.lease_epoch
+        assert circuit.half_open_issuer == "worker-proof"
+
+    app.state.moneyprinter.assert_not_called()
