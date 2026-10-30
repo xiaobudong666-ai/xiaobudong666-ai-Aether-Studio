@@ -183,18 +183,23 @@ def test_g76_postgres_heartbeat_waits_for_task_lock_and_rechecks_new_lease(postg
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(send_old_heartbeat)
-            assert _wait_until_postgres_reports_lock_wait(sessions), (
-                "heartbeat did not wait on the PostgreSQL generation_tasks row lock"
-            )
+            try:
+                assert _wait_until_postgres_reports_lock_wait(sessions), (
+                    "heartbeat did not wait on the PostgreSQL generation_tasks row lock"
+                )
 
-            task.lease_owner = "worker-new"
-            task.lease_epoch = old_epoch + 1
-            task.lease_expires_at = (
-                datetime.datetime.now(datetime.timezone.utc)
-                + datetime.timedelta(minutes=5)
-            )
-            task.updated_at = datetime.datetime.now(datetime.timezone.utc)
-            locker.commit()
+                task.lease_owner = "worker-new"
+                task.lease_epoch = old_epoch + 1
+                task.lease_expires_at = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(minutes=5)
+                )
+                task.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                locker.commit()
+            finally:
+                # Never leave the worker thread blocked if the lock assertion fails.
+                if locker.in_transaction():
+                    locker.rollback()
 
             response = future.result(timeout=10)
 
