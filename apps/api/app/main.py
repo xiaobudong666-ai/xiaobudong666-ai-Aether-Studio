@@ -2311,7 +2311,13 @@ def create_app(
             now = utc_now()
             invalid_code = None
             invalid_message = None
-            if task.cancel_requested_at is not None or task.status == "CANCELED":
+            # Serialize the final artifact commit with the Owner emergency stop.
+            # The kill-switch can be activated while the sidecar upload is in flight.
+            final_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+            if final_circuit is not None and final_circuit.state == "DISABLED":
+                invalid_code = "PROVIDER_EMERGENCY_STOPPED"
+                invalid_message = "紧急停机期间迟到产物已隔离"
+            elif task.cancel_requested_at is not None or task.status == "CANCELED":
                 invalid_code = "TASK_CANCELED"
                 invalid_message = "任务已取消，迟到产物已隔离"
             elif task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
