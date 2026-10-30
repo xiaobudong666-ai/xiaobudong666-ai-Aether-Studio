@@ -2835,37 +2835,82 @@ def test_g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel(
 def test_g75_ineligible_provider_candidate_does_not_pin_half_open_probe(provider_control_context):
     """An ineligible FIFO candidate must not consume the tenant's HALF_OPEN probe."""
     client, sessions, app, _ = provider_control_context
-    # The test uses synthetic config/attestation only; no Provider adapter call is allowed.
+    # Synthetic config/attestation only; no Provider adapter call is allowed.
     app.state.moneyprinter = MagicMock()
     config = publish_provider_config(client, create_provider_config(client))
     assert attest_provider(client, sessions, config).status_code == 201
 
-    first_project = create_project(client, "G75 stale-config candidate")
-    second_project = create_project(client, "G75 eligible candidate")
-    first = create_task(client, first_project, key="g75-stale-config")
-    second = create_task(client, second_project, key="g75-eligible")
+    project = create_project(client, "G75 half-open queue candidates")
+    first = create_task(client, project, key="g75-stale-config")
     now = datetime.datetime.now(datetime.timezone.utc)
+    eligible_task_id = str(uuid.uuid4())
+    eligible_created_at = now - datetime.timedelta(seconds=1)
 
     with sessions() as db:
-        first_task = db.get(DBGenerationTask, first["taskId"])
-        second_task = db.get(DBGenerationTask, second["taskId"])
-        assert first_task is not None and second_task is not None
-        assert first_task.tenant_id == second_task.tenant_id
-        assert first_task.provider == second_task.provider == "moneyprinter"
-        assert first_task.capability_snapshot_json["mode"] == "moneyprinter"
-        assert second_task.capability_snapshot_json["configVersionId"] == config["id"]
+        stale_task = db.get(DBGenerationTask, first["taskId"])
+        assert stale_task is not None
+        assert stale_task.provider == "moneyprinter"
+        assert stale_task.capability_snapshot_json["mode"] == "moneyprinter"
+        assert stale_task.capability_snapshot_json["configVersionId"] == config["id"]
 
-        # Make the older FIFO candidate ineligible only at the post-circuit
-        # provider-config gate. The following task remains fully eligible.
-        stale_snapshot = dict(first_task.capability_snapshot_json)
+        # Keep the private one-task canary quota intact: seed the second queued
+        # candidate directly as a synthetic scheduler fixture, not a second API
+        # submission or an additional reservation.
+        eligible_snapshot = dict(stale_task.capability_snapshot_json)
+        stale_snapshot = dict(eligible_snapshot)
         stale_snapshot["configVersionId"] = "superseded-config-version"
-        first_task.capability_snapshot_json = stale_snapshot
-        first_task.created_at = now - datetime.timedelta(seconds=2)
-        second_task.created_at = now - datetime.timedelta(seconds=1)
+        stale_task.capability_snapshot_json = stale_snapshot
+        stale_task.created_at = now - datetime.timedelta(seconds=2)
 
+        eligible_task = DBGenerationTask(
+            id=eligible_task_id,
+            tenant_id=stale_task.tenant_id,
+            project_id=project["id"],
+            requested_by=stale_task.requested_by,
+            provider=stale_task.provider,
+            status="QUEUED",
+            progress=0,
+            message="Synthetic eligible G75 queue candidate",
+            request_json=dict(stale_task.request_json),
+            request_hash=stale_task.request_hash,
+            capability_snapshot_json=eligible_snapshot,
+            capability_snapshot_hash=stale_task.capability_snapshot_hash,
+            idempotency_key=idempotency_uuid("g75-eligible-synthetic-row"),
+            upstream_job_id=None,
+            provider_artifact_id=None,
+            media_id=None,
+            asset_version_id=None,
+            attempts=1,
+            max_attempts=stale_task.max_attempts,
+            lease_owner=None,
+            lease_epoch=0,
+            circuit_probe_epoch=None,
+            lease_expires_at=None,
+            cancel_requested_at=None,
+            error_code=None,
+            error_message=None,
+            created_at=eligible_created_at,
+            updated_at=eligible_created_at,
+            started_at=None,
+            completed_at=None,
+        )
+        db.add(eligible_task)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()),
+            generation_task_id=eligible_task_id,
+            attempt_no=1,
+            status="QUEUED",
+            submission_started_at=None,
+            upstream_job_id=None,
+            reconciliation_state="NOT_SUBMITTED",
+            error_code=None,
+            error_message=None,
+            created_at=eligible_created_at,
+            completed_at=None,
+        ))
         db.add(DBGenerationCircuitState(
             id=str(uuid.uuid4()),
-            tenant_id=first_task.tenant_id,
+            tenant_id=stale_task.tenant_id,
             provider="moneyprinter",
             state="HALF_OPEN",
             failure_timestamps_json=[],
@@ -2882,12 +2927,12 @@ def test_g75_ineligible_provider_candidate_does_not_pin_half_open_probe(provider
 
     claimed = claim(client, worker_id="worker-proof")
     assert claimed.status_code == 200, claimed.text
-    assert claimed.json()["taskId"] == second["taskId"]
+    assert claimed.json()["taskId"] == eligible_task_id
     assert claimed.json()["leaseEpoch"] == 1
 
     with sessions() as db:
         stale_task = db.get(DBGenerationTask, first["taskId"])
-        eligible_task = db.get(DBGenerationTask, second["taskId"])
+        eligible_task = db.get(DBGenerationTask, eligible_task_id)
         circuit = db.execute(
             select(DBGenerationCircuitState).where(
                 DBGenerationCircuitState.tenant_id == eligible_task.tenant_id,
