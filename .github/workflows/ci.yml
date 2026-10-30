@@ -585,3 +585,41 @@ jobs:
               -f infra/docker/docker-compose.g72-fake-only.override.yml \
               down --volumes --remove-orphans || true
           fi
+
+  g76-postgresql-concurrency:
+    name: G76 PostgreSQL lease-lock concurrency (FAKE-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16.6
+        env:
+          POSTGRES_USER: aether_ci
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: aether_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aether_ci -d aether_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PYTHONPATH: apps/api
+      AETHER_TEST_POSTGRES_URL: postgresql+psycopg://aether_ci:ci-only-password@localhost:5432/aether_ci
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API and test-only PostgreSQL dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/api/requirements.txt -r apps/api/requirements-postgres-test.txt
+
+      - name: Prove G76 heartbeat waits for PostgreSQL row lock and rejects superseded lease
+        run: python -m pytest apps/api/test_g76_postgres_concurrency.py -v
