@@ -14,7 +14,7 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, get_ident
+from threading import Barrier, Event, get_ident
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +36,7 @@ from app.models import (
     DBProject,
     DBRightsSnapshot,
     DBTenant,
+    DBUser,
 )
 
 
@@ -1195,4 +1196,219 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g73_postgres_keyset_claim_scans_past_205_foreign_wrong_mode_rows(postgres_context):
+    """PostgreSQL keyset paging must reach an eligible task beyond 205 foreign wrong-mode rows."""
+    client, sessions, app = postgres_context
+    eligible_task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_task_id)
+        assert eligible is not None
+        eligible_tenant_id = eligible.tenant_id
+        first_created = eligible.created_at - datetime.timedelta(days=1)
+
+        foreign_tenant = DBTenant(
+            id="g73-pg-foreign-tenant",
+            name="G73 PostgreSQL Foreign Tenant",
+            slug="g73-pg-foreign-tenant",
+            project_quota=50,
+            storage_quota_bytes=1024**3,
+            used_storage_bytes=0,
+            concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600,
+            render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"),
+            created_at=now,
+            updated_at=now,
+        )
+        foreign_owner = DBUser(
+            id="g73-pg-foreign-owner",
+            tenant_id=foreign_tenant.id,
+            email="g73-pg-foreign-owner@example.com",
+            display_name="G73 PostgreSQL Foreign Owner",
+            password_hash="synthetic-fixture-not-used-for-login",
+            role="owner",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        foreign_project = DBProject(
+            id="g73-pg-foreign-project",
+            tenant_id=foreign_tenant.id,
+            owner_id=foreign_owner.id,
+            name="G73 PostgreSQL foreign wrong-mode backlog",
+            timeline={"version": "1.1", "output": None, "tracks": []},
+            materials=[],
+            revision=1,
+            created_at=now,
+            updated_at=now,
+        )
+        ineligible_rows = []
+        for idx in range(205):
+            created_at = first_created + datetime.timedelta(microseconds=idx)
+            ineligible_rows.append(DBGenerationTask(
+                id=str(uuid.uuid4()),
+                tenant_id=foreign_tenant.id,
+                project_id=foreign_project.id,
+                requested_by=foreign_owner.id,
+                provider="moneyprinter",
+                status="QUEUED",
+                progress=0,
+                message="synthetic foreign-tenant wrong-mode PostgreSQL row",
+                request_json={"syntheticFixtureOnly": True},
+                request_hash=f"g73-pg-foreign-fixture-{idx}",
+                capability_snapshot_json={"mode": "moneyprinter"},
+                capability_snapshot_hash="0" * 64,
+                idempotency_key=f"g73-pg-foreign-idempotency-{idx}",
+                upstream_job_id=None,
+                provider_artifact_id=None,
+                media_id=None,
+                asset_version_id=None,
+                attempts=1,
+                max_attempts=1,
+                lease_owner=None,
+                lease_epoch=0,
+                circuit_probe_epoch=None,
+                lease_expires_at=None,
+                cancel_requested_at=None,
+                error_code=None,
+                error_message=None,
+                created_at=created_at,
+                updated_at=created_at,
+            ))
+        db.add_all([foreign_tenant, foreign_owner, foreign_project, *ineligible_rows])
+        db.commit()
+
+    worker_id = "g73-pg-keyset-worker"
+    with TestClient(app) as worker_client:
+        claimed = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+        )
+
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible_task_id
+    assert claimed.json()["providerMode"] == "deterministic-fake"
+
+    with sessions() as db:
+        eligible = db.get(DBGenerationTask, eligible_task_id)
+        assert eligible is not None
+        assert eligible.tenant_id == eligible_tenant_id
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == worker_id
+        assert eligible.lease_epoch == 1
+
+        foreign_queued = db.execute(
+            select(func.count(DBGenerationTask.id)).where(
+                DBGenerationTask.tenant_id == "g73-pg-foreign-tenant",
+                DBGenerationTask.status == "QUEUED",
+                DBGenerationTask.lease_owner.is_(None),
+            )
+        ).scalar_one()
+        assert foreign_queued == 205
+
+        foreign_claim_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id.in_(
+                    select(DBGenerationTask.id).where(
+                        DBGenerationTask.tenant_id == "g73-pg-foreign-tenant"
+                    )
+                ),
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one()
+        assert foreign_claim_events == 0
+
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g75_postgres_half_open_probe_is_single_claim_under_two_workers(postgres_context):
+    """Two concurrent PostgreSQL claimers must not acquire the same tenant's HALF_OPEN probe."""
+    client, sessions, app = postgres_context
+    task_ids = [_create_task(client), _create_task(client)]
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        first_task = db.get(DBGenerationTask, task_ids[0])
+        assert first_task is not None
+        tenant_id = first_task.tenant_id
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            provider="moneyprinter",
+            state="HALF_OPEN",
+            failure_timestamps_json=[],
+            opened_at=now - datetime.timedelta(minutes=2),
+            cooldown_until=now - datetime.timedelta(seconds=1),
+            half_open_task_id=None,
+            probe_epoch=7,
+            half_open_lease_epoch=None,
+            half_open_issuer=None,
+            disabled_reason_code=None,
+            updated_at=now,
+        ))
+        db.commit()
+
+    barrier = Barrier(2)
+
+    def concurrent_claim(worker_id: str):
+        with TestClient(app) as worker_client:
+            barrier.wait(timeout=10)
+            response = worker_client.post(
+                "/internal/generation-tasks/claim",
+                headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+            )
+            return worker_id, response
+
+    worker_ids = ("g75-pg-worker-a", "g75-pg-worker-b")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(concurrent_claim, worker_id) for worker_id in worker_ids]
+        results = [future.result(timeout=20) for future in futures]
+
+    claimed_results = [(worker_id, response) for worker_id, response in results if response.status_code == 200]
+    empty_results = [(worker_id, response) for worker_id, response in results if response.status_code == 204]
+    assert len(claimed_results) == 1, [(worker, response.status_code, response.text) for worker, response in results]
+    assert len(empty_results) == 1, [(worker, response.status_code, response.text) for worker, response in results]
+
+    winner_id, winner_response = claimed_results[0]
+    claimed_task_id = winner_response.json()["taskId"]
+    assert claimed_task_id in task_ids
+    assert winner_response.json()["leaseEpoch"] == 1
+    assert winner_response.json()["circuitProbeEpoch"] == 8
+
+    with sessions() as db:
+        persisted_tasks = [db.get(DBGenerationTask, task_id) for task_id in task_ids]
+        claimed_task = next(task for task in persisted_tasks if task.id == claimed_task_id)
+        unclaimed_task = next(task for task in persisted_tasks if task.id != claimed_task_id)
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        claimed_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id.in_(task_ids),
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one()
+
+        assert claimed_task.status == "SUBMITTING"
+        assert claimed_task.lease_owner == winner_id
+        assert claimed_task.lease_epoch == 1
+        assert claimed_task.circuit_probe_epoch == 8
+        assert unclaimed_task.status == "QUEUED"
+        assert unclaimed_task.lease_owner is None
+        assert unclaimed_task.lease_epoch == 0
+        assert circuit.state == "HALF_OPEN"
+        assert circuit.probe_epoch == 8
+        assert circuit.half_open_task_id == claimed_task_id
+        assert circuit.half_open_lease_epoch == claimed_task.lease_epoch
+        assert circuit.half_open_issuer == winner_id
+        assert claimed_events == 1
+
     app.state.moneyprinter.assert_not_called()
