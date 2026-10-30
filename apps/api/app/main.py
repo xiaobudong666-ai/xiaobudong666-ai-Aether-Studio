@@ -25,7 +25,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -2288,7 +2288,7 @@ def create_app(
             db.commit()
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
+            db.execute(update(DBTenant).where(DBTenant.id == task.tenant_id).values(used_storage_bytes=case((DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size), else_=0)))
             failed_task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one()
             failed_attempt = current_generation_attempt(db, failed_task)
             failed_task.status = "FAILED"
@@ -2469,7 +2469,7 @@ def create_app(
             db.refresh(asset_version)
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=func.max(0, DBTenant.used_storage_bytes - upload_size)))
+            db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=case((DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size), else_=0)))
             db.commit()
             if isinstance(exc, VideoUseError):
                 logger.exception("video-use media upload failed")
