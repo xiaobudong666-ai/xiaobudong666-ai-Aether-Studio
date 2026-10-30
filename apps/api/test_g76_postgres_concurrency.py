@@ -772,3 +772,141 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
         )).scalar_one() == 1
     app.state.moneyprinter.assert_not_called()
 
+def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_context, monkeypatch):
+    """A same-lease INGESTING transition cannot replace the artifact being uploaded."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id = task.project_id
+        tenant_id = task.tenant_id
+
+    worker_id = "worker-g76-artifact-id-race"
+    upstream_id = "g76-artifact-id-race-upstream"
+    original_artifact_id = "g76-artifact-original"
+    replacement_artifact_id = "g76-artifact-replacement"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    epoch = claimed.json()["leaseEpoch"]
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(epoch),
+    }
+    running = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={"status": "RUNNING", "progress": 10, "message": "synthetic running", "upstreamJobId": upstream_id},
+    )
+    assert running.status_code == 200, running.text
+    ingesting = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING", "progress": 95, "message": "synthetic ingesting",
+            "upstreamJobId": upstream_id, "providerArtifactId": original_artifact_id,
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
+
+    payload = b"g76-provider-artifact-id-race"
+    upload_started = Event()
+    release_upload = Event()
+
+    def blocked_upload(_project_id, filename, content_type, stream):
+        observed = stream.read()
+        assert observed == payload
+        upload_started.set()
+        if not release_upload.wait(timeout=12):
+            raise RuntimeError("synthetic blocked upload timed out")
+        return {
+            "mediaId": "g76-orphan-after-artifact-id-change",
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": 1.0,
+                "sizeBytes": len(observed),
+                "video": {"codec": "h264", "width": 320, "height": 240},
+            },
+        }
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", blocked_upload)
+
+    def send_artifact_intake():
+        with TestClient(app) as worker_client:
+            return worker_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers=worker_headers,
+                data={"providerArtifactId": original_artifact_id},
+                files={"file": ("synthetic.mp4", payload, "video/mp4")},
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(send_artifact_intake)
+        try:
+            assert upload_started.wait(timeout=10), "artifact upload did not reach the sidecar"
+            rejected = client.post(
+                f"/internal/generation-tasks/{task_id}/transition",
+                headers=worker_headers,
+                json={
+                    "status": "INGESTING", "progress": 96, "message": "conflicting artifact receipt",
+                    "upstreamJobId": upstream_id, "providerArtifactId": replacement_artifact_id,
+                },
+            )
+            assert rejected.status_code == 409, rejected.text
+            assert rejected.json()["detail"]["code"] == "PROVIDER_ARTIFACT_ID_IMMUTABLE"
+
+            # Defense-in-depth: simulate a separate writer changing the row while
+            # the sidecar request is in flight. The post-upload row lock must reject
+            # the stale artifact and retain its exact orphan evidence.
+            with sessions() as db:
+                stored = db.get(DBGenerationTask, task_id)
+                stored.provider_artifact_id = replacement_artifact_id
+                db.commit()
+        finally:
+            release_upload.set()
+        response = future.result(timeout=15)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_ID_MISMATCH"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, tenant_id)
+        assert stored.status == "INGESTING"
+        assert stored.provider_artifact_id == replacement_artifact_id
+        assert stored.media_id is None
+        assert stored.asset_version_id is None
+        assert tenant.used_storage_bytes == 0
+        orphan_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one()
+        assert orphan_event.metadata_json["reasonCode"] == "ARTIFACT_ID_MISMATCH"
+        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-artifact-id-change"
+        assert orphan_event.metadata_json["originalProviderArtifactId"] == original_artifact_id
+        assert orphan_event.metadata_json["currentTaskProviderArtifactId"] == replacement_artifact_id
+        assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
+        assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+            DBAssetVersion.media_id == "g76-orphan-after-artifact-id-change",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
+

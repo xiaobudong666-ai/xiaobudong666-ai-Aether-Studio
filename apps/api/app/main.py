@@ -2128,6 +2128,11 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "ILLEGAL_GENERATION_TRANSITION", "message": "生成任务状态迁移不合法"})
         if req.upstreamJobId and task.upstream_job_id and req.upstreamJobId != task.upstream_job_id:
             raise HTTPException(status_code=409, detail={"code": "UPSTREAM_ID_IMMUTABLE", "message": "上游任务编号不可替换"})
+        if req.providerArtifactId and task.provider_artifact_id and req.providerArtifactId != task.provider_artifact_id:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PROVIDER_ARTIFACT_ID_IMMUTABLE", "message": "上游产物编号不可替换"},
+            )
         previous = task.status
         attempt = current_generation_attempt(db, task)
         if req.upstreamJobId:
@@ -2315,6 +2320,9 @@ def create_app(
             elif x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
                 invalid_code = "LEASE_EPOCH_MISMATCH"
                 invalid_message = "上传期间任务租约版本已更新"
+            elif task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
+                invalid_code = "ARTIFACT_ID_MISMATCH"
+                invalid_message = "上传期间任务关联的上游产物编号已改变"
             elif task.status not in {"RUNNING", "INGESTING"}:
                 invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
                 invalid_message = "上传期间任务状态已改变"
@@ -2333,7 +2341,8 @@ def create_app(
                         "orphanedMediaId": media_id,
                         "orphanedMediaSha256": digest.hexdigest(),
                         "orphanedMediaSizeBytes": orphan_size,
-                        "originalProviderArtifactId": task.provider_artifact_id or providerArtifactId,
+                        "originalProviderArtifactId": providerArtifactId,
+                        "currentTaskProviderArtifactId": task.provider_artifact_id,
                         "originalUpstreamJobId": task.upstream_job_id or "",
                         "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                     })
@@ -2499,6 +2508,9 @@ def create_app(
             elif x_worker_lease_epoch is None or x_worker_lease_epoch != failed_task.lease_epoch:
                 invalid_code = "LEASE_EPOCH_MISMATCH"
                 invalid_message = "上传期间任务租约版本已更新"
+            elif failed_task.provider_artifact_id and failed_task.provider_artifact_id != providerArtifactId:
+                invalid_code = "ARTIFACT_ID_MISMATCH"
+                invalid_message = "上传期间任务关联的上游产物编号已改变"
             elif failed_task.status not in {"RUNNING", "INGESTING"}:
                 invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
                 invalid_message = "上传期间任务状态已改变"
@@ -2516,7 +2528,8 @@ def create_app(
                         "orphanedMediaId": media_id,
                         "orphanedMediaSha256": digest.hexdigest(),
                         "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
-                        "originalProviderArtifactId": failed_task.provider_artifact_id or providerArtifactId,
+                        "originalProviderArtifactId": providerArtifactId,
+                        "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
                         "originalUpstreamJobId": failed_task.upstream_job_id or "",
                         "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                     })
@@ -2561,7 +2574,8 @@ def create_app(
                     "orphanedMediaId": media_id,
                     "orphanedMediaSha256": digest.hexdigest(),
                     "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
-                    "originalProviderArtifactId": failed_task.provider_artifact_id or providerArtifactId,
+                    "originalProviderArtifactId": providerArtifactId,
+                        "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
                     "originalUpstreamJobId": failed_task.upstream_job_id or "",
                     "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                 })
