@@ -2541,6 +2541,7 @@ def create_app(
                 db.commit()
                 raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message}) from exc
 
+            previous_status = failed_task.status
             failed_attempt = current_generation_attempt(db, failed_task)
             failed_task.status = "FAILED"
             failed_task.error_code = "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED" if isinstance(exc, ValueError) else "ARTIFACT_INGEST_FAILED"
@@ -2574,7 +2575,7 @@ def create_app(
             )
             add_generation_event(
                 db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
-                actor_type="SYSTEM", actor_id="api", from_status=failed_task.status,
+                actor_type="SYSTEM", actor_id="api", from_status=previous_status,
                 to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
             )
             release_generation_reservation(
