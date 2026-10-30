@@ -1039,7 +1039,7 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
 
 
 def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(postgres_context, monkeypatch):
-    """A missing circuit row must not leave an unlocked window before artifact commit."""
+    """A missing circuit row must be materialized and locked before artifact commit."""
     client, sessions, app = postgres_context
     task_id = _create_task(client)
     with sessions() as db:
@@ -1089,6 +1089,7 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
     release_upload = Event()
     circuit_select_finished = Event()
     release_circuit_select = Event()
+    owner_request_started = Event()
     worker_thread = {"ident": None}
 
     def blocked_upload(_project_id, filename, content_type, stream):
@@ -1120,10 +1121,6 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
             if not release_circuit_select.wait(timeout=12):
                 raise RuntimeError("synthetic circuit-select barrier timed out")
 
-    monkeypatch.setattr(app.state.video_use, "upload_media", blocked_upload)
-    engine = sessions.kw["bind"]
-    event.listen(engine, "after_cursor_execute", after_cursor_execute)
-
     def send_artifact_intake():
         with TestClient(app) as worker_client:
             return worker_client.post(
@@ -1133,29 +1130,50 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
                 files={"file": ("synthetic.mp4", payload, "video/mp4")},
             )
 
+    def send_owner_kill_switch():
+        with TestClient(app) as owner_client:
+            login = owner_client.post(
+                "/auth/login",
+                json={"email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD},
+            )
+            assert login.status_code == 200, login.text
+            owner_client.headers.update({"X-Aether-CSRF": "1"})
+            owner_request_started.set()
+            return owner_client.post(
+                "/generation/providers/moneyprinter/kill-switch",
+                json={"disabled": True, "reasonCode": "G76_TEST_MISSING_CIRCUIT_RACE"},
+            )
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", blocked_upload)
+    engine = sessions.kw["bind"]
+    event.listen(engine, "after_cursor_execute", after_cursor_execute)
+
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(send_artifact_intake)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            artifact_future = pool.submit(send_artifact_intake)
             assert upload_started.wait(timeout=10), "artifact upload did not reach the sidecar"
             release_upload.set()
             assert circuit_select_finished.wait(timeout=10), "final circuit SELECT FOR UPDATE was not observed"
 
-            # The final SELECT has executed and found no row. The Owner now creates
-            # and commits DISABLED while the artifact transaction is paused.
-            stopped = client.post(
-                "/generation/providers/moneyprinter/kill-switch",
-                json={"disabled": True, "reasonCode": "G76_TEST_MISSING_CIRCUIT_RACE"},
-            )
-            assert stopped.status_code == 200, stopped.text
+            # Artifact finalization has atomically materialized and locked the
+            # previously absent circuit row. Owner stop must wait for that commit.
+            owner_future = pool.submit(send_owner_kill_switch)
+            assert owner_request_started.wait(timeout=10), "Owner kill-switch request did not start"
+            assert _wait_until_postgres_reports_lock_wait(
+                sessions, table_name="generation_circuit_states", timeout_seconds=8.0
+            ), "Owner kill-switch did not wait on the circuit-row serialization lock"
+            assert not owner_future.done()
+
             release_circuit_select.set()
-            response = future.result(timeout=15)
+            response = artifact_future.result(timeout=15)
+            stopped = owner_future.result(timeout=15)
     finally:
         release_upload.set()
         release_circuit_select.set()
         event.remove(engine, "after_cursor_execute", after_cursor_execute)
 
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "PROVIDER_EMERGENCY_STOPPED"
+    assert response.status_code == 201, response.text
+    assert stopped.status_code == 200, stopped.text
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
         tenant = db.get(DBTenant, tenant_id)
@@ -1166,32 +1184,15 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
             )
         ).scalar_one()
         assert circuit.state == "DISABLED"
-        assert stored.status == "INGESTING"
-        assert stored.asset_version_id is None
-        assert tenant.used_storage_bytes == 0
-        orphan_event = db.execute(select(DBGenerationEvent).where(
-            DBGenerationEvent.generation_task_id == task_id,
-            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one()
-        assert orphan_event.metadata_json["reasonCode"] == "PROVIDER_EMERGENCY_STOPPED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-missing-circuit-race"
-        assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
-        assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
-        assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
+        assert stored.status == "RIGHTS_BLOCKED"
+        assert stored.asset_version_id is not None
+        assert tenant.used_storage_bytes == len(payload)
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
             DBAssetVersion.media_id == "g76-orphan-after-missing-circuit-race",
-        )).scalar_one() == 0
-        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "SETTLED",
-        )).scalar_one() == 0
-        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "RESERVED",
         )).scalar_one() == 1
-        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "RELEASED",
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
