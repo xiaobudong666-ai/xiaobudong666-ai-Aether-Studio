@@ -1085,6 +1085,20 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
     )
     assert ingesting.status_code == 200, ingesting.text
 
+    # The claim path now materializes the circuit row. Delete it only in this
+    # disposable PostgreSQL fixture to recreate the absent-row state at
+    # artifact finalization, which is the race this test is intended to prove.
+    with sessions() as db:
+        deleted = db.execute(
+            text(
+                "DELETE FROM generation_circuit_states "
+                "WHERE tenant_id = :tenant_id AND provider = 'moneyprinter'"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        assert deleted.rowcount == 1
+        db.commit()
+
     payload = b"g76-postgres-missing-circuit-race-artifact"
     upload_started = Event()
     release_upload = Event()
