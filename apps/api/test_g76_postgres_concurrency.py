@@ -14,7 +14,7 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event, get_ident
+from threading import Barrier, Event
 from unittest.mock import MagicMock
 
 import pytest
@@ -1438,11 +1438,14 @@ def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_m
 
     owner_insert_finished = Event()
     release_owner_insert = Event()
-    owner_thread = {"ident": None}
+    owner_request_active = Event()
 
     def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        # TestClient dispatches the ASGI endpoint on its own portal thread;
+        # the outer caller thread is not the SQL execution thread. Scope the
+        # barrier to the Owner request window instead of comparing thread IDs.
         if (
-            owner_thread["ident"] == get_ident()
+            owner_request_active.is_set()
             and "insert into generation_circuit_states" in statement.lower()
         ):
             owner_insert_finished.set()
@@ -1457,7 +1460,7 @@ def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_m
             )
             assert login.status_code == 200, login.text
             owner_client.headers.update({"X-Aether-CSRF": "1"})
-            owner_thread["ident"] = get_ident()
+            owner_request_active.set()
             return owner_client.post(
                 "/generation/providers/moneyprinter/kill-switch",
                 json={"disabled": True, "reasonCode": "G76_TEST_MISSING_CIRCUIT_CLAIM_RACE"},
