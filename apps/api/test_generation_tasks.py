@@ -2379,11 +2379,20 @@ def test_g76_late_success_does_not_close_open_circuit(generation_context):
     now = datetime.datetime.now(datetime.timezone.utc)
     with sessions() as db:
         tenant_id = db.execute(select(DBTenant.id)).scalar_one()
-        db.add(DBGenerationCircuitState(
-            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
-            state="OPEN", failure_timestamps_json=[now.isoformat()], opened_at=now,
-            cooldown_until=now + datetime.timedelta(minutes=2), updated_at=now,
-        ))
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        circuit.state = "OPEN"
+        circuit.failure_timestamps_json = [now.isoformat()]
+        circuit.opened_at = now
+        circuit.cooldown_until = now + datetime.timedelta(minutes=2)
+        circuit.half_open_task_id = None
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        circuit.updated_at = now
         db.commit()
 
     _g76_finish_claimed_fake_task(client, task["taskId"], "worker-g76-old", "late-open")
@@ -2411,13 +2420,21 @@ def test_g76_half_open_only_current_probe_can_close(generation_context):
     now = datetime.datetime.now(datetime.timezone.utc)
     with sessions() as db:
         tenant_id = db.execute(select(DBTenant.id)).scalar_one()
-        db.add(DBGenerationCircuitState(
-            id=str(uuid.uuid4()), tenant_id=tenant_id, provider="moneyprinter",
-            state="HALF_OPEN", half_open_task_id=None, probe_epoch=0,
-            half_open_lease_epoch=None, half_open_issuer=None,
-            failure_timestamps_json=[now.isoformat()],
-            opened_at=now - datetime.timedelta(minutes=2), updated_at=now,
-        ))
+        circuit = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        circuit.state = "HALF_OPEN"
+        circuit.half_open_task_id = None
+        circuit.probe_epoch = 0
+        circuit.half_open_lease_epoch = None
+        circuit.half_open_issuer = None
+        circuit.failure_timestamps_json = [now.isoformat()]
+        circuit.opened_at = now - datetime.timedelta(minutes=2)
+        circuit.cooldown_until = None
+        circuit.updated_at = now
         db.commit()
     assert claim(client, "worker-g76-probe").json()["taskId"] == probe["taskId"]
 
