@@ -507,19 +507,30 @@ def create_app(
             utc_now(),
         )
 
+    def generation_task_by_id(
+        db: Session, task_id: str, *, for_update: bool = False
+    ) -> DBGenerationTask | None:
+        statement = select(DBGenerationTask).where(DBGenerationTask.id == task_id)
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        return db.execute(statement).scalar_one_or_none()
+
     def generation_task_for_tenant(
         db: Session,
         project_id: str,
         task_id: str,
         context: AuthContext,
+        *,
+        for_update: bool = False,
     ) -> DBGenerationTask:
-        task = db.execute(
-            select(DBGenerationTask).where(
-                DBGenerationTask.id == task_id,
-                DBGenerationTask.project_id == project_id,
-                DBGenerationTask.tenant_id == context.tenant_id,
-            )
-        ).scalar_one_or_none()
+        statement = select(DBGenerationTask).where(
+            DBGenerationTask.id == task_id,
+            DBGenerationTask.project_id == project_id,
+            DBGenerationTask.tenant_id == context.tenant_id,
+        )
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        task = db.execute(statement).scalar_one_or_none()
         if task is None:
             raise HTTPException(
                 status_code=404,
@@ -1719,7 +1730,9 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_roles(context, "owner", "editor")
-        task = generation_task_for_tenant(db, project_id, task_id, context)
+        task = generation_task_for_tenant(
+            db, project_id, task_id, context, for_update=True
+        )
         if task.cancel_requested_at is None and task.status not in TERMINAL_GENERATION_STATES:
             now = utc_now()
             previous = task.status
@@ -1764,7 +1777,9 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_roles(context, "owner", "editor")
-        task = generation_task_for_tenant(db, project_id, task_id, context)
+        task = generation_task_for_tenant(
+            db, project_id, task_id, context, for_update=True
+        )
         # G70/G71: a completed upstream job may already have produced billable output.
         # A failed media transfer requires reconciliation of the ORIGINAL artifact,
         # not another generation attempt with a new upstream job and possible charge.
@@ -2063,7 +2078,7 @@ def create_app(
     ):
         require_internal_token(x_worker_token)
         begin_serialized_write(db)
-        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        task = generation_task_by_id(db, task_id, for_update=True)
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         now = utc_now()
@@ -2089,7 +2104,7 @@ def create_app(
     ):
         require_internal_token(x_worker_token)
         begin_serialized_write(db)
-        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        task = generation_task_by_id(db, task_id, for_update=True)
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         now = utc_now()
@@ -2170,7 +2185,7 @@ def create_app(
         require_internal_token(x_worker_token)
         if any(marker in providerArtifactId for marker in ("://", "..", "\\", "/")):
             raise HTTPException(status_code=422, detail={"code": "ARTIFACT_ID_INVALID", "message": "产物编号格式不安全"})
-        task = db.execute(select(DBGenerationTask).where(DBGenerationTask.id == task_id)).scalar_one_or_none()
+        task = generation_task_by_id(db, task_id, for_update=True)
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         if task.provider == "deterministic-fake-talking-head":
