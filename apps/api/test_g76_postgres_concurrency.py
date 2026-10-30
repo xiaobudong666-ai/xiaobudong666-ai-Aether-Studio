@@ -193,6 +193,7 @@ def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context
             captured_by=project_row.owner_id,
             captured_at=now,
         )
+        asset_id = asset.id
         db.add_all([asset, rights])
         db.commit()
 
@@ -204,7 +205,7 @@ def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context
         "aspectRatio": "9:16",
         "resolution": "720p",
         "voiceId": "synthetic-seed",
-        "imageAssetVersionId": asset.id,
+        "imageAssetVersionId": asset_id,
         "idempotencyKey": key,
         "expectedProjectRevision": project["revision"],
         "confirmSyntheticTestOnly": True,
@@ -243,7 +244,7 @@ def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context
     body = claimed.json()
     assert body["taskId"] == task_id
     assert body["providerMode"] == "talking-head-fake"
-    assert body["request"]["imageAssetId"] == asset.id
+    assert body["request"]["imageAssetId"] == asset_id
     assert body["request"]["fakeTaskType"] == "talking-head"
 
     with sessions() as db:
