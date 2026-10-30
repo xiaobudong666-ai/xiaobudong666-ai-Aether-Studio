@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import os
+from pathlib import Path
 import secrets
 import time
 import uuid
@@ -463,3 +464,98 @@ def test_g76_postgres_heartbeat_waits_for_task_lock_and_rechecks_new_lease(postg
     finally:
         locker.rollback()
         locker.close()
+
+
+def test_g76_postgres_additive_migration_is_idempotent_and_preserves_legacy_rows(
+    postgres_context,
+):
+    """The draft PostgreSQL migration must safely upgrade a legacy schema twice."""
+    _client, sessions, _app = postgres_context
+    with sessions() as db:
+        engine = db.get_bind()
+
+    schema = f"g76_migration_{uuid.uuid4().hex[:12]}"
+    migration_path = Path(__file__).parent / "migrations" / "20261030_g76_probe_epoch_issuer.sql"
+    statements = [
+        statement.strip()
+        for statement in migration_path.read_text(encoding="utf-8").split(";")
+        if statement.strip()
+    ]
+    assert len(statements) == 5
+
+    with engine.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+        connection.execute(text("CREATE TABLE generation_tasks (id VARCHAR PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE generation_circuit_states (id VARCHAR PRIMARY KEY)"))
+        connection.execute(text("INSERT INTO generation_tasks (id) VALUES ('legacy-task')"))
+        connection.execute(
+            text("INSERT INTO generation_circuit_states (id) VALUES ('legacy-circuit')")
+        )
+
+        # Running the same additive migration twice proves IF NOT EXISTS behavior.
+        for _ in range(2):
+            for statement in statements:
+                connection.execute(text(statement))
+
+        columns = connection.execute(
+            text(
+                """
+                SELECT table_name, column_name, is_nullable, column_default, data_type
+                FROM information_schema.columns
+                WHERE table_schema = :schema
+                """
+            ),
+            {"schema": schema},
+        ).all()
+        actual = {
+            (row.table_name, row.column_name): (
+                row.is_nullable,
+                row.column_default,
+                row.data_type,
+            )
+            for row in columns
+        }
+
+        expected = {
+            ("generation_tasks", "lease_epoch"),
+            ("generation_tasks", "circuit_probe_epoch"),
+            ("generation_circuit_states", "probe_epoch"),
+            ("generation_circuit_states", "half_open_lease_epoch"),
+            ("generation_circuit_states", "half_open_issuer"),
+        }
+        assert expected.issubset(actual)
+
+        for key in (
+            ("generation_tasks", "lease_epoch"),
+            ("generation_circuit_states", "probe_epoch"),
+        ):
+            nullable, default, data_type = actual[key]
+            assert nullable == "NO"
+            assert default is not None and "0" in default
+            assert data_type == "integer"
+
+        assert actual[("generation_tasks", "circuit_probe_epoch")][0] == "YES"
+        assert actual[("generation_circuit_states", "half_open_lease_epoch")][0] == "YES"
+        assert actual[("generation_circuit_states", "half_open_issuer")][0] == "YES"
+        assert actual[("generation_circuit_states", "half_open_issuer")][2] == "character varying"
+
+        task_row = connection.execute(
+            text(
+                "SELECT id, lease_epoch, circuit_probe_epoch "
+                "FROM generation_tasks WHERE id = 'legacy-task'"
+            )
+        ).one()
+        circuit_row = connection.execute(
+            text(
+                "SELECT id, probe_epoch, half_open_lease_epoch, half_open_issuer "
+                "FROM generation_circuit_states WHERE id = 'legacy-circuit'"
+            )
+        ).one()
+        assert task_row.lease_epoch == 0
+        assert task_row.circuit_probe_epoch is None
+        assert circuit_row.probe_epoch == 0
+        assert circuit_row.half_open_lease_epoch is None
+        assert circuit_row.half_open_issuer is None
+
+        connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
