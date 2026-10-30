@@ -1,0 +1,2 @@
+# Test-only PostgreSQL driver. Never installed in production images.
+psycopg[binary]==3.2.10
