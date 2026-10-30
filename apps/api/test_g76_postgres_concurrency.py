@@ -1166,7 +1166,14 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             artifact_future = pool.submit(send_artifact_intake)
-            assert upload_started.wait(timeout=10), "artifact upload did not reach the sidecar"
+            if not upload_started.wait(timeout=10):
+                if artifact_future.done():
+                    early_response = artifact_future.result(timeout=1)
+                    pytest.fail(
+                        "artifact intake returned before sidecar: "
+                        f"HTTP {early_response.status_code} {early_response.text}"
+                    )
+                pytest.fail("artifact upload did not reach the sidecar and request is still pending")
             release_upload.set()
             assert circuit_select_finished.wait(timeout=10), "final circuit SELECT FOR UPDATE was not observed"
 
