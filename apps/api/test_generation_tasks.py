@@ -2717,7 +2717,10 @@ def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_con
 
 @pytest.fixture()
 def postgres_generation_context():
-    database_url = os.environ.get("AETHER_POSTGRES_TEST_DATABASE_URL")
+    database_url = (
+        os.environ.get("AETHER_POSTGRES_TEST_DATABASE_URL")
+        or os.environ.get("AETHER_TEST_POSTGRES_URL")
+    )
     if not database_url:
         pytest.skip("AETHER_POSTGRES_TEST_DATABASE_URL is not configured")
 
