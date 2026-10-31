@@ -764,6 +764,17 @@ def test_generated_media_download_requires_current_export_rights(generation_cont
     owner_denied = client.get(media_url)
     assert owner_denied.status_code == 403
     assert owner_denied.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    owner_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check",
+        params={"purpose": "EXPORT"},
+    ).json()
+    assert owner_rights_check["allowed"] is False
+    assert owner_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    owner_default_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check"
+    ).json()
+    assert owner_default_rights_check["allowed"] is False
+    assert owner_default_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
     assert stream_calls == []
 
     editor_password = secrets.token_urlsafe(24)
@@ -792,6 +803,12 @@ def test_generated_media_download_requires_current_export_rights(generation_cont
     editor_denied = client.get(media_url)
     assert editor_denied.status_code == 403
     assert editor_denied.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    editor_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check",
+        params={"purpose": "EXPORT"},
+    ).json()
+    assert editor_rights_check["allowed"] is False
+    assert editor_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
     assert stream_calls == []
 
     revoked = client.post(
