@@ -357,6 +357,10 @@ def test_04_viewer_is_read_only_with_zero_writes(generation_context):
     }).status_code == 201
     client.post("/auth/logout")
     assert client.post("/auth/login", json={"email": "viewer@example.com", "password": password}).status_code == 200
+    assert client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset"},
+    ).status_code == 200
     response = client.post(
         f"/projects/{project['id']}/generation-tasks",
         json=generation_request(client, project),
@@ -434,6 +438,161 @@ def test_14_list_detail_are_scoped_paginated_and_prompt_free(generation_context)
     detail = client.get(f"/projects/{project['id']}/generation-tasks/{task['taskId']}").json()
     assert len(detail["attempts"]) == 1
     assert "videoSubject" not in str(detail)
+
+
+
+def test_g72_keyset_task_list_combines_filters_and_scopes_actor(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "g72-query-filters")
+    matching = create_task(client, project, key="g72-query-match")
+    other = create_task(client, project, key="g72-query-other")
+    created_at = datetime.datetime(2026, 10, 30, 10, 0, tzinfo=datetime.timezone.utc)
+    with sessions() as db:
+        owner_id = db.execute(
+            select(DBUser.id).where(DBUser.email == "owner@example.com")
+        ).scalar_one()
+        matching_row = db.get(DBGenerationTask, matching["taskId"])
+        other_row = db.get(DBGenerationTask, other["taskId"])
+        matching_row.status = "FAILED"
+        matching_row.provider = "moneyprinter"
+        matching_row.requested_by = owner_id
+        matching_row.error_code = "SYNTHETIC_FAILURE"
+        matching_row.created_at = created_at
+        other_row.status = "QUEUED"
+        other_row.provider = "deterministic-fake-talking-head"
+        other_row.error_code = None
+        other_row.created_at = created_at + datetime.timedelta(minutes=10)
+        db.commit()
+
+    response = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={
+            "pagination": "keyset",
+            "pageSize": 10,
+            "status": "FAILED",
+            "provider": "moneyprinter",
+            "requestedBy": owner_id,
+            "createdAfter": (created_at - datetime.timedelta(seconds=1)).isoformat(),
+            "createdBefore": (created_at + datetime.timedelta(seconds=1)).isoformat(),
+            "errorCode": "SYNTHETIC_FAILURE",
+        },
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert [item["taskId"] for item in payload["items"]] == [matching["taskId"]]
+    assert payload["statusFilterSemantics"] == "storedStatus"
+    assert payload["pagination"] == "keyset"
+    assert payload["sort"] == "createdAt:desc"
+    assert payload["sortTieBreaker"] == "taskId"
+    assert payload["nextKeysetCursor"] is None
+    assert payload["nextCursor"] is None
+
+    wrong_actor = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "requestedBy": "not-a-member-id"},
+    )
+    assert wrong_actor.status_code == 200
+    assert wrong_actor.json()["items"] == []
+    assert wrong_actor.json()["nextKeysetCursor"] is None
+
+    invalid_status = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "status": "NOT_A_STATUS"},
+    )
+    assert invalid_status.status_code == 422
+
+    invalid_range = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={
+            "pagination": "keyset",
+            "createdAfter": (created_at + datetime.timedelta(days=1)).isoformat(),
+            "createdBefore": created_at.isoformat(),
+        },
+    )
+    assert invalid_range.status_code == 422
+
+
+def test_g72_keyset_cursor_is_stable_after_insert_and_bound_to_query_scope(generation_context):
+    client, sessions, _, _ = generation_context
+    project = create_project(client, "g72-keyset-stability")
+    tasks = [
+        create_task(client, project, key=f"g72-keyset-{index}")
+        for index in range(3)
+    ]
+    fixed_time = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    with sessions() as db:
+        rows = [db.get(DBGenerationTask, task["taskId"]) for task in tasks]
+        for row in rows:
+            row.created_at = fixed_time
+        db.commit()
+        expected_desc = sorted((row.id for row in rows), reverse=True)
+
+    first = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "pageSize": 1, "sort": "createdAt:desc"},
+    )
+    assert first.status_code == 200, first.text
+    first_payload = first.json()
+    assert first_payload["items"][0]["taskId"] == expected_desc[0]
+    cursor = first_payload["nextKeysetCursor"]
+    assert isinstance(cursor, str) and cursor
+
+    inserted = create_task(client, project, key="g72-keyset-inserted-after-page-one")
+    second = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "pageSize": 1, "sort": "createdAt:desc", "after": cursor},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["items"][0]["taskId"] == expected_desc[1]
+    assert second.json()["items"][0]["taskId"] != inserted["taskId"]
+
+    third = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "pageSize": 1, "sort": "createdAt:desc", "after": second.json()["nextKeysetCursor"]},
+    )
+    assert third.status_code == 200, third.text
+    assert third.json()["items"][0]["taskId"] == expected_desc[2]
+    assert third.json()["nextKeysetCursor"] is None
+
+    ascending = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "pageSize": 10, "sort": "createdAt:asc"},
+    )
+    assert ascending.status_code == 200, ascending.text
+    ascending_ids = [item["taskId"] for item in ascending.json()["items"]]
+    assert ascending_ids == sorted(ascending_ids, key=lambda task_id: (
+        fixed_time if task_id in expected_desc else datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
+        task_id,
+    ))
+
+    changed_filter = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "pageSize": 1, "sort": "createdAt:desc", "status": "FAILED", "after": cursor},
+    )
+    assert changed_filter.status_code == 409
+    assert changed_filter.json()["detail"]["code"] == "GENERATION_CURSOR_SCOPE_MISMATCH"
+
+    other_project = create_project(client, "g72-keyset-other-project")
+    changed_project = client.get(
+        f"/projects/{other_project['id']}/generation-tasks",
+        params={"pagination": "keyset", "after": cursor},
+    )
+    assert changed_project.status_code == 409
+    assert changed_project.json()["detail"]["code"] == "GENERATION_CURSOR_SCOPE_MISMATCH"
+
+    malformed = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset", "after": "%%%"},
+    )
+    assert malformed.status_code == 422
+    assert malformed.json()["detail"]["code"] == "GENERATION_CURSOR_INVALID"
+
+    mixed_mode = client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "offset", "after": cursor},
+    )
+    assert mixed_mode.status_code == 422
+    assert mixed_mode.json()["detail"]["code"] == "GENERATION_CURSOR_MODE_MISMATCH"
 
 
 def test_15_csrf_protects_generation_mutations(generation_context):
@@ -809,6 +968,10 @@ def test_37_tenant_scope_hides_foreign_task(generation_context):
     client.post("/auth/logout")
     client.post("/auth/login", json={"email": "foreign@example.com", "password": password})
     assert client.get(f"/projects/{project['id']}/generation-tasks/{task['taskId']}").status_code == 404
+    assert client.get(
+        f"/projects/{project['id']}/generation-tasks",
+        params={"pagination": "keyset"},
+    ).status_code == 404
 
 
 def test_38_storage_quota_rejects_before_media_store(generation_context):
