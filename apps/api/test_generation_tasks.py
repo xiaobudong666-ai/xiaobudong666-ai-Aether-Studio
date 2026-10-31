@@ -722,25 +722,30 @@ def test_generated_media_download_requires_current_export_rights(generation_cont
     stream_calls = []
 
     class FakeUpstream:
-        status_code = 200
-        headers = {
-            "content-type": "video/mp4",
-            "content-length": str(len(payload)),
-        }
+        def __init__(self, body):
+            self.body = body
+            self.status_code = 200
+            self.headers = {
+                "content-type": "video/mp4",
+                "content-length": str(len(body)),
+            }
 
         def iter_bytes(self):
-            yield payload
+            yield self.body
 
     class FakeStreamContext:
+        def __init__(self, body):
+            self.response = FakeUpstream(body)
+
         def __enter__(self):
-            return FakeUpstream()
+            return self.response
 
         def __exit__(self, exc_type, exc, traceback):
             return False
 
     def fake_stream(path, headers=None):
         stream_calls.append((path, headers))
-        return FakeStreamContext()
+        return FakeStreamContext(payload)
 
     monkeypatch.setattr(app.state.video_use, "stream", fake_stream, raising=False)
     media_url = f"/video-use/media/{project['id']}/{media_id}"
