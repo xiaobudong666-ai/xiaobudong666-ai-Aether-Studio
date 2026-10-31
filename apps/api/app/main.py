@@ -506,10 +506,20 @@ def create_app(
     def generation_rights(db: Session, task: DBGenerationTask) -> dict:
         if not task.asset_version_id:
             return {"allowed": False, "code": "RIGHTS_MISSING"}
-        return rights_decision(
+        decision = rights_decision(
             latest_rights_snapshot(db, task.asset_version_id, "EXPORT"),
             utc_now(),
         )
+        # Human-entered rights snapshots are evidence records, not trusted
+        # M12 export grants. The current model has no verifiable issuer/signature
+        # binding. Until the Owner-approved issuer contract is implemented,
+        # a caller-selected ALLOWED snapshot must never authorize generated use.
+        if decision.get("allowed"):
+            return {
+                "allowed": False,
+                "code": "RIGHTS_TRUSTED_ISSUER_REQUIRED",
+            }
+        return decision
 
     def generation_task_by_id(
         db: Session, task_id: str, *, for_update: bool = False
