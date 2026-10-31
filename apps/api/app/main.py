@@ -521,6 +521,29 @@ def create_app(
             }
         return decision
 
+    def generated_asset_export_rights(
+        db: Session, asset: DBAssetVersion
+    ) -> dict | None:
+        generated_task = db.execute(
+            select(DBGenerationTask)
+            .where(
+                DBGenerationTask.project_id == asset.project_id,
+                DBGenerationTask.tenant_id == asset.tenant_id,
+                DBGenerationTask.asset_version_id == asset.id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if generated_task is not None:
+            return generation_rights(db, generated_task)
+        provenance = (
+            asset.probe_json.get("provenance")
+            if isinstance(asset.probe_json, dict)
+            else None
+        )
+        if isinstance(provenance, dict) and provenance.get("generationTaskId"):
+            return {"allowed": False, "code": "GENERATION_TASK_MISSING"}
+        return None
+
     def generation_task_by_id(
         db: Session, task_id: str, *, for_update: bool = False
     ) -> DBGenerationTask | None:
@@ -1743,10 +1766,12 @@ def create_app(
                     status_code=422,
                     detail={"code": "TALKING_HEAD_AUDIO_INVALID", "message": "独立旁白素材无效"},
                 )
-            audio_rights = rights_decision(
-                latest_rights_snapshot(db, audio_asset.id, "EXPORT"),
-                utc_now(),
-            )
+            audio_rights = generated_asset_export_rights(db, audio_asset)
+            if audio_rights is None:
+                audio_rights = rights_decision(
+                    latest_rights_snapshot(db, audio_asset.id, "EXPORT"),
+                    utc_now(),
+                )
             if not audio_rights.get("allowed"):
                 raise HTTPException(
                     status_code=422,
@@ -3390,11 +3415,21 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         project_for_tenant(db, project_id, context)
-        asset_for_tenant(db, project_id, asset_version_id, context)
+        asset = asset_for_tenant(db, project_id, asset_version_id, context)
         snapshot = latest_rights_snapshot(db, asset_version_id, purpose)
+        generated_rights = (
+            generated_asset_export_rights(db, asset)
+            if purpose in (None, "EXPORT")
+            else None
+        )
+        decision = (
+            generated_rights
+            if generated_rights is not None
+            else rights_decision(snapshot, utc_now())
+        )
         return {
             "assetVersionId": asset_version_id,
-            **rights_decision(snapshot, utc_now()),
+            **decision,
             "snapshot": rights_snapshot_response(snapshot) if snapshot else None,
         }
 
@@ -3469,36 +3504,13 @@ def create_app(
             .limit(1)
         ).scalar_one_or_none()
         if asset is not None:
-            generated_task = db.execute(
-                select(DBGenerationTask)
-                .where(
-                    DBGenerationTask.project_id == project_id,
-                    DBGenerationTask.tenant_id == context.tenant_id,
-                    DBGenerationTask.asset_version_id == asset.id,
-                )
-                .limit(1)
-            ).scalar_one_or_none()
-            provenance = (
-                asset.probe_json.get("provenance")
-                if isinstance(asset.probe_json, dict)
-                else None
-            )
-            if generated_task is not None:
-                rights = generation_rights(db, generated_task)
-                if not rights.get("allowed"):
-                    raise HTTPException(
-                        status_code=403,
-                        detail={
-                            "code": rights.get("code", "RIGHTS_MISSING"),
-                            "message": "该生成资产当前缺少有效 EXPORT 权利证据，禁止下载",
-                        },
-                    )
-            elif isinstance(provenance, dict) and provenance.get("generationTaskId"):
+            generated_rights = generated_asset_export_rights(db, asset)
+            if generated_rights is not None and not generated_rights.get("allowed"):
                 raise HTTPException(
                     status_code=403,
                     detail={
-                        "code": "GENERATION_TASK_MISSING",
-                        "message": "生成资产缺少可核验的原始任务，禁止下载",
+                        "code": generated_rights.get("code", "RIGHTS_MISSING"),
+                        "message": "该生成资产当前缺少可信 EXPORT 权利证据，禁止下载",
                     },
                 )
 
@@ -3793,10 +3805,12 @@ def create_app(
             if asset is None:
                 rights_failures.append({"mediaId": media_id, "code": "ASSET_VERSION_MISSING"})
                 continue
-            decision = rights_decision(
-                latest_rights_snapshot(db, asset.id, "EXPORT"),
-                utc_now(),
-            )
+            decision = generated_asset_export_rights(db, asset)
+            if decision is None:
+                decision = rights_decision(
+                    latest_rights_snapshot(db, asset.id, "EXPORT"),
+                    utc_now(),
+                )
             if not decision["allowed"]:
                 rights_failures.append(
                     {"mediaId": media_id, "assetVersionId": asset.id, "code": decision["code"]}
