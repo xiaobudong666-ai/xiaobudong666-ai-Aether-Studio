@@ -41,6 +41,18 @@ class VideoUseAdapter:
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
+            files = kwargs.get("files")
+            if isinstance(files, dict):
+                for part in files.values():
+                    if isinstance(part, tuple) and len(part) >= 2:
+                        stream = part[1]
+                        if hasattr(stream, "seek"):
+                            try:
+                                stream.seek(0)
+                            except (OSError, ValueError) as exc:
+                                raise VideoUseConnectionError(
+                                    "video-use upload stream cannot be rewound safely"
+                                ) from exc
             try:
                 with httpx.Client(timeout=self.timeout, trust_env=False) as client:
                     response = client.request(method, f"{self.api_url}{path}", **kwargs)
@@ -84,13 +96,25 @@ class VideoUseAdapter:
         filename: str,
         content_type: str | None,
         stream: BinaryIO,
+        *,
+        idempotency_key: str | None = None,
+        content_sha256: str | None = None,
     ) -> dict[str, Any]:
+        headers: dict[str, str] = {}
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+            if content_sha256 is None:
+                raise ValueError("content_sha256 is required with an idempotency key")
+            headers["X-Content-SHA256"] = content_sha256
+        elif content_sha256 is not None:
+            raise ValueError("idempotency_key is required with content_sha256")
         return self._json(
             self._request(
                 "POST",
                 "/media",
                 data={"projectId": project_id},
                 files={"file": (filename, stream, content_type or "application/octet-stream")},
+                headers=headers or None,
             )
         )
 
