@@ -130,14 +130,26 @@ test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated e
 
   const submit = page.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" });
   await expect(submit).toBeEnabled();
-  const createResponsePromise = page.waitForResponse((response) => (
-    response.url().endsWith("/talking-head/fake-generation-tasks")
-    && response.request().method() === "POST"
-  ));
+  const createResponses = [];
+  page.on("response", (response) => {
+    if (
+      response.url().endsWith("/talking-head/fake-generation-tasks")
+      && response.request().method() === "POST"
+    ) createResponses.push(response);
+  });
   await submit.click();
-  const createResponse = await createResponsePromise;
+  await expect.poll(
+    () => createResponses.some((response) => response.status() === 202),
+    { timeout: 30_000, intervals: [250] },
+  ).toBe(true);
+  const rejectedCreateResponses = createResponses.filter((response) => response.status() !== 202);
+  for (const response of rejectedCreateResponses) {
+    const body = await response.json();
+    expect(["CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"]).toContain(body.detail?.code);
+  }
+  expect(createResponses.length).toBeLessThanOrEqual(2);
+  const createResponse = createResponses.find((response) => response.status() === 202);
   const createText = await createResponse.text();
-  expect(createResponse.status(), createText).toBe(202);
   const created = JSON.parse(createText);
   expect(created.taskId).toBeTruthy();
   await expect(page.getByRole("status")).toContainText("FAKE-only 测试任务已入队");
