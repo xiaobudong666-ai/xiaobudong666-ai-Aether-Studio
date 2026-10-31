@@ -630,9 +630,13 @@ jobs:
           "${compose[@]}" exec -T api python /tmp/g70-g71-worker-transfer-failure-smoke.py
           media_count_after="$("${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
           [[ "$media_count_after" =~ ^[0-9]+$ ]]
-          expected_media_count=$((media_count_before + 1))
+          # One object is the Worker lost-ACK orphan. Seven more are the
+          # G70/G71 concurrent proxy proof: three matching lost-ACK uploads,
+          # two unaffected foreign-project uploads in each of two fault modes.
+          # The pre-storage target uploads must create no Sidecar object.
+          expected_media_count=$((media_count_before + 8))
           test "$media_count_after" = "$expected_media_count"
-          echo "Sidecar object count increased by exactly one: one committed/lost-ACK object recovered; pre-storage failures created none ($media_count_before -> $media_count_after)"
+          echo "Sidecar object count increased by exactly eight: one Worker lost-ACK object plus seven concurrent project-scope control objects; pre-storage target uploads created none ($media_count_before -> $media_count_after)"
 
       - name: Export G72 Compose network evidence
         if: always()
