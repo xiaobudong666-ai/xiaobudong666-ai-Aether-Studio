@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -56,6 +57,22 @@ def validate_identifier(value: str, label: str) -> str:
     if not IDENTIFIER.fullmatch(value):
         raise ValueError(f"{label} contains unsupported characters")
     return value
+
+
+def idempotent_media_id(project_id: str, idempotency_key: str) -> str:
+    """Stable Sidecar media identity for a single governed generation task."""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"aether-video-use:{project_id}:{idempotency_key}",
+    ))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class RenderRange(BaseModel):
@@ -378,6 +395,7 @@ def create_app(
     upstream = Path(upstream_root or os.environ.get("VIDEO_USE_UPSTREAM_ROOT", "/opt/video-use"))
     store = MediaStore(root)
     jobs = JobStore(root)
+    upload_idempotency_lock = asyncio.Lock()
     pool = executor or ThreadPoolExecutor(
         max_workers=max(1, int(os.environ.get("VIDEO_USE_WORKERS", "2"))),
         thread_name_prefix="video-use",
@@ -680,55 +698,125 @@ def create_app(
     async def upload_media(
         projectId: str = Form(...),
         file: UploadFile = File(...),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        content_sha256: str | None = Header(default=None, alias="X-Content-SHA256"),
     ):
         try:
             validate_identifier(projectId, "projectId")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        suffix = Path(file.filename or "").suffix.lower()
+
+        filename = Path(file.filename or "").name
+        suffix = Path(filename).suffix.lower()
         if suffix not in ALLOWED_EXTENSIONS:
             raise HTTPException(status_code=415, detail="不支持该媒体文件扩展名")
-        media_id = str(uuid.uuid4())
-        destination = store.media_dir(projectId) / f"{media_id}{suffix}"
+        if (idempotency_key is None) != (content_sha256 is None):
+            raise HTTPException(
+                status_code=422,
+                detail="Idempotency-Key and X-Content-SHA256 must be supplied together",
+            )
+        if idempotency_key is not None:
+            if (
+                not 1 <= len(idempotency_key) <= 256
+                or any(ord(char) < 33 or ord(char) > 126 for char in idempotency_key)
+            ):
+                raise HTTPException(status_code=422, detail="Idempotency-Key format is invalid")
+            if (
+                len(content_sha256 or "") != 64
+                or any(char not in "0123456789abcdefABCDEF" for char in (content_sha256 or ""))
+            ):
+                raise HTTPException(status_code=422, detail="X-Content-SHA256 format is invalid")
+            media_id = idempotent_media_id(projectId, idempotency_key)
+        else:
+            media_id = str(uuid.uuid4())
+
+        media_dir = store.media_dir(projectId)
+        destination = media_dir / f"{media_id}{suffix}"
+        temporary = media_dir / f".{media_id}.{uuid.uuid4().hex}{suffix}.pending"
+        # ffprobe uses the final extension; keep it at the end of the temporary name.
+        temporary = media_dir / f".{media_id}.{uuid.uuid4().hex}.pending{suffix}"
+        idempotent_replay = False
         size = 0
-        try:
-            with destination.open("wb") as output:
-                while chunk := await file.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > MAX_UPLOAD_BYTES:
-                        raise HTTPException(status_code=413, detail="媒体文件过大")
-                    output.write(chunk)
-            metadata = probe(destination)
-            if suffix in IMAGE_EXTENSIONS:
-                video = metadata.get("video") or {}
-                formats = set(str(metadata.get("format") or "").split(","))
-                if (
-                    not video.get("width")
-                    or not video.get("height")
-                    or metadata.get("audio") is not None
-                    or not formats.intersection(IMAGE_FORMATS)
-                ):
+        digest = hashlib.sha256()
+
+        async def persist_upload() -> dict[str, Any]:
+            nonlocal idempotent_replay, size, metadata, media_type, destination
+            try:
+                with temporary.open("wb") as output:
+                    while chunk := await file.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            raise HTTPException(status_code=413, detail="媒体文件过大")
+                        digest.update(chunk)
+                        output.write(chunk)
+
+                actual_sha256 = digest.hexdigest()
+                if content_sha256 is not None and actual_sha256 != content_sha256.lower():
                     raise HTTPException(
                         status_code=422,
-                        detail="图片文件未通过图像格式与尺寸校验",
+                        detail="Uploaded bytes do not match X-Content-SHA256",
                     )
-                media_type = "image"
-            else:
-                media_type = "video" if metadata.get("video") else "audio"
-        except Exception:
-            destination.unlink(missing_ok=True)
-            raise
-        finally:
-            await file.close()
 
-        return {
-            "mediaId": media_id,
-            "projectId": projectId,
-            "fileName": Path(file.filename or destination.name).name,
-            "contentType": file.content_type,
-            "mediaType": media_type,
-            "metadata": metadata,
-        }
+                metadata = probe(temporary)
+                if suffix in IMAGE_EXTENSIONS:
+                    video = metadata.get("video") or {}
+                    formats = set(str(metadata.get("format") or "").split(","))
+                    if (
+                        not video.get("width")
+                        or not video.get("height")
+                        or metadata.get("audio") is not None
+                        or not formats.intersection(IMAGE_FORMATS)
+                    ):
+                        raise HTTPException(
+                            status_code=422,
+                            detail="图片文件未通过图像格式与尺寸校验",
+                        )
+                    media_type = "image"
+                else:
+                    media_type = "video" if metadata.get("video") else "audio"
+
+                if idempotency_key is not None:
+                    matches = list(media_dir.glob(f"{media_id}.*"))
+                    if len(matches) > 1:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Idempotency key maps to ambiguous Sidecar objects",
+                        )
+                    if matches:
+                        existing = matches[0]
+                        if sha256_file(existing) != actual_sha256:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Idempotency key was already used for different media bytes",
+                            )
+                        destination = existing
+                        idempotent_replay = True
+                        metadata = probe(existing)
+                        temporary.unlink(missing_ok=True)
+                    else:
+                        temporary.replace(destination)
+                else:
+                    temporary.replace(destination)
+
+                return {
+                    "mediaId": media_id,
+                    "projectId": projectId,
+                    "fileName": filename or destination.name,
+                    "contentType": file.content_type,
+                    "mediaType": media_type,
+                    "metadata": metadata,
+                    "idempotentReplay": idempotent_replay,
+                }
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
+            finally:
+                await file.close()
+
+        if idempotency_key is not None:
+            async with upload_idempotency_lock:
+                return await persist_upload()
+        return await persist_upload()
 
     @app.get("/media/{project_id}/{media_id}")
     def get_media(project_id: str, media_id: str):
