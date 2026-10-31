@@ -809,6 +809,11 @@ def test_generated_media_download_requires_current_export_rights(generation_cont
     ).json()
     assert editor_rights_check["allowed"] is False
     assert editor_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    editor_default_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check"
+    ).json()
+    assert editor_default_rights_check["allowed"] is False
+    assert editor_default_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
     assert stream_calls == []
 
     revoked = client.post(
