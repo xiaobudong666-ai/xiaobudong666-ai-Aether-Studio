@@ -168,7 +168,6 @@ def create_fake_task(client: httpx.Client, mode: str) -> tuple[str, str, int]:
 
     # Arm only after all setup/preflight work; the next POST /media must be
     # the real Worker -> API artifact-intake upload for this task.
-    before = proxy_stats()
     arm_proxy(mode)
     created = client.post(base, json=payload)
     assert created.status_code == 202, f"{mode} create={created.status_code} {created.text[:300]}"
@@ -442,6 +441,7 @@ def main() -> None:
     assert committed["arm_upstream_statuses"] == [201, 201, 201]
     assert len(set(committed["arm_media_ids"])) == 1
     assert committed["arm_media_ids"][0] == committed_orphan["mediaId"]
+    assert committed["arm_replay_flags"] == [False, True, True]
 
     assert pre_storage["mode"] == "fail_before_forward"
     assert pre_storage["arm_attempts"] == 3
@@ -449,6 +449,7 @@ def main() -> None:
     assert pre_storage["arm_dropped_success"] == 0
     assert pre_storage["arm_upstream_statuses"] == []
     assert pre_storage["arm_media_ids"] == []
+    assert pre_storage["arm_replay_flags"] == []
     assert proxy["armed"] is False and proxy["remaining"] == 0
 
     evidence = {
