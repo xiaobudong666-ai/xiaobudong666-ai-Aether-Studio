@@ -673,6 +673,39 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Setup Node.js 24 for G72 browser integration
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm 10.30.3 for G72 browser integration
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Install frontend dependencies and Chromium for G72 browser integration
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Verify G72 normal UI entry reaches the actual FAKE-only Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AETHER_PLAYWRIGHT_PASSWORD="$AETHER_BOOTSTRAP_ADMIN_PASSWORD"
+          pnpm exec playwright test --config=playwright.g72.config.mjs
+
+      - name: Upload G72 normal UI-to-Worker browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g72-normal-ui-worker-evidence
+          path: |
+            playwright-report-g72/
+            test-results-g72/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Capture failure diagnostics without credentials
         if: failure()
         shell: bash
