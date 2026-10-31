@@ -621,11 +621,11 @@ jobs:
         run: |
           set -euo pipefail
           compose=(docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml)
-          media_count_before="${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))'
+          media_count_before="$("${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
           [[ "$media_count_before" =~ ^[0-9]+$ ]]
           echo "G70_WORKER_MEDIA_COUNT_BEFORE=$media_count_before" >> "$GITHUB_ENV"
           "${compose[@]}" exec -T api python /tmp/g70-g71-worker-transfer-failure-smoke.py
-          media_count_after="${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))'
+          media_count_after="$("${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
           [[ "$media_count_after" =~ ^[0-9]+$ ]]
           expected_media_count=$((media_count_before + 1))
           test "$media_count_after" = "$expected_media_count"
