@@ -1922,6 +1922,14 @@ def create_app(
         require_roles(context, "owner")
         project_for_tenant(db, project_id, context)
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        if context.user_id != task.requested_by:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "OWNER_SELF_ONLY",
+                    "message": "仅原任务发起Owner本人可以恢复该任务的原始产物",
+                },
+            )
 
         if task.asset_version_id:
             return generation_task_response(
@@ -2105,6 +2113,14 @@ def create_app(
         task = generation_task_for_tenant(
             db, project_id, task_id, context, for_update=True
         )
+        if context.user_id != task.requested_by:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "OWNER_SELF_ONLY",
+                    "message": "恢复提交时任务发起人已变化，拒绝继续",
+                },
+            )
         project_statement = select(DBProject).where(
             DBProject.id == project_id,
             DBProject.tenant_id == context.tenant_id,
