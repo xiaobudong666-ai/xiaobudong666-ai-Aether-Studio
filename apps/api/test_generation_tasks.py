@@ -1136,7 +1136,7 @@ def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_atte
     )
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["status"] == "RIGHTS_BLOCKED"
-    assert recovered.json()["mediaId"] == media_id
+    assert recovered.json()["results"][0]["mediaId"] == media_id
 
     # Repeating the same Owner action is idempotent: no second asset, event,
     # storage reservation, usage settlement, upload or generation attempt.
@@ -1145,7 +1145,7 @@ def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_atte
         json={"reason": "Owner repeated recovery request for idempotency check"},
     )
     assert repeated.status_code == 200, repeated.text
-    assert repeated.json()["assetVersionId"] == recovered.json()["assetVersionId"]
+    assert repeated.json()["results"][0]["assetVersionId"] == recovered.json()["results"][0]["assetVersionId"]
 
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)

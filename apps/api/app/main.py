@@ -2185,6 +2185,7 @@ def create_app(
                 },
             )
 
+        now = utc_now()
         generated_seconds = max(1, int(duration_seconds + 0.999999))
         if settled_entry is not None:
             if settled_entry.generated_seconds != generated_seconds:
@@ -2303,7 +2304,16 @@ def create_app(
             ).scalar_one_or_none()
             or 0
         ) + 1
-        now = utc_now()
+        asset_probe = {
+            **probe_metadata,
+            "provenance": {
+                "provider": task.provider,
+                "providerArtifactId": task.provider_artifact_id,
+                "generationTaskId": task.id,
+                "attempt": task.attempts,
+                "capabilitySnapshotHash": task.capability_snapshot_hash,
+            },
+        }
         asset = DBAssetVersion(
             id=str(uuid.uuid4()),
             tenant_id=task.tenant_id,
@@ -2314,7 +2324,7 @@ def create_app(
             media_type="video",
             content_type="video/mp4",
             size_bytes=actual_size,
-            probe_json=probe_metadata,
+            probe_json=asset_probe,
             created_by=task.requested_by,
             created_at=now,
         )
