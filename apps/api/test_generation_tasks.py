@@ -75,6 +75,7 @@ class FakeGeneratedMediaStore:
         self.fail_probe = False
         self.interrupt = False
         self.media_objects = {}
+        self.inspections = 0
 
     def check_health(self):
         return {"status": "healthy"}
@@ -105,6 +106,7 @@ class FakeGeneratedMediaStore:
         }
 
     def inspect_media(self, project_id, media_id):
+        self.inspections += 1
         stored = self.media_objects.get((project_id, media_id))
         if stored is None:
             raise VideoUseNotFoundError("media not found")
@@ -1186,9 +1188,21 @@ def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_atte
         assert sum(1 for row in usage if row.kind == "SETTLED") == 0
         assert sum(1 for row in usage if row.kind == "RELEASED") == 0
         assert receipts == 1
+        receipt = db.execute(
+            select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+            )
+        ).scalar_one()
+        assert receipt.actor_type == "OWNER"
+        assert receipt.actor_id == stored.requested_by
+        assert receipt.metadata_json["reason"] == "Owner verified original job and orphan media receipt"
+        assert receipt.metadata_json["usageReservationState"] == "RESERVED_HELD"
+        assert receipt.metadata_json["m11M13Reconciliation"] == "PENDING"
         assert tenant.used_storage_bytes == len(payload)
         assert sum(1 for item in project_row.materials if item.get("id") == media_id) == 1
     assert media_store.uploads == 0
+    assert media_store.inspections == 1
     app.state.moneyprinter.assert_not_called()
 
 
@@ -1270,6 +1284,130 @@ def test_g70_g71_owner_recovery_rejects_orphan_hash_mismatch(generation_context)
         assert sum(1 for row in usage if row.kind == "RESERVED") == 1
         assert sum(1 for row in usage if row.kind in {"RELEASED", "SETTLED"}) == 0
     assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+
+def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_owner(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-recovery-owner-and-tenant-scope")
+    task = create_task(client, project, key="g70-recovery-owner-and-tenant-scope")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    admin_password = secrets.token_urlsafe(24)
+    foreign_password = secrets.token_urlsafe(24)
+    with sessions() as db:
+        tenant_id = db.get(DBProject, project["id"]).tenant_id
+        db.add(DBUser(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            email="g70-recovery-admin-no-delegation@example.com",
+            display_name="G70 Recovery Admin Without Delegation",
+            password_hash=hash_password(admin_password),
+            role="admin",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        ))
+        foreign_tenant = DBTenant(
+            id="g70-recovery-foreign-tenant",
+            name="G70 Recovery Foreign Tenant",
+            slug="g70-recovery-foreign-tenant",
+            project_quota=50,
+            storage_quota_bytes=1024**3,
+            used_storage_bytes=0,
+            concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600,
+            render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([
+            foreign_tenant,
+            DBUser(
+                id=str(uuid.uuid4()),
+                tenant_id=foreign_tenant.id,
+                email="g70-recovery-foreign-owner@example.com",
+                display_name="G70 Recovery Foreign Owner",
+                password_hash=hash_password(foreign_password),
+                role="owner",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+        ])
+        db.commit()
+
+    url = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    assert client.post("/auth/logout").status_code == 204
+    admin_login = client.post(
+        "/auth/login",
+        json={
+            "email": "g70-recovery-admin-no-delegation@example.com",
+            "password": admin_password,
+        },
+    )
+    assert admin_login.status_code == 200, admin_login.text
+    admin_response = client.post(
+        url,
+        json={"reason": "Admin has no explicit delegation for recovery"},
+    )
+    assert admin_response.status_code == 403, admin_response.text
+    assert admin_response.json()["detail"]["code"] == "PERMISSION_DENIED"
+
+    assert client.post("/auth/logout").status_code == 204
+    foreign_login = client.post(
+        "/auth/login",
+        json={
+            "email": "g70-recovery-foreign-owner@example.com",
+            "password": foreign_password,
+        },
+    )
+    assert foreign_login.status_code == 200, foreign_login.text
+    foreign_response = client.post(
+        url,
+        json={"reason": "Foreign tenant Owner cannot recover another tenant task"},
+    )
+    assert foreign_response.status_code == 404, foreign_response.text
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        tenant = db.execute(select(DBTenant).where(DBTenant.id == stored.tenant_id)).scalar_one()
+        assets = db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one()
+        recovery_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+            )
+        ).scalar_one()
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert stored.attempts == 1
+        assert assets == 0
+        assert recovery_events == 0
+        assert tenant.used_storage_bytes == 0
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind in {"RELEASED", "SETTLED"}) == 0
+    assert media_store.uploads == 0
+    assert media_store.inspections == 0
     app.state.moneyprinter.assert_not_called()
 
 
