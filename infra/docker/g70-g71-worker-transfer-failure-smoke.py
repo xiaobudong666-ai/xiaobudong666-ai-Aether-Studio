@@ -439,6 +439,7 @@ def main() -> None:
     assert committed["arm_forwarded"] == 3
     assert committed["arm_dropped_success"] == 3
     assert committed["arm_upstream_statuses"] == [201, 201, 201]
+    assert committed["arm_replay_flags"] == [False, True, True]
     assert len(set(committed["arm_media_ids"])) == 1
     assert committed["arm_media_ids"][0] == committed_orphan["mediaId"]
     assert committed["arm_replay_flags"] == [False, True, True]
@@ -449,6 +450,7 @@ def main() -> None:
     assert pre_storage["arm_dropped_success"] == 0
     assert pre_storage["arm_upstream_statuses"] == []
     assert pre_storage["arm_media_ids"] == []
+    assert pre_storage["arm_replay_flags"] == []
     assert pre_storage["arm_replay_flags"] == []
     assert proxy["armed"] is False and proxy["remaining"] == 0
 
