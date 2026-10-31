@@ -29,6 +29,7 @@ _state: dict[str, Any] = {
     "arm_dropped_success": 0,
     "arm_upstream_statuses": [],
     "arm_media_ids": [],
+    "arm_replay_flags": [],
 }
 _lock = asyncio.Lock()
 
@@ -67,6 +68,7 @@ async def arm(request: Request) -> dict[str, Any]:
             "arm_dropped_success": 0,
             "arm_upstream_statuses": [],
             "arm_media_ids": [],
+            "arm_replay_flags": [],
         })
         return {"armed": True, "mode": mode, "failures": failures}
 
@@ -127,9 +129,12 @@ async def forward(path: str, request: Request) -> Response:
 
     if is_media_post and fault_mode == "forward_then_drop_ack":
         media_id = None
+        replay_flag = None
         if upstream_response.status_code == 201:
             try:
-                media_id = upstream_response.json().get("mediaId")
+                payload = upstream_response.json()
+                media_id = payload.get("mediaId")
+                replay_flag = bool(payload.get("idempotentReplay", False))
             except (TypeError, ValueError):
                 media_id = None
         async with _lock:
@@ -139,6 +144,8 @@ async def forward(path: str, request: Request) -> Response:
                 _state["arm_dropped_success"] += 1
             if media_id:
                 _state["arm_media_ids"].append(str(media_id))
+            if replay_flag is not None:
+                _state["arm_replay_flags"].append(replay_flag)
         return JSONResponse(
             status_code=503,
             content={"detail": "FAKE-only injected lost Sidecar acknowledgement"},
