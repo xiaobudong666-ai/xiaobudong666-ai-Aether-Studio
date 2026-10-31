@@ -778,7 +778,7 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
         assert stored.cancel_requested_at is not None
         assert stored.lease_owner is None
         assert stored.lease_expires_at is None
-        assert stored.media_id == "_expected_media_id(project_id, f"generation:{task_id}")"
+        assert stored.media_id == _expected_media_id(project_id, f"generation:{task_id}")
         assert stored.asset_version_id is None
         assert tenant.used_storage_bytes == 0
         orphan_event = db.execute(select(DBGenerationEvent).where(
@@ -786,14 +786,14 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "TASK_CANCELED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "_expected_media_id(project_id, f"generation:{task_id}")"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
         assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "_expected_media_id(project_id, f"generation:{task_id}")",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -923,14 +923,14 @@ def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "ARTIFACT_ID_MISMATCH"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "_expected_media_id(project_id, f"generation:{task_id}")"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["originalProviderArtifactId"] == original_artifact_id
         assert orphan_event.metadata_json["currentTaskProviderArtifactId"] == replacement_artifact_id
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "_expected_media_id(project_id, f"generation:{task_id}")",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -1052,14 +1052,14 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "PROVIDER_EMERGENCY_STOPPED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "_expected_media_id(project_id, f"generation:{task_id}")"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
         assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "_expected_media_id(project_id, f"generation:{task_id}")",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -1252,7 +1252,7 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
         assert tenant.used_storage_bytes == len(payload)
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "_expected_media_id(project_id, f"generation:{task_id}")",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,

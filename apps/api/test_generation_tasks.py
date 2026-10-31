@@ -2697,6 +2697,42 @@ def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
         media_id = _expected_video_use_media_id(project_id, idempotency_key)
         path = durable_dir / f"{media_id}.mp4"
         path.write_bytes(raw)
+        saved_files.append(path)
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration:stream=codec_type,codec_name,width,height",
+                "-of", "json", str(path),
+            ],
+            check=True, capture_output=True, text=True, timeout=20,
+        )
+        probed = json.loads(result.stdout)
+        tracks = probed.get("streams") or []
+        videos = [track for track in tracks if track.get("codec_type") == "video"]
+        audios = [track for track in tracks if track.get("codec_type") == "audio"]
+        assert len(videos) == 1 and videos[0].get("codec_name") == "h264"
+        assert len(audios) == 1 and audios[0].get("codec_name") == "aac"
+        assert int(videos[0].get("width") or 0) > 0
+        assert int(videos[0].get("height") or 0) > 0
+        duration = float((probed.get("format") or {}).get("duration") or 0)
+        assert 0.5 <= duration <= 3.0
+        media_store.uploads += 1
+        return {
+            "mediaId": media_id,
+            "projectId": project_id,
+            "fileName": filename,
+            "contentType": content_type,
+            "metadata": {
+                "durationSeconds": duration,
+                "sizeBytes": path.stat().st_size,
+                "video": {
+                    "codec": "h264",
+                    "width": int(videos[0]["width"]),
+                    "height": int(videos[0]["height"]),
+                },
+                "audio": {"codec": "aac"},
+            },
+        }
 
 
     # Only the test video-use replacement writes to local temporary storage;
@@ -2777,6 +2813,9 @@ def test_g72_native_video_use_http_store_survives_sidecar_restart(
                     "X-Content-SHA256": content_sha256,
                 },
             )
+            assert response.status_code == 201, response.text
+            media_store.uploads += 1
+            return response.json()
 
 
         monkeypatch.setattr(media_store, "upload_media", native_video_use_upload)
