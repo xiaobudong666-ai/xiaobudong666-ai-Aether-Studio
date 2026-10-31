@@ -23,8 +23,11 @@ HOP_BY_HOP = {
 _state: dict[str, Any] = {
     "armed": False,
     "mode": None,
+    "project_id": None,
     "remaining": 0,
     "arm_attempts": 0,
+    "arm_matched_project_ids": [],
+    "arm_ignored_other_project_uploads": 0,
     "arm_forwarded": 0,
     "arm_dropped_success": 0,
     "arm_upstream_statuses": [],
@@ -52,25 +55,47 @@ async def arm(request: Request) -> dict[str, Any]:
         payload = await request.json()
         mode = str(payload.get("mode") or "")
         failures = int(payload.get("failures") or 0)
+        project_id = str(payload.get("projectId") or "")
     except (TypeError, ValueError):
         raise HTTPException(status_code=422, detail="Invalid fault plan")
-    if mode not in {"fail_before_forward", "forward_then_drop_ack"} or failures != 3:
-        raise HTTPException(status_code=422, detail="Only the bounded three-request FAKE-only plans are allowed")
+    safe_project_id = (
+        bool(project_id)
+        and len(project_id) <= 128
+        and project_id.isascii()
+        and all(character.isalnum() or character in "_-" for character in project_id)
+    )
+    if (
+        mode not in {"fail_before_forward", "forward_then_drop_ack"}
+        or failures != 3
+        or not safe_project_id
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Only bounded three-request FAKE-only plans with a valid projectId are allowed",
+        )
     async with _lock:
         if _state["armed"] or _state["remaining"]:
             raise HTTPException(status_code=409, detail="A fault plan is already active")
         _state.update({
             "armed": True,
             "mode": mode,
+            "project_id": project_id,
             "remaining": failures,
             "arm_attempts": 0,
+            "arm_matched_project_ids": [],
+            "arm_ignored_other_project_uploads": 0,
             "arm_forwarded": 0,
             "arm_dropped_success": 0,
             "arm_upstream_statuses": [],
             "arm_media_ids": [],
             "arm_replay_flags": [],
         })
-        return {"armed": True, "mode": mode, "failures": failures}
+        return {
+            "armed": True,
+            "mode": mode,
+            "projectId": project_id,
+            "failures": failures,
+        }
 
 
 @app.get("/__fault/stats")
@@ -90,17 +115,38 @@ async def forward(path: str, request: Request) -> Response:
 
     method = request.method.upper()
     is_media_post = method == "POST" and path == "media"
+    body = await request.body()
     fault_mode: str | None = None
     if is_media_post:
         async with _lock:
-            if _state["armed"] and _state["remaining"] > 0:
-                fault_mode = str(_state["mode"])
-                _state["remaining"] -= 1
-                _state["arm_attempts"] += 1
-                if _state["remaining"] == 0:
-                    _state["armed"] = False
+            should_inspect_project = bool(
+                _state["armed"] and _state["remaining"] > 0
+            )
 
-    body = await request.body()
+        request_project_id: str | None = None
+        if should_inspect_project:
+            try:
+                # request.body() above caches the raw multipart bytes; Starlette's
+                # form parser reads that cached body, leaving the original bytes
+                # available for the unchanged upstream forward below.
+                form = await request.form()
+                values = form.getlist("projectId")
+                if len(values) == 1 and isinstance(values[0], str):
+                    request_project_id = values[0]
+            except Exception:
+                request_project_id = None
+
+            async with _lock:
+                if _state["armed"] and _state["remaining"] > 0:
+                    if request_project_id == _state["project_id"]:
+                        fault_mode = str(_state["mode"])
+                        _state["remaining"] -= 1
+                        _state["arm_attempts"] += 1
+                        _state["arm_matched_project_ids"].append(request_project_id)
+                        if _state["remaining"] == 0:
+                            _state["armed"] = False
+                    else:
+                        _state["arm_ignored_other_project_uploads"] += 1
     if fault_mode == "fail_before_forward":
         return JSONResponse(
             status_code=503,
