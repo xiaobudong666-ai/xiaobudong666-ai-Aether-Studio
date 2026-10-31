@@ -639,6 +639,14 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 1
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
@@ -646,7 +654,7 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RELEASED",
-        )).scalar_one() == 1
+        )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
 
