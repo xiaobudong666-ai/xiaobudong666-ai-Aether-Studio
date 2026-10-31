@@ -10,6 +10,8 @@ if (!/^[A-Za-z0-9_-]{12,128}$/.test(testPassword)) {
 
 export default defineConfig({
   testDir: "./e2e",
+  // G72 must run only with its dedicated Compose-backed config, never the standalone SQLite webServer.
+  testIgnore: ["g72-normal-entry.spec.mjs"],
   outputDir: "test-results",
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
