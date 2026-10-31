@@ -112,14 +112,16 @@ def proxy_stats() -> dict:
     return response.json()
 
 
-def arm_proxy(mode: str) -> dict:
+def arm_proxy(mode: str, project_id: str) -> dict:
     response = proxy_request(
         "POST",
         "/__fault/arm",
-        json={"mode": mode, "failures": 3},
+        json={"mode": mode, "projectId": project_id, "failures": 3},
     )
     assert response.status_code == 200, response.text[:300]
-    return response.json()
+    payload = response.json()
+    assert payload.get("projectId") == project_id
+    return payload
 
 
 def expected_media_id(project_id: str, task_id: str) -> str:
@@ -166,9 +168,10 @@ def create_fake_task(client: httpx.Client, mode: str) -> tuple[str, str, int]:
         assert tenant is not None
         storage_before = int(tenant.used_storage_bytes or 0)
 
-    # Arm only after all setup/preflight work; the next POST /media must be
-    # the real Worker -> API artifact-intake upload for this task.
-    arm_proxy(mode)
+    # Arm only after all setup/preflight work. The proxy additionally matches
+    # the multipart projectId, so another project's upload cannot consume this
+    # task's bounded three-request fault plan.
+    arm_proxy(mode, project_id)
     created = client.post(base, json=payload)
     assert created.status_code == 202, f"{mode} create={created.status_code} {created.text[:300]}"
     task_id = created.json()["taskId"]
@@ -289,6 +292,22 @@ def run_case(client: httpx.Client, mode: str) -> dict:
     retry = client.post(f"/projects/{project_id}/generation-tasks/{task_id}/retry")
     assert retry.status_code == 409, retry.text[:300]
     assert retry.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+    # Re-read all durable invariants after the rejected generic retry. A 409
+    # alone is insufficient if the request mutated task/attempt/usage state.
+    after_retry = inspect_task(project_id, task_id, storage_before)
+    assert after_retry == evidence, (
+        "generic retry changed durable task, attempt, usage, or storage state: "
+        f"before={evidence} after={after_retry}"
+    )
+    evidence["genericRetry"] = {
+        "status": 409,
+        "code": "ARTIFACT_RECOVERY_REQUIRED",
+        "attemptsAfter": after_retry["attempts"],
+        "usageAfter": after_retry["usage"],
+        "reconciliationAfter": after_retry["reconciliation"],
+        "durableStateUnchanged": True,
+    }
 
     media_id = evidence["mediaId"]
     inspection = httpx.get(
@@ -443,6 +462,8 @@ def main() -> None:
     assert len(set(committed["arm_media_ids"])) == 1
     assert committed["arm_media_ids"][0] == committed_orphan["mediaId"]
     assert committed["arm_replay_flags"] == [False, True, True]
+    assert committed["project_id"] == committed_orphan["projectId"]
+    assert committed["arm_matched_project_ids"] == [committed_orphan["projectId"]] * 3
 
     assert pre_storage["mode"] == "fail_before_forward"
     assert pre_storage["arm_attempts"] == 3
@@ -451,7 +472,8 @@ def main() -> None:
     assert pre_storage["arm_upstream_statuses"] == []
     assert pre_storage["arm_media_ids"] == []
     assert pre_storage["arm_replay_flags"] == []
-    assert pre_storage["arm_replay_flags"] == []
+    assert pre_storage["project_id"] == pre_storage_failure["projectId"]
+    assert pre_storage["arm_matched_project_ids"] == [pre_storage_failure["projectId"]] * 3
     assert proxy["armed"] is False and proxy["remaining"] == 0
 
     evidence = {
