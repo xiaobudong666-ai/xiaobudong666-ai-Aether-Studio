@@ -732,12 +732,13 @@ def create_app(
 
         media_dir = store.media_dir(projectId)
         destination = media_dir / f"{media_id}{suffix}"
-        temporary = media_dir / f".{media_id}.{uuid.uuid4().hex}{suffix}.pending"
         # ffprobe uses the final extension; keep it at the end of the temporary name.
         temporary = media_dir / f".{media_id}.{uuid.uuid4().hex}.pending{suffix}"
         idempotent_replay = False
         size = 0
         digest = hashlib.sha256()
+        metadata: dict[str, Any] = {}
+        media_type = "video"
 
         async def persist_upload() -> dict[str, Any]:
             nonlocal idempotent_replay, size, metadata, media_type, destination
