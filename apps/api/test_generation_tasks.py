@@ -1367,7 +1367,7 @@ def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_ow
     assert same_owner_login.status_code == 200, same_owner_login.text
     same_owner_response = client.post(
         url,
-        json={"reason": "Another tenant Owner cannot recover this task"},
+        json={"reason": "Another owner in the same tenant cannot recover this task"},
     )
     assert same_owner_response.status_code == 403, same_owner_response.text
     assert same_owner_response.json()["detail"]["code"] == "OWNER_SELF_ONLY"
