@@ -3444,6 +3444,54 @@ def create_app(
         material = next((item for item in project.materials if item.get("id") == media_id), None)
         if material is None:
             raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND", "message": "未找到该媒体文件"})
+
+        # Generated outputs are downloadable only while their latest EXPORT
+        # evidence is valid. A RIGHTS_BLOCKED task must not become readable
+        # merely because recovery added the orphan to project.materials.
+        asset = db.execute(
+            select(DBAssetVersion)
+            .where(
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == context.tenant_id,
+                DBAssetVersion.media_id == media_id,
+            )
+            .order_by(DBAssetVersion.version_no.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if asset is not None:
+            generated_task = db.execute(
+                select(DBGenerationTask)
+                .where(
+                    DBGenerationTask.project_id == project_id,
+                    DBGenerationTask.tenant_id == context.tenant_id,
+                    DBGenerationTask.asset_version_id == asset.id,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            provenance = (
+                asset.probe_json.get("provenance")
+                if isinstance(asset.probe_json, dict)
+                else None
+            )
+            if generated_task is not None:
+                rights = generation_rights(db, generated_task)
+                if not rights.get("allowed"):
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": rights.get("code", "RIGHTS_MISSING"),
+                            "message": "该生成资产当前缺少有效 EXPORT 权利证据，禁止下载",
+                        },
+                    )
+            elif isinstance(provenance, dict) and provenance.get("generationTaskId"):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "GENERATION_TASK_MISSING",
+                        "message": "生成资产缺少可核验的原始任务，禁止下载",
+                    },
+                )
+
         media_type = material.get("contentType") or ("video/mp4" if material.get("type") == "video" else "audio/mpeg")
         return proxy_video_use_stream(f"/media/{project_id}/{media_id}", request, media_type)
 
