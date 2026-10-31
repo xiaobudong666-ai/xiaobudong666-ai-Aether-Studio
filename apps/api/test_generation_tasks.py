@@ -756,25 +756,53 @@ def test_generated_media_download_requires_current_export_rights(generation_cont
     assert stream_calls == []
 
     rights_url = f"/projects/{project['id']}/asset-versions/{asset_id}/rights-snapshots"
-    allowed = client.post(
+    owner_allowed = client.post(
         rights_url,
-        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "synthetic-export-allowed"},
+        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "owner-self-asserted"},
     )
-    assert allowed.status_code == 201, allowed.text
-    downloaded = client.get(media_url)
-    assert downloaded.status_code == 200
-    assert downloaded.content == payload
-    assert len(stream_calls) == 1
+    assert owner_allowed.status_code == 201, owner_allowed.text
+    owner_denied = client.get(media_url)
+    assert owner_denied.status_code == 403
+    assert owner_denied.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    assert stream_calls == []
+
+    editor_password = secrets.token_urlsafe(24)
+    created_editor = client.post(
+        "/admin/users",
+        json={
+            "email": "generated-export-editor@example.com",
+            "displayName": "Generated Export Editor",
+            "password": editor_password,
+            "role": "editor",
+        },
+    )
+    assert created_editor.status_code == 201, created_editor.text
+    assert client.post("/auth/logout").status_code == 204
+    editor_login = client.post(
+        "/auth/login",
+        json={"email": "generated-export-editor@example.com", "password": editor_password},
+    )
+    assert editor_login.status_code == 200, editor_login.text
+
+    editor_allowed = client.post(
+        rights_url,
+        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "editor-self-asserted"},
+    )
+    assert editor_allowed.status_code == 201, editor_allowed.text
+    editor_denied = client.get(media_url)
+    assert editor_denied.status_code == 403
+    assert editor_denied.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    assert stream_calls == []
 
     revoked = client.post(
         rights_url,
-        json={"status": "REVOKED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "synthetic-export-revoked"},
+        json={"status": "REVOKED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "editor-revoked"},
     )
     assert revoked.status_code == 201, revoked.text
     denied = client.get(media_url)
     assert denied.status_code == 403
     assert denied.json()["detail"]["code"] == "RIGHTS_REVOKED"
-    assert len(stream_calls) == 1
+    assert stream_calls == []
 
 
 def test_31_repeated_artifact_completion_is_idempotent_without_double_quota(generation_context):
@@ -796,7 +824,7 @@ def test_31_repeated_artifact_completion_is_idempotent_without_double_quota(gene
     assert media_store.uploads == 1
 
 
-def test_32_rights_default_block_then_allowed_is_derived_without_mutating_evidence(generation_context):
+def test_32_generated_rights_require_trusted_issuer_and_preserve_evidence_status(generation_context):
     client, _, _, _ = generation_context
     project = create_project(client)
     task = ingest_success(client, project)
@@ -843,7 +871,11 @@ def test_32_rights_default_block_then_allowed_is_derived_without_mutating_eviden
     )
     assert response.status_code == 201
     refreshed = client.get(f"/projects/{project['id']}/generation-tasks/{task['taskId']}").json()
-    assert refreshed["status"] == "SUCCEEDED"
+    assert refreshed["rights"] == {
+        "allowed": False,
+        "code": "RIGHTS_TRUSTED_ISSUER_REQUIRED",
+    }
+    assert refreshed["status"] == "RIGHTS_BLOCKED"
     assert refreshed["storedStatus"] == "RIGHTS_BLOCKED"
 
 
@@ -2067,7 +2099,7 @@ def test_p0_runtime_bridge_requires_rights_and_explicit_action(generation_contex
     assert unchanged["timeline"]["tracks"] == []
 
 
-def test_p0_runtime_bridge_explicitly_writes_vertical_draft_without_render(generation_context):
+def test_p0_runtime_bridge_blocks_self_asserted_rights_without_trusted_issuer(generation_context):
     client, sessions, _, _ = generation_context
     project = create_project(client, "P0 bridge apply")
     task = ingest_success(client, project, key="p0-bridge-apply")
@@ -2078,7 +2110,7 @@ def test_p0_runtime_bridge_explicitly_writes_vertical_draft_without_render(gener
             "status": "ALLOWED",
             "purpose": "EXPORT",
             "territory": "GLOBAL",
-            "evidenceRef": "evidence://p0-runtime-bridge",
+            "evidenceRef": "owner-self-asserted-p0-runtime-bridge",
         },
     )
     assert rights.status_code == 201
@@ -2091,11 +2123,11 @@ def test_p0_runtime_bridge_explicitly_writes_vertical_draft_without_render(gener
             "subtitles": [{"text": "口播测试", "startMs": 0, "durationMs": 1000}],
         },
     )
-    assert response.status_code == 200, response.text
-    saved = response.json()
-    assert saved["revision"] == current["revision"] + 1
-    assert saved["timeline"]["output"] == {"aspect": "9:16", "width": 1080, "height": 1920}
-    assert [track["type"] for track in saved["timeline"]["tracks"]] == ["video", "subtitle"]
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    unchanged = client.get(f"/projects/{project['id']}").json()
+    assert unchanged["revision"] == current["revision"]
+    assert unchanged["timeline"]["tracks"] == []
     with sessions() as db:
         assert db.execute(select(func.count(DBCandidate.id))).scalar_one() == 0
 
