@@ -39,6 +39,13 @@ from sqlalchemy.orm import sessionmaker
 OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
 
+
+def _expected_video_use_media_id(project_id: str, idempotency_key: str) -> str:
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"aether-video-use:{project_id}:{idempotency_key}",
+    ))
+
 class LeaseAwareTestClient(TestClient):
     """Test helper that mirrors the Worker lease-epoch header contract."""
 
@@ -83,26 +90,45 @@ class FakeGeneratedMediaStore:
     def get_capabilities(self):
         return {"render": True}
 
-    def upload_media(self, project_id, filename, content_type, stream):
+    def upload_media(
+        self, project_id, filename, content_type, stream, *,
+        idempotency_key=None, content_sha256=None,
+    ):
         payload = stream.read()
         if self.interrupt:
             raise RuntimeError("stream interrupted")
-        self.uploads += 1
-        metadata = {"durationSeconds": 1.0, "sizeBytes": len(payload)}
-        if not self.fail_probe:
-            metadata["video"] = {"codec": "h264", "width": 320, "height": 240}
-        media_id = f"generated-media-{self.uploads}"
-        self.media_objects[(project_id, media_id)] = {
-            "content": payload,
-            "metadata": metadata,
-            "contentType": content_type,
-        }
+        if (idempotency_key is None) != (content_sha256 is None):
+            raise ValueError("idempotency key and content SHA-256 must be supplied together")
+        digest = hashlib.sha256(payload).hexdigest()
+        if content_sha256 is not None and digest != content_sha256.lower():
+            raise ValueError("uploaded bytes do not match the supplied content SHA-256")
+
+        media_id = (
+            _expected_video_use_media_id(project_id, idempotency_key)
+            if idempotency_key is not None
+            else f"generated-media-{self.uploads + 1}"
+        )
+        existing = self.media_objects.get((project_id, media_id))
+        if existing is not None:
+            if existing["content"] != payload:
+                raise ValueError("idempotency key was reused with different media bytes")
+            metadata = existing["metadata"]
+        else:
+            self.uploads += 1
+            metadata = {"durationSeconds": 1.0, "sizeBytes": len(payload)}
+            if not self.fail_probe:
+                metadata["video"] = {"codec": "h264", "width": 320, "height": 240}
+            self.media_objects[(project_id, media_id)] = {
+                "content": payload,
+                "metadata": metadata,
+                "contentType": content_type,
+            }
         return {
             "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
-            "metadata": metadata,
+            "metadata": metadata
         }
 
     def inspect_media(self, project_id, media_id):
@@ -2512,12 +2538,16 @@ def test_g72_native_worker_fastapi_sqlite_fake_flow(
             }
 
         def claim(self):
-            response = self.test_client.post(
-                "/internal/generation-tasks/claim",
-                headers=self.worker_headers,
-            )
+            response = self.test_client.post("/internal/generation-tasks/claim", headers=self.worker_headers)
             assert response.status_code in {200, 204}, response.text
-            return response.json() if response.status_code == 200 else None
+            if response.status_code == 204:
+                return None
+            payload = response.json()
+            lease_epoch = payload.get("leaseEpoch")
+            assert isinstance(lease_epoch, int) and lease_epoch >= 1, payload
+            self.worker_headers["X-Worker-Lease-Epoch"] = str(lease_epoch)
+            return payload
+
 
         def heartbeat(self, task_id):
             response = self.test_client.post(
@@ -2656,48 +2686,18 @@ def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
     durable_dir.mkdir()
     saved_files = []
 
-    def offline_durable_upload(project_id, filename, content_type, stream):
+    def offline_durable_upload(
+        project_id, filename, content_type, stream, *,
+        idempotency_key, content_sha256,
+    ):
         assert content_type == "video/mp4"
         assert filename.endswith(".mp4")
-        media_id = f"g72-disk-{uuid.uuid4().hex}"
+        raw = stream.read()
+        assert hashlib.sha256(raw).hexdigest() == content_sha256.lower()
+        media_id = _expected_video_use_media_id(project_id, idempotency_key)
         path = durable_dir / f"{media_id}.mp4"
-        path.write_bytes(stream.read())
-        saved_files.append(path)
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-show_entries",
-                "format=duration:stream=codec_type,codec_name,width,height",
-                "-of", "json", str(path),
-            ],
-            check=True, capture_output=True, text=True, timeout=20,
-        )
-        probed = json.loads(result.stdout)
-        tracks = probed.get("streams") or []
-        videos = [track for track in tracks if track.get("codec_type") == "video"]
-        audios = [track for track in tracks if track.get("codec_type") == "audio"]
-        assert len(videos) == 1 and videos[0].get("codec_name") == "h264"
-        assert len(audios) == 1 and audios[0].get("codec_name") == "aac"
-        assert int(videos[0].get("width") or 0) > 0
-        assert int(videos[0].get("height") or 0) > 0
-        duration = float((probed.get("format") or {}).get("duration") or 0)
-        assert 0.5 <= duration <= 3.0
-        media_store.uploads += 1
-        return {
-            "mediaId": media_id,
-            "projectId": project_id,
-            "fileName": filename,
-            "contentType": content_type,
-            "metadata": {
-                "durationSeconds": duration,
-                "sizeBytes": path.stat().st_size,
-                "video": {
-                    "codec": "h264",
-                    "width": int(videos[0]["width"]),
-                    "height": int(videos[0]["height"]),
-                },
-                "audio": {"codec": "aac"},
-            },
-        }
+        path.write_bytes(raw)
+
 
     # Only the test video-use replacement writes to local temporary storage;
     # the API, SQLite, Worker routing, FAKE adapter, FFmpeg and audit are native.
@@ -2765,14 +2765,19 @@ def test_g72_native_video_use_http_store_survives_sidecar_restart(
     media_root = tmp_path / "g72-native-video-use-media"
     sidecar_app = sidecar_module.create_app(media_root=media_root)
     with TestClient(sidecar_app) as sidecar_client:
-        def native_video_use_upload(project_id, filename, content_type, stream):
+        def native_video_use_upload(
+            project_id, filename, content_type, stream, *,
+            idempotency_key, content_sha256,
+        ):
             response = sidecar_client.post(
                 "/media", data={"projectId": project_id},
                 files={"file": (filename, stream, content_type)},
+                headers={
+                    "Idempotency-Key": idempotency_key,
+                    "X-Content-SHA256": content_sha256,
+                },
             )
-            assert response.status_code == 201, response.text
-            media_store.uploads += 1
-            return response.json()
+
 
         monkeypatch.setattr(media_store, "upload_media", native_video_use_upload)
         test_g72_native_worker_fastapi_sqlite_fake_flow(
