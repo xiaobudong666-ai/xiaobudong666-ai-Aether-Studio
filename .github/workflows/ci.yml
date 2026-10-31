@@ -231,10 +231,13 @@ jobs:
         run: |
           password="ci-$(openssl rand -hex 24)"
           worker_token="ci-$(openssl rand -hex 32)"
+          fault_proxy_token="ci-$(openssl rand -hex 24)"
           echo "::add-mask::$password"
           echo "::add-mask::$worker_token"
+          echo "::add-mask::$fault_proxy_token"
           echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
           echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+          echo "G70_FAULT_PROXY_TOKEN=$fault_proxy_token" >> "$GITHUB_ENV"
 
       - name: Validate Compose configuration
         run: |
@@ -526,13 +529,20 @@ jobs:
           from pathlib import Path
           services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-merged.json").read_text())["services"]
           api, worker = services["api"], services["worker"]
+          proxy = services["g70-fault-proxy"]
           assert api["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
           assert api["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
           assert api["environment"]["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert api["environment"]["VIDEO_USE_API_URL"] == "http://g70-fault-proxy:8003"
+          assert api["environment"]["G70_FAULT_PROXY_TOKEN"] == os.environ["G70_FAULT_PROXY_TOKEN"]
           assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
           assert worker["environment"]["AETHER_TALKING_HEAD_MODE"] == "disabled"
           assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          assert worker["environment"]["VIDEO_USE_API_URL"] == "http://video-use:8002"
           assert set(api["networks"]) == {"aether-net"}
+          assert set(proxy["networks"]) == {"aether-net"}
+          assert not proxy.get("ports"), "fault proxy must not publish a host port"
+          assert proxy["environment"]["G70_FAULT_PROXY_TOKEN"] == os.environ["G70_FAULT_PROXY_TOKEN"]
           assert "aether-net" in worker["networks"]
           assert set(services["video-use"]["networks"]) == {"aether-net"}
           PY
@@ -543,13 +553,16 @@ jobs:
           set -euo pipefail
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
-            up -d --build --wait --wait-timeout 300 api worker video-use
+            up -d --build --wait --wait-timeout 300 api worker video-use g70-fault-proxy
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             cp infra/docker/g70-g71-compose-recovery-smoke.py api:/tmp/g70-g71-compose-recovery-smoke.py
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g70-g71-worker-transfer-failure-smoke.py api:/tmp/g70-g71-worker-transfer-failure-smoke.py
 
       - name: Prove real Worker network, FFmpeg, sidecar persistence and audit
         shell: bash
@@ -603,6 +616,21 @@ jobs:
           test "$media_count_after" = "$G70_MEDIA_COUNT_BEFORE"
           echo "Sidecar media object count unchanged by recovery: $media_count_after"
 
+      - name: Prove real Worker transfer failure, lost-ACK idempotency and Owner recovery (FAKE-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml)
+          media_count_before="${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))'
+          [[ "$media_count_before" =~ ^[0-9]+$ ]]
+          echo "G70_WORKER_MEDIA_COUNT_BEFORE=$media_count_before" >> "$GITHUB_ENV"
+          "${compose[@]}" exec -T api python /tmp/g70-g71-worker-transfer-failure-smoke.py
+          media_count_after="${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))'
+          [[ "$media_count_after" =~ ^[0-9]+$ ]]
+          expected_media_count=$((media_count_before + 1))
+          test "$media_count_after" = "$expected_media_count"
+          echo "Sidecar object count increased by exactly one: one committed/lost-ACK object recovered; pre-storage failures created none ($media_count_before -> $media_count_after)"
+
       - name: Export G70/G71 recovery evidence
         if: always()
         shell: bash
@@ -624,6 +652,27 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Export G70/G71 Worker transfer failure evidence
+        if: always()
+        shell: bash
+        run: |
+          if docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp api:/tmp/g70-g71-worker-transfer-failure-evidence.json "$RUNNER_TEMP/g70-g71-worker-transfer-failure-evidence.json"; then
+            echo "G70/G71 Worker failure evidence exported"
+          else
+            echo "G70/G71 Worker failure evidence file unavailable" >&2
+          fi
+
+      - name: Upload G70/G71 Worker transfer failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g70-g71-worker-transfer-failure-evidence
+          path: ${{ runner.temp }}/g70-g71-worker-transfer-failure-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Capture failure diagnostics without credentials
         if: failure()
         shell: bash
@@ -633,7 +682,7 @@ jobs:
             ps || true
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
-            logs --tail=75 api worker video-use || true
+            logs --tail=75 api worker video-use g70-fault-proxy || true
 
       - name: Destroy only this CI run's disposable FAKE-only volumes
         if: always()
