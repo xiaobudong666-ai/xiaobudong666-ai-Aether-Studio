@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -40,6 +41,7 @@ PROXY_BASE = "http://g70-fault-proxy:8003"
 VIDEO_USE_BASE = "http://video-use:8002"
 TOKEN = os.environ.get("G70_FAULT_PROXY_TOKEN", "")
 EVIDENCE_PATH = Path("/tmp/g70-g71-worker-transfer-failure-evidence.json")
+G72_STATE_PATH = Path("/tmp/g72-ci-fake-only-network-state.json")
 
 
 @contextmanager
@@ -445,10 +447,184 @@ def run_case(client: httpx.Client, mode: str) -> dict:
     return evidence
 
 
+
+def load_g72_source_bytes() -> tuple[dict, bytes, str]:
+    """Reuse the verified deterministic G72 artifact as a disposable Sidecar fixture."""
+    assert G72_STATE_PATH.is_file(), "G72 network smoke must run before G70 concurrency proof"
+    state = json.loads(G72_STATE_PATH.read_text(encoding="utf8"))
+    response = httpx.get(
+        f"{VIDEO_USE_BASE}/media/{state['projectId']}/{state['mediaId']}",
+        timeout=60,
+        trust_env=False,
+    )
+    assert response.status_code == 200, (
+        f"G72 source Sidecar read={response.status_code} {response.text[:200]}"
+    )
+    payload = response.content
+    digest = hashlib.sha256(payload).hexdigest()
+    assert digest == state["sha256"], "G72 source bytes differ from the recorded SHA-256"
+    assert len(payload) == int(state["bytes"]), "G72 source size differs from the recorded size"
+    assert len(payload) > 1000 and payload[4:8] == b"ftyp", "G72 source is not a valid MP4 fixture"
+    return state, payload, digest
+
+
+def run_concurrent_project_scope_case(
+    mode: str,
+    source_bytes: bytes,
+    source_sha256: str,
+) -> dict:
+    """Five concurrent uploads prove three bounded faults stay scoped to one project."""
+    target_project_id = f"g70-concurrent-{uuid.uuid4().hex[:12]}"
+    foreign_project_ids = [
+        f"g70-foreign-{uuid.uuid4().hex[:12]}",
+        f"g70-foreign-{uuid.uuid4().hex[:12]}",
+    ]
+    arm_proxy(mode, target_project_id)
+
+    requests = [
+        ("target", target_project_id, f"target-{index}")
+        for index in range(3)
+    ] + [
+        ("foreign", project_id, f"foreign-{index}")
+        for index, project_id in enumerate(foreign_project_ids)
+    ]
+    # Interleave project IDs so unrelated traffic races with the armed plan.
+    requests = [
+        requests[0], requests[3], requests[1], requests[4], requests[2],
+    ]
+
+    def upload(item: tuple[str, str, str]) -> tuple[str, str, str, httpx.Response]:
+        role, project_id, label = item
+        response = proxy_request(
+            "POST",
+            "/media",
+            data={"projectId": project_id},
+            files={"file": (f"{mode}-{label}.mp4", source_bytes, "video/mp4")},
+        )
+        return role, project_id, label, response
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(upload, requests))
+
+    target_results = [item for item in results if item[0] == "target"]
+    foreign_results = [item for item in results if item[0] == "foreign"]
+    assert len(target_results) == 3 and len(foreign_results) == 2
+
+    expected_detail = (
+        "FAKE-only injected lost Sidecar acknowledgement"
+        if mode == "forward_then_drop_ack"
+        else "FAKE-only injected pre-storage failure"
+    )
+    for _role, _project_id, _label, response in target_results:
+        assert response.status_code == 503, (
+            f"{mode} target upload was not faulted: {response.status_code} {response.text[:200]}"
+        )
+        assert response.json().get("detail") == expected_detail
+
+    foreign_media = []
+    for _role, project_id, label, response in foreign_results:
+        assert response.status_code == 201, (
+            f"{mode} foreign project upload was affected: {response.status_code} {response.text[:200]}"
+        )
+        payload = response.json()
+        assert payload.get("projectId") == project_id
+        media_id = payload.get("mediaId")
+        assert media_id
+        foreign_media.append({"projectId": project_id, "mediaId": media_id, "label": label})
+
+    stats = proxy_stats()
+    assert stats["project_id"] == target_project_id
+    assert stats["arm_attempts"] == 3
+    assert stats["arm_matched_project_ids"] == [target_project_id] * 3
+    assert stats["armed"] is False and stats["remaining"] == 0
+    assert 0 <= int(stats["arm_ignored_other_project_uploads"]) <= 2
+
+    target_media_checks = []
+    if mode == "forward_then_drop_ack":
+        assert stats["arm_forwarded"] == 3
+        assert stats["arm_dropped_success"] == 3
+        assert stats["arm_upstream_statuses"] == [201, 201, 201]
+        assert stats["arm_replay_flags"] == [False, False, False]
+        media_ids = stats["arm_media_ids"]
+        assert len(media_ids) == 3 and len(set(media_ids)) == 3
+        for media_id in media_ids:
+            inspect = httpx.get(
+                f"{VIDEO_USE_BASE}/media/{target_project_id}/{media_id}/inspect",
+                timeout=60,
+                trust_env=False,
+            )
+            assert inspect.status_code == 200, inspect.text[:200]
+            inspected = inspect.json()
+            assert inspected["sha256"] == source_sha256
+            assert inspected["sizeBytes"] == len(source_bytes)
+            media = httpx.get(
+                f"{VIDEO_USE_BASE}/media/{target_project_id}/{media_id}",
+                timeout=60,
+                trust_env=False,
+            )
+            assert media.status_code == 200, media.text[:200]
+            assert hashlib.sha256(media.content).hexdigest() == source_sha256
+            target_media_checks.append({
+                "mediaId": media_id,
+                "sha256": inspected["sha256"],
+                "sizeBytes": inspected["sizeBytes"],
+                "persistedAfterLostAck": True,
+            })
+    else:
+        assert stats["arm_forwarded"] == 0
+        assert stats["arm_dropped_success"] == 0
+        assert stats["arm_upstream_statuses"] == []
+        assert stats["arm_media_ids"] == []
+        assert stats["arm_replay_flags"] == []
+
+    foreign_media_checks = []
+    for item in foreign_media:
+        inspect = httpx.get(
+            f"{VIDEO_USE_BASE}/media/{item['projectId']}/{item['mediaId']}/inspect",
+            timeout=60,
+            trust_env=False,
+        )
+        assert inspect.status_code == 200, inspect.text[:200]
+        inspected = inspect.json()
+        assert inspected["projectId"] == item["projectId"]
+        assert inspected["sha256"] == source_sha256
+        assert inspected["sizeBytes"] == len(source_bytes)
+        foreign_media_checks.append({
+            **item,
+            "sha256": inspected["sha256"],
+            "sizeBytes": inspected["sizeBytes"],
+            "unaffectedByOtherProjectFaultPlan": True,
+        })
+
+    return {
+        "mode": mode,
+        "targetProjectId": target_project_id,
+        "concurrentRequests": 5,
+        "targetProjectRequests": 3,
+        "foreignProjectRequests": 2,
+        "targetResponses": [item[3].status_code for item in target_results],
+        "foreignResponses": [item[3].status_code for item in foreign_results],
+        "ignoredForeignUploadsWhileArmed": stats["arm_ignored_other_project_uploads"],
+        "proxyStats": stats,
+        "targetMediaChecks": target_media_checks,
+        "foreignMediaChecks": foreign_media_checks,
+        "sameProcessConcurrency": "PASS",
+        "multiInstanceBehavior": "NOT_TESTED",
+    }
+
+
 def main() -> None:
     with authenticate() as client:
         committed_orphan = run_case(client, "forward_then_drop_ack")
         pre_storage_failure = run_case(client, "fail_before_forward")
+
+    source_state, source_bytes, source_sha256 = load_g72_source_bytes()
+    concurrent_lost_ack = run_concurrent_project_scope_case(
+        "forward_then_drop_ack", source_bytes, source_sha256,
+    )
+    concurrent_pre_storage = run_concurrent_project_scope_case(
+        "fail_before_forward", source_bytes, source_sha256,
+    )
 
     proxy = proxy_stats()
     committed = committed_orphan["proxy"]
@@ -490,6 +666,15 @@ def main() -> None:
         "requestsPerFaultPlan": 3,
         "commitThenLostAck": committed_orphan,
         "preStorageFailure": pre_storage_failure,
+        "concurrentProjectScope": {
+            "sourceProjectId": source_state["projectId"],
+            "sourceMediaId": source_state["mediaId"],
+            "sourceSha256": source_sha256,
+            "fixture": "existing deterministic G72 FAKE-only MP4",
+            "lostAck": concurrent_lost_ack,
+            "preStorageFailure": concurrent_pre_storage,
+            "proxyTopology": "one Uvicorn process in disposable Compose; multi-instance state sharing is not claimed",
+        },
         "conclusion": {
             "lostAck": "one deterministic Sidecar media ID survives three lost acknowledgements; Owner recovery succeeds without a new generation attempt",
             "preStorageFailure": "no Sidecar object exists; task and usage remain HELD; Owner recovery fails closed pending original artifact retrieval",
