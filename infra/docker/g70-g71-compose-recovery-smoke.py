@@ -441,6 +441,223 @@ def verify() -> None:
     }
     write_evidence({"phase": "verified", **result})
     print(json.dumps({"phase": "g70_g71_recovery_verified", **result}), flush=True)
+    verify_missing_original_object()
+
+
+def verify_missing_original_object() -> None:
+    """The absent-original-object path must remain HELD and never regenerate."""
+    state = json.loads(STATE_PATH.read_text(encoding="utf8"))
+    project_id = state["projectId"]
+    missing_media_id = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+    upstream_job_id = f"fake-missing-original-job-{uuid.uuid4()}"
+    provider_artifact_id = f"fake-missing-original-artifact-{uuid.uuid4()}"
+    reservation_key = f"g70-missing-original-{uuid.uuid4()}"
+    now = dt.datetime.now(dt.timezone.utc)
+    missing_sha256 = "b" * 64
+    missing_size = int(state["bytes"])
+
+    with SessionLocal() as db:
+        source_task = db.get(DBGenerationTask, state["sourceTaskId"])
+        project = db.get(DBProject, project_id)
+        tenant = db.get(DBTenant, state["tenantId"])
+        assert source_task is not None and project is not None and tenant is not None
+        assert source_task.project_id == project_id
+        assert source_task.tenant_id == state["tenantId"]
+        assert source_task.requested_by == state["requestedBy"]
+        storage_before = int(tenant.used_storage_bytes or 0)
+
+        values = {
+            column.key: getattr(source_task, column.key)
+            for column in DBGenerationTask.__table__.columns
+        }
+        values.update({
+            "id": task_id,
+            "tenant_id": state["tenantId"],
+            "project_id": project_id,
+            "requested_by": state["requestedBy"],
+            "status": "FAILED",
+            "progress": 100,
+            "message": "Synthetic FAKE-only original Sidecar object absent after transfer failure",
+            "request_json": copy.deepcopy(source_task.request_json),
+            "request_hash": source_task.request_hash,
+            "capability_snapshot_json": copy.deepcopy(source_task.capability_snapshot_json),
+            "capability_snapshot_hash": source_task.capability_snapshot_hash,
+            "idempotency_key": str(uuid.uuid4()),
+            "upstream_job_id": upstream_job_id,
+            "provider_artifact_id": provider_artifact_id,
+            "media_id": missing_media_id,
+            "asset_version_id": None,
+            "attempts": 1,
+            "max_attempts": 3,
+            "lease_owner": None,
+            "lease_epoch": 0,
+            "circuit_probe_epoch": None,
+            "lease_expires_at": None,
+            "cancel_requested_at": None,
+            "error_code": "ARTIFACT_INGEST_FAILED",
+            "error_message": "synthetic missing Sidecar object; no retrieval permission",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": now,
+            "completed_at": now,
+        })
+        task = DBGenerationTask(**values)
+        attempt = DBGenerationAttempt(
+            id=attempt_id,
+            generation_task_id=task_id,
+            attempt_no=1,
+            status="FAILED",
+            submission_started_at=now,
+            upstream_job_id=upstream_job_id,
+            reconciliation_state="HELD",
+            error_code="ARTIFACT_INGEST_FAILED",
+            error_message="synthetic missing original Sidecar object",
+            created_at=now,
+            completed_at=now,
+        )
+        failure_event = DBGenerationEvent(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_id=attempt_id,
+            event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING",
+            to_status="FAILED",
+            actor_type="SYSTEM",
+            actor_id="g70-g71-missing-original-fake-only",
+            metadata_json={
+                "originalUpstreamJobId": upstream_job_id,
+                "originalProviderArtifactId": provider_artifact_id,
+                "reconciliationState": "HELD",
+                "usageReservation": "HELD",
+                "orphanedMediaId": missing_media_id,
+                "orphanedMediaSha256": missing_sha256,
+                "orphanedMediaSizeBytes": missing_size,
+                "orphanedMediaMetadata": {
+                    "video": {"width": 320, "height": 568},
+                    "durationSeconds": 1.0,
+                },
+                "fixtureKind": "SYNTHETIC_FAKE_ONLY_MISSING_OBJECT",
+            },
+            created_at=now,
+        )
+        reserved_usage = DBGenerationUsageEntry(
+            id=str(uuid.uuid4()),
+            tenant_id=state["tenantId"],
+            project_id=project_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            kind="RESERVED",
+            request_units=1,
+            generated_seconds=1,
+            reservation_key=reservation_key,
+            config_version_id=None,
+            created_at=now,
+        )
+        db.add_all([task, attempt, failure_event, reserved_usage])
+        db.commit()
+
+    with authenticate() as client:
+        blocked_retry = client.post(
+            f"/projects/{project_id}/generation-tasks/{task_id}/retry"
+        )
+        assert blocked_retry.status_code == 409, blocked_retry.text[:300]
+        assert blocked_retry.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+
+        denied_recovery = client.post(
+            f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
+            json={"reason": "Owner verifies missing original Sidecar object"},
+        )
+        assert denied_recovery.status_code == 409, denied_recovery.text[:500]
+        assert denied_recovery.json()["detail"]["code"] == "ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED"
+
+        inspect = httpx.get(
+            f"{VIDEO_USE_BASE}/media/{project_id}/{missing_media_id}/inspect",
+            timeout=30,
+            trust_env=False,
+        )
+        assert inspect.status_code == 404, f"missing Sidecar inspect={inspect.status_code}"
+        direct = httpx.get(
+            f"{VIDEO_USE_BASE}/media/{project_id}/{missing_media_id}",
+            timeout=30,
+            trust_env=False,
+        )
+        assert direct.status_code == 404, f"missing Sidecar read={direct.status_code}"
+
+    with SessionLocal() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.get(DBGenerationAttempt, attempt_id)
+        tenant = db.get(DBTenant, state["tenantId"])
+        assert task is not None and attempt is not None and tenant is not None
+        assert task.status == "FAILED"
+        assert task.error_code == "ARTIFACT_INGEST_FAILED"
+        assert task.asset_version_id is None
+        assert task.media_id == missing_media_id
+        assert task.attempts == 1
+        assert attempt.reconciliation_state == "HELD"
+        assert int(tenant.used_storage_bytes or 0) == storage_before
+
+        attempt_count = db.execute(
+            select(func.count(DBGenerationAttempt.id)).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        reserved = db.execute(
+            select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "RESERVED",
+            )
+        ).scalar_one()
+        released_or_settled = db.execute(
+            select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind.in_(("RELEASED", "SETTLED")),
+            )
+        ).scalar_one()
+        failure_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+            )
+        ).scalar_one()
+        recovery_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+            )
+        ).scalar_one()
+        assert (attempt_count, reserved, released_or_settled) == (1, 1, 0)
+        assert (failure_events, recovery_events) == (1, 0)
+        assert not any(
+            isinstance(item, dict) and item.get("id") == missing_media_id
+            for item in (db.get(DBProject, project_id).materials or [])
+        )
+
+    evidence = json.loads(EVIDENCE_PATH.read_text(encoding="utf8"))
+    evidence["missingOriginalObject"] = {
+        "taskId": task_id,
+        "mediaId": missing_media_id,
+        "sha256Evidence": "synthetic-valid-format-only",
+        "expectedResult": "409 ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED",
+        "genericRetry": "409 ARTIFACT_RECOVERY_REQUIRED; no new attempt",
+        "taskRemains": "FAILED / ARTIFACT_INGEST_FAILED",
+        "attempts": 1,
+        "reconciliation": "HELD",
+        "usage": {"RESERVED": 1, "RELEASED": 0, "SETTLED": 0},
+        "assetVersionCreated": False,
+        "projectMaterialCreated": False,
+        "storageQuotaChanged": False,
+        "sidecarInspect": "404",
+        "sidecarRead": "404",
+        "providerCalls": 0,
+        "verified": True,
+    }
+    write_evidence(evidence)
+    print(json.dumps({
+        "phase": "g70_g71_missing_original_fail_closed_verified",
+        **evidence["missingOriginalObject"],
+    }), flush=True)
 
 
 if __name__ == "__main__":
