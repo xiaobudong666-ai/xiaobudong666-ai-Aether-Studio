@@ -8,6 +8,7 @@ heartbeat endpoint waits for the task-row lock, then observes the new lease.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import os
 from pathlib import Path
 import secrets
@@ -44,6 +45,13 @@ OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
 
 
+def _expected_media_id(project_id: str, idempotency_key: str) -> str:
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"aether-video-use:{project_id}:{idempotency_key}",
+    ))
+
+
 class FakeMediaStore:
     def check_health(self):
         return {"status": "healthy"}
@@ -51,10 +59,23 @@ class FakeMediaStore:
     def get_capabilities(self):
         return {"render": True}
 
-    def upload_media(self, project_id, filename, content_type, stream):
+    def upload_media(
+        self, project_id, filename, content_type, stream, *,
+        idempotency_key=None, content_sha256=None,
+    ):
         payload = stream.read()
+        digest = hashlib.sha256(payload).hexdigest()
+        if (idempotency_key is None) != (content_sha256 is None):
+            raise ValueError("idempotency key and content SHA-256 must be supplied together")
+        if content_sha256 is not None and digest != content_sha256.lower():
+            raise ValueError("uploaded bytes do not match the supplied content SHA-256")
+        media_id = (
+            _expected_media_id(project_id, idempotency_key)
+            if idempotency_key is not None
+            else f"unused-{uuid.uuid4()}"
+        )
         return {
-            "mediaId": f"unused-{uuid.uuid4()}",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -639,6 +660,14 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 1
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
@@ -646,7 +675,7 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RELEASED",
-        )).scalar_one() == 1
+        )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
 
@@ -695,14 +724,17 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
     upload_started = Event()
     release_upload = Event()
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-owner-cancel",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -746,7 +778,7 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
         assert stored.cancel_requested_at is not None
         assert stored.lease_owner is None
         assert stored.lease_expires_at is None
-        assert stored.media_id == "g76-orphan-after-owner-cancel"
+        assert stored.media_id == _expected_media_id(project_id, f"generation:{task_id}")
         assert stored.asset_version_id is None
         assert tenant.used_storage_bytes == 0
         orphan_event = db.execute(select(DBGenerationEvent).where(
@@ -754,14 +786,14 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "TASK_CANCELED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-owner-cancel"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
         assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-owner-cancel",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -818,14 +850,17 @@ def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_
     upload_started = Event()
     release_upload = Event()
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-artifact-id-change",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -888,14 +923,14 @@ def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "ARTIFACT_ID_MISMATCH"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-artifact-id-change"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["originalProviderArtifactId"] == original_artifact_id
         assert orphan_event.metadata_json["currentTaskProviderArtifactId"] == replacement_artifact_id
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-artifact-id-change",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -957,14 +992,17 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
     upload_started = Event()
     release_upload = Event()
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-kill-switch",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -1014,14 +1052,14 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "PROVIDER_EMERGENCY_STOPPED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-kill-switch"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
         assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-kill-switch",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -1107,15 +1145,18 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
     owner_request_started = Event()
     worker_thread = {"ident": None}
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         worker_thread["ident"] = get_ident()
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-missing-circuit-race",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -1211,7 +1252,7 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
         assert tenant.used_storage_bytes == len(payload)
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-missing-circuit-race",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,

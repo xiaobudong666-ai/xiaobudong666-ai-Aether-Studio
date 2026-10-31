@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import inspect
 import os
 import threading
@@ -13,7 +14,7 @@ import pytest
 from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import create_app
-from app.video_use_adapter import VideoUseError
+from app.video_use_adapter import VideoUseError, VideoUseNotFoundError
 from app.models import (
     DBAdoption,
     DBAssetVersion,
@@ -37,6 +38,13 @@ from sqlalchemy.orm import sessionmaker
 
 OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
+
+
+def _expected_video_use_media_id(project_id: str, idempotency_key: str) -> str:
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"aether-video-use:{project_id}:{idempotency_key}",
+    ))
 
 class LeaseAwareTestClient(TestClient):
     """Test helper that mirrors the Worker lease-epoch header contract."""
@@ -73,6 +81,8 @@ class FakeGeneratedMediaStore:
         self.uploads = 0
         self.fail_probe = False
         self.interrupt = False
+        self.media_objects = {}
+        self.inspections = 0
 
     def check_health(self):
         return {"status": "healthy"}
@@ -80,20 +90,61 @@ class FakeGeneratedMediaStore:
     def get_capabilities(self):
         return {"render": True}
 
-    def upload_media(self, project_id, filename, content_type, stream):
+    def upload_media(
+        self, project_id, filename, content_type, stream, *,
+        idempotency_key=None, content_sha256=None,
+    ):
         payload = stream.read()
         if self.interrupt:
             raise RuntimeError("stream interrupted")
-        self.uploads += 1
-        metadata = {"durationSeconds": 1.0, "sizeBytes": len(payload)}
-        if not self.fail_probe:
-            metadata["video"] = {"codec": "h264", "width": 320, "height": 240}
+        if (idempotency_key is None) != (content_sha256 is None):
+            raise ValueError("idempotency key and content SHA-256 must be supplied together")
+        digest = hashlib.sha256(payload).hexdigest()
+        if content_sha256 is not None and digest != content_sha256.lower():
+            raise ValueError("uploaded bytes do not match the supplied content SHA-256")
+
+        media_id = (
+            _expected_video_use_media_id(project_id, idempotency_key)
+            if idempotency_key is not None
+            else f"generated-media-{self.uploads + 1}"
+        )
+        existing = self.media_objects.get((project_id, media_id))
+        if existing is not None:
+            if existing["content"] != payload:
+                raise ValueError("idempotency key was reused with different media bytes")
+            metadata = existing["metadata"]
+        else:
+            self.uploads += 1
+            metadata = {"durationSeconds": 1.0, "sizeBytes": len(payload)}
+            if not self.fail_probe:
+                metadata["video"] = {"codec": "h264", "width": 320, "height": 240}
+            self.media_objects[(project_id, media_id)] = {
+                "content": payload,
+                "metadata": metadata,
+                "contentType": content_type,
+            }
         return {
-            "mediaId": f"generated-media-{self.uploads}",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
-            "metadata": metadata,
+            "metadata": metadata
+        }
+
+    def inspect_media(self, project_id, media_id):
+        self.inspections += 1
+        stored = self.media_objects.get((project_id, media_id))
+        if stored is None:
+            raise VideoUseNotFoundError("media not found")
+        payload = stored["content"]
+        return {
+            "projectId": project_id,
+            "mediaId": media_id,
+            "mediaType": "video",
+            "contentType": stored["contentType"],
+            "sizeBytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "metadata": stored["metadata"],
         }
 
 
@@ -652,6 +703,14 @@ def test_g72_upload_failure_compensates_storage_with_portable_case(generation_co
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 1
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
@@ -659,7 +718,7 @@ def test_g72_upload_failure_compensates_storage_with_portable_case(generation_co
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RELEASED",
-        )).scalar_one() == 1
+        )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
 def test_30_success_creates_one_material_and_immutable_asset_with_provenance(generation_context):
@@ -676,6 +735,122 @@ def test_30_success_creates_one_material_and_immutable_asset_with_provenance(gen
         assert db.execute(select(func.count(DBCandidate.id))).scalar_one() == 0
         assert db.execute(select(func.count(DBAdoption.id))).scalar_one() == 0
         assert stored_project.timeline["tracks"] == []
+
+
+def test_generated_media_download_requires_current_export_rights(generation_context, monkeypatch):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "generated-media-export-rights")
+    task = ingest_success(client, project)
+    result = task["results"][0]
+    media_id = result["mediaId"]
+    asset_id = result["assetVersionId"]
+    payload = media_store.media_objects[(project["id"], media_id)]["content"]
+    stream_calls = []
+
+    class FakeUpstream:
+        def __init__(self, body):
+            self.body = body
+            self.status_code = 200
+            self.headers = {
+                "content-type": "video/mp4",
+                "content-length": str(len(body)),
+            }
+
+        def iter_bytes(self):
+            yield self.body
+
+    class FakeStreamContext:
+        def __init__(self, body):
+            self.response = FakeUpstream(body)
+
+        def __enter__(self):
+            return self.response
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_stream(path, headers=None):
+        stream_calls.append((path, headers))
+        return FakeStreamContext(payload)
+
+    monkeypatch.setattr(app.state.video_use, "stream", fake_stream, raising=False)
+    media_url = f"/video-use/media/{project['id']}/{media_id}"
+
+    missing = client.get(media_url)
+    assert missing.status_code == 403
+    assert missing.json()["detail"]["code"] == "RIGHTS_MISSING"
+    assert stream_calls == []
+
+    rights_url = f"/projects/{project['id']}/asset-versions/{asset_id}/rights-snapshots"
+    owner_allowed = client.post(
+        rights_url,
+        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "owner-self-asserted"},
+    )
+    assert owner_allowed.status_code == 201, owner_allowed.text
+    owner_denied = client.get(media_url)
+    assert owner_denied.status_code == 403
+    assert owner_denied.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    owner_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check",
+        params={"purpose": "EXPORT"},
+    ).json()
+    assert owner_rights_check["allowed"] is False
+    assert owner_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    owner_default_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check"
+    ).json()
+    assert owner_default_rights_check["allowed"] is False
+    assert owner_default_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    assert stream_calls == []
+
+    editor_password = secrets.token_urlsafe(24)
+    created_editor = client.post(
+        "/admin/users",
+        json={
+            "email": "generated-export-editor@example.com",
+            "displayName": "Generated Export Editor",
+            "password": editor_password,
+            "role": "editor",
+        },
+    )
+    assert created_editor.status_code == 201, created_editor.text
+    assert client.post("/auth/logout").status_code == 204
+    editor_login = client.post(
+        "/auth/login",
+        json={"email": "generated-export-editor@example.com", "password": editor_password},
+    )
+    assert editor_login.status_code == 200, editor_login.text
+
+    editor_allowed = client.post(
+        rights_url,
+        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "editor-self-asserted"},
+    )
+    assert editor_allowed.status_code == 201, editor_allowed.text
+    editor_denied = client.get(media_url)
+    assert editor_denied.status_code == 403
+    assert editor_denied.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    editor_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check",
+        params={"purpose": "EXPORT"},
+    ).json()
+    assert editor_rights_check["allowed"] is False
+    assert editor_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    editor_default_rights_check = client.get(
+        f"/projects/{project['id']}/asset-versions/{asset_id}/rights-check"
+    ).json()
+    assert editor_default_rights_check["allowed"] is False
+    assert editor_default_rights_check["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    assert stream_calls == []
+
+    revoked = client.post(
+        rights_url,
+        json={"status": "REVOKED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "editor-revoked"},
+    )
+    assert revoked.status_code == 201, revoked.text
+    denied = client.get(media_url)
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "RIGHTS_REVOKED"
+    assert stream_calls == []
 
 
 def test_31_repeated_artifact_completion_is_idempotent_without_double_quota(generation_context):
@@ -697,7 +872,7 @@ def test_31_repeated_artifact_completion_is_idempotent_without_double_quota(gene
     assert media_store.uploads == 1
 
 
-def test_32_rights_default_block_then_allowed_is_derived_without_mutating_evidence(generation_context):
+def test_32_generated_rights_require_trusted_issuer_and_preserve_evidence_status(generation_context):
     client, _, _, _ = generation_context
     project = create_project(client)
     task = ingest_success(client, project)
@@ -744,7 +919,11 @@ def test_32_rights_default_block_then_allowed_is_derived_without_mutating_eviden
     )
     assert response.status_code == 201
     refreshed = client.get(f"/projects/{project['id']}/generation-tasks/{task['taskId']}").json()
-    assert refreshed["status"] == "SUCCEEDED"
+    assert refreshed["rights"] == {
+        "allowed": False,
+        "code": "RIGHTS_TRUSTED_ISSUER_REQUIRED",
+    }
+    assert refreshed["status"] == "RIGHTS_BLOCKED"
     assert refreshed["storedStatus"] == "RIGHTS_BLOCKED"
 
 
@@ -904,6 +1083,22 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
         events_before = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
         usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
 
     blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
     assert blocked.status_code == 409
@@ -918,8 +1113,477 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == events_before
         assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.kind == "SETTLED"
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
         )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g71_artifact_stream_failure_holds_reservation_and_blocks_new_paid_attempt(generation_context):
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "g71-stream-failure-hold")
+    task = create_task(client, project, key="g71-stream-failure-hold")
+    task_id = task["taskId"]
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        stored.max_attempts = 3
+        db.commit()
+
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="original-paid-job").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", upstreamJobId="original-paid-job",
+        providerArtifactId="original-paid-artifact",
+    ).status_code == 200
+    failed = transition(
+        client, task_id, "FAILED", upstreamJobId="original-paid-job",
+        errorCode="ARTIFACT_STREAM_FAILED", errorMessage="synthetic stream interruption",
+        retryable=False,
+    )
+    assert failed.status_code == 200
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert row.status == "FAILED"
+        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+
+    blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.attempts == 1
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+
+def seed_g71_orphan_artifact(
+    sessions,
+    media_store,
+    project_id,
+    task_id,
+    *,
+    include_sidecar_object=True,
+    expected_sha256=None,
+    include_orphan_reference=True,
+):
+    payload = b"synthetic-original-orphan-video"
+    media_id = f"orphan-media-{task_id[:8]}"
+    digest = hashlib.sha256(payload).hexdigest()
+    metadata = {
+        "durationSeconds": 1.0,
+        "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    if include_sidecar_object:
+        media_store.media_objects[(project_id, media_id)] = {
+            "content": payload,
+            "metadata": metadata,
+            "contentType": "video/mp4",
+        }
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic original artifact transfer failure"
+        task.upstream_job_id = "original-upstream-job"
+        task.provider_artifact_id = "original-provider-artifact"
+        task.media_id = media_id if include_orphan_reference else None
+        task.completed_at = now
+        task.updated_at = now
+        task.lease_owner = None
+        task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = "original-upstream-job"
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        event_metadata = {
+            "originalUpstreamJobId": "original-upstream-job",
+            "originalProviderArtifactId": "original-provider-artifact",
+            "reconciliationState": "HELD",
+            "usageReservation": "HELD",
+        }
+        if include_orphan_reference:
+            event_metadata.update({
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": expected_sha256 or digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata,
+            })
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_id=attempt.id,
+            event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING",
+            to_status="FAILED",
+            actor_type="SYSTEM",
+            actor_id="api",
+            metadata_json=event_metadata,
+            created_at=now,
+        ))
+        db.commit()
+    return media_id, payload
+
+
+def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_attempt(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-owner-orphan-recovery")
+    task = create_task(client, project, key="g70-owner-orphan-recovery")
+    task_id = task["taskId"]
+    media_id, payload = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+
+    url = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    recovered = client.post(
+        url,
+        json={"reason": "Owner verified original job and orphan media receipt"},
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["status"] == "RIGHTS_BLOCKED"
+    assert recovered.json()["results"][0]["mediaId"] == media_id
+
+    # Repeating the same Owner action is idempotent: no second asset, event,
+    # storage reservation, usage settlement, upload or generation attempt.
+    repeated = client.post(
+        url,
+        json={"reason": "Owner repeated recovery request for idempotency check"},
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["results"][0]["assetVersionId"] == recovered.json()["results"][0]["assetVersionId"]
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        project_row = db.get(DBProject, project["id"])
+        assets = list(db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == project["id"],
+                DBAssetVersion.media_id == media_id,
+            )
+        ).scalars())
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        attempts = list(db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalars())
+        receipts = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+            )
+        ).scalar_one()
+        assert stored.status == "RIGHTS_BLOCKED"
+        assert stored.error_code is None
+        assert stored.upstream_job_id == "original-upstream-job"
+        assert stored.provider_artifact_id == "original-provider-artifact"
+        assert stored.attempts == 1
+        assert len(attempts) == 1
+        assert len(assets) == 1
+        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert assets[0].size_bytes == len(payload)
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind == "SETTLED") == 0
+        assert sum(1 for row in usage if row.kind == "RELEASED") == 0
+        assert receipts == 1
+        receipt = db.execute(
+            select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+            )
+        ).scalar_one()
+        assert receipt.actor_type == "OWNER"
+        assert receipt.actor_id == stored.requested_by
+        assert receipt.metadata_json["reason"] == "Owner verified original job and orphan media receipt"
+        assert receipt.metadata_json["usageReservationState"] == "RESERVED_HELD"
+        assert receipt.metadata_json["m11M13Reconciliation"] == "PENDING"
+        assert tenant.used_storage_bytes == len(payload)
+        assert sum(1 for item in project_row.materials if item.get("id") == media_id) == 1
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_owner_recovery_fails_closed_when_original_media_is_absent(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-owner-original-fetch-blocked")
+    task = create_task(client, project, key="g70-owner-original-fetch-blocked")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(
+        sessions,
+        media_store,
+        project["id"],
+        task_id,
+        include_sidecar_object=False,
+        include_orphan_reference=True,
+    )
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checked original job but sidecar media is absent"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind in {"RELEASED", "SETTLED"}) == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_owner_recovery_rejects_orphan_hash_mismatch(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-owner-orphan-hash-mismatch")
+    task = create_task(client, project, key="g70-owner-orphan-hash-mismatch")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(
+        sessions,
+        media_store,
+        project["id"],
+        task_id,
+        expected_sha256="0" * 64,
+    )
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checks hash mismatch isolation behavior"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_INTEGRITY_MISMATCH"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        assets = db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one()
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind in {"RELEASED", "SETTLED"}) == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+
+def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_owner(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-recovery-owner-and-tenant-scope")
+    task = create_task(client, project, key="g70-recovery-owner-and-tenant-scope")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    admin_password = secrets.token_urlsafe(24)
+    same_tenant_owner_password = secrets.token_urlsafe(24)
+    foreign_password = secrets.token_urlsafe(24)
+    with sessions() as db:
+        tenant_id = db.get(DBProject, project["id"]).tenant_id
+        db.add_all([
+            DBUser(
+                id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                email="g70-recovery-admin-no-delegation@example.com",
+                display_name="G70 Recovery Admin Without Delegation",
+                password_hash=hash_password(admin_password),
+                role="admin",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+            DBUser(
+                id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                email="g70-recovery-other-owner@example.com",
+                display_name="G70 Recovery Other Same-Tenant Owner",
+                password_hash=hash_password(same_tenant_owner_password),
+                role="owner",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+        ])
+        foreign_tenant = DBTenant(
+            id="g70-recovery-foreign-tenant",
+            name="G70 Recovery Foreign Tenant",
+            slug="g70-recovery-foreign-tenant",
+            project_quota=50,
+            storage_quota_bytes=1024**3,
+            used_storage_bytes=0,
+            concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600,
+            render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([
+            foreign_tenant,
+            DBUser(
+                id=str(uuid.uuid4()),
+                tenant_id=foreign_tenant.id,
+                email="g70-recovery-foreign-owner@example.com",
+                display_name="G70 Recovery Foreign Owner",
+                password_hash=hash_password(foreign_password),
+                role="owner",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+        ])
+        db.commit()
+
+    url = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    assert client.post("/auth/logout").status_code == 204
+    same_owner_login = client.post(
+        "/auth/login",
+        json={
+            "email": "g70-recovery-other-owner@example.com",
+            "password": same_tenant_owner_password,
+        },
+    )
+    assert same_owner_login.status_code == 200, same_owner_login.text
+    same_owner_response = client.post(
+        url,
+        json={"reason": "Another owner in the same tenant cannot recover this task"},
+    )
+    assert same_owner_response.status_code == 403, same_owner_response.text
+    assert same_owner_response.json()["detail"]["code"] == "OWNER_SELF_ONLY"
+
+    assert client.post("/auth/logout").status_code == 204
+    admin_login = client.post(
+        "/auth/login",
+        json={
+            "email": "g70-recovery-admin-no-delegation@example.com",
+            "password": admin_password,
+        },
+    )
+    assert admin_login.status_code == 200, admin_login.text
+    admin_response = client.post(
+        url,
+        json={"reason": "Admin has no explicit delegation for recovery"},
+    )
+    assert admin_response.status_code == 403, admin_response.text
+    assert admin_response.json()["detail"]["code"] == "PERMISSION_DENIED"
+
+    assert client.post("/auth/logout").status_code == 204
+    foreign_login = client.post(
+        "/auth/login",
+        json={
+            "email": "g70-recovery-foreign-owner@example.com",
+            "password": foreign_password,
+        },
+    )
+    assert foreign_login.status_code == 200, foreign_login.text
+    foreign_response = client.post(
+        url,
+        json={"reason": "Foreign tenant Owner cannot recover another tenant task"},
+    )
+    assert foreign_response.status_code == 404, foreign_response.text
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        tenant = db.execute(select(DBTenant).where(DBTenant.id == stored.tenant_id)).scalar_one()
+        assets = db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one()
+        recovery_events = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+            )
+        ).scalar_one()
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert stored.attempts == 1
+        assert assets == 0
+        assert recovery_events == 0
+        assert tenant.used_storage_bytes == 0
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind in {"RELEASED", "SETTLED"}) == 0
+    assert media_store.uploads == 0
+    assert media_store.inspections == 0
     app.state.moneyprinter.assert_not_called()
 
 
@@ -1483,7 +2147,7 @@ def test_p0_runtime_bridge_requires_rights_and_explicit_action(generation_contex
     assert unchanged["timeline"]["tracks"] == []
 
 
-def test_p0_runtime_bridge_explicitly_writes_vertical_draft_without_render(generation_context):
+def test_p0_runtime_bridge_blocks_self_asserted_rights_without_trusted_issuer(generation_context):
     client, sessions, _, _ = generation_context
     project = create_project(client, "P0 bridge apply")
     task = ingest_success(client, project, key="p0-bridge-apply")
@@ -1494,7 +2158,7 @@ def test_p0_runtime_bridge_explicitly_writes_vertical_draft_without_render(gener
             "status": "ALLOWED",
             "purpose": "EXPORT",
             "territory": "GLOBAL",
-            "evidenceRef": "evidence://p0-runtime-bridge",
+            "evidenceRef": "owner-self-asserted-p0-runtime-bridge",
         },
     )
     assert rights.status_code == 201
@@ -1507,11 +2171,11 @@ def test_p0_runtime_bridge_explicitly_writes_vertical_draft_without_render(gener
             "subtitles": [{"text": "口播测试", "startMs": 0, "durationMs": 1000}],
         },
     )
-    assert response.status_code == 200, response.text
-    saved = response.json()
-    assert saved["revision"] == current["revision"] + 1
-    assert saved["timeline"]["output"] == {"aspect": "9:16", "width": 1080, "height": 1920}
-    assert [track["type"] for track in saved["timeline"]["tracks"]] == ["video", "subtitle"]
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    unchanged = client.get(f"/projects/{project['id']}").json()
+    assert unchanged["revision"] == current["revision"]
+    assert unchanged["timeline"]["tracks"] == []
     with sessions() as db:
         assert db.execute(select(func.count(DBCandidate.id))).scalar_one() == 0
 
@@ -1874,12 +2538,16 @@ def test_g72_native_worker_fastapi_sqlite_fake_flow(
             }
 
         def claim(self):
-            response = self.test_client.post(
-                "/internal/generation-tasks/claim",
-                headers=self.worker_headers,
-            )
+            response = self.test_client.post("/internal/generation-tasks/claim", headers=self.worker_headers)
             assert response.status_code in {200, 204}, response.text
-            return response.json() if response.status_code == 200 else None
+            if response.status_code == 204:
+                return None
+            payload = response.json()
+            lease_epoch = payload.get("leaseEpoch")
+            assert isinstance(lease_epoch, int) and lease_epoch >= 1, payload
+            self.worker_headers["X-Worker-Lease-Epoch"] = str(lease_epoch)
+            return payload
+
 
         def heartbeat(self, task_id):
             response = self.test_client.post(
@@ -2018,12 +2686,17 @@ def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
     durable_dir.mkdir()
     saved_files = []
 
-    def offline_durable_upload(project_id, filename, content_type, stream):
+    def offline_durable_upload(
+        project_id, filename, content_type, stream, *,
+        idempotency_key, content_sha256,
+    ):
         assert content_type == "video/mp4"
         assert filename.endswith(".mp4")
-        media_id = f"g72-disk-{uuid.uuid4().hex}"
+        raw = stream.read()
+        assert hashlib.sha256(raw).hexdigest() == content_sha256.lower()
+        media_id = _expected_video_use_media_id(project_id, idempotency_key)
         path = durable_dir / f"{media_id}.mp4"
-        path.write_bytes(stream.read())
+        path.write_bytes(raw)
         saved_files.append(path)
         result = subprocess.run(
             [
@@ -2060,6 +2733,7 @@ def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
                 "audio": {"codec": "aac"},
             },
         }
+
 
     # Only the test video-use replacement writes to local temporary storage;
     # the API, SQLite, Worker routing, FAKE adapter, FFmpeg and audit are native.
@@ -2127,14 +2801,22 @@ def test_g72_native_video_use_http_store_survives_sidecar_restart(
     media_root = tmp_path / "g72-native-video-use-media"
     sidecar_app = sidecar_module.create_app(media_root=media_root)
     with TestClient(sidecar_app) as sidecar_client:
-        def native_video_use_upload(project_id, filename, content_type, stream):
+        def native_video_use_upload(
+            project_id, filename, content_type, stream, *,
+            idempotency_key, content_sha256,
+        ):
             response = sidecar_client.post(
                 "/media", data={"projectId": project_id},
                 files={"file": (filename, stream, content_type)},
+                headers={
+                    "Idempotency-Key": idempotency_key,
+                    "X-Content-SHA256": content_sha256,
+                },
             )
             assert response.status_code == 201, response.text
             media_store.uploads += 1
             return response.json()
+
 
         monkeypatch.setattr(media_store, "upload_media", native_video_use_upload)
         test_g72_native_worker_fastapi_sqlite_fake_flow(

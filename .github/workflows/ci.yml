@@ -231,10 +231,13 @@ jobs:
         run: |
           password="ci-$(openssl rand -hex 24)"
           worker_token="ci-$(openssl rand -hex 32)"
+          fault_proxy_token="ci-$(openssl rand -hex 24)"
           echo "::add-mask::$password"
           echo "::add-mask::$worker_token"
+          echo "::add-mask::$fault_proxy_token"
           echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
           echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+          echo "G70_FAULT_PROXY_TOKEN=$fault_proxy_token" >> "$GITHUB_ENV"
 
       - name: Validate Compose configuration
         run: |
@@ -490,8 +493,8 @@ jobs:
   g72-fake-compose-network:
     # Independent nonproduction evidence only. The primary Node/Python security
     # audit remains the mandatory release gate; do not treat this as a waiver.
-    name: G72 FAKE-ONLY independent Compose network smoke (not a release gate)
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route') || (github.event_name == 'pull_request' && github.head_ref == 'feat/fusion-m0-g72-fake-only-route')
+    name: G72 + G70/G71 FAKE-only Compose persistence and recovery smoke (not a release gate)
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route' || github.ref == 'refs/heads/feat/g70-g71-artifact-usage-hold')) || (github.event_name == 'pull_request' && (github.head_ref == 'feat/fusion-m0-g72-fake-only-route' || github.head_ref == 'feat/g70-g71-artifact-usage-hold'))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -509,10 +512,13 @@ jobs:
           echo "COMPOSE_PROJECT_NAME=aether-g72-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
           password="ci-$(openssl rand -hex 24)"
           worker_token="ci-$(openssl rand -hex 32)"
+          fault_proxy_token="ci-$(openssl rand -hex 32)"
           echo "::add-mask::$password"
           echo "::add-mask::$worker_token"
+          echo "::add-mask::$fault_proxy_token"
           echo "AETHER_BOOTSTRAP_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
           echo "AETHER_WORKER_TOKEN=$worker_token" >> "$GITHUB_ENV"
+          echo "G70_FAULT_PROXY_TOKEN=$fault_proxy_token" >> "$GITHUB_ENV"
 
       - name: Confirm merged isolated FAKE-only network contract
         shell: bash
@@ -526,13 +532,20 @@ jobs:
           from pathlib import Path
           services = json.loads(Path(os.environ["RUNNER_TEMP"], "g72-merged.json").read_text())["services"]
           api, worker = services["api"], services["worker"]
+          proxy = services["g70-fault-proxy"]
           assert api["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
           assert api["environment"]["AETHER_FAKE_ONLY_NONPROD"] == "true"
           assert api["environment"]["AETHER_RUNTIME_STAGE"] == "nonproduction"
+          assert api["environment"]["VIDEO_USE_API_URL"] == "http://g70-fault-proxy:8003"
+          assert api["environment"]["G70_FAULT_PROXY_TOKEN"] == os.environ["G70_FAULT_PROXY_TOKEN"]
           assert worker["environment"]["AETHER_GENERATION_PROVIDER_MODE"] == "deterministic-fake"
           assert worker["environment"]["AETHER_TALKING_HEAD_MODE"] == "disabled"
           assert worker["environment"]["AETHER_GENERATION_CREDENTIAL_STATE"] == "ABSENT"
+          assert worker["environment"]["VIDEO_USE_API_URL"] == "http://video-use:8002"
           assert set(api["networks"]) == {"aether-net"}
+          assert set(proxy["networks"]) == {"aether-net"}
+          assert not proxy.get("ports"), "fault proxy must not publish a host port"
+          assert proxy["environment"]["G70_FAULT_PROXY_TOKEN"] == os.environ["G70_FAULT_PROXY_TOKEN"]
           assert "aether-net" in worker["networks"]
           assert set(services["video-use"]["networks"]) == {"aether-net"}
           PY
@@ -543,10 +556,16 @@ jobs:
           set -euo pipefail
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
-            up -d --build --wait --wait-timeout 300 api worker video-use
+            up -d --build --wait --wait-timeout 300 api worker video-use g70-fault-proxy
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g70-g71-compose-recovery-smoke.py api:/tmp/g70-g71-compose-recovery-smoke.py
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g70-g71-worker-transfer-failure-smoke.py api:/tmp/g70-g71-worker-transfer-failure-smoke.py
 
       - name: Prove real Worker network, FFmpeg, sidecar persistence and audit
         shell: bash
@@ -556,7 +575,21 @@ jobs:
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py prepare
 
-      - name: Prove sidecar and Worker restart preserve exact asset and receipts
+      - name: Prepare G70/G71 orphan against the real Sidecar and record object count
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g70-g71-compose-recovery-smoke.py prepare
+          media_count="$(docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
+          [[ "$media_count" =~ ^[0-9]+$ ]]
+          echo "G70_MEDIA_COUNT_BEFORE=$media_count" >> "$GITHUB_ENV"
+          echo "Sidecar media object count before recovery: $media_count"
+
+      - name: Prove Sidecar and Worker restart preserve G72 and G70/G71 original objects
         shell: bash
         run: |
           set -euo pipefail
@@ -567,6 +600,139 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py verify
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g70-g71-compose-recovery-smoke.py verify
+
+      - name: Verify G70/G71 recovery did not upload another Sidecar object
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${G70_MEDIA_COUNT_BEFORE:-}" ]; then
+            echo "Skipped object-count comparison because G70 prepare did not complete"
+            exit 0
+          fi
+          media_count_after="$(docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
+          test "$media_count_after" = "$G70_MEDIA_COUNT_BEFORE"
+          echo "Sidecar media object count unchanged by recovery: $media_count_after"
+
+      - name: Prove real Worker transfer failure, lost-ACK idempotency and Owner recovery (FAKE-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml)
+          media_count_before="$("${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
+          [[ "$media_count_before" =~ ^[0-9]+$ ]]
+          echo "G70_WORKER_MEDIA_COUNT_BEFORE=$media_count_before" >> "$GITHUB_ENV"
+          "${compose[@]}" exec -T api python /tmp/g70-g71-worker-transfer-failure-smoke.py
+          media_count_after="$("${compose[@]}" exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
+          [[ "$media_count_after" =~ ^[0-9]+$ ]]
+          # One object is the Worker lost-ACK orphan. Seven more are the
+          # G70/G71 concurrent proxy proof: three matching lost-ACK uploads,
+          # two unaffected foreign-project uploads in each of two fault modes.
+          # The pre-storage target uploads must create no Sidecar object.
+          expected_media_count=$((media_count_before + 8))
+          test "$media_count_after" = "$expected_media_count"
+          echo "Sidecar object count increased by exactly eight: one Worker lost-ACK object plus seven concurrent project-scope control objects; pre-storage target uploads created none ($media_count_before -> $media_count_after)"
+
+      - name: Export G72 Compose network evidence
+        if: always()
+        shell: bash
+        run: |
+          if docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp api:/tmp/g72-ci-fake-only-network-state.json "$RUNNER_TEMP/g72-ci-fake-only-network-state.json"; then
+            echo "G72 Compose network evidence exported"
+          else
+            echo "G72 Compose network evidence file unavailable" >&2
+          fi
+
+      - name: Upload G72 Compose network evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g72-compose-network-evidence
+          path: ${{ runner.temp }}/g72-ci-fake-only-network-state.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Export G70/G71 recovery evidence
+        if: always()
+        shell: bash
+        run: |
+          if docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp api:/tmp/g70-g71-ci-fake-only-recovery-evidence.json "$RUNNER_TEMP/g70-g71-ci-fake-only-recovery-evidence.json"; then
+            echo "G70/G71 evidence exported"
+          else
+            echo "G70/G71 evidence file unavailable" >&2
+          fi
+
+      - name: Upload G70/G71 recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g70-g71-compose-recovery-evidence
+          path: ${{ runner.temp }}/g70-g71-ci-fake-only-recovery-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Export G70/G71 Worker transfer failure evidence
+        if: always()
+        shell: bash
+        run: |
+          if docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp api:/tmp/g70-g71-worker-transfer-failure-evidence.json "$RUNNER_TEMP/g70-g71-worker-transfer-failure-evidence.json"; then
+            echo "G70/G71 Worker failure evidence exported"
+          else
+            echo "G70/G71 Worker failure evidence file unavailable" >&2
+          fi
+
+      - name: Upload G70/G71 Worker transfer failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g70-g71-worker-transfer-failure-evidence
+          path: ${{ runner.temp }}/g70-g71-worker-transfer-failure-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Setup Node.js 24 for G72 browser integration
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm 10.30.3 for G72 browser integration
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Install frontend dependencies and Chromium for G72 browser integration
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Verify G72 normal UI entry reaches the actual FAKE-only Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AETHER_PLAYWRIGHT_PASSWORD="$AETHER_BOOTSTRAP_ADMIN_PASSWORD"
+          pnpm exec playwright test --config=playwright.g72.config.mjs
+
+      - name: Upload G72 normal UI-to-Worker browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g72-normal-ui-worker-evidence
+          path: |
+            playwright-report-g72/
+            test-results-g72/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Capture failure diagnostics without credentials
         if: failure()
@@ -577,7 +743,7 @@ jobs:
             ps || true
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
-            logs --tail=75 api worker video-use || true
+            logs --tail=75 api worker video-use g70-fault-proxy || true
 
       - name: Destroy only this CI run's disposable FAKE-only volumes
         if: always()

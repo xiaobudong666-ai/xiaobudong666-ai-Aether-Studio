@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import uuid
 from collections.abc import Callable, Generator
@@ -103,6 +104,7 @@ from .schemas import (
     GenerationProviderPolicyRequest,
     GenerationWorkerHeartbeatRequest,
     GenerationWorkerTransitionRequest,
+    RecoverGenerationArtifactRequest,
     LoginRequest,
     ProjectResponse,
     UpdateProjectRequest,
@@ -117,7 +119,7 @@ from .talking_head_planner import SubtitleCue, build_talking_head_timeline
 from .detection_evidence import build_release_evidence, normalize_rights_evidence
 from .runtime_gates import enforce_release_gates, enforce_timeline_receipt
 from .timeline_render import build_render_payload
-from .video_use_adapter import VideoUseAdapter, VideoUseError
+from .video_use_adapter import VideoUseAdapter, VideoUseError, VideoUseNotFoundError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api.main")
@@ -504,10 +506,43 @@ def create_app(
     def generation_rights(db: Session, task: DBGenerationTask) -> dict:
         if not task.asset_version_id:
             return {"allowed": False, "code": "RIGHTS_MISSING"}
-        return rights_decision(
+        decision = rights_decision(
             latest_rights_snapshot(db, task.asset_version_id, "EXPORT"),
             utc_now(),
         )
+        # Human-entered rights snapshots are evidence records, not trusted
+        # M12 export grants. The current model has no verifiable issuer/signature
+        # binding. Until the Owner-approved issuer contract is implemented,
+        # a caller-selected ALLOWED snapshot must never authorize generated use.
+        if decision.get("allowed"):
+            return {
+                "allowed": False,
+                "code": "RIGHTS_TRUSTED_ISSUER_REQUIRED",
+            }
+        return decision
+
+    def generated_asset_export_rights(
+        db: Session, asset: DBAssetVersion
+    ) -> dict | None:
+        generated_task = db.execute(
+            select(DBGenerationTask)
+            .where(
+                DBGenerationTask.project_id == asset.project_id,
+                DBGenerationTask.tenant_id == asset.tenant_id,
+                DBGenerationTask.asset_version_id == asset.id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if generated_task is not None:
+            return generation_rights(db, generated_task)
+        provenance = (
+            asset.probe_json.get("provenance")
+            if isinstance(asset.probe_json, dict)
+            else None
+        )
+        if isinstance(provenance, dict) and provenance.get("generationTaskId"):
+            return {"allowed": False, "code": "GENERATION_TASK_MISSING"}
+        return None
 
     def generation_task_by_id(
         db: Session, task_id: str, *, for_update: bool = False
@@ -1731,10 +1766,12 @@ def create_app(
                     status_code=422,
                     detail={"code": "TALKING_HEAD_AUDIO_INVALID", "message": "独立旁白素材无效"},
                 )
-            audio_rights = rights_decision(
-                latest_rights_snapshot(db, audio_asset.id, "EXPORT"),
-                utc_now(),
-            )
+            audio_rights = generated_asset_export_rights(db, audio_asset)
+            if audio_rights is None:
+                audio_rights = rights_decision(
+                    latest_rights_snapshot(db, audio_asset.id, "EXPORT"),
+                    utc_now(),
+                )
             if not audio_rights.get("allowed"):
                 raise HTTPException(
                     status_code=422,
@@ -1895,6 +1932,467 @@ def create_app(
             actor_type="USER", actor_id=context.user_id,
             from_status=previous, to_status="QUEUED",
             metadata={"attempt": task.attempts}, now=now,
+        )
+        db.commit()
+        return generation_task_response(
+            db, task, rights=generation_rights(db, task), include_history=True
+        )
+
+    @created_app.post(
+        "/projects/{project_id}/generation-tasks/{task_id}/recover-artifact"
+    )
+    def recover_generation_artifact(
+        project_id: str,
+        task_id: str,
+        req: RecoverGenerationArtifactRequest,
+        context: AuthContext = Depends(context_dependency),
+        db: Session = Depends(db_dependency),
+    ):
+        """Owner-only recovery of a verified orphan already present in video-use.
+
+        This route never calls a generation Provider and never uploads media.
+        If the original object is absent, upstream retrieval remains a separate,
+        explicitly gated integration and this route fails closed.
+        """
+        require_roles(context, "owner")
+        project_for_tenant(db, project_id, context)
+        task = generation_task_for_tenant(db, project_id, task_id, context)
+        if context.user_id != task.requested_by:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "OWNER_SELF_ONLY",
+                    "message": "仅原任务发起Owner本人可以恢复该任务的原始产物",
+                },
+            )
+
+        if task.asset_version_id:
+            return generation_task_response(
+                db, task, rights=generation_rights(db, task), include_history=True
+            )
+        if task.status != "FAILED" or task.error_code != "ARTIFACT_INGEST_FAILED":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_NOT_REQUIRED",
+                    "message": "当前任务不处于原始产物转存待恢复状态",
+                },
+            )
+
+        attempt = current_generation_attempt(db, task)
+        if attempt is None or attempt.reconciliation_state != "HELD":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_EVIDENCE_MISSING",
+                    "message": "缺少 HELD 对账状态，禁止人工恢复",
+                },
+            )
+        if not task.upstream_job_id or not task.provider_artifact_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORIGINAL_ARTIFACT_IDENTITY_MISSING",
+                    "message": "原始上游任务或产物编号不完整，禁止猜测恢复",
+                },
+            )
+
+        failure_event = db.execute(
+            select(DBGenerationEvent)
+            .where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.attempt_id == attempt.id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+            )
+            .order_by(DBGenerationEvent.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        evidence = (
+            failure_event.metadata_json
+            if failure_event is not None and isinstance(failure_event.metadata_json, dict)
+            else {}
+        )
+        orphan_media_id = str(evidence.get("orphanedMediaId") or "")
+        if not orphan_media_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED",
+                    "message": "Sidecar 中没有已登记的孤儿媒资；本操作不会调用 Provider，需另行审批原始上游产物读取。",
+                },
+            )
+        if (
+            task.media_id != orphan_media_id
+            or evidence.get("originalUpstreamJobId") != task.upstream_job_id
+            or evidence.get("originalProviderArtifactId") != task.provider_artifact_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_EVIDENCE_MISMATCH",
+                    "message": "任务、上游产物与孤儿媒资证据不一致",
+                },
+            )
+
+        expected_sha256 = str(evidence.get("orphanedMediaSha256") or "").lower()
+        try:
+            expected_size = int(evidence.get("orphanedMediaSizeBytes") or 0)
+        except (TypeError, ValueError):
+            expected_size = 0
+        if (
+            len(expected_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha256)
+            or expected_size <= 0
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_EVIDENCE_INVALID",
+                    "message": "孤儿媒资缺少有效 SHA256 或字节数证据",
+                },
+            )
+
+        try:
+            inspected = created_app.state.video_use.inspect_media(
+                project_id, orphan_media_id
+            )
+        except VideoUseNotFoundError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED",
+                    "message": "Sidecar 中未找到原始孤儿媒资；未执行上传或 Provider 调用",
+                },
+            ) from exc
+        except VideoUseError as exc:
+            logger.exception("video-use orphan media inspection failed")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_INSPECTION_UNAVAILABLE",
+                    "message": "无法读取孤儿媒资校验信息，任务继续保持 HELD",
+                },
+            ) from exc
+
+        actual_sha256 = str(inspected.get("sha256") or "").lower()
+        try:
+            actual_size = int(inspected.get("sizeBytes") or 0)
+        except (TypeError, ValueError):
+            actual_size = 0
+        probe_metadata = inspected.get("metadata")
+        video_metadata = (
+            probe_metadata.get("video")
+            if isinstance(probe_metadata, dict)
+            else None
+        )
+        try:
+            duration_seconds = float(
+                probe_metadata.get("durationSeconds") or 0
+            ) if isinstance(probe_metadata, dict) else 0
+        except (TypeError, ValueError):
+            duration_seconds = 0
+        provider_policy = (
+            task.capability_snapshot_json.get("providerPolicy") or {}
+            if isinstance(task.capability_snapshot_json, dict)
+            else {}
+        )
+        try:
+            policy_max_bytes = int(provider_policy.get("maxArtifactBytes") or max_upload_bytes)
+        except (TypeError, ValueError):
+            policy_max_bytes = max_upload_bytes
+
+        if (
+            inspected.get("projectId") != project_id
+            or inspected.get("mediaId") != orphan_media_id
+            or inspected.get("contentType") != "video/mp4"
+            or not hmac.compare_digest(actual_sha256, expected_sha256)
+            or actual_size != expected_size
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_INTEGRITY_MISMATCH",
+                    "message": "孤儿媒资项目、ID、SHA256、字节数或类型与失败事件不一致",
+                },
+            )
+        if (
+            actual_size <= 0
+            or actual_size > min(max_upload_bytes, policy_max_bytes)
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "ORPHAN_MEDIA_SIZE_OUT_OF_POLICY",
+                    "message": "孤儿媒资大小超出原任务允许范围",
+                },
+            )
+        if (
+            not isinstance(video_metadata, dict)
+            or int(video_metadata.get("width") or 0) <= 0
+            or int(video_metadata.get("height") or 0) <= 0
+            or not math.isfinite(duration_seconds)
+            or not (0 < duration_seconds <= 86_400)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROBE_INVALID",
+                    "message": "孤儿媒资未通过重新执行的 FFprobe 视频校验",
+                },
+            )
+
+        # The sidecar call above is read-only. Re-open a serialized transaction
+        # and re-check every mutable binding before quota, asset or settlement writes.
+        db.rollback()
+        begin_serialized_write(db)
+        task = generation_task_for_tenant(
+            db, project_id, task_id, context, for_update=True
+        )
+        if context.user_id != task.requested_by:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "OWNER_SELF_ONLY",
+                    "message": "恢复提交时任务发起人已变化，拒绝继续",
+                },
+            )
+        project_statement = select(DBProject).where(
+            DBProject.id == project_id,
+            DBProject.tenant_id == context.tenant_id,
+        )
+        if app_engine.dialect.name != "sqlite":
+            project_statement = project_statement.with_for_update()
+        project = db.execute(project_statement).scalar_one_or_none()
+        if project is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "PROJECT_NOT_FOUND", "message": "未找到该项目"},
+            )
+        if task.asset_version_id:
+            return generation_task_response(
+                db, task, rights=generation_rights(db, task), include_history=True
+            )
+
+        attempt = current_generation_attempt(db, task)
+        failure_event = db.execute(
+            select(DBGenerationEvent)
+            .where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.attempt_id == (attempt.id if attempt else ""),
+                DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+            )
+            .order_by(DBGenerationEvent.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        current_evidence = (
+            failure_event.metadata_json
+            if failure_event is not None and isinstance(failure_event.metadata_json, dict)
+            else {}
+        )
+        if (
+            task.status != "FAILED"
+            or task.error_code != "ARTIFACT_INGEST_FAILED"
+            or attempt is None
+            or attempt.reconciliation_state != "HELD"
+            or task.media_id != orphan_media_id
+            or task.upstream_job_id != current_evidence.get("originalUpstreamJobId")
+            or task.provider_artifact_id != current_evidence.get("originalProviderArtifactId")
+            or current_evidence.get("orphanedMediaId") != orphan_media_id
+            or current_evidence.get("orphanedMediaSha256") != evidence.get("orphanedMediaSha256")
+            or current_evidence.get("orphanedMediaSizeBytes") != evidence.get("orphanedMediaSizeBytes")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_STATE_CHANGED",
+                    "message": "恢复期间任务或原始证据发生变化，请重新核对",
+                },
+            )
+
+        reserved_entry = db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task.id,
+                DBGenerationUsageEntry.kind == "RESERVED",
+            )
+        ).scalar_one_or_none()
+        released_entry = db.execute(
+            select(DBGenerationUsageEntry.id).where(
+                DBGenerationUsageEntry.task_id == task.id,
+                DBGenerationUsageEntry.kind == "RELEASED",
+            )
+        ).scalar_one_or_none()
+        existing_settled_entry = db.execute(
+            select(DBGenerationUsageEntry.id).where(
+                DBGenerationUsageEntry.task_id == task.id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )
+        ).scalar_one_or_none()
+        if reserved_entry is None or released_entry is not None or existing_settled_entry is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_USAGE_RESERVATION_NOT_RECOVERABLE",
+                    "message": "原始用量预留不完整、已释放或已有结算记录；需先由 M11/M13 对账",
+                },
+            )
+
+        # Artifact recovery is not a trusted financial settlement or durable
+        # APPLY/STOP acknowledgement. Keep the original usage reservation
+        # untouched until the authoritative M11/M13 reconciliation completes.
+        now = utc_now()
+        generated_seconds = max(1, int(duration_seconds + 0.999999))
+
+        existing_asset = db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == context.tenant_id,
+                DBAssetVersion.media_id == orphan_media_id,
+            )
+        ).scalar_one_or_none()
+        if existing_asset is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_ALREADY_HAS_ASSET_VERSION",
+                    "message": "该媒资已有资产版本但任务未绑定，需先进行人工对账",
+                },
+            )
+
+        storage_reservation = db.execute(
+            update(DBTenant)
+            .where(
+                DBTenant.id == context.tenant_id,
+                DBTenant.used_storage_bytes + actual_size <= DBTenant.storage_quota_bytes,
+            )
+            .values(
+                used_storage_bytes=DBTenant.used_storage_bytes + actual_size,
+                updated_at=utc_now(),
+            )
+        )
+        if storage_reservation.rowcount != 1:
+            db.rollback()
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "STORAGE_QUOTA_EXCEEDED",
+                    "message": "恢复原始媒资将超过团队存储额度，任务继续保持 HELD",
+                },
+            )
+
+        materials = list(project.materials or [])
+        existing_material = next(
+            (
+                item for item in materials
+                if isinstance(item, dict) and item.get("id") == orphan_media_id
+            ),
+            None,
+        )
+        material = {
+            "id": orphan_media_id,
+            "name": f"generation-{task.id}.mp4",
+            "url": f"/api/video-use/media/{project_id}/{orphan_media_id}",
+            "type": "video",
+            "contentType": "video/mp4",
+            "duration": {
+                "value": max(1, round(duration_seconds * 24_000)),
+                "timescale": 24_000,
+            },
+            "sizeBytes": actual_size,
+        }
+        if existing_material is not None:
+            if (
+                existing_material.get("url") != material["url"]
+                or existing_material.get("type") != "video"
+                or int(existing_material.get("sizeBytes") or 0) != actual_size
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
+                        "message": "项目中已存在同 ID 但元数据不一致的素材",
+                    },
+                )
+        else:
+            project.materials = [*materials, material]
+            project.revision += 1
+            project.updated_at = utc_now()
+
+        next_version = (
+            db.execute(
+                select(func.max(DBAssetVersion.version_no)).where(
+                    DBAssetVersion.project_id == project_id,
+                    DBAssetVersion.media_id == orphan_media_id,
+                )
+            ).scalar_one_or_none()
+            or 0
+        ) + 1
+        asset_probe = {
+            **probe_metadata,
+            "provenance": {
+                "provider": task.provider,
+                "providerArtifactId": task.provider_artifact_id,
+                "generationTaskId": task.id,
+                "attempt": task.attempts,
+                "capabilitySnapshotHash": task.capability_snapshot_hash,
+            },
+        }
+        asset = DBAssetVersion(
+            id=str(uuid.uuid4()),
+            tenant_id=task.tenant_id,
+            project_id=project_id,
+            media_id=orphan_media_id,
+            version_no=next_version,
+            sha256=actual_sha256,
+            media_type="video",
+            content_type="video/mp4",
+            size_bytes=actual_size,
+            probe_json=asset_probe,
+            created_by=task.requested_by,
+            created_at=now,
+        )
+        db.add(asset)
+
+        previous_status = task.status
+        task.status = "RIGHTS_BLOCKED"
+        task.progress = 100
+        task.message = "原始生成产物已恢复入库；用量预留保持HELD，等待M11/M13可信对账及权利审核"
+        task.asset_version_id = asset.id
+        task.media_id = orphan_media_id
+        task.error_code = None
+        task.error_message = None
+        task.completed_at = now
+        task.updated_at = now
+        task.lease_owner = None
+        task.lease_expires_at = None
+        attempt.status = "RIGHTS_BLOCKED"
+        attempt.reconciliation_state = "ARTIFACT_INGESTED"
+        attempt.error_code = None
+        attempt.error_message = None
+        attempt.completed_at = now
+
+        add_generation_event(
+            db,
+            task,
+            attempt=attempt,
+            event_type="ARTIFACT_RECOVERY_COMPLETED",
+            actor_type="OWNER",
+            actor_id=context.user_id,
+            from_status=previous_status,
+            to_status="RIGHTS_BLOCKED",
+            metadata={
+                "reason": req.reason,
+                "source": "VERIFIED_EXISTING_SIDECAR_OBJECT",
+                "upstreamJobId": task.upstream_job_id,
+                "providerArtifactId": task.provider_artifact_id,
+                "mediaId": orphan_media_id,
+                "sha256": actual_sha256,
+                "sizeBytes": actual_size,
+                "assetVersionId": asset.id,
+                "generatedSecondsCandidate": generated_seconds,
+                "usageReservationState": "RESERVED_HELD",
+                "m11M13Reconciliation": "PENDING",
+            },
+            now=now,
         )
         db.commit()
         return generation_task_response(
@@ -2190,10 +2688,29 @@ def create_app(
         attempt.status = req.status
         attempt.error_code = req.errorCode
         attempt.error_message = safe_error_message(req.errorMessage)
+        # G70/G71: once the original upstream job is known and an artifact
+        # transfer fails, the provider may already have charged for the output.
+        # Keep the existing generation reservation HELD; never record RELEASED
+        # or allow the generic retry path to create a second paid attempt.
+        artifact_recovery_hold = bool(
+            req.status == "FAILED"
+            and task.upstream_job_id
+            and req.errorCode
+            and str(req.errorCode).startswith("ARTIFACT_")
+        )
+        if artifact_recovery_hold:
+            task.error_code = "ARTIFACT_INGEST_FAILED"
+            attempt.error_code = task.error_code
+            attempt.reconciliation_state = "HELD"
         if req.status == "UNKNOWN":
             attempt.reconciliation_state = "UNKNOWN"
         if req.status in {"FAILED", "CANCELED", "UNKNOWN", "PARTIAL"}:
-            if req.status == "FAILED" and not req.retryable and task.error_code:
+            if (
+                req.status == "FAILED"
+                and not req.retryable
+                and task.error_code
+                and not artifact_recovery_hold
+            ):
                 task.error_code = f"NON_RETRYABLE_{task.error_code}"
                 attempt.error_code = task.error_code
             task.completed_at = now
@@ -2212,17 +2729,27 @@ def create_app(
             if req.status == "CANCELED" or (
                 req.status == "FAILED" and (not req.retryable or task.attempts >= task.max_attempts)
             ):
-                release_generation_reservation(
-                    db, task, attempt,
-                    reason_code=req.errorCode or req.status, now=now,
-                )
+                if not artifact_recovery_hold:
+                    release_generation_reservation(
+                        db, task, attempt,
+                        reason_code=req.errorCode or req.status, now=now,
+                    )
         else:
             task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
+        transition_metadata = {"progress": req.progress}
+        if artifact_recovery_hold:
+            transition_metadata.update({
+                "originalErrorCode": req.errorCode,
+                "reconciliationState": "HELD",
+                "usageReservation": "HELD",
+                "upstreamJobId": task.upstream_job_id,
+                "providerArtifactId": task.provider_artifact_id,
+            })
         add_generation_event(
             db, task, attempt=attempt, event_type="WORKER_TRANSITION",
             actor_type="WORKER", actor_id=x_worker_id,
             from_status=previous, to_status=req.status,
-            metadata={"progress": req.progress}, now=now,
+            metadata=transition_metadata, now=now,
         )
         db.commit()
         return {"taskId": task.id, "status": task.status, "progress": task.progress}
@@ -2303,6 +2830,11 @@ def create_app(
 
         task_project_id = task.project_id
         task_tenant_id = task.tenant_id
+        artifact_idempotency_key = f"generation:{task_id}"
+        expected_media_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"aether-video-use:{task_project_id}:{artifact_idempotency_key}",
+        ))
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
@@ -2318,10 +2850,17 @@ def create_app(
         metadata = {}
         try:
             uploaded = created_app.state.video_use.upload_media(
-                task_project_id, f"generation-{task_id}.mp4", "video/mp4", file.file
+                task_project_id,
+                f"generation-{task_id}.mp4",
+                "video/mp4",
+                file.file,
+                idempotency_key=artifact_idempotency_key,
+                content_sha256=digest.hexdigest(),
             )
             metadata = uploaded.get("metadata") or {}
             media_id = str(uploaded.get("mediaId") or "")
+            if media_id != expected_media_id:
+                raise ValueError("generated artifact returned an unexpected idempotent media identity")
 
             # The storage reservation commit above intentionally ends the first task
             # lock before the network call. Re-open a serialized transaction after
@@ -2614,6 +3153,26 @@ def create_app(
             failed_attempt.error_message = failed_task.error_message
             failed_attempt.completed_at = failed_task.completed_at
             failure_metadata = {"compensatedQuotaBytes": upload_size}
+            artifact_recovery_hold = bool(failed_task.upstream_job_id and providerArtifactId)
+            if artifact_recovery_hold:
+                # The remote job is already known and may be billable. Storage
+                # compensation is separate from generation usage: preserve the
+                # original RESERVED entry. The deterministic Sidecar ID lets the
+                # Owner inspect/recover a committed object even when its upload
+                # acknowledgement was lost and no response body reached the API.
+                failed_attempt.reconciliation_state = "HELD"
+                failed_task.media_id = expected_media_id
+                failure_metadata.update({
+                    "originalProviderArtifactId": providerArtifactId,
+                    "originalUpstreamJobId": failed_task.upstream_job_id,
+                    "reconciliationState": "HELD",
+                    "usageReservation": "HELD",
+                    "orphanedMediaId": expected_media_id,
+                    "orphanedMediaSha256": digest.hexdigest(),
+                    "orphanedMediaSizeBytes": upload_size,
+                    "orphanedMediaMetadata": {},
+                    "artifactIdempotencyKey": artifact_idempotency_key,
+                })
             if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
                 failed_task.media_id = media_id
                 failure_metadata.update({
@@ -2621,7 +3180,7 @@ def create_app(
                     "orphanedMediaSha256": digest.hexdigest(),
                     "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
                     "originalProviderArtifactId": providerArtifactId,
-                        "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
+                    "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
                     "originalUpstreamJobId": failed_task.upstream_job_id or "",
                     "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                 })
@@ -2638,10 +3197,11 @@ def create_app(
                 actor_type="SYSTEM", actor_id="api", from_status=previous_status,
                 to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
             )
-            release_generation_reservation(
-                db, failed_task, failed_attempt,
-                reason_code=failed_task.error_code, now=failed_task.completed_at,
-            )
+            if not artifact_recovery_hold:
+                release_generation_reservation(
+                    db, failed_task, failed_attempt,
+                    reason_code=failed_task.error_code, now=failed_task.completed_at,
+                )
             db.commit()
             if isinstance(exc, ValueError):
                 raise HTTPException(status_code=422, detail={"code": "ARTIFACT_VALIDATION_FAILED", "message": "生成产物未通过媒体校验"}) from exc
@@ -2875,11 +3435,21 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         project_for_tenant(db, project_id, context)
-        asset_for_tenant(db, project_id, asset_version_id, context)
+        asset = asset_for_tenant(db, project_id, asset_version_id, context)
         snapshot = latest_rights_snapshot(db, asset_version_id, purpose)
+        generated_rights = (
+            generated_asset_export_rights(db, asset)
+            if purpose in (None, "EXPORT")
+            else None
+        )
+        decision = (
+            generated_rights
+            if generated_rights is not None
+            else rights_decision(snapshot, utc_now())
+        )
         return {
             "assetVersionId": asset_version_id,
-            **rights_decision(snapshot, utc_now()),
+            **decision,
             "snapshot": rights_snapshot_response(snapshot) if snapshot else None,
         }
 
@@ -2939,6 +3509,31 @@ def create_app(
         material = next((item for item in project.materials if item.get("id") == media_id), None)
         if material is None:
             raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND", "message": "未找到该媒体文件"})
+
+        # Generated outputs are downloadable only while their latest EXPORT
+        # evidence is valid. A RIGHTS_BLOCKED task must not become readable
+        # merely because recovery added the orphan to project.materials.
+        asset = db.execute(
+            select(DBAssetVersion)
+            .where(
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == context.tenant_id,
+                DBAssetVersion.media_id == media_id,
+            )
+            .order_by(DBAssetVersion.version_no.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if asset is not None:
+            generated_rights = generated_asset_export_rights(db, asset)
+            if generated_rights is not None and not generated_rights.get("allowed"):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": generated_rights.get("code", "RIGHTS_MISSING"),
+                        "message": "该生成资产当前缺少可信 EXPORT 权利证据，禁止下载",
+                    },
+                )
+
         media_type = material.get("contentType") or ("video/mp4" if material.get("type") == "video" else "audio/mpeg")
         return proxy_video_use_stream(f"/media/{project_id}/{media_id}", request, media_type)
 
@@ -3230,10 +3825,12 @@ def create_app(
             if asset is None:
                 rights_failures.append({"mediaId": media_id, "code": "ASSET_VERSION_MISSING"})
                 continue
-            decision = rights_decision(
-                latest_rights_snapshot(db, asset.id, "EXPORT"),
-                utc_now(),
-            )
+            decision = generated_asset_export_rights(db, asset)
+            if decision is None:
+                decision = rights_decision(
+                    latest_rights_snapshot(db, asset.id, "EXPORT"),
+                    utc_now(),
+                )
             if not decision["allowed"]:
                 rights_failures.append(
                     {"mediaId": media_id, "assetVersionId": asset.id, "code": decision["code"]}

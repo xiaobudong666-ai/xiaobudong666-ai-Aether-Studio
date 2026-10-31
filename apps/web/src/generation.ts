@@ -475,7 +475,9 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 export class GenerationApiClient {
   constructor(
     private readonly apiBase = "/api",
-    private readonly request: FetchLike = fetch,
+    // Keep the browser global as the receiver. A bare stored `fetch` invoked
+    // later as `this.request(...)` throws "Illegal invocation" in Chromium.
+    private readonly request: FetchLike = (input, init) => globalThis.fetch(input, init),
   ) {}
 
   private async json<T>(path: string, init?: RequestInit): Promise<T> {

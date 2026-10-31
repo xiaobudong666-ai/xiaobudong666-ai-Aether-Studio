@@ -1,13 +1,52 @@
 # Explicit FAKE-only integration override. NEVER include in production Compose.
 # Disposable nonproduction environment only; does not grant provider credentials.
-# docker compose -f infra/docker/docker-compose.yml \
-#   -f infra/docker/docker-compose.g72-fake-only.override.yml config
+# The API -> video-use path is routed through a private, token-armed fault proxy.
+# The proxy has no published port and forwards normally unless a bounded test
+# plan is explicitly armed by the disposable CI smoke script.
 services:
   api:
     environment:
       AETHER_GENERATION_PROVIDER_MODE: deterministic-fake
       AETHER_FAKE_ONLY_NONPROD: "true"
       AETHER_RUNTIME_STAGE: nonproduction
+      VIDEO_USE_API_URL: http://g70-fault-proxy:8003
+      G70_FAULT_PROXY_TOKEN: ${G70_FAULT_PROXY_TOKEN:-ci-test-only-g70-fault-proxy}
+    depends_on:
+      g70-fault-proxy:
+        condition: service_healthy
+
+  g70-fault-proxy:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    command:
+      - uvicorn
+      - app.g70_fault_proxy:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8003"
+    networks:
+      - aether-net
+    environment:
+      G70_FAULT_PROXY_TOKEN: ${G70_FAULT_PROXY_TOKEN:-ci-test-only-g70-fault-proxy}
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    depends_on:
+      video-use:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/__health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
   worker:
     environment:
       AETHER_GENERATION_PROVIDER_MODE: deterministic-fake
