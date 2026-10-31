@@ -132,6 +132,8 @@ def prepare() -> None:
 
         tenant = db.get(DBTenant, project.tenant_id)
         assert tenant is not None
+        tenant_id = project.tenant_id
+        requested_by = project.owner_id
         storage_before = int(tenant.used_storage_bytes or 0)
 
         values = {
@@ -227,8 +229,8 @@ def prepare() -> None:
         "taskId": task_id,
         "attemptId": attempt_id,
         "projectId": project_id,
-        "tenantId": project.tenant_id,
-        "requestedBy": project.owner_id,
+        "tenantId": tenant_id,
+        "requestedBy": requested_by,
         "sourceTaskId": source_task_id,
         "sourceMediaId": source_media_id,
         "mediaId": orphan_media_id,
@@ -259,6 +261,33 @@ def verify() -> None:
         before = client.get(f"/projects/{project_id}/generation-tasks/{task_id}")
         assert before.status_code == 200, before.text[:300]
         assert before.json()["status"] == "FAILED"
+
+        # Generic retry must not create a new paid generation attempt while the
+        # original artifact is held for recovery.
+        blocked_retry = client.post(
+            f"/projects/{project_id}/generation-tasks/{task_id}/retry"
+        )
+        assert blocked_retry.status_code == 409, blocked_retry.text[:300]
+        assert blocked_retry.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+        with SessionLocal() as db:
+            attempt_count = db.execute(
+                select(func.count(DBGenerationAttempt.id)).where(
+                    DBGenerationAttempt.generation_task_id == task_id
+                )
+            ).scalar_one()
+            assert attempt_count == 1
+            assert db.execute(
+                select(func.count(DBGenerationUsageEntry.id)).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                    DBGenerationUsageEntry.kind == "RESERVED",
+                )
+            ).scalar_one() == 1
+            assert db.execute(
+                select(func.count(DBGenerationUsageEntry.id)).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                    DBGenerationUsageEntry.kind.in_(("RELEASED", "SETTLED")),
+                )
+            ).scalar_one() == 0
 
         recovered = client.post(
             url,
@@ -405,6 +434,7 @@ def verify() -> None:
         "publicExport": "403 RIGHTS_MISSING",
         "sidecarInspectAfterRestart": "PASS",
         "sidecarBytesAfterRestart": "PASS",
+        "genericRetry": "409 ARTIFACT_RECOVERY_REQUIRED; no new attempt",
         "ownerRecovery": "PASS",
         "repeatedOwnerRecovery": "IDEMPOTENT",
         "providerCalls": 0,
