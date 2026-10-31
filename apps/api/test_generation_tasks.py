@@ -711,6 +711,67 @@ def test_30_success_creates_one_material_and_immutable_asset_with_provenance(gen
         assert stored_project.timeline["tracks"] == []
 
 
+def test_generated_media_download_requires_current_export_rights(generation_context, monkeypatch):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "generated-media-export-rights")
+    task = ingest_success(client, project)
+    result = task["results"][0]
+    media_id = result["mediaId"]
+    asset_id = result["assetVersionId"]
+    payload = media_store.media_objects[(project["id"], media_id)]["content"]
+    stream_calls = []
+
+    class FakeUpstream:
+        status_code = 200
+        headers = {
+            "content-type": "video/mp4",
+            "content-length": str(len(payload)),
+        }
+
+        def iter_bytes(self):
+            yield payload
+
+    class FakeStreamContext:
+        def __enter__(self):
+            return FakeUpstream()
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_stream(path, headers=None):
+        stream_calls.append((path, headers))
+        return FakeStreamContext()
+
+    monkeypatch.setattr(app.state.video_use, "stream", fake_stream, raising=False)
+    media_url = f"/video-use/media/{project['id']}/{media_id}"
+
+    missing = client.get(media_url)
+    assert missing.status_code == 403
+    assert missing.json()["detail"]["code"] == "RIGHTS_MISSING"
+    assert stream_calls == []
+
+    rights_url = f"/projects/{project['id']}/asset-versions/{asset_id}/rights-snapshots"
+    allowed = client.post(
+        rights_url,
+        json={"status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "synthetic-export-allowed"},
+    )
+    assert allowed.status_code == 201, allowed.text
+    downloaded = client.get(media_url)
+    assert downloaded.status_code == 200
+    assert downloaded.content == payload
+    assert len(stream_calls) == 1
+
+    revoked = client.post(
+        rights_url,
+        json={"status": "REVOKED", "purpose": "EXPORT", "territory": "GLOBAL", "evidenceRef": "synthetic-export-revoked"},
+    )
+    assert revoked.status_code == 201, revoked.text
+    denied = client.get(media_url)
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "RIGHTS_REVOKED"
+    assert len(stream_calls) == 1
+
+
 def test_31_repeated_artifact_completion_is_idempotent_without_double_quota(generation_context):
     client, sessions, _, media_store = generation_context
     project = create_project(client)
