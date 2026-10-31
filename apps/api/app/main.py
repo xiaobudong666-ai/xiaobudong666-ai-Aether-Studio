@@ -2830,6 +2830,11 @@ def create_app(
 
         task_project_id = task.project_id
         task_tenant_id = task.tenant_id
+        artifact_idempotency_key = f"generation:{task_id}"
+        expected_media_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"aether-video-use:{task_project_id}:{artifact_idempotency_key}",
+        ))
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
@@ -2845,10 +2850,17 @@ def create_app(
         metadata = {}
         try:
             uploaded = created_app.state.video_use.upload_media(
-                task_project_id, f"generation-{task_id}.mp4", "video/mp4", file.file
+                task_project_id,
+                f"generation-{task_id}.mp4",
+                "video/mp4",
+                file.file,
+                idempotency_key=artifact_idempotency_key,
+                content_sha256=digest.hexdigest(),
             )
             metadata = uploaded.get("metadata") or {}
             media_id = str(uploaded.get("mediaId") or "")
+            if media_id != expected_media_id:
+                raise ValueError("generated artifact returned an unexpected idempotent media identity")
 
             # The storage reservation commit above intentionally ends the first task
             # lock before the network call. Re-open a serialized transaction after
@@ -3143,15 +3155,23 @@ def create_app(
             failure_metadata = {"compensatedQuotaBytes": upload_size}
             artifact_recovery_hold = bool(failed_task.upstream_job_id and providerArtifactId)
             if artifact_recovery_hold:
-                # The remote job is already known and may be billable.  Storage
+                # The remote job is already known and may be billable. Storage
                 # compensation is separate from generation usage: preserve the
-                # original RESERVED entry until artifact reconciliation settles it.
+                # original RESERVED entry. The deterministic Sidecar ID lets the
+                # Owner inspect/recover a committed object even when its upload
+                # acknowledgement was lost and no response body reached the API.
                 failed_attempt.reconciliation_state = "HELD"
+                failed_task.media_id = expected_media_id
                 failure_metadata.update({
                     "originalProviderArtifactId": providerArtifactId,
                     "originalUpstreamJobId": failed_task.upstream_job_id,
                     "reconciliationState": "HELD",
                     "usageReservation": "HELD",
+                    "orphanedMediaId": expected_media_id,
+                    "orphanedMediaSha256": digest.hexdigest(),
+                    "orphanedMediaSizeBytes": upload_size,
+                    "orphanedMediaMetadata": {},
+                    "artifactIdempotencyKey": artifact_idempotency_key,
                 })
             if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
                 failed_task.media_id = media_id
