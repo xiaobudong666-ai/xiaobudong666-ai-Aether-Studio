@@ -70,7 +70,7 @@ def seed_test_image_and_remix_rights(project_id: str) -> str:
             id=str(uuid.uuid4()),
             tenant_id=project.tenant_id,
             project_id=project.id,
-            media_id="synthetic-g70-fake-image",
+            media_id=f"synthetic-g70-fake-image-{uuid.uuid4().hex[:12]}",
             version_no=1,
             sha256="a" * 64,
             media_type="image",
