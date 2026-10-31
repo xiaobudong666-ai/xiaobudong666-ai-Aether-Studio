@@ -1183,7 +1183,7 @@ def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_atte
         assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
         assert assets[0].size_bytes == len(payload)
         assert sum(1 for row in usage if row.kind == "RESERVED") == 1
-        assert sum(1 for row in usage if row.kind == "SETTLED") == 1
+        assert sum(1 for row in usage if row.kind == "SETTLED") == 0
         assert sum(1 for row in usage if row.kind == "RELEASED") == 0
         assert receipts == 1
         assert tenant.used_storage_bytes == len(payload)
@@ -1203,7 +1203,7 @@ def test_g70_g71_owner_recovery_fails_closed_when_original_media_is_absent(gener
         project["id"],
         task_id,
         include_sidecar_object=False,
-        include_orphan_reference=False,
+        include_orphan_reference=True,
     )
     response = client.post(
         f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",

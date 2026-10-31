@@ -2170,55 +2170,26 @@ def create_app(
                 DBGenerationUsageEntry.kind == "RELEASED",
             )
         ).scalar_one_or_none()
-        settled_entry = db.execute(
-            select(DBGenerationUsageEntry).where(
+        existing_settled_entry = db.execute(
+            select(DBGenerationUsageEntry.id).where(
                 DBGenerationUsageEntry.task_id == task.id,
                 DBGenerationUsageEntry.kind == "SETTLED",
             )
         ).scalar_one_or_none()
-        if reserved_entry is None or released_entry is not None:
+        if reserved_entry is None or released_entry is not None or existing_settled_entry is not None:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "GENERATION_USAGE_RESERVATION_NOT_RECOVERABLE",
-                    "message": "原始生成费用预留不完整或已释放，禁止自动结算",
+                    "message": "原始用量预留不完整、已释放或已有结算记录；需先由 M11/M13 对账",
                 },
             )
 
+        # Artifact recovery is not a trusted financial settlement or durable
+        # APPLY/STOP acknowledgement. Keep the original usage reservation
+        # untouched until the authoritative M11/M13 reconciliation completes.
         now = utc_now()
         generated_seconds = max(1, int(duration_seconds + 0.999999))
-        if settled_entry is not None:
-            if settled_entry.generated_seconds != generated_seconds:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "GENERATION_USAGE_SETTLEMENT_MISMATCH",
-                        "message": "已有结算记录与原始媒资时长不一致",
-                    },
-                )
-        else:
-            settled_seconds = db.execute(
-                select(func.coalesce(func.sum(DBGenerationUsageEntry.generated_seconds), 0)).where(
-                    DBGenerationUsageEntry.tenant_id == task.tenant_id,
-                    DBGenerationUsageEntry.kind.in_(["SETTLED", "ADJUSTED"]),
-                    DBGenerationUsageEntry.created_at >= now.replace(
-                        day=1, hour=0, minute=0, second=0, microsecond=0
-                    ),
-                )
-            ).scalar_one()
-            seconds_limit = int(
-                (task.capability_snapshot_json.get("quota") or {}).get(
-                    "monthlyGeneratedSecondsLimit", 0
-                )
-            )
-            if seconds_limit < 1 or int(settled_seconds) + generated_seconds > seconds_limit:
-                raise HTTPException(
-                    status_code=429,
-                    detail={
-                        "code": "GENERATED_SECONDS_QUOTA_EXCEEDED",
-                        "message": "恢复后的原始产物将超过当前月生成时长额度，任务继续保持 HELD",
-                    },
-                )
 
         existing_asset = db.execute(
             select(DBAssetVersion).where(
@@ -2333,7 +2304,7 @@ def create_app(
         previous_status = task.status
         task.status = "RIGHTS_BLOCKED"
         task.progress = 100
-        task.message = "原始生成产物已恢复入库，等待权利审核"
+        task.message = "原始生成产物已恢复入库；用量预留保持HELD，等待M11/M13可信对账及权利审核"
         task.asset_version_id = asset.id
         task.media_id = orphan_media_id
         task.error_code = None
@@ -2348,18 +2319,6 @@ def create_app(
         attempt.error_message = None
         attempt.completed_at = now
 
-        if settled_entry is None:
-            add_usage_entry(
-                db,
-                task=task,
-                attempt=attempt,
-                kind="SETTLED",
-                request_units=0,
-                generated_seconds=generated_seconds,
-                reservation_key=f"generation:{task.id}",
-                config_version_id=task.capability_snapshot_json.get("configVersionId"),
-                now=now,
-            )
         add_generation_event(
             db,
             task,
@@ -2378,7 +2337,9 @@ def create_app(
                 "sha256": actual_sha256,
                 "sizeBytes": actual_size,
                 "assetVersionId": asset.id,
-                "generatedSeconds": generated_seconds,
+                "generatedSecondsCandidate": generated_seconds,
+                "usageReservationState": "RESERVED_HELD",
+                "m11M13Reconciliation": "PENDING",
             },
             now=now,
         )
