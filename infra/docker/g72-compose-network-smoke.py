@@ -202,11 +202,15 @@ def verify() -> None:
             saved["projectId"], saved["taskId"], saved["sha256"],
         )
         assert evidence == saved, "asset or receipt mutated after restart"
+        # The direct Sidecar GET in check_asset_and_receipts() proves that
+        # the original bytes and SHA survived restart. The public API download
+        # must remain blocked because this FAKE task has no trusted M12 EXPORT
+        # issuer evidence; storage durability is not export authorization.
         media = client.get(
             f"/video-use/media/{saved['projectId']}/{saved['mediaId']}"
         )
-        assert media.status_code == 200
-        assert hashlib.sha256(media.content).hexdigest() == saved["sha256"]
+        assert media.status_code == 403, media.text
+        assert media.json()["detail"]["code"] == "RIGHTS_MISSING"
         print(json.dumps({
             "phase": "after_restart", "fakeOnly": True,
             "verified": True, "result": evidence,
