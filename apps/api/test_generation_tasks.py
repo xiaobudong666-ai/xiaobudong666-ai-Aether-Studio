@@ -1297,20 +1297,34 @@ def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_ow
 
     now = datetime.datetime.now(datetime.timezone.utc)
     admin_password = secrets.token_urlsafe(24)
+    same_tenant_owner_password = secrets.token_urlsafe(24)
     foreign_password = secrets.token_urlsafe(24)
     with sessions() as db:
         tenant_id = db.get(DBProject, project["id"]).tenant_id
-        db.add(DBUser(
-            id=str(uuid.uuid4()),
-            tenant_id=tenant_id,
-            email="g70-recovery-admin-no-delegation@example.com",
-            display_name="G70 Recovery Admin Without Delegation",
-            password_hash=hash_password(admin_password),
-            role="admin",
-            is_active=True,
-            created_at=now,
-            updated_at=now,
-        ))
+        db.add_all([
+            DBUser(
+                id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                email="g70-recovery-admin-no-delegation@example.com",
+                display_name="G70 Recovery Admin Without Delegation",
+                password_hash=hash_password(admin_password),
+                role="admin",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+            DBUser(
+                id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                email="g70-recovery-other-owner@example.com",
+                display_name="G70 Recovery Other Same-Tenant Owner",
+                password_hash=hash_password(same_tenant_owner_password),
+                role="owner",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+        ])
         foreign_tenant = DBTenant(
             id="g70-recovery-foreign-tenant",
             name="G70 Recovery Foreign Tenant",
@@ -1342,6 +1356,22 @@ def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_ow
         db.commit()
 
     url = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    assert client.post("/auth/logout").status_code == 204
+    same_owner_login = client.post(
+        "/auth/login",
+        json={
+            "email": "g70-recovery-other-owner@example.com",
+            "password": same_tenant_owner_password,
+        },
+    )
+    assert same_owner_login.status_code == 200, same_owner_login.text
+    same_owner_response = client.post(
+        url,
+        json={"reason": "Another tenant Owner cannot recover this task"},
+    )
+    assert same_owner_response.status_code == 403, same_owner_response.text
+    assert same_owner_response.json()["detail"]["code"] == "OWNER_SELF_ONLY"
+
     assert client.post("/auth/logout").status_code == 204
     admin_login = client.post(
         "/auth/login",
