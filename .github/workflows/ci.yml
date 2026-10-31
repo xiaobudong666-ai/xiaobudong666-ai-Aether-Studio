@@ -490,7 +490,7 @@ jobs:
   g72-fake-compose-network:
     # Independent nonproduction evidence only. The primary Node/Python security
     # audit remains the mandatory release gate; do not treat this as a waiver.
-    name: G72 FAKE-ONLY independent Compose network smoke (not a release gate)
+    name: G72 + G70/G71 FAKE-only Compose persistence and recovery smoke (not a release gate)
     if: (github.event_name == 'push' && (github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route' || github.ref == 'refs/heads/feat/g70-g71-artifact-usage-hold')) || (github.event_name == 'pull_request' && (github.head_ref == 'feat/fusion-m0-g72-fake-only-route' || github.head_ref == 'feat/g70-g71-artifact-usage-hold'))
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -547,6 +547,9 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             cp infra/docker/g72-compose-network-smoke.py api:/tmp/g72-compose-network-smoke.py
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp infra/docker/g70-g71-compose-recovery-smoke.py api:/tmp/g70-g71-compose-recovery-smoke.py
 
       - name: Prove real Worker network, FFmpeg, sidecar persistence and audit
         shell: bash
@@ -556,7 +559,21 @@ jobs:
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py prepare
 
-      - name: Prove sidecar and Worker restart preserve exact asset and receipts
+      - name: Prepare G70/G71 orphan against the real Sidecar and record object count
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g70-g71-compose-recovery-smoke.py prepare
+          media_count="$(docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
+          [[ "$media_count" =~ ^[0-9]+$ ]]
+          echo "G70_MEDIA_COUNT_BEFORE=$media_count" >> "$GITHUB_ENV"
+          echo "Sidecar media object count before recovery: $media_count"
+
+      - name: Prove Sidecar and Worker restart preserve G72 and G70/G71 original objects
         shell: bash
         run: |
           set -euo pipefail
@@ -567,6 +584,45 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             exec -T api python /tmp/g72-compose-network-smoke.py verify
+          docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T api python /tmp/g70-g71-compose-recovery-smoke.py verify
+
+      - name: Verify G70/G71 recovery did not upload another Sidecar object
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${G70_MEDIA_COUNT_BEFORE:-}" ]; then
+            echo "G70 Sidecar media count was not captured" >&2
+            exit 1
+          fi
+          media_count_after="$(docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            exec -T video-use python -c 'from pathlib import Path; root=Path("/media/projects"); print(sum(1 for project in root.iterdir() if project.is_dir() for path in (project / "media").glob("*") if path.is_file()))')"
+          test "$media_count_after" = "$G70_MEDIA_COUNT_BEFORE"
+          echo "Sidecar media object count unchanged by recovery: $media_count_after"
+
+      - name: Export G70/G71 recovery evidence
+        if: always()
+        shell: bash
+        run: |
+          if docker compose -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.g72-fake-only.override.yml \
+            cp api:/tmp/g70-g71-ci-fake-only-recovery-evidence.json "$RUNNER_TEMP/g70-g71-ci-fake-only-recovery-evidence.json"; then
+            echo "G70/G71 evidence exported"
+          else
+            echo "G70/G71 evidence file unavailable" >&2
+          fi
+
+      - name: Upload G70/G71 recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g70-g71-compose-recovery-evidence
+          path: ${{ runner.temp }}/g70-g71-ci-fake-only-recovery-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Capture failure diagnostics without credentials
         if: failure()
