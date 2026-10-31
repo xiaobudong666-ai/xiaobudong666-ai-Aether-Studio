@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import inspect
 import os
 import threading
@@ -13,7 +14,7 @@ import pytest
 from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import create_app
-from app.video_use_adapter import VideoUseError
+from app.video_use_adapter import VideoUseError, VideoUseNotFoundError
 from app.models import (
     DBAdoption,
     DBAssetVersion,
@@ -73,6 +74,7 @@ class FakeGeneratedMediaStore:
         self.uploads = 0
         self.fail_probe = False
         self.interrupt = False
+        self.media_objects = {}
 
     def check_health(self):
         return {"status": "healthy"}
@@ -88,12 +90,33 @@ class FakeGeneratedMediaStore:
         metadata = {"durationSeconds": 1.0, "sizeBytes": len(payload)}
         if not self.fail_probe:
             metadata["video"] = {"codec": "h264", "width": 320, "height": 240}
+        media_id = f"generated-media-{self.uploads}"
+        self.media_objects[(project_id, media_id)] = {
+            "content": payload,
+            "metadata": metadata,
+            "contentType": content_type,
+        }
         return {
-            "mediaId": f"generated-media-{self.uploads}",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
             "metadata": metadata,
+        }
+
+    def inspect_media(self, project_id, media_id):
+        stored = self.media_objects.get((project_id, media_id))
+        if stored is None:
+            raise VideoUseNotFoundError("media not found")
+        payload = stored["content"]
+        return {
+            "projectId": project_id,
+            "mediaId": media_id,
+            "mediaType": "video",
+            "contentType": stored["contentType"],
+            "sizeBytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "metadata": stored["metadata"],
         }
 
 
@@ -1016,6 +1039,237 @@ def test_g71_artifact_stream_failure_holds_reservation_and_blocks_new_paid_attem
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RELEASED",
         )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+
+def seed_g71_orphan_artifact(
+    sessions,
+    media_store,
+    project_id,
+    task_id,
+    *,
+    include_sidecar_object=True,
+    expected_sha256=None,
+    include_orphan_reference=True,
+):
+    payload = b"synthetic-original-orphan-video"
+    media_id = f"orphan-media-{task_id[:8]}"
+    digest = hashlib.sha256(payload).hexdigest()
+    metadata = {
+        "durationSeconds": 1.0,
+        "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    if include_sidecar_object:
+        media_store.media_objects[(project_id, media_id)] = {
+            "content": payload,
+            "metadata": metadata,
+            "contentType": "video/mp4",
+        }
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic original artifact transfer failure"
+        task.upstream_job_id = "original-upstream-job"
+        task.provider_artifact_id = "original-provider-artifact"
+        task.media_id = media_id if include_orphan_reference else None
+        task.completed_at = now
+        task.updated_at = now
+        task.lease_owner = None
+        task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = "original-upstream-job"
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        event_metadata = {
+            "originalUpstreamJobId": "original-upstream-job",
+            "originalProviderArtifactId": "original-provider-artifact",
+            "reconciliationState": "HELD",
+            "usageReservation": "HELD",
+        }
+        if include_orphan_reference:
+            event_metadata.update({
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": expected_sha256 or digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata,
+            })
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_id=attempt.id,
+            event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING",
+            to_status="FAILED",
+            actor_type="SYSTEM",
+            actor_id="api",
+            metadata_json=event_metadata,
+            created_at=now,
+        ))
+        db.commit()
+    return media_id, payload
+
+
+def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_attempt(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-owner-orphan-recovery")
+    task = create_task(client, project, key="g70-owner-orphan-recovery")
+    task_id = task["taskId"]
+    media_id, payload = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+
+    url = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    recovered = client.post(
+        url,
+        json={"reason": "Owner verified original job and orphan media receipt"},
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["status"] == "RIGHTS_BLOCKED"
+    assert recovered.json()["mediaId"] == media_id
+
+    # Repeating the same Owner action is idempotent: no second asset, event,
+    # storage reservation, usage settlement, upload or generation attempt.
+    repeated = client.post(
+        url,
+        json={"reason": "Owner repeated recovery request for idempotency check"},
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["assetVersionId"] == recovered.json()["assetVersionId"]
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        project_row = db.get(DBProject, project["id"])
+        assets = list(db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == project["id"],
+                DBAssetVersion.media_id == media_id,
+            )
+        ).scalars())
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        attempts = list(db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalars())
+        receipts = db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+            )
+        ).scalar_one()
+        assert stored.status == "RIGHTS_BLOCKED"
+        assert stored.error_code is None
+        assert stored.upstream_job_id == "original-upstream-job"
+        assert stored.provider_artifact_id == "original-provider-artifact"
+        assert stored.attempts == 1
+        assert len(attempts) == 1
+        assert len(assets) == 1
+        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert assets[0].size_bytes == len(payload)
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind == "SETTLED") == 1
+        assert sum(1 for row in usage if row.kind == "RELEASED") == 0
+        assert receipts == 1
+        assert tenant.used_storage_bytes == len(payload)
+        assert sum(1 for item in project_row.materials if item.get("id") == media_id) == 1
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_owner_recovery_fails_closed_when_original_media_is_absent(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-owner-original-fetch-blocked")
+    task = create_task(client, project, key="g70-owner-original-fetch-blocked")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(
+        sessions,
+        media_store,
+        project["id"],
+        task_id,
+        include_sidecar_object=False,
+        include_orphan_reference=False,
+    )
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checked original job but sidecar media is absent"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind in {"RELEASED", "SETTLED"}) == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_owner_recovery_rejects_orphan_hash_mismatch(generation_context):
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-owner-orphan-hash-mismatch")
+    task = create_task(client, project, key="g70-owner-orphan-hash-mismatch")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(
+        sessions,
+        media_store,
+        project["id"],
+        task_id,
+        expected_sha256="0" * 64,
+    )
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checks hash mismatch isolation behavior"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_INTEGRITY_MISMATCH"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        assets = db.execute(
+            select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project["id"]
+            )
+        ).scalar_one()
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0
+        assert sum(1 for row in usage if row.kind == "RESERVED") == 1
+        assert sum(1 for row in usage if row.kind in {"RELEASED", "SETTLED"}) == 0
+    assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
 
 

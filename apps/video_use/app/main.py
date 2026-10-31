@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -736,6 +737,33 @@ def create_app(
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         return FileResponse(source, filename=source.name)
+
+    @app.get("/media/{project_id}/{media_id}/inspect")
+    def inspect_media(project_id: str, media_id: str):
+        try:
+            source = store.find_media(project_id, media_id)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
+        try:
+            metadata = probe(source)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=422, detail="媒体文件无法通过重新探测") from exc
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        suffix = source.suffix.lower()
+        content_type = "video/mp4" if suffix == ".mp4" else "application/octet-stream"
+        media_type = "video" if metadata.get("video") else "audio"
+        return {
+            "projectId": project_id,
+            "mediaId": media_id,
+            "mediaType": media_type,
+            "contentType": content_type,
+            "sizeBytes": source.stat().st_size,
+            "sha256": digest.hexdigest(),
+            "metadata": metadata,
+        }
 
     @app.post("/renders", status_code=status.HTTP_202_ACCEPTED)
     def create_render(request: RenderJobRequest):

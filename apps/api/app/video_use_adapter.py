@@ -4,6 +4,7 @@ import os
 import time
 from contextlib import contextmanager
 from typing import Any, BinaryIO, Iterator
+from urllib.parse import quote
 
 import httpx
 
@@ -17,6 +18,10 @@ class VideoUseConnectionError(VideoUseError):
 
 
 class VideoUseTimeoutError(VideoUseError):
+    pass
+
+
+class VideoUseNotFoundError(VideoUseError):
     pass
 
 
@@ -88,6 +93,16 @@ class VideoUseAdapter:
                 files={"file": (filename, stream, content_type or "application/octet-stream")},
             )
         )
+
+    def inspect_media(self, project_id: str, media_id: str) -> dict[str, Any]:
+        safe_project_id = quote(project_id, safe="")
+        safe_media_id = quote(media_id, safe="")
+        response = self._request(
+            "GET", f"/media/{safe_project_id}/{safe_media_id}/inspect"
+        )
+        if response.status_code == 404:
+            raise VideoUseNotFoundError("video-use media was not found")
+        return self._json(response)
 
     def submit_render(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._json(self._request("POST", "/renders", json=payload))

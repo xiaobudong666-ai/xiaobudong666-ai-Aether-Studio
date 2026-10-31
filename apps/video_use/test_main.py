@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 import time
 from pathlib import Path
@@ -119,6 +120,15 @@ def test_upload_probe_render_and_download_are_real(tmp_path):
         media = upload.json()
         assert media["metadata"]["video"]["width"] == 320
         assert media["metadata"]["durationSeconds"] > 0.9
+        inspected = client.get(f"/media/project-1/{media['mediaId']}/inspect")
+        assert inspected.status_code == 200, inspected.text
+        inspection = inspected.json()
+        assert inspection["projectId"] == "project-1"
+        assert inspection["mediaId"] == media["mediaId"]
+        assert inspection["contentType"] == "video/mp4"
+        assert inspection["sizeBytes"] == len(source.read_bytes())
+        assert inspection["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+        assert inspection["metadata"]["video"]["width"] == 320
 
         render = client.post(
             "/renders",
