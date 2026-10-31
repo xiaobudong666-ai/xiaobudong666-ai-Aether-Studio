@@ -904,6 +904,22 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
         events_before = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
         usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
 
     blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
     assert blocked.status_code == 409
@@ -918,7 +934,79 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == events_before
         assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.kind == "SETTLED"
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g71_artifact_stream_failure_holds_reservation_and_blocks_new_paid_attempt(generation_context):
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "g71-stream-failure-hold")
+    task = create_task(client, project, key="g71-stream-failure-hold")
+    task_id = task["taskId"]
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        stored.max_attempts = 3
+        db.commit()
+
+    assert claim(client).status_code == 200
+    assert transition(client, task_id, "RUNNING", upstreamJobId="original-paid-job").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", upstreamJobId="original-paid-job",
+        providerArtifactId="original-paid-artifact",
+    ).status_code == 200
+    failed = transition(
+        client, task_id, "FAILED", upstreamJobId="original-paid-job",
+        errorCode="ARTIFACT_STREAM_FAILED", errorMessage="synthetic stream interruption",
+        retryable=False,
+    )
+    assert failed.status_code == 200
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert row.status == "FAILED"
+        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+
+    blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.attempts == 1
+        assert row.upstream_job_id == "original-paid-job"
+        assert row.provider_artifact_id == "original-paid-artifact"
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
