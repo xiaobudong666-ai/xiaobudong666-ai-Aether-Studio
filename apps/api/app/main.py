@@ -2190,10 +2190,29 @@ def create_app(
         attempt.status = req.status
         attempt.error_code = req.errorCode
         attempt.error_message = safe_error_message(req.errorMessage)
+        # G70/G71: once the original upstream job is known and an artifact
+        # transfer fails, the provider may already have charged for the output.
+        # Keep the existing generation reservation HELD; never record RELEASED
+        # or allow the generic retry path to create a second paid attempt.
+        artifact_recovery_hold = bool(
+            req.status == "FAILED"
+            and task.upstream_job_id
+            and req.errorCode
+            and str(req.errorCode).startswith("ARTIFACT_")
+        )
+        if artifact_recovery_hold:
+            task.error_code = "ARTIFACT_INGEST_FAILED"
+            attempt.error_code = task.error_code
+            attempt.reconciliation_state = "HELD"
         if req.status == "UNKNOWN":
             attempt.reconciliation_state = "UNKNOWN"
         if req.status in {"FAILED", "CANCELED", "UNKNOWN", "PARTIAL"}:
-            if req.status == "FAILED" and not req.retryable and task.error_code:
+            if (
+                req.status == "FAILED"
+                and not req.retryable
+                and task.error_code
+                and not artifact_recovery_hold
+            ):
                 task.error_code = f"NON_RETRYABLE_{task.error_code}"
                 attempt.error_code = task.error_code
             task.completed_at = now
@@ -2212,17 +2231,27 @@ def create_app(
             if req.status == "CANCELED" or (
                 req.status == "FAILED" and (not req.retryable or task.attempts >= task.max_attempts)
             ):
-                release_generation_reservation(
-                    db, task, attempt,
-                    reason_code=req.errorCode or req.status, now=now,
-                )
+                if not artifact_recovery_hold:
+                    release_generation_reservation(
+                        db, task, attempt,
+                        reason_code=req.errorCode or req.status, now=now,
+                    )
         else:
             task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
+        transition_metadata = {"progress": req.progress}
+        if artifact_recovery_hold:
+            transition_metadata.update({
+                "originalErrorCode": req.errorCode,
+                "reconciliationState": "HELD",
+                "usageReservation": "HELD",
+                "upstreamJobId": task.upstream_job_id,
+                "providerArtifactId": task.provider_artifact_id,
+            })
         add_generation_event(
             db, task, attempt=attempt, event_type="WORKER_TRANSITION",
             actor_type="WORKER", actor_id=x_worker_id,
             from_status=previous, to_status=req.status,
-            metadata={"progress": req.progress}, now=now,
+            metadata=transition_metadata, now=now,
         )
         db.commit()
         return {"taskId": task.id, "status": task.status, "progress": task.progress}
@@ -2614,6 +2643,18 @@ def create_app(
             failed_attempt.error_message = failed_task.error_message
             failed_attempt.completed_at = failed_task.completed_at
             failure_metadata = {"compensatedQuotaBytes": upload_size}
+            artifact_recovery_hold = bool(failed_task.upstream_job_id and providerArtifactId)
+            if artifact_recovery_hold:
+                # The remote job is already known and may be billable.  Storage
+                # compensation is separate from generation usage: preserve the
+                # original RESERVED entry until artifact reconciliation settles it.
+                failed_attempt.reconciliation_state = "HELD"
+                failure_metadata.update({
+                    "originalProviderArtifactId": providerArtifactId,
+                    "originalUpstreamJobId": failed_task.upstream_job_id,
+                    "reconciliationState": "HELD",
+                    "usageReservation": "HELD",
+                })
             if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
                 failed_task.media_id = media_id
                 failure_metadata.update({
@@ -2621,7 +2662,7 @@ def create_app(
                     "orphanedMediaSha256": digest.hexdigest(),
                     "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
                     "originalProviderArtifactId": providerArtifactId,
-                        "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
+                    "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
                     "originalUpstreamJobId": failed_task.upstream_job_id or "",
                     "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                 })
@@ -2638,10 +2679,11 @@ def create_app(
                 actor_type="SYSTEM", actor_id="api", from_status=previous_status,
                 to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
             )
-            release_generation_reservation(
-                db, failed_task, failed_attempt,
-                reason_code=failed_task.error_code, now=failed_task.completed_at,
-            )
+            if not artifact_recovery_hold:
+                release_generation_reservation(
+                    db, failed_task, failed_attempt,
+                    reason_code=failed_task.error_code, now=failed_task.completed_at,
+                )
             db.commit()
             if isinstance(exc, ValueError):
                 raise HTTPException(status_code=422, detail={"code": "ARTIFACT_VALIDATION_FAILED", "message": "生成产物未通过媒体校验"}) from exc
