@@ -149,7 +149,7 @@ def create_fake_task(client: httpx.Client, mode: str) -> tuple[str, str, int]:
         "durationSeconds": 1,
         "aspectRatio": "9:16",
         "resolution": "720p",
-        "voiceId": "synthetic-g70-seed",
+        "voiceId": "synthetic-seed",
         "imageAssetVersionId": asset_id,
         "idempotencyKey": str(uuid.uuid4()),
         "expectedProjectRevision": project["revision"],
