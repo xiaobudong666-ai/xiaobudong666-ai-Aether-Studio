@@ -130,18 +130,88 @@ test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated e
 
   const submit = page.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" });
   await expect(submit).toBeEnabled();
+
+  // Diagnose browser-only failures before the first API request. This probe is
+  // read-only and uses the same GenerationApiClient class as the product UI.
+  const browserRuntimeDiagnostics = await page.evaluate(async () => {
+    let randomUUID;
+    try {
+      const available = typeof globalThis.crypto?.randomUUID === "function";
+      if (available) globalThis.crypto.randomUUID();
+      randomUUID = { available };
+    } catch (error) {
+      randomUUID = {
+        available: typeof globalThis.crypto?.randomUUID === "function",
+        error: `${error?.name ?? "Error"}: ${error?.message ?? String(error)}`,
+      };
+    }
+    try {
+      const { GenerationApiClient } = await import("/src/generation.ts");
+      const api = new GenerationApiClient("/api");
+      const capabilities = await api.talkingHeadCapabilities();
+      return {
+        secureContext: globalThis.isSecureContext,
+        randomUUID,
+        apiClient: { status: "ok", mode: capabilities.mode, enabled: capabilities.enabled },
+      };
+    } catch (error) {
+      return {
+        secureContext: globalThis.isSecureContext,
+        randomUUID,
+        apiClient: {
+          status: "error",
+          name: error?.name ?? "Error",
+          message: error?.message ?? String(error),
+        },
+      };
+    }
+  });
+  console.log("G72_BROWSER_RUNTIME_DIAGNOSTICS", JSON.stringify(browserRuntimeDiagnostics));
+  expect(browserRuntimeDiagnostics.apiClient.status, JSON.stringify(browserRuntimeDiagnostics)).toBe("ok");
+
   const createResponses = [];
+  const observedGenerationTraffic = [];
+  page.on("request", (request) => {
+    const url = request.url();
+    if (url.includes("/talking-head/") || url.includes("/generation/providers/moneyprinter/")) {
+      observedGenerationTraffic.push({ method: request.method(), url: new URL(url).pathname });
+    }
+  });
+  page.on("requestfailed", (request) => {
+    const url = request.url();
+    if (url.includes("/talking-head/") || url.includes("/generation/providers/moneyprinter/")) {
+      observedGenerationTraffic.push({
+        method: request.method(),
+        url: new URL(url).pathname,
+        failure: request.failure()?.errorText ?? "unknown",
+      });
+    }
+  });
   page.on("response", (response) => {
+    const url = response.url();
+    if (url.includes("/talking-head/") || url.includes("/generation/providers/moneyprinter/")) {
+      observedGenerationTraffic.push({
+        method: response.request().method(),
+        url: new URL(url).pathname,
+        status: response.status(),
+      });
+    }
     if (
-      response.url().endsWith("/talking-head/fake-generation-tasks")
+      url.endsWith("/talking-head/fake-generation-tasks")
       && response.request().method() === "POST"
     ) createResponses.push(response);
   });
   await submit.click();
-  await expect.poll(
-    () => createResponses.some((response) => response.status() === 202),
-    { timeout: 30_000, intervals: [250] },
-  ).toBe(true);
+  try {
+    await expect.poll(
+      () => createResponses.some((response) => response.status() === 202),
+      { timeout: 30_000, intervals: [250] },
+    ).toBe(true);
+  } catch (error) {
+    const statusMessage = await page.getByRole("status").innerText().catch(() => "");
+    console.log("G72_GENERATION_DIAGNOSTICS", JSON.stringify({ observedGenerationTraffic, statusMessage }));
+    throw error;
+  }
   const rejectedCreateResponses = createResponses.filter((response) => response.status() !== 202);
   for (const response of rejectedCreateResponses) {
     const body = await response.json();
