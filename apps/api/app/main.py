@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
 import hashlib
 import hmac
@@ -25,7 +26,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy import and_, case, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -238,6 +239,104 @@ def _as_utc(value: datetime.datetime | None) -> datetime.datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=datetime.timezone.utc)
     return value.astimezone(datetime.timezone.utc)
+
+
+GENERATION_TASK_LIST_STATUSES = {
+    "QUEUED", "SUBMITTING", "RUNNING", "INGESTING", "RIGHTS_BLOCKED",
+    "SUCCEEDED", "FAILED", "CANCELED", "UNKNOWN", "PARTIAL",
+}
+GENERATION_TASK_LIST_SORTS = {"createdAt:desc", "createdAt:asc"}
+
+
+def generation_task_list_scope_hash(
+    *,
+    tenant_id: str,
+    project_id: str,
+    status: str | None,
+    provider: str | None,
+    requested_by: str | None,
+    created_after: datetime.datetime | None,
+    created_before: datetime.datetime | None,
+    error_code: str | None,
+    sort: str,
+) -> str:
+    """Bind a keyset cursor to its tenant, project, filters and fixed sort contract."""
+    def normalized_time(value: datetime.datetime | None) -> str | None:
+        current = _as_utc(value)
+        return current.isoformat().replace("+00:00", "Z") if current else None
+
+    return sha256_json({
+        "tenantId": tenant_id,
+        "projectId": project_id,
+        "status": status,
+        "provider": provider,
+        "requestedBy": requested_by,
+        "createdAfter": normalized_time(created_after),
+        "createdBefore": normalized_time(created_before),
+        "errorCode": error_code,
+        "sort": sort,
+        "tieBreaker": "taskId",
+        "version": 1,
+    })
+
+
+def encode_generation_task_cursor(task: DBGenerationTask, scope_hash: str) -> str:
+    created_at = _as_utc(task.created_at)
+    payload = {
+        "version": 1,
+        "createdAt": created_at.isoformat().replace("+00:00", "Z"),
+        "taskId": task.id,
+        "scopeHash": scope_hash,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_generation_task_cursor(
+    token: str,
+    *,
+    expected_scope_hash: str,
+) -> tuple[datetime.datetime, str]:
+    """Decode a continuation marker; authorization is always rechecked by the route."""
+    if (
+        not token
+        or len(token) > 2048
+        or any(not (character.isalnum() or character in "-_") for character in token)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "GENERATION_CURSOR_INVALID", "message": "任务分页游标格式无效"},
+        )
+    try:
+        padded = token + ("=" * (-len(token) % 4))
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"version", "createdAt", "taskId", "scopeHash"}
+            or payload.get("version") != 1
+            or not isinstance(payload.get("createdAt"), str)
+            or not isinstance(payload.get("taskId"), str)
+            or not payload["taskId"]
+            or len(payload["taskId"]) > 128
+            or not isinstance(payload.get("scopeHash"), str)
+        ):
+            raise ValueError("invalid cursor payload")
+        created_at = datetime.datetime.fromisoformat(
+            payload["createdAt"].replace("Z", "+00:00")
+        )
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("cursor timestamp must be timezone-aware")
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "GENERATION_CURSOR_INVALID", "message": "任务分页游标内容无效"},
+        )
+    if payload["scopeHash"] != expected_scope_hash:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "GENERATION_CURSOR_SCOPE_MISMATCH", "message": "筛选条件或项目已变化，请重置分页"},
+        )
+    return created_at.astimezone(datetime.timezone.utc), payload["taskId"]
 
 
 def rights_decision(snapshot: DBRightsSnapshot | None, now: datetime.datetime) -> dict:
@@ -1592,28 +1691,157 @@ def create_app(
         project_id: str,
         cursor: int = Query(default=0, ge=0),
         pageSize: int = Query(default=20, ge=1, le=100),
+        pagination: str = Query(default="offset", min_length=6, max_length=8),
+        after: str | None = Query(default=None, max_length=2048),
+        status: str | None = Query(default=None, min_length=1, max_length=32),
+        provider: str | None = Query(default=None, min_length=1, max_length=80),
+        requestedBy: str | None = Query(default=None, min_length=1, max_length=128),
+        createdAfter: datetime.datetime | None = Query(default=None),
+        createdBefore: datetime.datetime | None = Query(default=None),
+        errorCode: str | None = Query(default=None, min_length=1, max_length=120),
+        sort: str = Query(default="createdAt:desc", min_length=1, max_length=32),
         context: AuthContext = Depends(context_dependency),
         db: Session = Depends(db_dependency),
     ):
         project_for_tenant(db, project_id, context)
-        rows = list(db.execute(
-            select(DBGenerationTask)
-            .where(
-                DBGenerationTask.project_id == project_id,
-                DBGenerationTask.tenant_id == context.tenant_id,
+        if pagination not in {"offset", "keyset"}:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_PAGINATION_UNSUPPORTED", "message": "不支持的任务分页模式"},
             )
-            .order_by(DBGenerationTask.created_at.desc(), DBGenerationTask.id.desc())
-            .offset(cursor)
-            .limit(pageSize + 1)
-        ).scalars())
+        if sort not in GENERATION_TASK_LIST_SORTS:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_SORT_UNSUPPORTED", "message": "任务排序仅支持创建时间升序或降序"},
+            )
+        if status is not None and status not in GENERATION_TASK_LIST_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_STATUS_FILTER_INVALID", "message": "任务状态筛选值无效"},
+            )
+        provider = provider.strip() if provider is not None else None
+        requestedBy = requestedBy.strip() if requestedBy is not None else None
+        errorCode = errorCode.strip() if errorCode is not None else None
+        if provider == "" or requestedBy == "" or errorCode == "":
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_FILTER_INVALID", "message": "任务筛选条件不能为空字符串"},
+            )
+        if createdAfter is not None and (
+            createdAfter.tzinfo is None or createdAfter.utcoffset() is None
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_TIME_FILTER_TIMEZONE_REQUIRED", "message": "创建时间筛选必须包含时区"},
+            )
+        if createdBefore is not None and (
+            createdBefore.tzinfo is None or createdBefore.utcoffset() is None
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_TIME_FILTER_TIMEZONE_REQUIRED", "message": "创建时间筛选必须包含时区"},
+            )
+        created_after_utc = createdAfter.astimezone(datetime.timezone.utc) if createdAfter else None
+        created_before_utc = createdBefore.astimezone(datetime.timezone.utc) if createdBefore else None
+        if (
+            created_after_utc is not None
+            and created_before_utc is not None
+            and created_after_utc > created_before_utc
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_TIME_RANGE_INVALID", "message": "创建时间起点不能晚于终点"},
+            )
+        if pagination == "keyset" and cursor != 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_CURSOR_MODE_MISMATCH", "message": "稳定游标模式不能同时使用旧偏移量"},
+            )
+        if pagination == "offset" and after is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "GENERATION_CURSOR_MODE_MISMATCH", "message": "偏移量模式不能使用稳定游标"},
+            )
+
+        query = select(DBGenerationTask).where(
+            DBGenerationTask.project_id == project_id,
+            DBGenerationTask.tenant_id == context.tenant_id,
+        )
+        if status is not None:
+            # The status filter is explicitly against the persisted state, not the
+            # rights-derived display status returned in the response.
+            query = query.where(DBGenerationTask.status == status)
+        if provider is not None:
+            query = query.where(DBGenerationTask.provider == provider)
+        if requestedBy is not None:
+            query = query.where(DBGenerationTask.requested_by == requestedBy)
+        if created_after_utc is not None:
+            query = query.where(DBGenerationTask.created_at >= created_after_utc)
+        if created_before_utc is not None:
+            query = query.where(DBGenerationTask.created_at <= created_before_utc)
+        if errorCode is not None:
+            query = query.where(DBGenerationTask.error_code == errorCode)
+
+        scope_hash = generation_task_list_scope_hash(
+            tenant_id=context.tenant_id,
+            project_id=project_id,
+            status=status,
+            provider=provider,
+            requested_by=requestedBy,
+            created_after=created_after_utc,
+            created_before=created_before_utc,
+            error_code=errorCode,
+            sort=sort,
+        )
+        cursor_time: datetime.datetime | None = None
+        cursor_task_id: str | None = None
+        if pagination == "keyset" and after is not None:
+            cursor_time, cursor_task_id = decode_generation_task_cursor(
+                after, expected_scope_hash=scope_hash
+            )
+            if sort == "createdAt:desc":
+                query = query.where(or_(
+                    DBGenerationTask.created_at < cursor_time,
+                    and_(
+                        DBGenerationTask.created_at == cursor_time,
+                        DBGenerationTask.id < cursor_task_id,
+                    ),
+                ))
+            else:
+                query = query.where(or_(
+                    DBGenerationTask.created_at > cursor_time,
+                    and_(
+                        DBGenerationTask.created_at == cursor_time,
+                        DBGenerationTask.id > cursor_task_id,
+                    ),
+                ))
+
+        if sort == "createdAt:desc":
+            query = query.order_by(DBGenerationTask.created_at.desc(), DBGenerationTask.id.desc())
+        else:
+            query = query.order_by(DBGenerationTask.created_at.asc(), DBGenerationTask.id.asc())
+        if pagination == "offset":
+            query = query.offset(cursor)
+        rows = list(db.execute(query.limit(pageSize + 1)).scalars())
         has_more = len(rows) > pageSize
         items = rows[:pageSize]
+        next_keyset_cursor = (
+            encode_generation_task_cursor(items[-1], scope_hash)
+            if pagination == "keyset" and has_more and items
+            else None
+        )
         return {
             "items": [
                 generation_task_response(db, task, rights=generation_rights(db, task))
                 for task in items
             ],
-            "nextCursor": cursor + pageSize if has_more else None,
+            # Preserve the legacy integer cursor contract for existing clients.
+            "nextCursor": cursor + pageSize if pagination == "offset" and has_more else None,
+            "nextKeysetCursor": next_keyset_cursor,
+            "pagination": pagination,
+            "sort": sort,
+            "sortTieBreaker": "taskId",
+            "statusFilterSemantics": "storedStatus",
         }
 
     @created_app.get("/projects/{project_id}/generation-tasks/{task_id}")
