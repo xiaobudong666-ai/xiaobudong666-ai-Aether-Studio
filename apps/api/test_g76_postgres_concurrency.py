@@ -15,7 +15,7 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event, get_ident
+from threading import Barrier, Event, Lock, get_ident
 from unittest.mock import MagicMock
 
 import pytest
@@ -676,6 +676,194 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RELEASED",
         )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def _prepare_g70_g71_postgres_duplicate_intake(client):
+    task_id = _create_task(client)
+    worker_id = "worker-g70-g71-duplicate-intake"
+    upstream_id = f"g70-g71-upstream-{task_id}"
+    artifact_id = f"g70-g71-artifact-{task_id}"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    running = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "RUNNING",
+            "progress": 10,
+            "message": "synthetic G70/G71 running",
+            "upstreamJobId": upstream_id,
+        },
+    )
+    assert running.status_code == 200, running.text
+    ingesting = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING",
+            "progress": 95,
+            "message": "synthetic G70/G71 ingesting",
+            "upstreamJobId": upstream_id,
+            "providerArtifactId": artifact_id,
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
+    return task_id, worker_headers, artifact_id
+
+
+def _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload):
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert tenant is not None
+        attempts = list(db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalars())
+        assets = list(db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == task.project_id,
+                DBAssetVersion.media_id == task.media_id,
+            )
+        ).scalars())
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(DBGenerationUsageEntry.task_id == task_id)
+        ).scalars())
+        events = list(db.execute(
+            select(DBGenerationEvent).where(DBGenerationEvent.generation_task_id == task_id)
+        ).scalars())
+
+        assert task.status == "RIGHTS_BLOCKED"
+        assert task.attempts == 1
+        assert task.asset_version_id is not None
+        assert task.media_id == _expected_media_id(
+            task.project_id, f"generation:{task_id}"
+        )
+        assert len(attempts) == 1
+        assert attempts[0].reconciliation_state == "ARTIFACT_INGESTED"
+        assert len(assets) == 1
+        assert assets[0].id == task.asset_version_id
+        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert tenant.used_storage_bytes == len(payload)
+        assert sum(row.kind == "RESERVED" for row in usage) == 1
+        assert sum(row.kind == "SETTLED" for row in usage) == 1
+        assert sum(row.kind == "RELEASED" for row in usage) == 0
+        assert sum(row.event_type == "ARTIFACT_INGESTED" for row in events) == 1
+        assert sum(row.event_type == "ARTIFACT_INGEST_FAILED" for row in events) == 0
+
+
+def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, payload):
+    with TestClient(app) as worker_client:
+        return worker_client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers=worker_headers,
+            data={"providerArtifactId": artifact_id},
+            files={"file": ("synthetic-g70-g71.mp4", payload, "video/mp4")},
+        )
+
+
+def test_g70_g71_postgres_concurrent_duplicate_artifact_intake_is_idempotent(
+    postgres_context, monkeypatch
+):
+    """Two independent HTTP clients must produce one asset/settlement and no false failure."""
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"synthetic-g70-g71-concurrent-artifact"
+    original_upload = app.state.video_use.upload_media
+    upload_barrier = Barrier(2)
+    counter_lock = Lock()
+    upload_calls = 0
+
+    def synchronized_upload(*args, **kwargs):
+        nonlocal upload_calls
+        with counter_lock:
+            upload_calls += 1
+        upload_barrier.wait(timeout=15)
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", synchronized_upload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                _post_g70_g71_duplicate_intake,
+                app, task_id, worker_headers, artifact_id, payload,
+            )
+            for _ in range(2)
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert upload_calls == 2
+    assert [response.status_code for response in responses] == [201, 201], [
+        response.text for response in responses
+    ]
+    results = [response.json()["results"][0] for response in responses]
+    assert results[0]["assetVersionId"] == results[1]["assetVersionId"]
+    assert results[0]["mediaId"] == results[1]["mediaId"]
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_duplicate_intake_lost_ack_releases_extra_storage_reservation(
+    postgres_context, monkeypatch
+):
+    """A duplicate sidecar ACK lost after first commit must not leak storage reservation."""
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"synthetic-g70-g71-lost-duplicate-ack"
+    original_upload = app.state.video_use.upload_media
+    second_upload_entered = Event()
+    first_response_completed = Event()
+    counter_lock = Lock()
+    upload_calls = 0
+
+    def lose_second_ack_after_first_commit(*args, **kwargs):
+        nonlocal upload_calls
+        with counter_lock:
+            upload_calls += 1
+            call_number = upload_calls
+        if call_number == 1:
+            assert second_upload_entered.wait(15), "second duplicate did not reach sidecar upload"
+            return original_upload(*args, **kwargs)
+        second_upload_entered.set()
+        assert first_response_completed.wait(20), "first intake did not commit before simulated ACK loss"
+        raise VideoUseError("synthetic duplicate sidecar acknowledgement lost after first commit")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", lose_second_ack_after_first_commit)
+
+    def send_and_signal_first_response():
+        response = _post_g70_g71_duplicate_intake(
+            app, task_id, worker_headers, artifact_id, payload
+        )
+        first_response_completed.set()
+        return response
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(send_and_signal_first_response),
+            pool.submit(send_and_signal_first_response),
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert upload_calls == 2
+    assert [response.status_code for response in responses] == [201, 201], [
+        response.text for response in responses
+    ]
+    results = [response.json()["results"][0] for response in responses]
+    assert results[0]["assetVersionId"] == results[1]["assetVersionId"]
+    assert results[0]["mediaId"] == results[1]["mediaId"]
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
     app.state.moneyprinter.assert_not_called()
 
 

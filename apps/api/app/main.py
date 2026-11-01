@@ -3073,6 +3073,18 @@ def create_app(
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
 
+        duplicate_storage_release_started = False
+
+        def release_duplicate_storage_reservation() -> None:
+            db.execute(
+                update(DBTenant)
+                .where(DBTenant.id == task_tenant_id)
+                .values(used_storage_bytes=case(
+                    (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                    else_=0,
+                ), updated_at=utc_now())
+            )
+
         uploaded = None
         media_id = None
         metadata = {}
@@ -3114,6 +3126,35 @@ def create_app(
                 )
                 db.commit()
                 raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+
+            # A concurrent duplicate intake may have completed while this request
+            # was uploading. Reconcile against the durable asset + receipt before
+            # treating the now-terminal task as a failed late artifact.
+            if task.asset_version_id is not None:
+                completion = db.execute(
+                    select(DBGenerationEvent).where(
+                        DBGenerationEvent.generation_task_id == task.id,
+                        DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+                        DBGenerationEvent.actor_id == x_worker_id,
+                    )
+                ).scalar_one_or_none()
+                existing_asset = db.get(DBAssetVersion, task.asset_version_id)
+                same_ingest = (
+                    task.provider_artifact_id == providerArtifactId
+                    and completion is not None
+                    and existing_asset is not None
+                    and existing_asset.tenant_id == task.tenant_id
+                    and existing_asset.project_id == task.project_id
+                    and existing_asset.media_id == expected_media_id
+                    and existing_asset.sha256 == digest.hexdigest()
+                )
+                if same_ingest:
+                    duplicate_storage_release_started = True
+                    release_duplicate_storage_reservation()
+                    db.commit()
+                    return generation_task_response(
+                        db, task, rights=generation_rights(db, task), include_history=True
+                    )
 
             now = utc_now()
             invalid_code = None
@@ -3274,6 +3315,10 @@ def create_app(
             raise
         except Exception as exc:
             db.rollback()
+            # If the duplicate-reservation commit itself had an ambiguous ACK,
+            # do not decrement the same reservation a second time.
+            if duplicate_storage_release_started:
+                raise
             begin_serialized_write(db)
             failed_statement = (
                 select(DBGenerationTask)
@@ -3295,8 +3340,11 @@ def create_app(
                 db.commit()
                 raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
 
-            # A commit can succeed while its ACK is lost. Query the durable row and
-            # ARTIFACT_INGESTED receipt before attempting any compensation.
+            # A commit can succeed while its ACK is lost. Reconcile only against the
+            # durable asset, artifact ID, worker receipt and content hash. If the
+            # sidecar call itself did not return, this request's storage reservation
+            # is duplicate and can be released. If it returned, preserve storage:
+            # this may be the original request whose final DB commit ACK was lost.
             if failed_task.asset_version_id is not None:
                 completion = db.execute(
                     select(DBGenerationEvent).where(
@@ -3305,9 +3353,25 @@ def create_app(
                         DBGenerationEvent.actor_id == x_worker_id,
                     )
                 ).scalar_one_or_none()
-                if failed_task.provider_artifact_id == providerArtifactId and completion is not None:
-                    db.rollback()
-                    return generation_task_response(db, failed_task, rights=generation_rights(db, failed_task), include_history=True)
+                existing_asset = db.get(DBAssetVersion, failed_task.asset_version_id)
+                same_ingest = (
+                    failed_task.provider_artifact_id == providerArtifactId
+                    and completion is not None
+                    and existing_asset is not None
+                    and existing_asset.tenant_id == failed_task.tenant_id
+                    and existing_asset.project_id == failed_task.project_id
+                    and existing_asset.media_id == expected_media_id
+                    and existing_asset.sha256 == digest.hexdigest()
+                )
+                if same_ingest:
+                    if uploaded is None:
+                        release_duplicate_storage_reservation()
+                        db.commit()
+                    else:
+                        db.rollback()
+                    return generation_task_response(
+                        db, failed_task, rights=generation_rights(db, failed_task), include_history=True
+                    )
 
             now = utc_now()
             invalid_code = None
