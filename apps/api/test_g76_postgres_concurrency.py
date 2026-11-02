@@ -851,8 +851,7 @@ def test_g70_g71_postgres_duplicate_intake_lost_ack_releases_extra_storage_reser
 
     def send_and_signal_first_response():
         response = _post_g70_g71_duplicate_intake(
-            app, task_id, worker_headers, artifact_id, payload,
-            raise_server_exceptions=False,
+            app, task_id, worker_headers, artifact_id, payload
         )
         first_response_completed.set()
         return response
@@ -1904,7 +1903,8 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
     monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_abort_request)
     try:
         response = _post_g70_g71_duplicate_intake(
-            app, task_id, worker_headers, artifact_id, payload
+            app, task_id, worker_headers, artifact_id, payload,
+            raise_server_exceptions=False,
         )
     except SimulatedAbruptRequestExit:
         response = None
