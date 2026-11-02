@@ -203,6 +203,20 @@ class GenerationWorkerTransitionRequest(BaseModel):
     retryable: bool = False
 
 
+class RecoverGenerationArtifactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=8, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def reject_blank_recovery_reason(cls, value: str) -> str:
+        cleaned = value.strip()
+        if len(cleaned) < 8:
+            raise ValueError("recovery reason must contain at least 8 non-space characters")
+        return cleaned
+
+
 class GenerationProviderPolicyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

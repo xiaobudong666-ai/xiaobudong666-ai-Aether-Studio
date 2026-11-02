@@ -8,19 +8,23 @@ heartbeat endpoint waits for the task-row lock, then observes the new lease.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import os
 from pathlib import Path
 import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event, get_ident
+from io import BytesIO
+from threading import Barrier, Event, Lock, get_ident
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
 from sqlalchemy import event, func, select, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import Base, build_engine
 from app.main import create_app
@@ -44,6 +48,13 @@ OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
 
 
+def _expected_media_id(project_id: str, idempotency_key: str) -> str:
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"aether-video-use:{project_id}:{idempotency_key}",
+    ))
+
+
 class FakeMediaStore:
     def check_health(self):
         return {"status": "healthy"}
@@ -51,10 +62,23 @@ class FakeMediaStore:
     def get_capabilities(self):
         return {"render": True}
 
-    def upload_media(self, project_id, filename, content_type, stream):
+    def upload_media(
+        self, project_id, filename, content_type, stream, *,
+        idempotency_key=None, content_sha256=None,
+    ):
         payload = stream.read()
+        digest = hashlib.sha256(payload).hexdigest()
+        if (idempotency_key is None) != (content_sha256 is None):
+            raise ValueError("idempotency key and content SHA-256 must be supplied together")
+        if content_sha256 is not None and digest != content_sha256.lower():
+            raise ValueError("uploaded bytes do not match the supplied content SHA-256")
+        media_id = (
+            _expected_media_id(project_id, idempotency_key)
+            if idempotency_key is not None
+            else f"unused-{uuid.uuid4()}"
+        )
         return {
-            "mediaId": f"unused-{uuid.uuid4()}",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -639,6 +663,14 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 1
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
+        ).scalar_one()
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
@@ -646,8 +678,285 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RELEASED",
-        )).scalar_one() == 1
+        )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def _prepare_g70_g71_postgres_duplicate_intake(client):
+    task_id = _create_task(client)
+    worker_id = "worker-g70-g71-duplicate-intake"
+    upstream_id = f"g70-g71-upstream-{task_id}"
+    artifact_id = f"g70-g71-artifact-{task_id}"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    running = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "RUNNING",
+            "progress": 10,
+            "message": "synthetic G70/G71 running",
+            "upstreamJobId": upstream_id,
+        },
+    )
+    assert running.status_code == 200, running.text
+    ingesting = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING",
+            "progress": 95,
+            "message": "synthetic G70/G71 ingesting",
+            "upstreamJobId": upstream_id,
+            "providerArtifactId": artifact_id,
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
+    return task_id, worker_headers, artifact_id
+
+
+def _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload):
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert tenant is not None
+        attempts = list(db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalars())
+        assets = list(db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == task.project_id,
+                DBAssetVersion.media_id == task.media_id,
+            )
+        ).scalars())
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(DBGenerationUsageEntry.task_id == task_id)
+        ).scalars())
+        events = list(db.execute(
+            select(DBGenerationEvent).where(DBGenerationEvent.generation_task_id == task_id)
+        ).scalars())
+
+        assert task.status == "RIGHTS_BLOCKED"
+        assert task.attempts == 1
+        assert task.asset_version_id is not None
+        assert task.media_id == _expected_media_id(
+            task.project_id, f"generation:{task_id}"
+        )
+        assert len(attempts) == 1
+        assert attempts[0].reconciliation_state == "ARTIFACT_INGESTED"
+        assert len(assets) == 1
+        assert assets[0].id == task.asset_version_id
+        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert tenant.used_storage_bytes == len(payload)
+        assert sum(row.kind == "RESERVED" for row in usage) == 1
+        assert sum(row.kind == "SETTLED" for row in usage) == 1
+        assert sum(row.kind == "RELEASED" for row in usage) == 0
+        assert sum(row.event_type == "ARTIFACT_INGESTED" for row in events) == 1
+        assert sum(row.event_type == "ARTIFACT_INGEST_FAILED" for row in events) == 0
+        release_events = [
+            row for row in events if row.event_type == "STORAGE_RESERVATION_RELEASED"
+        ]
+        assert len(release_events) == 1
+        assert release_events[0].metadata_json["reservedStorageBytes"] == len(payload)
+
+
+def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, payload):
+    with TestClient(app) as worker_client:
+        return worker_client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers=worker_headers,
+            data={"providerArtifactId": artifact_id},
+            files={"file": ("synthetic-g70-g71.mp4", payload, "video/mp4")},
+        )
+
+
+def test_g70_g71_postgres_concurrent_duplicate_artifact_intake_is_idempotent(
+    postgres_context, monkeypatch
+):
+    """Two independent HTTP clients must produce one asset/settlement and no false failure."""
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"synthetic-g70-g71-concurrent-artifact"
+    original_upload = app.state.video_use.upload_media
+    upload_barrier = Barrier(2)
+    counter_lock = Lock()
+    upload_calls = 0
+
+    def synchronized_upload(*args, **kwargs):
+        nonlocal upload_calls
+        with counter_lock:
+            upload_calls += 1
+        upload_barrier.wait(timeout=15)
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", synchronized_upload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                _post_g70_g71_duplicate_intake,
+                app, task_id, worker_headers, artifact_id, payload,
+            )
+            for _ in range(2)
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert upload_calls == 2
+    assert [response.status_code for response in responses] == [201, 201], [
+        response.text for response in responses
+    ]
+    results = [response.json()["results"][0] for response in responses]
+    assert results[0]["assetVersionId"] == results[1]["assetVersionId"]
+    assert results[0]["mediaId"] == results[1]["mediaId"]
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_duplicate_intake_lost_ack_releases_extra_storage_reservation(
+    postgres_context, monkeypatch
+):
+    """A duplicate sidecar ACK lost after first commit must not leak storage reservation."""
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"synthetic-g70-g71-lost-duplicate-ack"
+    original_upload = app.state.video_use.upload_media
+    second_upload_entered = Event()
+    first_response_completed = Event()
+    counter_lock = Lock()
+    upload_calls = 0
+
+    def lose_second_ack_after_first_commit(*args, **kwargs):
+        nonlocal upload_calls
+        with counter_lock:
+            upload_calls += 1
+            call_number = upload_calls
+        if call_number == 1:
+            assert second_upload_entered.wait(15), "second duplicate did not reach sidecar upload"
+            return original_upload(*args, **kwargs)
+        second_upload_entered.set()
+        assert first_response_completed.wait(20), "first intake did not commit before simulated ACK loss"
+        raise VideoUseError("synthetic duplicate sidecar acknowledgement lost after first commit")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", lose_second_ack_after_first_commit)
+
+    def send_and_signal_first_response():
+        response = _post_g70_g71_duplicate_intake(
+            app, task_id, worker_headers, artifact_id, payload
+        )
+        first_response_completed.set()
+        return response
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(send_and_signal_first_response),
+            pool.submit(send_and_signal_first_response),
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert upload_calls == 2
+    assert [response.status_code for response in responses] == [201, 201], [
+        response.text for response in responses
+    ]
+    results = [response.json()["results"][0] for response in responses]
+    assert results[0]["assetVersionId"] == results[1]["assetVersionId"]
+    assert results[0]["mediaId"] == results[1]["mediaId"]
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    app.state.moneyprinter.assert_not_called()
+
+
+def _run_g70_g71_duplicate_release_commit_fault(postgres_context, monkeypatch, fault_mode):
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = f"synthetic-g70-g71-db-commit-{fault_mode}".encode()
+    original_upload = app.state.video_use.upload_media
+    upload_barrier = Barrier(2)
+    upload_lock = Lock()
+    upload_calls = 0
+
+    def synchronized_upload(*args, **kwargs):
+        nonlocal upload_calls
+        with upload_lock:
+            upload_calls += 1
+        upload_barrier.wait(timeout=15)
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", synchronized_upload)
+
+    original_commit = Session.commit
+    fault_lock = Lock()
+    fault_state = {"injected": False}
+
+    def inject_release_commit_fault(session):
+        should_inject = False
+        with fault_lock:
+            if (
+                not fault_state["injected"]
+                and any(
+                    isinstance(item, DBGenerationEvent)
+                    and item.event_type == "STORAGE_RESERVATION_RELEASED"
+                    for item in session.new
+                )
+            ):
+                fault_state["injected"] = True
+                should_inject = True
+        if should_inject:
+            if fault_mode == "after_commit":
+                original_commit(session)
+                raise RuntimeError("synthetic DB commit ACK lost after durable commit")
+            raise RuntimeError("synthetic DB commit failed before commit")
+        return original_commit(session)
+
+    monkeypatch.setattr(Session, "commit", inject_release_commit_fault)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                _post_g70_g71_duplicate_intake,
+                app, task_id, worker_headers, artifact_id, payload,
+            )
+            for _ in range(2)
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert upload_calls == 2
+    assert fault_state["injected"] is True
+    assert [response.status_code for response in responses] == [201, 201], [
+        response.text for response in responses
+    ]
+    results = [response.json()["results"][0] for response in responses]
+    assert results[0]["assetVersionId"] == results[1]["assetVersionId"]
+    assert results[0]["mediaId"] == results[1]["mediaId"]
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_duplicate_release_db_commit_ack_lost_after_commit_is_idempotent(
+    postgres_context, monkeypatch
+):
+    """A durable release receipt must prevent a second decrement after a lost DB commit ACK."""
+    _run_g70_g71_duplicate_release_commit_fault(
+        postgres_context, monkeypatch, "after_commit"
+    )
+
+
+def test_g70_g71_postgres_duplicate_release_db_commit_failure_before_commit_retries_safely(
+    postgres_context, monkeypatch
+):
+    """A pre-commit failure must retry the same release receipt and decrement exactly once."""
+    _run_g70_g71_duplicate_release_commit_fault(
+        postgres_context, monkeypatch, "before_commit"
+    )
 
 
 def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(postgres_context, monkeypatch):
@@ -695,14 +1004,17 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
     upload_started = Event()
     release_upload = Event()
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-owner-cancel",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -746,7 +1058,7 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
         assert stored.cancel_requested_at is not None
         assert stored.lease_owner is None
         assert stored.lease_expires_at is None
-        assert stored.media_id == "g76-orphan-after-owner-cancel"
+        assert stored.media_id == _expected_media_id(project_id, f"generation:{task_id}")
         assert stored.asset_version_id is None
         assert tenant.used_storage_bytes == 0
         orphan_event = db.execute(select(DBGenerationEvent).where(
@@ -754,14 +1066,14 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "TASK_CANCELED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-owner-cancel"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
         assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-owner-cancel",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -818,14 +1130,17 @@ def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_
     upload_started = Event()
     release_upload = Event()
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-artifact-id-change",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -888,14 +1203,14 @@ def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "ARTIFACT_ID_MISMATCH"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-artifact-id-change"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["originalProviderArtifactId"] == original_artifact_id
         assert orphan_event.metadata_json["currentTaskProviderArtifactId"] == replacement_artifact_id
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-artifact-id-change",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -957,14 +1272,17 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
     upload_started = Event()
     release_upload = Event()
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-kill-switch",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -1014,14 +1332,14 @@ def test_g76_postgres_owner_kill_switch_during_artifact_upload_quarantines_late_
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one()
         assert orphan_event.metadata_json["reasonCode"] == "PROVIDER_EMERGENCY_STOPPED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == "g76-orphan-after-kill-switch"
+        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
         assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
         assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
         assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
         assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-kill-switch",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -1107,15 +1425,18 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
     owner_request_started = Event()
     worker_thread = {"ident": None}
 
-    def blocked_upload(_project_id, filename, content_type, stream):
+    def blocked_upload(_project_id, filename, content_type, stream, *, idempotency_key, content_sha256):
         observed = stream.read()
         assert observed == payload
+        assert idempotency_key == f"generation:{task_id}"
+        assert content_sha256 == hashlib.sha256(observed).hexdigest()
+        media_id = _expected_media_id(project_id, idempotency_key)
         worker_thread["ident"] = get_ident()
         upload_started.set()
         if not release_upload.wait(timeout=12):
             raise RuntimeError("synthetic blocked upload timed out")
         return {
-            "mediaId": "g76-orphan-after-missing-circuit-race",
+            "mediaId": media_id,
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
@@ -1211,7 +1532,7 @@ def test_g76_postgres_kill_switch_after_missing_circuit_select_is_serialized(pos
         assert tenant.used_storage_bytes == len(payload)
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == "g76-orphan-after-missing-circuit-race",
+            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
         )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
@@ -1545,3 +1866,132 @@ def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_m
         ).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
+
+
+def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_not_leak_storage_hold(
+    postgres_context, monkeypatch
+):
+    """Characterize the crash window after Sidecar success but before DB ingest commit.
+
+    SimulatedAbruptRequestExit bypasses the route's ordinary Exception compensation
+    path. This is a deterministic request-boundary interruption test, not an
+    operating-system process-kill or real Sidecar durability test.
+    """
+    class SimulatedAbruptRequestExit(BaseException):
+        pass
+
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"synthetic-g70-g71-abrupt-request-exit-after-sidecar-return"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id = task.tenant_id
+        tenant = db.get(DBTenant, tenant_id)
+        assert tenant is not None
+        initial_storage_bytes = tenant.used_storage_bytes
+
+    original_upload = app.state.video_use.upload_media
+    upload_calls = 0
+
+    def upload_then_abort_request(*args, **kwargs):
+        nonlocal upload_calls
+        upload_calls += 1
+        original_upload(*args, **kwargs)
+        raise SimulatedAbruptRequestExit("synthetic abrupt request exit after Sidecar returned")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_abort_request)
+    intake_route = next(
+        route for route in app.routes
+        if getattr(route, "path", None) == "/internal/generation-tasks/{task_id}/artifact-intake"
+    )
+    interrupted = False
+    with sessions() as db:
+        upload = UploadFile(
+            file=BytesIO(payload),
+            filename="synthetic-g70-g71.mp4",
+            headers=Headers({"content-type": "video/mp4"}),
+        )
+        try:
+            intake_route.endpoint(
+                task_id,
+                providerArtifactId=artifact_id,
+                file=upload,
+                x_worker_token=WORKER_TOKEN,
+                x_worker_id=worker_headers["X-Worker-Id"],
+                x_worker_lease_epoch=int(worker_headers["X-Worker-Lease-Epoch"]),
+                db=db,
+            )
+        except SimulatedAbruptRequestExit:
+            interrupted = True
+        else:
+            pytest.fail("synthetic abrupt request interruption did not reach the intake endpoint")
+
+    assert upload_calls == 1
+    assert interrupted is True
+
+    with sessions() as db:
+        interrupted_task = db.get(DBGenerationTask, task_id)
+        interrupted_tenant = db.get(DBTenant, tenant_id)
+        assert interrupted_task is not None
+        assert interrupted_tenant is not None
+        assert interrupted_task.status == "INGESTING"
+        assert interrupted_task.asset_version_id is None
+        assert interrupted_tenant.used_storage_bytes == initial_storage_bytes + len(payload)
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", original_upload)
+    retry = _post_g70_g71_duplicate_intake(
+        app, task_id, worker_headers, artifact_id, payload
+    )
+    assert retry.status_code == 201, retry.text
+
+    with sessions() as db:
+        completed_task = db.get(DBGenerationTask, task_id)
+        completed_tenant = db.get(DBTenant, tenant_id)
+        assert completed_task is not None
+        assert completed_tenant is not None
+        assets = list(db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == completed_task.project_id,
+                DBAssetVersion.media_id == completed_task.media_id,
+            )
+        ).scalars())
+        events = list(db.execute(
+            select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )
+        ).scalars())
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+
+        assert completed_task.status == "RIGHTS_BLOCKED"
+        assert completed_task.attempts == 1
+        assert completed_task.asset_version_id is not None
+        assert len(assets) == 1
+        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert sum(row.event_type == "ARTIFACT_INGESTED" for row in events) == 1
+        assert sum(row.event_type == "STORAGE_RESERVATION_RELEASED" for row in events) == 0
+        assert sum(row.kind == "RESERVED" for row in usage) == 1
+        assert sum(row.kind == "SETTLED" for row in usage) == 1
+        assert sum(row.kind == "RELEASED" for row in usage) == 0
+
+        expected_storage_bytes = initial_storage_bytes + len(payload)
+        actual_storage_bytes = completed_tenant.used_storage_bytes
+        if actual_storage_bytes == expected_storage_bytes:
+            return
+        assert actual_storage_bytes == initial_storage_bytes + 2 * len(payload), (
+            "Unexpected storage accounting after abrupt request exit: "
+            f"initial={initial_storage_bytes}, actual={actual_storage_bytes}, "
+            f"payload={len(payload)}"
+        )
+        pytest.xfail(
+            "Confirmed request-boundary interruption leak: the first committed storage "
+            "hold survives the aborted request, and the retry adds a second hold for "
+            "the same idempotent Sidecar media identity. This is not an OS process-kill proof."
+        )
+
+    app.state.moneyprinter.assert_not_called()

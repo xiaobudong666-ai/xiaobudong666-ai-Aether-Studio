@@ -31,7 +31,7 @@ const capabilities = {
 };
 
 const queuedTask: ServerGenerationTask = {
-  taskId: "server-generation-1", projectId: "project-1", provider: "moneyprinter",
+  taskId: "server-generation-1", requestedBy: "owner-1", projectId: "project-1", provider: "moneyprinter",
   status: "QUEUED", storedStatus: "QUEUED", progress: 0,
   message: "生成任务已进入受治理队列", attempt: 1, maxAttempts: 3,
   cancelRequested: false, rights: { allowed: false, code: "RIGHTS_MISSING" },

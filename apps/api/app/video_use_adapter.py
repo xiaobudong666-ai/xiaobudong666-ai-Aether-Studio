@@ -4,6 +4,7 @@ import os
 import time
 from contextlib import contextmanager
 from typing import Any, BinaryIO, Iterator
+from urllib.parse import quote
 
 import httpx
 
@@ -17,6 +18,10 @@ class VideoUseConnectionError(VideoUseError):
 
 
 class VideoUseTimeoutError(VideoUseError):
+    pass
+
+
+class VideoUseNotFoundError(VideoUseError):
     pass
 
 
@@ -36,6 +41,18 @@ class VideoUseAdapter:
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
+            files = kwargs.get("files")
+            if isinstance(files, dict):
+                for part in files.values():
+                    if isinstance(part, tuple) and len(part) >= 2:
+                        stream = part[1]
+                        if hasattr(stream, "seek"):
+                            try:
+                                stream.seek(0)
+                            except (OSError, ValueError) as exc:
+                                raise VideoUseConnectionError(
+                                    "video-use upload stream cannot be rewound safely"
+                                ) from exc
             try:
                 with httpx.Client(timeout=self.timeout, trust_env=False) as client:
                     response = client.request(method, f"{self.api_url}{path}", **kwargs)
@@ -79,15 +96,37 @@ class VideoUseAdapter:
         filename: str,
         content_type: str | None,
         stream: BinaryIO,
+        *,
+        idempotency_key: str | None = None,
+        content_sha256: str | None = None,
     ) -> dict[str, Any]:
+        headers: dict[str, str] = {}
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+            if content_sha256 is None:
+                raise ValueError("content_sha256 is required with an idempotency key")
+            headers["X-Content-SHA256"] = content_sha256
+        elif content_sha256 is not None:
+            raise ValueError("idempotency_key is required with content_sha256")
         return self._json(
             self._request(
                 "POST",
                 "/media",
                 data={"projectId": project_id},
                 files={"file": (filename, stream, content_type or "application/octet-stream")},
+                headers=headers or None,
             )
         )
+
+    def inspect_media(self, project_id: str, media_id: str) -> dict[str, Any]:
+        safe_project_id = quote(project_id, safe="")
+        safe_media_id = quote(media_id, safe="")
+        response = self._request(
+            "GET", f"/media/{safe_project_id}/{safe_media_id}/inspect"
+        )
+        if response.status_code == 404:
+            raise VideoUseNotFoundError("video-use media was not found")
+        return self._json(response)
 
     def submit_render(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._json(self._request("POST", "/renders", json=payload))

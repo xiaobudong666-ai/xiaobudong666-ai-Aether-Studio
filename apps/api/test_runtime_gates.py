@@ -221,8 +221,8 @@ def governed_render_context(tmp_path):
 
 
 # ----------------------------------------------------------- apply-draft gate
-def test_apply_draft_receipt_gate_fails_closed_and_passes(governed_generation_context):
-    client, sessions = governed_generation_context
+def test_apply_draft_requires_trusted_export_before_timeline_receipt_gate(governed_generation_context):
+    client, _ = governed_generation_context
     project = create_generation_project(client, "G1 apply gate")
     task = create_task(client, project, key="g1-apply-gate")
     claimed = claim(client).json()
@@ -246,23 +246,24 @@ def test_apply_draft_receipt_gate_fails_closed_and_passes(governed_generation_co
 
     current = client.get(f"/projects/{project['id']}").json()
     endpoint = f"/projects/{project['id']}/generation-tasks/{task['taskId']}/apply-talking-head-draft"
-
-    missing = client.post(endpoint, json={"expectedRevision": current["revision"], "aspect": "9:16", "subtitles": []})
-    assert missing.status_code == 422
-    assert missing.json()["detail"]["code"] == "TIMELINE_RECEIPT_REQUIRED"
-    assert client.get(f"/projects/{project['id']}").json()["revision"] == current["revision"]
-
-    applied = client.post(
-        endpoint,
-        json={
+    requests = [
+        {"expectedRevision": current["revision"], "aspect": "9:16", "subtitles": []},
+        {
             "expectedRevision": current["revision"],
             "aspect": "9:16",
             "subtitles": [],
             "timelineReceipt": valid_receipt(current["revision"], current["revision"] + 1),
         },
-    )
-    assert applied.status_code == 200, applied.text
-    assert applied.json()["revision"] == current["revision"] + 1
+    ]
+
+    # The M12 trusted-issuer gate is evaluated before timeline application.
+    # A valid timeline receipt cannot turn a caller-created ALLOWED snapshot
+    # into trusted generated-media export authorization.
+    for payload in requests:
+        blocked = client.post(endpoint, json=payload)
+        assert blocked.status_code == 422, blocked.text
+        assert blocked.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+        assert client.get(f"/projects/{project['id']}").json()["revision"] == current["revision"]
 
 
 # -------------------------------------------------------------- adopt gate

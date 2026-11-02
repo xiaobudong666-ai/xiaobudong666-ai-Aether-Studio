@@ -1,5 +1,7 @@
+import hashlib
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -119,6 +121,15 @@ def test_upload_probe_render_and_download_are_real(tmp_path):
         media = upload.json()
         assert media["metadata"]["video"]["width"] == 320
         assert media["metadata"]["durationSeconds"] > 0.9
+        inspected = client.get(f"/media/project-1/{media['mediaId']}/inspect")
+        assert inspected.status_code == 200, inspected.text
+        inspection = inspected.json()
+        assert inspection["projectId"] == "project-1"
+        assert inspection["mediaId"] == media["mediaId"]
+        assert inspection["contentType"] == "video/mp4"
+        assert inspection["sizeBytes"] == len(source.read_bytes())
+        assert inspection["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+        assert inspection["metadata"]["video"]["width"] == 320
 
         render = client.post(
             "/renders",
@@ -138,6 +149,77 @@ def test_upload_probe_render_and_download_are_real(tmp_path):
         assert artifact.status_code == 200
         assert artifact.headers["content-type"] == "video/mp4"
         assert len(artifact.content) > 1_000
+
+
+def test_generated_upload_idempotency_survives_lost_ack_without_duplicate_media(tmp_path):
+    upstream = tmp_path / "upstream"
+    make_fake_upstream(upstream)
+    source = tmp_path / "source.mp4"
+    make_source(source)
+    image = tmp_path / "different.png"
+    make_image(image)
+    media_root = tmp_path / "media"
+    idempotency_key = "generation:task-idempotency-test"
+    expected_media_id = str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"aether-video-use:project-idempotency:{idempotency_key}",
+    ))
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    with TestClient(create_app(media_root=media_root, upstream_root=upstream)) as client:
+        headers = {
+            "Idempotency-Key": idempotency_key,
+            "X-Content-SHA256": digest,
+        }
+        with source.open("rb") as stream:
+            first = client.post(
+                "/media",
+                data={"projectId": "project-idempotency"},
+                files={"file": ("generated.mp4", stream, "video/mp4")},
+                headers=headers,
+            )
+        assert first.status_code == 201, first.text
+        first_payload = first.json()
+        assert first_payload["mediaId"] == expected_media_id
+        assert first_payload["idempotentReplay"] is False
+
+        with source.open("rb") as stream:
+            replay = client.post(
+                "/media",
+                data={"projectId": "project-idempotency"},
+                files={"file": ("generated.mp4", stream, "video/mp4")},
+                headers=headers,
+            )
+        assert replay.status_code == 201, replay.text
+        replay_payload = replay.json()
+        assert replay_payload["mediaId"] == expected_media_id
+        assert replay_payload["idempotentReplay"] is True
+        media_files = list(
+            (media_root / "projects" / "project-idempotency" / "media").glob(
+                f"{expected_media_id}.*"
+            )
+        )
+        assert len(media_files) == 1
+
+        conflicting_headers = {
+            "Idempotency-Key": idempotency_key,
+            "X-Content-SHA256": hashlib.sha256(image.read_bytes()).hexdigest(),
+        }
+        with image.open("rb") as stream:
+            conflict = client.post(
+                "/media",
+                data={"projectId": "project-idempotency"},
+                files={"file": ("different.png", stream, "image/png")},
+                headers=conflicting_headers,
+            )
+        assert conflict.status_code == 409, conflict.text
+        media_files_after_conflict = list(
+            (media_root / "projects" / "project-idempotency" / "media").glob(
+                f"{expected_media_id}.*"
+            )
+        )
+        assert len(media_files_after_conflict) == 1
+        assert hashlib.sha256(media_files_after_conflict[0].read_bytes()).hexdigest() == digest
 
 
 def test_upload_probe_image_is_classified_and_stored_as_image(tmp_path):

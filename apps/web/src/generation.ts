@@ -450,8 +450,20 @@ export interface ApplyTalkingHeadDraftRequest {
   subtitles: Array<{ text: string; startMs: number; durationMs: number }>;
 }
 
+export interface ServerGenerationEvent {
+  id: string;
+  type: string;
+  fromStatus: string | null;
+  toStatus: string | null;
+  actorType: string;
+  actorId: string;
+  createdAt: string;
+  metadata: Record<string, unknown>;
+}
+
 export interface ServerGenerationTask {
   taskId: string;
+  requestedBy: string;
   projectId: string;
   provider: string;
   status: ServerGenerationStatus;
@@ -465,6 +477,7 @@ export interface ServerGenerationTask {
   errorMessage?: string | null;
   rights: { allowed: boolean; code: string };
   results: ServerGenerationResult[];
+  events?: ServerGenerationEvent[];
   requestSummary?: { videoAspect?: "16:9" | "9:16" | "1:1"; videoClipDuration?: number; outputCount?: number; inputAssetVersionIds?: string[]; promptLength?: number };
   createdAt: string;
   updatedAt: string;
@@ -475,7 +488,9 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 export class GenerationApiClient {
   constructor(
     private readonly apiBase = "/api",
-    private readonly request: FetchLike = fetch,
+    // Keep the browser global as the receiver. A bare stored `fetch` invoked
+    // later as `this.request(...)` throws "Illegal invocation" in Chromium.
+    private readonly request: FetchLike = (input, init) => globalThis.fetch(input, init),
   ) {}
 
   private async json<T>(path: string, init?: RequestInit): Promise<T> {
