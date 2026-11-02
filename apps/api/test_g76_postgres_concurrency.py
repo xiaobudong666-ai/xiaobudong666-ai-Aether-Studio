@@ -770,9 +770,9 @@ def _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload):
 
 
 def _post_g70_g71_duplicate_intake(
-    app, task_id, worker_headers, artifact_id, payload, *, raise_server_exceptions=True
+    app, task_id, worker_headers, artifact_id, payload, *, client_app=None
 ):
-    with TestClient(app, raise_server_exceptions=raise_server_exceptions) as worker_client:
+    with TestClient(client_app or app) as worker_client:
         return worker_client.post(
             f"/internal/generation-tasks/{task_id}/artifact-intake",
             headers=worker_headers,
@@ -1879,6 +1879,17 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
     class SimulatedAbruptRequestExit(BaseException):
         pass
 
+    class CatchAbruptRequestExit:
+        def __init__(self, inner_app):
+            self.inner_app = inner_app
+
+        async def __call__(self, scope, receive, send):
+            try:
+                await self.inner_app(scope, receive, send)
+            except SimulatedAbruptRequestExit:
+                from starlette.responses import Response
+                await Response(status_code=500)(scope, receive, send)
+
     owner_client, sessions, app = postgres_context
     task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
     payload = b"synthetic-g70-g71-abrupt-request-exit-after-sidecar-return"
@@ -1901,17 +1912,14 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
         raise SimulatedAbruptRequestExit("synthetic abrupt request exit after Sidecar returned")
 
     monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_abort_request)
-    try:
-        response = _post_g70_g71_duplicate_intake(
-            app, task_id, worker_headers, artifact_id, payload,
-            raise_server_exceptions=False,
-        )
-    except SimulatedAbruptRequestExit:
-        response = None
+    interruption_boundary_app = CatchAbruptRequestExit(app)
+    response = _post_g70_g71_duplicate_intake(
+        app, task_id, worker_headers, artifact_id, payload,
+        client_app=interruption_boundary_app,
+    )
 
     assert upload_calls == 1
-    if response is not None:
-        assert response.status_code >= 500, response.text
+    assert response.status_code == 500, response.text
 
     with sessions() as db:
         interrupted_task = db.get(DBGenerationTask, task_id)
