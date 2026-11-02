@@ -3386,6 +3386,15 @@ def create_app(
             if duplicate_storage_release_requested:
                 existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
                 if existing_release is not None:
+                    existing_bytes = int(
+                        (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
+                    )
+                    if (
+                        existing_release.generation_task_id != task_id
+                        or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
+                        or existing_bytes != upload_size
+                    ):
+                        raise RuntimeError("duplicate storage release receipt does not match this request")
                     db.rollback()
                     duplicate_statement = (
                         select(DBGenerationTask)
