@@ -332,6 +332,7 @@ def task_response(
     request = task.request_json or {}
     payload: dict[str, Any] = {
         "taskId": task.id,
+        "requestedBy": task.requested_by,
         "projectId": task.project_id,
         "provider": task.provider,
         "status": effective_status,
@@ -402,6 +403,7 @@ def task_response(
             "fromStatus": event.from_status,
             "toStatus": event.to_status,
             "actorType": event.actor_type,
+            "actorId": event.actor_id,
             "createdAt": iso_utc(event.created_at),
             "metadata": event.metadata_json,
         } for event in events]
