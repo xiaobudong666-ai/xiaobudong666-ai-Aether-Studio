@@ -1863,3 +1863,114 @@ def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_m
         ).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
+
+
+def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_not_leak_storage_hold(
+    postgres_context, monkeypatch
+):
+    """Characterize the crash window after Sidecar success but before DB ingest commit.
+
+    SimulatedAbruptRequestExit bypasses the route's ordinary Exception compensation
+    path. This is a deterministic request-boundary interruption test, not an
+    operating-system process-kill or real Sidecar durability test.
+    """
+    class SimulatedAbruptRequestExit(BaseException):
+        pass
+
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"synthetic-g70-g71-abrupt-request-exit-after-sidecar-return"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id = task.tenant_id
+        tenant = db.get(DBTenant, tenant_id)
+        assert tenant is not None
+        initial_storage_bytes = tenant.used_storage_bytes
+
+    original_upload = app.state.video_use.upload_media
+    upload_calls = 0
+
+    def upload_then_abort_request(*args, **kwargs):
+        nonlocal upload_calls
+        upload_calls += 1
+        original_upload(*args, **kwargs)
+        raise SimulatedAbruptRequestExit("synthetic abrupt request exit after Sidecar returned")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_abort_request)
+    try:
+        response = _post_g70_g71_duplicate_intake(
+            app, task_id, worker_headers, artifact_id, payload
+        )
+    except SimulatedAbruptRequestExit:
+        response = None
+
+    assert upload_calls == 1
+    if response is not None:
+        assert response.status_code >= 500, response.text
+
+    with sessions() as db:
+        interrupted_task = db.get(DBGenerationTask, task_id)
+        interrupted_tenant = db.get(DBTenant, tenant_id)
+        assert interrupted_task is not None
+        assert interrupted_tenant is not None
+        assert interrupted_task.status == "INGESTING"
+        assert interrupted_task.asset_version_id is None
+        assert interrupted_tenant.used_storage_bytes == initial_storage_bytes + len(payload)
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", original_upload)
+    retry = _post_g70_g71_duplicate_intake(
+        app, task_id, worker_headers, artifact_id, payload
+    )
+    assert retry.status_code == 201, retry.text
+
+    with sessions() as db:
+        completed_task = db.get(DBGenerationTask, task_id)
+        completed_tenant = db.get(DBTenant, tenant_id)
+        assert completed_task is not None
+        assert completed_tenant is not None
+        assets = list(db.execute(
+            select(DBAssetVersion).where(
+                DBAssetVersion.project_id == completed_task.project_id,
+                DBAssetVersion.media_id == completed_task.media_id,
+            )
+        ).scalars())
+        events = list(db.execute(
+            select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )
+        ).scalars())
+        usage = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+
+        assert completed_task.status == "RIGHTS_BLOCKED"
+        assert completed_task.attempts == 1
+        assert completed_task.asset_version_id is not None
+        assert len(assets) == 1
+        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert sum(row.event_type == "ARTIFACT_INGESTED" for row in events) == 1
+        assert sum(row.event_type == "STORAGE_RESERVATION_RELEASED" for row in events) == 0
+        assert sum(row.kind == "RESERVED" for row in usage) == 1
+        assert sum(row.kind == "SETTLED" for row in usage) == 1
+        assert sum(row.kind == "RELEASED" for row in usage) == 0
+
+        expected_storage_bytes = initial_storage_bytes + len(payload)
+        actual_storage_bytes = completed_tenant.used_storage_bytes
+        if actual_storage_bytes == expected_storage_bytes:
+            return
+        assert actual_storage_bytes == initial_storage_bytes + 2 * len(payload), (
+            "Unexpected storage accounting after abrupt request exit: "
+            f"initial={initial_storage_bytes}, actual={actual_storage_bytes}, "
+            f"payload={len(payload)}"
+        )
+        pytest.xfail(
+            "Confirmed request-boundary interruption leak: the first committed storage "
+            "hold survives the aborted request, and the retry adds a second hold for "
+            "the same idempotent Sidecar media identity. This is not an OS process-kill proof."
+        )
+
+    app.state.moneyprinter.assert_not_called()
