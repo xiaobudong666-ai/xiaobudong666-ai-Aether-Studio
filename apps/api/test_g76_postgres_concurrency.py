@@ -15,11 +15,14 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from threading import Barrier, Event, Lock, get_ident
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
 from sqlalchemy import event, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -769,10 +772,8 @@ def _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload):
         assert release_events[0].metadata_json["reservedStorageBytes"] == len(payload)
 
 
-def _post_g70_g71_duplicate_intake(
-    app, task_id, worker_headers, artifact_id, payload, *, client_app=None
-):
-    with TestClient(client_app or app) as worker_client:
+def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, payload):
+    with TestClient(app) as worker_client:
         return worker_client.post(
             f"/internal/generation-tasks/{task_id}/artifact-intake",
             headers=worker_headers,
@@ -1879,17 +1880,6 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
     class SimulatedAbruptRequestExit(BaseException):
         pass
 
-    class CatchAbruptRequestExit:
-        def __init__(self, inner_app):
-            self.inner_app = inner_app
-
-        async def __call__(self, scope, receive, send):
-            try:
-                await self.inner_app(scope, receive, send)
-            except SimulatedAbruptRequestExit:
-                from starlette.responses import Response
-                await Response(status_code=500)(scope, receive, send)
-
     owner_client, sessions, app = postgres_context
     task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
     payload = b"synthetic-g70-g71-abrupt-request-exit-after-sidecar-return"
@@ -1912,14 +1902,34 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
         raise SimulatedAbruptRequestExit("synthetic abrupt request exit after Sidecar returned")
 
     monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_abort_request)
-    interruption_boundary_app = CatchAbruptRequestExit(app)
-    response = _post_g70_g71_duplicate_intake(
-        app, task_id, worker_headers, artifact_id, payload,
-        client_app=interruption_boundary_app,
+    intake_route = next(
+        route for route in app.routes
+        if getattr(route, "path", None) == "/internal/generation-tasks/{task_id}/artifact-intake"
     )
+    interrupted = False
+    with sessions() as db:
+        upload = UploadFile(
+            file=BytesIO(payload),
+            filename="synthetic-g70-g71.mp4",
+            headers=Headers({"content-type": "video/mp4"}),
+        )
+        try:
+            intake_route.endpoint(
+                task_id,
+                providerArtifactId=artifact_id,
+                file=upload,
+                x_worker_token=WORKER_TOKEN,
+                x_worker_id=worker_headers["X-Worker-Id"],
+                x_worker_lease_epoch=int(worker_headers["X-Worker-Lease-Epoch"]),
+                db=db,
+            )
+        except SimulatedAbruptRequestExit:
+            interrupted = True
+        else:
+            pytest.fail("synthetic abrupt request interruption did not reach the intake endpoint")
 
     assert upload_calls == 1
-    assert response.status_code == 500, response.text
+    assert interrupted is True
 
     with sessions() as db:
         interrupted_task = db.get(DBGenerationTask, task_id)
