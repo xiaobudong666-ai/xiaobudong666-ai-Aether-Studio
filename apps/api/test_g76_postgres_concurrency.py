@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import Base, build_engine
 from app.main import create_app
@@ -762,6 +762,11 @@ def _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload):
         assert sum(row.kind == "RELEASED" for row in usage) == 0
         assert sum(row.event_type == "ARTIFACT_INGESTED" for row in events) == 1
         assert sum(row.event_type == "ARTIFACT_INGEST_FAILED" for row in events) == 0
+        release_events = [
+            row for row in events if row.event_type == "STORAGE_RESERVATION_RELEASED"
+        ]
+        assert len(release_events) == 1
+        assert release_events[0].metadata_json["reservedStorageBytes"] == len(payload)
 
 
 def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, payload):
@@ -865,6 +870,90 @@ def test_g70_g71_postgres_duplicate_intake_lost_ack_releases_extra_storage_reser
     assert results[0]["mediaId"] == results[1]["mediaId"]
     _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
     app.state.moneyprinter.assert_not_called()
+
+
+def _run_g70_g71_duplicate_release_commit_fault(postgres_context, monkeypatch, fault_mode):
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = f"synthetic-g70-g71-db-commit-{fault_mode}".encode()
+    original_upload = app.state.video_use.upload_media
+    upload_barrier = Barrier(2)
+    upload_lock = Lock()
+    upload_calls = 0
+
+    def synchronized_upload(*args, **kwargs):
+        nonlocal upload_calls
+        with upload_lock:
+            upload_calls += 1
+        upload_barrier.wait(timeout=15)
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", synchronized_upload)
+
+    original_commit = Session.commit
+    fault_lock = Lock()
+    fault_state = {"injected": False}
+
+    def inject_release_commit_fault(session):
+        should_inject = False
+        with fault_lock:
+            if (
+                not fault_state["injected"]
+                and any(
+                    isinstance(item, DBGenerationEvent)
+                    and item.event_type == "STORAGE_RESERVATION_RELEASED"
+                    for item in session.new
+                )
+            ):
+                fault_state["injected"] = True
+                should_inject = True
+        if should_inject:
+            if fault_mode == "after_commit":
+                original_commit(session)
+                raise RuntimeError("synthetic DB commit ACK lost after durable commit")
+            raise RuntimeError("synthetic DB commit failed before commit")
+        return original_commit(session)
+
+    monkeypatch.setattr(Session, "commit", inject_release_commit_fault)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                _post_g70_g71_duplicate_intake,
+                app, task_id, worker_headers, artifact_id, payload,
+            )
+            for _ in range(2)
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert upload_calls == 2
+    assert fault_state["injected"] is True
+    assert [response.status_code for response in responses] == [201, 201], [
+        response.text for response in responses
+    ]
+    results = [response.json()["results"][0] for response in responses]
+    assert results[0]["assetVersionId"] == results[1]["assetVersionId"]
+    assert results[0]["mediaId"] == results[1]["mediaId"]
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_duplicate_release_db_commit_ack_lost_after_commit_is_idempotent(
+    postgres_context, monkeypatch
+):
+    """A durable release receipt must prevent a second decrement after a lost DB commit ACK."""
+    _run_g70_g71_duplicate_release_commit_fault(
+        postgres_context, monkeypatch, "after_commit"
+    )
+
+
+def test_g70_g71_postgres_duplicate_release_db_commit_failure_before_commit_retries_safely(
+    postgres_context, monkeypatch
+):
+    """A pre-commit failure must retry the same release receipt and decrement exactly once."""
+    _run_g70_g71_duplicate_release_commit_fault(
+        postgres_context, monkeypatch, "before_commit"
+    )
 
 
 def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(postgres_context, monkeypatch):
