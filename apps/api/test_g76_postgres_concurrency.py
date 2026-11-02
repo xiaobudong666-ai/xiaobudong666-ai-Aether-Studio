@@ -769,8 +769,10 @@ def _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload):
         assert release_events[0].metadata_json["reservedStorageBytes"] == len(payload)
 
 
-def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, payload):
-    with TestClient(app) as worker_client:
+def _post_g70_g71_duplicate_intake(
+    app, task_id, worker_headers, artifact_id, payload, *, raise_server_exceptions=True
+):
+    with TestClient(app, raise_server_exceptions=raise_server_exceptions) as worker_client:
         return worker_client.post(
             f"/internal/generation-tasks/{task_id}/artifact-intake",
             headers=worker_headers,
@@ -849,7 +851,8 @@ def test_g70_g71_postgres_duplicate_intake_lost_ack_releases_extra_storage_reser
 
     def send_and_signal_first_response():
         response = _post_g70_g71_duplicate_intake(
-            app, task_id, worker_headers, artifact_id, payload
+            app, task_id, worker_headers, artifact_id, payload,
+            raise_server_exceptions=False,
         )
         first_response_completed.set()
         return response
