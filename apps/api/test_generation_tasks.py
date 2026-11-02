@@ -531,6 +531,14 @@ def test_g72_keyset_task_list_combines_filters_and_scopes_actor(generation_conte
     assert response.status_code == 200, response.text
     payload = response.json()
     assert [item["taskId"] for item in payload["items"]] == [matching["taskId"]]
+    assert payload["items"][0]["requestedBy"] == owner_id
+    detail = client.get(f"/projects/{project['id']}/generation-tasks/{matching['taskId']}")
+    assert detail.status_code == 200, detail.text
+    detail_payload = detail.json()
+    assert detail_payload["requestedBy"] == owner_id
+    created_event = next(event for event in detail_payload["events"] if event["type"] == "TASK_CREATED")
+    assert created_event["actorType"] == "USER"
+    assert created_event["actorId"] == owner_id
     assert payload["statusFilterSemantics"] == "storedStatus"
     assert payload["pagination"] == "keyset"
     assert payload["sort"] == "createdAt:desc"
