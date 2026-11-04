@@ -62,10 +62,6 @@ export interface GenerationTask {
   requiresPreflight?: boolean;
   createdAt: string;
   updatedAt: string;
-  /** Service response metadata used by lifecycle/audit detail views. */
-  capabilitySnapshotHash?: string | null;
-  startedAt?: string | null;
-  completedAt?: string | null;
 }
 
 export interface PreflightResult {
@@ -485,6 +481,10 @@ export interface ServerGenerationTask {
   requestSummary?: { videoAspect?: "16:9" | "9:16" | "1:1"; videoClipDuration?: number; outputCount?: number; inputAssetVersionIds?: string[]; promptLength?: number };
   createdAt: string;
   updatedAt: string;
+  /** Immutable capability snapshot and task lifecycle timestamps from the API. */
+  capabilitySnapshotHash?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
 }
 
 export type GenerationTaskSort = "createdAt:desc" | "createdAt:asc";
