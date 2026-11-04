@@ -220,7 +220,7 @@ def governed_render_context(tmp_path):
 
 
 # ----------------------------------------------------------- apply-draft gate
-def test_apply_draft_receipt_gate_fails_closed_and_passes(governed_generation_context):
+def test_apply_draft_requires_trusted_export_rights_before_timeline_receipt(governed_generation_context):
     client, sessions = governed_generation_context
     project = create_generation_project(client, "G1 apply gate")
     task = create_task(client, project, key="g1-apply-gate")
@@ -246,12 +246,14 @@ def test_apply_draft_receipt_gate_fails_closed_and_passes(governed_generation_co
     current = client.get(f"/projects/{project['id']}").json()
     endpoint = f"/projects/{project['id']}/generation-tasks/{task['taskId']}/apply-talking-head-draft"
 
+    # A caller-selected ALLOWED snapshot is not a trusted M12 issuer grant.
+    # The rights gate must deny before the timeline-receipt branch can mutate the project.
     missing = client.post(endpoint, json={"expectedRevision": current["revision"], "aspect": "9:16", "subtitles": []})
     assert missing.status_code == 422
-    assert missing.json()["detail"]["code"] == "TIMELINE_RECEIPT_REQUIRED"
+    assert missing.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
     assert client.get(f"/projects/{project['id']}").json()["revision"] == current["revision"]
 
-    applied = client.post(
+    with_receipt = client.post(
         endpoint,
         json={
             "expectedRevision": current["revision"],
@@ -260,8 +262,9 @@ def test_apply_draft_receipt_gate_fails_closed_and_passes(governed_generation_co
             "timelineReceipt": valid_receipt(current["revision"], current["revision"] + 1),
         },
     )
-    assert applied.status_code == 200, applied.text
-    assert applied.json()["revision"] == current["revision"] + 1
+    assert with_receipt.status_code == 422
+    assert with_receipt.json()["detail"]["code"] == "RIGHTS_TRUSTED_ISSUER_REQUIRED"
+    assert client.get(f"/projects/{project['id']}").json()["revision"] == current["revision"]
 
 
 # -------------------------------------------------------------- adopt gate

@@ -587,7 +587,7 @@ def test_generated_media_download_requires_current_export_rights(generation_cont
     result = task["results"][0]
     media_id = result["mediaId"]
     asset_id = result["assetVersionId"]
-    payload = media_store.media_objects[(project["id"], media_id)]["content"]
+    payload = b"synthetic-generated-media-payload"
     stream_calls = []
 
     class FakeUpstream:
