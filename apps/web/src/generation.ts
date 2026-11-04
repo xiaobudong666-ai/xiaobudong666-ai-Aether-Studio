@@ -62,6 +62,10 @@ export interface GenerationTask {
   requiresPreflight?: boolean;
   createdAt: string;
   updatedAt: string;
+  /** Service response metadata used by lifecycle/audit detail views. */
+  capabilitySnapshotHash?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
 }
 
 export interface PreflightResult {
