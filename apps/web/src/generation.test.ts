@@ -3,6 +3,7 @@ import {
   DeterministicGenerationAdapter,
   GenerationApiClient,
   GenerationInput,
+  ServerGenerationTask,
   deterministicChecksum,
   paginateTasks,
   preflightGeneration,
@@ -234,12 +235,15 @@ describe("IM9–IM11 28 acceptance cases", () => {
 });
 
 describe("IM12–IM14 generation API client", () => {
-  const task = {
-    taskId: "server-task-1", projectId: "project-1", provider: "moneyprinter",
+  const task: ServerGenerationTask = {
+    taskId: "server-task-1", requestedBy: "owner-1", projectId: "project-1", provider: "moneyprinter",
     status: "QUEUED", storedStatus: "QUEUED", progress: 0, message: "queued",
     attempt: 1, maxAttempts: 3, cancelRequested: false,
     rights: { allowed: false, code: "RIGHTS_MISSING" }, results: [],
     createdAt: "2026-08-27T00:00:00Z", updatedAt: "2026-08-27T00:00:00Z",
+    capabilitySnapshotHash: "a".repeat(64),
+    startedAt: "2026-08-27T00:00:01Z",
+    completedAt: null,
   };
 
   test("mutations carry CSRF and idempotency headers", async () => {
