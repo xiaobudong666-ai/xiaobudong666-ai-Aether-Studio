@@ -481,6 +481,40 @@ export interface ServerGenerationTask {
   requestSummary?: { videoAspect?: "16:9" | "9:16" | "1:1"; videoClipDuration?: number; outputCount?: number; inputAssetVersionIds?: string[]; promptLength?: number };
   createdAt: string;
   updatedAt: string;
+  /** Immutable capability snapshot and task lifecycle timestamps from the API. */
+  capabilitySnapshotHash: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export type GenerationTaskSort = "createdAt:desc" | "createdAt:asc";
+
+export interface GenerationTaskListQuery {
+  pageSize?: number;
+  pagination?: "offset" | "keyset";
+  /** Offset-mode continuation. The API rejects this when pagination is keyset. */
+  cursor?: number;
+  /** Scope-bound keyset continuation returned by the API. */
+  after?: string;
+  status?: ServerGenerationStatus;
+  provider?: string;
+  requestedBy?: string;
+  /** ISO-8601 timestamps with an explicit timezone offset are required by the API. */
+  createdAfter?: string;
+  /** ISO-8601 timestamps with an explicit timezone offset are required by the API. */
+  createdBefore?: string;
+  errorCode?: string;
+  sort?: GenerationTaskSort;
+}
+
+export interface GenerationTaskListPage {
+  items: ServerGenerationTask[];
+  nextCursor: number | null;
+  nextKeysetCursor: string | null;
+  pagination: "offset" | "keyset";
+  sort: GenerationTaskSort;
+  sortTieBreaker: "taskId";
+  statusFilterSemantics: "storedStatus";
 }
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -562,6 +596,28 @@ export class GenerationApiClient {
         },
         body: JSON.stringify(body),
       },
+    );
+  }
+
+  listPage(
+    projectId: string,
+    query: GenerationTaskListQuery = {},
+  ): Promise<GenerationTaskListPage> {
+    const params = new URLSearchParams();
+    params.set("pageSize", String(query.pageSize ?? 20));
+    params.set("pagination", query.pagination ?? "keyset");
+    params.set("sort", query.sort ?? "createdAt:desc");
+    if (query.cursor !== undefined) params.set("cursor", String(query.cursor));
+    if (query.after !== undefined) params.set("after", query.after);
+    if (query.status !== undefined) params.set("status", query.status);
+    if (query.provider !== undefined) params.set("provider", query.provider);
+    if (query.requestedBy !== undefined) params.set("requestedBy", query.requestedBy);
+    if (query.createdAfter !== undefined) params.set("createdAfter", query.createdAfter);
+    if (query.createdBefore !== undefined) params.set("createdBefore", query.createdBefore);
+    if (query.errorCode !== undefined) params.set("errorCode", query.errorCode);
+
+    return this.json(
+      `/projects/${encodeURIComponent(projectId)}/generation-tasks?${params.toString()}`,
     );
   }
 

@@ -3,6 +3,7 @@ import {
   DeterministicGenerationAdapter,
   GenerationApiClient,
   GenerationInput,
+  ServerGenerationTask,
   deterministicChecksum,
   paginateTasks,
   preflightGeneration,
@@ -234,12 +235,15 @@ describe("IM9–IM11 28 acceptance cases", () => {
 });
 
 describe("IM12–IM14 generation API client", () => {
-  const task = {
-    taskId: "server-task-1", projectId: "project-1", provider: "moneyprinter",
+  const task: ServerGenerationTask = {
+    taskId: "server-task-1", requestedBy: "owner-1", projectId: "project-1", provider: "moneyprinter",
     status: "QUEUED", storedStatus: "QUEUED", progress: 0, message: "queued",
     attempt: 1, maxAttempts: 3, cancelRequested: false,
     rights: { allowed: false, code: "RIGHTS_MISSING" }, results: [],
     createdAt: "2026-08-27T00:00:00Z", updatedAt: "2026-08-27T00:00:00Z",
+    capabilitySnapshotHash: "a".repeat(64),
+    startedAt: "2026-08-27T00:00:01Z",
+    completedAt: null,
   };
 
   test("mutations carry CSRF and idempotency headers", async () => {
@@ -262,12 +266,16 @@ describe("IM12–IM14 generation API client", () => {
   });
 
   test("G72 FAKE-only talking-head uses explicit validation and idempotent create routes", async () => {
-    const task = {
-      taskId: "g72-fake-task", projectId: "project-1",
+    const task: ServerGenerationTask = {
+      taskId: "g72-fake-task", requestedBy: "owner-1", projectId: "project-1",
       provider: "deterministic-fake-talking-head", status: "QUEUED", storedStatus: "QUEUED",
       progress: 0, message: "FAKE-only test task", attempt: 1, maxAttempts: 1,
       cancelRequested: false, rights: { allowed: false, code: "RIGHTS_MISSING" },
-      results: [], createdAt: "2026-10-29T00:00:00Z", updatedAt: "2026-10-29T00:00:00Z",
+      results: [],
+      capabilitySnapshotHash: "a".repeat(64),
+      startedAt: null,
+      completedAt: null,
+      createdAt: "2026-10-29T00:00:00Z", updatedAt: "2026-10-29T00:00:00Z",
     };
     const preflight = {
       allowed: true, status: "PREFLIGHT", fakeOnly: true,
@@ -329,6 +337,77 @@ describe("IM12–IM14 generation API client", () => {
     expect(request).toHaveBeenCalledWith(
       "/api/projects/project-1/generation-tasks?pageSize=100", undefined,
     );
+  });
+
+  test("keyset task list preserves all server filters and the opaque continuation cursor", async () => {
+    const cursor = "eyJ2ZXJzaW9uIjoxLCJ0YXNrSWQiOiJ0YXNrLTEifQ";
+    const page = {
+      items: [task],
+      nextCursor: null,
+      nextKeysetCursor: cursor,
+      pagination: "keyset",
+      sort: "createdAt:desc",
+      sortTieBreaker: "taskId",
+      statusFilterSemantics: "storedStatus",
+    };
+    const request = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      void _input;
+      void _init;
+      return { ok: true, status: 200, json: async () => page } as Response;
+    });
+    const client = new GenerationApiClient("/api", request);
+    const result = await client.listPage("project/one", {
+      pageSize: 25,
+      pagination: "keyset",
+      after: cursor,
+      status: "RIGHTS_BLOCKED",
+      provider: "deterministic-fake-talking-head",
+      requestedBy: "owner+editor@example.test",
+      createdAfter: "2026-11-01T00:00:00+08:00",
+      createdBefore: "2026-11-04T23:59:59+08:00",
+      errorCode: "RIGHTS_MISSING",
+      sort: "createdAt:desc",
+    });
+
+    const requestedUrl = new URL(String(request.mock.calls[0][0]), "https://aether.test");
+    expect(requestedUrl.pathname).toBe("/api/projects/project%2Fone/generation-tasks");
+    expect(requestedUrl.searchParams.get("pageSize")).toBe("25");
+    expect(requestedUrl.searchParams.get("pagination")).toBe("keyset");
+    expect(requestedUrl.searchParams.get("after")).toBe(cursor);
+    expect(requestedUrl.searchParams.get("status")).toBe("RIGHTS_BLOCKED");
+    expect(requestedUrl.searchParams.get("provider")).toBe("deterministic-fake-talking-head");
+    expect(requestedUrl.searchParams.get("requestedBy")).toBe("owner+editor@example.test");
+    expect(requestedUrl.searchParams.get("createdAfter")).toBe("2026-11-01T00:00:00+08:00");
+    expect(requestedUrl.searchParams.get("createdBefore")).toBe("2026-11-04T23:59:59+08:00");
+    expect(requestedUrl.searchParams.get("errorCode")).toBe("RIGHTS_MISSING");
+    expect(requestedUrl.searchParams.get("sort")).toBe("createdAt:desc");
+    expect(result.nextKeysetCursor).toBe(cursor);
+    expect(result.items[0].taskId).toBe("server-task-1");
+  });
+
+  test("offset task list keeps its numeric cursor separate from keyset continuation", async () => {
+    const request = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      void _input;
+      void _init;
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          items: [task], nextCursor: 40, nextKeysetCursor: null,
+          pagination: "offset", sort: "createdAt:asc",
+          sortTieBreaker: "taskId", statusFilterSemantics: "storedStatus",
+        }),
+      } as Response;
+    });
+    const client = new GenerationApiClient("/api", request);
+    const result = await client.listPage("project-1", {
+      pagination: "offset", cursor: 20, pageSize: 20, sort: "createdAt:asc",
+    });
+    const requestedUrl = new URL(String(request.mock.calls[0][0]), "https://aether.test");
+    expect(requestedUrl.searchParams.get("pagination")).toBe("offset");
+    expect(requestedUrl.searchParams.get("cursor")).toBe("20");
+    expect(requestedUrl.searchParams.has("after")).toBe(false);
+    expect(result.nextCursor).toBe(40);
+    expect(result.nextKeysetCursor).toBeNull();
   });
 
   test("API errors redact token-like details", async () => {
