@@ -331,6 +331,71 @@ describe("IM12–IM14 generation API client", () => {
     );
   });
 
+  test("keyset task list preserves all server filters and the opaque continuation cursor", async () => {
+    const cursor = "eyJ2ZXJzaW9uIjoxLCJ0YXNrSWQiOiJ0YXNrLTEifQ";
+    const page = {
+      items: [task],
+      nextCursor: null,
+      nextKeysetCursor: cursor,
+      pagination: "keyset",
+      sort: "createdAt:desc",
+      sortTieBreaker: "taskId",
+      statusFilterSemantics: "storedStatus",
+    };
+    const request = vi.fn(async () => ({
+      ok: true, status: 200, json: async () => page,
+    } as Response));
+    const client = new GenerationApiClient("/api", request);
+    const result = await client.listPage("project/one", {
+      pageSize: 25,
+      pagination: "keyset",
+      after: cursor,
+      status: "RIGHTS_BLOCKED",
+      provider: "deterministic-fake-talking-head",
+      requestedBy: "owner+editor@example.test",
+      createdAfter: "2026-11-01T00:00:00+08:00",
+      createdBefore: "2026-11-04T23:59:59+08:00",
+      errorCode: "RIGHTS_MISSING",
+      sort: "createdAt:desc",
+    });
+
+    const requestedUrl = new URL(String(request.mock.calls[0][0]), "https://aether.test");
+    expect(requestedUrl.pathname).toBe("/api/projects/project%2Fone/generation-tasks");
+    expect(requestedUrl.searchParams.get("pageSize")).toBe("25");
+    expect(requestedUrl.searchParams.get("pagination")).toBe("keyset");
+    expect(requestedUrl.searchParams.get("after")).toBe(cursor);
+    expect(requestedUrl.searchParams.get("status")).toBe("RIGHTS_BLOCKED");
+    expect(requestedUrl.searchParams.get("provider")).toBe("deterministic-fake-talking-head");
+    expect(requestedUrl.searchParams.get("requestedBy")).toBe("owner+editor@example.test");
+    expect(requestedUrl.searchParams.get("createdAfter")).toBe("2026-11-01T00:00:00+08:00");
+    expect(requestedUrl.searchParams.get("createdBefore")).toBe("2026-11-04T23:59:59+08:00");
+    expect(requestedUrl.searchParams.get("errorCode")).toBe("RIGHTS_MISSING");
+    expect(requestedUrl.searchParams.get("sort")).toBe("createdAt:desc");
+    expect(result.nextKeysetCursor).toBe(cursor);
+    expect(result.items[0].taskId).toBe("server-task-1");
+  });
+
+  test("offset task list keeps its numeric cursor separate from keyset continuation", async () => {
+    const request = vi.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({
+        items: [task], nextCursor: 40, nextKeysetCursor: null,
+        pagination: "offset", sort: "createdAt:asc",
+        sortTieBreaker: "taskId", statusFilterSemantics: "storedStatus",
+      }),
+    } as Response));
+    const client = new GenerationApiClient("/api", request);
+    const result = await client.listPage("project-1", {
+      pagination: "offset", cursor: 20, pageSize: 20, sort: "createdAt:asc",
+    });
+    const requestedUrl = new URL(String(request.mock.calls[0][0]), "https://aether.test");
+    expect(requestedUrl.searchParams.get("pagination")).toBe("offset");
+    expect(requestedUrl.searchParams.get("cursor")).toBe("20");
+    expect(requestedUrl.searchParams.has("after")).toBe(false);
+    expect(result.nextCursor).toBe(40);
+    expect(result.nextKeysetCursor).toBeNull();
+  });
+
   test("API errors redact token-like details", async () => {
     const request = vi.fn(async () => ({
       ok: false, status: 502,
