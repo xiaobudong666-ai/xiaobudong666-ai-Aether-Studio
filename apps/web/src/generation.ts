@@ -482,9 +482,9 @@ export interface ServerGenerationTask {
   createdAt: string;
   updatedAt: string;
   /** Immutable capability snapshot and task lifecycle timestamps from the API. */
-  capabilitySnapshotHash?: string | null;
-  startedAt?: string | null;
-  completedAt?: string | null;
+  capabilitySnapshotHash: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
 }
 
 export type GenerationTaskSort = "createdAt:desc" | "createdAt:asc";
