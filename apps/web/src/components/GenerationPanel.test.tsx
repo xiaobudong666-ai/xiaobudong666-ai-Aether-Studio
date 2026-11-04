@@ -35,7 +35,8 @@ const queuedTask: ServerGenerationTask = {
   status: "QUEUED", storedStatus: "QUEUED", progress: 0,
   message: "生成任务已进入受治理队列", attempt: 1, maxAttempts: 3,
   cancelRequested: false, rights: { allowed: false, code: "RIGHTS_MISSING" },
-  results: [], createdAt: "2026-08-27T00:00:00Z", updatedAt: "2026-08-27T00:00:00Z",
+  results: [], capabilitySnapshotHash: null, startedAt: null, completedAt: null,
+  createdAt: "2026-08-27T00:00:00Z", updatedAt: "2026-08-27T00:00:00Z",
 };
 
 function response(payload: unknown, status = 200): Response {
