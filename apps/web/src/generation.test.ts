@@ -342,9 +342,11 @@ describe("IM12–IM14 generation API client", () => {
       sortTieBreaker: "taskId",
       statusFilterSemantics: "storedStatus",
     };
-    const request = vi.fn(async () => ({
-      ok: true, status: 200, json: async () => page,
-    } as Response));
+    const request = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      void _input;
+      void _init;
+      return { ok: true, status: 200, json: async () => page } as Response;
+    });
     const client = new GenerationApiClient("/api", request);
     const result = await client.listPage("project/one", {
       pageSize: 25,
@@ -376,14 +378,18 @@ describe("IM12–IM14 generation API client", () => {
   });
 
   test("offset task list keeps its numeric cursor separate from keyset continuation", async () => {
-    const request = vi.fn(async () => ({
-      ok: true, status: 200,
-      json: async () => ({
-        items: [task], nextCursor: 40, nextKeysetCursor: null,
-        pagination: "offset", sort: "createdAt:asc",
-        sortTieBreaker: "taskId", statusFilterSemantics: "storedStatus",
-      }),
-    } as Response));
+    const request = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      void _input;
+      void _init;
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          items: [task], nextCursor: 40, nextKeysetCursor: null,
+          pagination: "offset", sort: "createdAt:asc",
+          sortTieBreaker: "taskId", statusFilterSemantics: "storedStatus",
+        }),
+      } as Response;
+    });
     const client = new GenerationApiClient("/api", request);
     const result = await client.listPage("project-1", {
       pagination: "offset", cursor: 20, pageSize: 20, sort: "createdAt:asc",
