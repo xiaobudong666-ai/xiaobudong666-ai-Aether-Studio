@@ -266,12 +266,16 @@ describe("IM12–IM14 generation API client", () => {
   });
 
   test("G72 FAKE-only talking-head uses explicit validation and idempotent create routes", async () => {
-    const task = {
-      taskId: "g72-fake-task", projectId: "project-1",
+    const task: ServerGenerationTask = {
+      taskId: "g72-fake-task", requestedBy: "owner-1", projectId: "project-1",
       provider: "deterministic-fake-talking-head", status: "QUEUED", storedStatus: "QUEUED",
       progress: 0, message: "FAKE-only test task", attempt: 1, maxAttempts: 1,
       cancelRequested: false, rights: { allowed: false, code: "RIGHTS_MISSING" },
-      results: [], createdAt: "2026-10-29T00:00:00Z", updatedAt: "2026-10-29T00:00:00Z",
+      results: [],
+      capabilitySnapshotHash: "a".repeat(64),
+      startedAt: null,
+      completedAt: null,
+      createdAt: "2026-10-29T00:00:00Z", updatedAt: "2026-10-29T00:00:00Z",
     };
     const preflight = {
       allowed: true, status: "PREFLIGHT", fakeOnly: true,
