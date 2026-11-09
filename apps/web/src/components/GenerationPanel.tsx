@@ -155,6 +155,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
       if (scope !== activeScopeRef.current || preflightVersion !== preflightVersionRef.current) return;
       invalidatePreflight();
       setMessage(error instanceof Error ? error.message : "服务端预检失败。");
+      setBusy(false);
     } finally {
       if (scope === activeScopeRef.current && preflightVersion === preflightVersionRef.current) setBusy(false);
     }
