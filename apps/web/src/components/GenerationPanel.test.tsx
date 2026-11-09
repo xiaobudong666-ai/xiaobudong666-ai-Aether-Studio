@@ -1,5 +1,5 @@
 import { ProjectDTO } from "@aether/contracts";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ServerGenerationTask } from "../generation";
 import { GenerationPanel } from "./GenerationPanel";
@@ -143,5 +143,65 @@ describe("GenerationPanel server authority", () => {
     fireEvent.click(useButton);
     expect(await screen.findByText(/adopted=false 的剪辑引用/)).toBeTruthy();
     expect(screen.getByText(/全部 adopted=false，未写入最终时间线/)).toBeTruthy();
+  });
+
+  test("G72 late preflight for a previous project cannot authorize submit in a new project", async () => {
+    let resolveValidate: ((value: Response) => void) | undefined;
+    const pendingValidate = new Promise<Response>((resolve) => { resolveValidate = resolve; });
+    const existingFetch = installFetch();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/generation-tasks/validate")) return pendingValidate;
+      if (url.includes("/projects/project-2/generation-tasks?pageSize=100")) {
+        return response({ items: [], nextCursor: null });
+      }
+      return existingFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const nextProject: ProjectDTO = { ...project, id: "project-2", revision: 2 };
+    const props = { role: "owner" as const, tenantId: "tenant-1", actorId: "owner-1", assetVersions: [] };
+    const mounted = render(<GenerationPanel {...props} project={project} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "口播项目一" } });
+    fireEvent.click(screen.getByLabelText("确认外部生成边界"));
+    fireEvent.click(screen.getByRole("button", { name: "执行服务端预检" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/generation-tasks/validate"))).toBe(true));
+    mounted.rerender(<GenerationPanel {...props} project={nextProject} />);
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/projects/project-2/generation-tasks?pageSize=100"))).toBe(true));
+    await act(async () => { resolveValidate?.(response({ allowed: true, status: "PREFLIGHT" })); });
+    expect((screen.getByRole("button", { name: "提交生成" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByText(/服务端预检通过/)).toBeNull();
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/generation-tasks") && init?.method === "POST")).toHaveLength(0);
+  });
+
+  test("G72 actor switch invalidates a previously accepted preflight in the same project", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const mounted = render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "口播测试" } });
+    fireEvent.click(screen.getByLabelText("确认外部生成边界"));
+    fireEvent.click(screen.getByRole("button", { name: "执行服务端预检" }));
+    expect(await screen.findByText(/服务端预检通过/)).toBeTruthy();
+    mounted.rerender(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-2" project={project} assetVersions={[]} />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "提交生成" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/generation-tasks") && init?.method === "POST")).toHaveLength(0);
+  });
+
+  test("G72 rejected preflight releases busy state for a safe retry", async () => {
+    const existingFetch = installFetch();
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/generation-tasks/validate")) return response({ detail: "BLOCKED" }, 403);
+      return existingFetch(input, init);
+    }));
+    render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "口播测试" } });
+    fireEvent.click(screen.getByLabelText("确认外部生成边界"));
+    fireEvent.click(screen.getByRole("button", { name: "执行服务端预检" }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "执行服务端预检" }) as HTMLButtonElement).disabled).toBe(false));
+    expect((screen.getByRole("button", { name: "提交生成" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
