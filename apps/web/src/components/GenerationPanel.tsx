@@ -38,6 +38,13 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     [],
   );
   const requestSequence = useRef(0);
+  // Bind async results and preflight authorization to the current actor/project.
+  // Updating the ref during render closes the window before useEffect cleanup.
+  const activeScope = JSON.stringify([tenantId, actorId, role, project?.id, project?.revision]);
+  const activeScopeRef = useRef(activeScope);
+  activeScopeRef.current = activeScope;
+  const preflightVersionRef = useRef(0);
+  const preflightScopeRef = useRef<string | null>(null);
   const idempotencyKeyRef = useRef<string | null>(null);
   const [open, setOpen] = useState(false);
   const [capabilities, setCapabilities] = useState<GenerationCapabilitySnapshot | null>(null);
@@ -69,12 +76,15 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     [assetVersions, project?.id],
   );
   const invalidatePreflight = () => {
+    preflightVersionRef.current += 1;
+    preflightScopeRef.current = null;
     setPreflightBody(null);
     idempotencyKeyRef.current = null;
   };
 
   const loadServerState = useCallback(async (silent = false) => {
     const projectId = project?.id;
+    const scope = activeScopeRef.current;
     const sequence = ++requestSequence.current;
     if (!projectId) {
       setTasks([]);
@@ -84,18 +94,18 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     if (!silent) setBusy(true);
     try {
       const [nextCapabilities, nextTasks] = await Promise.all([api.capabilities(), api.list(projectId)]);
-      if (sequence !== requestSequence.current || projectId !== project?.id) return;
+      if (sequence !== requestSequence.current || scope !== activeScopeRef.current || projectId !== project?.id) return;
       setCapabilities(nextCapabilities);
       setTasks(nextTasks);
       if (!silent && !nextCapabilities.enabled) {
         setMessage(`生成 Provider 当前不可用：${nextCapabilities.reasonCode || "PROVIDER_DISABLED"}；既有任务仍可读取。`);
       }
     } catch (error) {
-      if (sequence === requestSequence.current && !silent) setMessage(error instanceof Error ? error.message : "无法读取生成任务。");
+      if (sequence === requestSequence.current && scope === activeScopeRef.current && !silent) setMessage(error instanceof Error ? error.message : "无法读取生成任务。");
     } finally {
-      if (!silent && sequence === requestSequence.current) setBusy(false);
+      if (!silent && sequence === requestSequence.current && scope === activeScopeRef.current) setBusy(false);
     }
-  }, [api, project?.id]);
+  }, [api, project?.id, project?.revision, tenantId, actorId, role]);
 
   useEffect(() => {
     invalidatePreflight();
@@ -131,31 +141,44 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
       setMessage("请填写生成主题、确认外部生成边界，并等待能力快照载入。");
       return;
     }
+    const scope = activeScopeRef.current;
+    const preflightVersion = preflightVersionRef.current;
     setBusy(true);
     try {
       await api.validate(project.id, body);
+      // A project/actor switch or form edit invalidates an in-flight preflight.
+      if (scope !== activeScopeRef.current || preflightVersion !== preflightVersionRef.current) return;
+      preflightScopeRef.current = scope;
       setPreflightBody(body);
       setMessage("服务端预检通过：可创建受治理生成任务。");
     } catch (error) {
+      if (scope !== activeScopeRef.current || preflightVersion !== preflightVersionRef.current) return;
       invalidatePreflight();
       setMessage(error instanceof Error ? error.message : "服务端预检失败。");
     } finally {
-      setBusy(false);
+      if (scope === activeScopeRef.current && preflightVersion === preflightVersionRef.current) setBusy(false);
     }
   };
 
   const submit = async () => {
     if (!project || !preflightBody || !idempotencyKeyRef.current) return;
+    if (preflightScopeRef.current !== activeScopeRef.current || preflightBody.expectedProjectRevision !== project.revision) {
+      invalidatePreflight();
+      setMessage("当前身份、项目或版本已变化，请重新执行服务端预检。");
+      return;
+    }
+    const scope = activeScopeRef.current;
     setBusy(true);
     try {
       const task = await api.create(project.id, preflightBody);
+      if (scope !== activeScopeRef.current) return;
       setTasks((previous) => [task, ...previous.filter((candidate) => candidate.taskId !== task.taskId)]);
       setMessage(`任务 ${task.taskId} 已进入服务端队列；重复提交使用同一幂等键。`);
       invalidatePreflight();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "生成任务创建失败。");
+      if (scope === activeScopeRef.current) setMessage(error instanceof Error ? error.message : "生成任务创建失败。");
     } finally {
-      setBusy(false);
+      if (scope === activeScopeRef.current) setBusy(false);
     }
   };
 
