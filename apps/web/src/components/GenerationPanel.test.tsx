@@ -189,6 +189,37 @@ describe("GenerationPanel server authority", () => {
     expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/generation-tasks") && init?.method === "POST")).toHaveLength(0);
   });
 
+
+  test("G72 late cancel must not replace a switched project's task or message", async () => {
+    let resolveCancel: ((value: Response) => void) | undefined;
+    const pendingCancel = new Promise<Response>((resolve) => { resolveCancel = resolve; });
+    const originalFetch = installFetch([queuedTask]);
+    const nextProject: ProjectDTO = { ...project, id: "project-2", revision: 2 };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/cancel")) return pendingCancel;
+      if (url.includes("/projects/project-2/generation-tasks?pageSize=100")) {
+        return response({ items: [{ ...queuedTask, projectId: "project-2", message: "项目二仍在队列" }], nextCursor: null });
+      }
+      return originalFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const props = { role: "owner" as const, tenantId: "tenant-1", actorId: "owner-1", assetVersions: [] };
+    const mounted = render(<GenerationPanel {...props} project={project} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText("server-generation-1");
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cancel"))).toBe(true));
+    mounted.rerender(<GenerationPanel {...props} project={nextProject} />);
+    await screen.findByText("项目二仍在队列");
+    await act(async () => {
+      resolveCancel?.(response({ ...queuedTask, status: "CANCELED", storedStatus: "CANCELED", message: "旧项目已取消" }));
+    });
+    expect(screen.getByText("项目二仍在队列")).toBeTruthy();
+    expect(screen.queryByText("旧项目已取消")).toBeNull();
+    expect(screen.queryByText(/取消意图已由服务端持久化/)).toBeNull();
+  });
+
   test("G72 rejected preflight releases busy state for a safe retry", async () => {
     const existingFetch = installFetch();
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
