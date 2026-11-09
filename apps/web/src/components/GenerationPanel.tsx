@@ -105,16 +105,19 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     } finally {
       if (!silent && sequence === requestSequence.current && scope === activeScopeRef.current) setBusy(false);
     }
-  }, [api, project?.id, project?.revision, tenantId, actorId, role]);
+  }, [api, project?.id]);
 
   useEffect(() => {
     invalidatePreflight();
+    // Changing actor/tenant/role must not continue showing the old scope's server state.
+    setTasks([]);
+    setCapabilities(null);
     setSelectedAssetIds([]);
     setReferences([]);
     setMessage(project?.id ? "已切换项目，正在从服务端恢复任务状态。" : null);
     void loadServerState();
     return () => { requestSequence.current += 1; };
-  }, [loadServerState, project?.id]);
+  }, [loadServerState, activeScope, project?.id]);
 
   useEffect(() => {
     if (!open || !project?.id || !tasks.some((task) => ACTIVE_STATUSES.has(task.status))) return undefined;
