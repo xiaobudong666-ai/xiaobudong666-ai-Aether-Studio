@@ -188,15 +188,19 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
 
   const mutateTask = async (taskId: string, action: "cancel" | "retry") => {
     if (!project) return;
+    const scope = activeScopeRef.current;
+    const projectId = project.id;
     setBusy(true);
     try {
-      const task = action === "cancel" ? await api.cancel(project.id, taskId) : await api.retry(project.id, taskId);
+      const task = action === "cancel" ? await api.cancel(projectId, taskId) : await api.retry(projectId, taskId);
+      // The server may have completed the old operation; never project its result onto a new actor/project.
+      if (scope !== activeScopeRef.current) return;
       setTasks((previous) => previous.map((candidate) => candidate.taskId === taskId ? task : candidate));
       setMessage(action === "cancel" ? "取消意图已由服务端持久化。" : "已追加新的重试 attempt；历史记录保持不变。");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "任务操作失败。");
+      if (scope === activeScopeRef.current) setMessage(error instanceof Error ? error.message : "任务操作失败。");
     } finally {
-      setBusy(false);
+      if (scope === activeScopeRef.current) setBusy(false);
     }
   };
 
@@ -205,19 +209,23 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
       setMessage(`权利检查阻断：${result.rights.code}。不会写入口播草稿。`);
       return;
     }
+    const scope = activeScopeRef.current;
+    const projectId = project.id;
     setBusy(true);
     try {
-      const updated = await api.applyTalkingHeadDraft(project.id, task.taskId, {
+      const updated = await api.applyTalkingHeadDraft(projectId, task.taskId, {
         expectedRevision: project.revision,
         aspect: task.requestSummary?.videoAspect || aspect,
         subtitles: [],
       });
+      // A late old-project result must never replace the current editor's project.
+      if (scope !== activeScopeRef.current) return;
       onProjectUpdated?.(updated);
       setMessage("口播草稿已显式写入 Canonical Timeline；未自动渲染、未发布。");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "口播草稿应用失败。");
+      if (scope === activeScopeRef.current) setMessage(error instanceof Error ? error.message : "口播草稿应用失败。");
     } finally {
-      setBusy(false);
+      if (scope === activeScopeRef.current) setBusy(false);
     }
   };
 
