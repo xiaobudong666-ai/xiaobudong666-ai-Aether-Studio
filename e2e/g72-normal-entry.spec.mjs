@@ -306,4 +306,47 @@ test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated e
     priorUnsentScriptCleared: true,
     duplicateCreateAvoided: true,
   }));
+  // Live-browser delayed-detail regression: an old project's export
+  // actions must be disabled immediately while the new project's GET is
+  // intentionally held. No real Provider or publishing side effect.
+  await page.getByLabel("选择项目").selectOption(projectId);
+  const openCutExport = page.getByRole("button", { name: "导出 OpenCut 快照" });
+  const openReelExport = page.getByRole("button", { name: "导出 OpenReel 项目" });
+  await expect(openCutExport).toBeEnabled();
+  await expect(openReelExport).toBeEnabled();
+  let releaseSecondProjectDetail;
+  const delayedDetail = new Promise((resolve) => {
+    releaseSecondProjectDetail = resolve;
+  });
+  let interceptedNewProjectDetail = false;
+  const delayedDetailPattern = `**/api/projects/${secondProjectId}`;
+  await page.route(delayedDetailPattern, async (route) => {
+    if (route.request().method() === "GET") {
+      interceptedNewProjectDetail = true;
+      await delayedDetail;
+    }
+    await route.continue();
+  });
+  try {
+    await page.getByLabel("选择项目").selectOption(secondProjectId);
+    await expect.poll(() => interceptedNewProjectDetail, { timeout: 15_000 }).toBe(true);
+    await expect(openCutExport).toBeDisabled();
+    await expect(openReelExport).toBeDisabled();
+    await expect(oralScript).toHaveValue("");
+    await expect(page.getByText(/FAKE-only 测试任务已入队/)).toHaveCount(0);
+    expect(createResponses.filter((response) => response.status() === 202))
+      .toHaveLength(successfulCreatesBeforeSwitch);
+  } finally {
+    releaseSecondProjectDetail();
+  }
+  await expect(openCutExport).toBeEnabled();
+  await expect(openReelExport).toBeEnabled();
+  await page.unroute(delayedDetailPattern);
+  console.log(JSON.stringify({
+    gate: "G72_BROWSER_DELAYED_PROJECT_DETAIL_WORKSPACE_FENCE_FAKE_ONLY",
+    routeIntercepted: interceptedNewProjectDetail,
+    oldProjectExportActionsDisabledDuringPendingDetail: true,
+    newProjectExportActionsRestoredAfterDetail: true,
+    fakeTaskCreateCountUnchanged: true,
+  }));
 });
