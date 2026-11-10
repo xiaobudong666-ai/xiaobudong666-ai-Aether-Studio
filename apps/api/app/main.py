@@ -3075,6 +3075,7 @@ def create_app(
 
         duplicate_storage_release_event_id = str(uuid.uuid4())
         duplicate_storage_release_requested = False
+        storage_release_reason = "DUPLICATE_ARTIFACT_INTAKE"
 
         def release_duplicate_storage_reservation() -> None:
             nonlocal duplicate_storage_release_requested
@@ -3103,7 +3104,7 @@ def create_app(
                 actor_type="SYSTEM",
                 actor_id="api",
                 metadata_json={
-                    "reasonCode": "DUPLICATE_ARTIFACT_INTAKE",
+                    "reasonCode": storage_release_reason,
                     "workerId": x_worker_id,
                     "leaseEpoch": x_worker_lease_epoch,
                     "providerArtifactId": providerArtifactId,
@@ -3159,14 +3160,30 @@ def create_app(
         media_id = None
         metadata = {}
         try:
-            uploaded = created_app.state.video_use.upload_media(
-                task_project_id,
-                f"generation-{task_id}.mp4",
-                "video/mp4",
-                file.file,
-                idempotency_key=artifact_idempotency_key,
-                content_sha256=digest.hexdigest(),
-            )
+            try:
+                uploaded = created_app.state.video_use.upload_media(
+                    task_project_id,
+                    f"generation-{task_id}.mp4",
+                    "video/mp4",
+                    file.file,
+                    idempotency_key=artifact_idempotency_key,
+                    content_sha256=digest.hexdigest(),
+                )
+            except BaseException as abrupt_exit:
+                if isinstance(abrupt_exit, Exception):
+                    # Ordinary transport errors use the established FAILED/HELD
+                    # recovery path; do not change paid-usage semantics.
+                    raise
+                # G70/G71: the reservation was committed before the sidecar
+                # call. An in-process abrupt request exit bypasses the normal
+                # Exception compensation path, so release this request's hold
+                # with an atomic DB receipt before propagating the interruption.
+                # This cannot protect against process kill or host crash.
+                db.rollback()
+                begin_serialized_write(db)
+                storage_release_reason = "UPLOAD_INTERRUPTED"
+                persist_duplicate_storage_reservation_release()
+                raise
             metadata = uploaded.get("metadata") or {}
             media_id = str(uploaded.get("mediaId") or "")
             if media_id != expected_media_id:
