@@ -446,10 +446,10 @@ describe("Aether Studio 中文工作台", () => {
 
     render(<App />);
     expect(await screen.findByRole("option", { name: "发布预告片（版本 1）" })).toBeTruthy();
-    fireEvent.change(screen.getByLabelText("口播文案"), { target: { value: "这是一条合成测试文案" } });
     fireEvent.click(screen.getByRole("button", { name: "从项目素材选择人物照片" }));
     expect(await screen.findByRole("option", { name: /portrait\.png/ })).toBeTruthy();
     fireEvent.change(screen.getByLabelText("选择人物图片素材"), { target: { value: "image-version-1" } });
+    fireEvent.change(screen.getByLabelText("口播文案"), { target: { value: "这是一条合成测试文案" } });
     fireEvent.click(screen.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" }));
     expect(await screen.findByText(/FAKE-only 测试任务已入队/)).toBeTruthy();
 
@@ -545,10 +545,10 @@ describe("Aether Studio 中文工作台", () => {
 
       render(<App />);
       expect(await screen.findByRole("option", { name: "发布预告片（版本 1）" })).toBeTruthy();
-      fireEvent.change(screen.getByLabelText("口播文案"), { target: { value: "旧项目机密文案" } });
       fireEvent.click(screen.getByRole("button", { name: "从项目素材选择人物照片" }));
-      expect(await screen.findByRole("option", { name: /portrait\\.png/ })).toBeTruthy();
+      expect(await screen.findByRole("option", { name: /portrait\.png/ })).toBeTruthy();
       fireEvent.change(screen.getByLabelText("选择人物图片素材"), { target: { value: "image-version-1" } });
+      fireEvent.change(screen.getByLabelText("口播文案"), { target: { value: "旧项目机密文案" } });
       fireEvent.click(screen.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" }));
 
       const awaitedUrl = pauseAt === "capabilities"
@@ -559,6 +559,8 @@ describe("Aether Studio 中文工作台", () => {
       await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(awaitedUrl))).toBe(true));
       fireEvent.change(screen.getByLabelText("选择项目"), { target: { value: "project-2" } });
       await waitFor(() => expect((screen.getByLabelText("选择项目") as HTMLSelectElement).value).toBe("project-2"));
+      expect((screen.getByLabelText("口播文案") as HTMLTextAreaElement).value).toBe("");
+      expect(screen.queryByDisplayValue("旧项目机密文案")).toBeNull();
       await act(async () => {
         releasePending(ok(pauseAt === "capabilities" ? capabilities : pauseAt === "preflight" ? validated : oldTask));
       });
