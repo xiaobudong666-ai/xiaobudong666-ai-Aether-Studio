@@ -1914,6 +1914,17 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
         assert interrupted_tenant.used_storage_bytes == initial_storage_bytes + len(payload)
 
     monkeypatch.setattr(app.state.video_use, "upload_media", original_upload)
+    # A crash-retry must not silently attach different bytes to an existing
+    # reserved Sidecar identity or charge additional storage for that payload.
+    mismatched = _post_g70_g71_duplicate_intake(
+        app, task_id, worker_headers, artifact_id, payload + b"-different"
+    )
+    assert mismatched.status_code == 409, mismatched.text
+    assert mismatched.json()["detail"]["code"] == "STORAGE_RESERVATION_IDENTITY_MISMATCH"
+    with sessions() as db:
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_storage_bytes + len(payload)
+        assert db.get(DBGenerationTask, task_id).asset_version_id is None
+
     retry = _post_g70_g71_duplicate_intake(
         app, task_id, worker_headers, artifact_id, payload
     )
