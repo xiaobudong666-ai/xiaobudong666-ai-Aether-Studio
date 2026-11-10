@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "./App";
 import { AssetLibrary } from "./components/AssetLibrary";
 
@@ -485,6 +485,91 @@ describe("Aether Studio 中文工作台", () => {
       String(input).endsWith("/generation-tasks") && init?.method === "POST"
     )).toBe(false);
   });
+
+  test.each(["capabilities", "preflight", "create"] as const)(
+    "G72 normal FAKE-only entry ignores stale %s after changing projects",
+    async (pauseAt) => {
+      const projectOne = {
+        ...createdProject,
+        materials: [{
+          id: "media-image-1", name: "portrait.png", url: "/api/media/media-image-1",
+          type: "image", contentType: "image/png", sizeBytes: 100,
+        }],
+      };
+      const projectTwo = { ...createdProject, id: "project-2", name: "第二个项目" };
+      const imageVersion = {
+        id: "image-version-1", projectId: "project-1", mediaId: "media-image-1",
+        versionNo: 1, sha256: "c".repeat(64), mediaType: "image",
+        contentType: "image/png", sizeBytes: 100,
+        probe: { image: { width: 48, height: 48 } },
+        createdBy: "owner-1", createdAt: "2026-10-29T00:00:00Z",
+      };
+      const capabilities = { mode: "deterministic-fake", enabled: true, snapshotHash: "a".repeat(64) };
+      const validated = { allowed: true, status: "PREFLIGHT", fakeOnly: true,
+        simulatedOutput: true, publishable: false, capabilitySnapshotHash: "a".repeat(64),
+        projectRevision: 1, quota: {} };
+      const oldTask = { taskId: "old-project-task", projectId: "project-1", status: "QUEUED" };
+      const ok = (payload: unknown) => ({ ok: true, status: 200, json: async () => payload } as Response);
+      let releasePending!: (value: Response) => void;
+      const pending = new Promise<Response>((resolve) => { releasePending = resolve; });
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/auth/me")) {
+          return ok({
+            id: "owner-1", email: "owner@example.com", displayName: "Owner", role: "owner",
+            tenant: { id: "tenant-1", name: "Aether Test", slug: "aether-test" },
+            quotas: {
+              projects: 50, storageBytes: 1000, storageBytesUsed: 0,
+              concurrentRenders: 2, monthlyRenderSeconds: 1000,
+              monthlyRenderSecondsUsed: 0, period: "2026-10",
+            },
+          });
+        }
+        if (url.endsWith("/projects") && (!init?.method || init.method === "GET"))
+          return ok([projectOne, projectTwo]);
+        if (url.endsWith("/projects/project-1")) return ok(projectOne);
+        if (url.endsWith("/projects/project-2")) return ok(projectTwo);
+        if (url.endsWith("/projects/project-1/asset-versions")) return ok([imageVersion]);
+        if (url.endsWith("/projects/project-2/asset-versions")) return ok([]);
+        if (url.endsWith("/generation/providers/moneyprinter/capabilities")
+          || url.endsWith("/generation/providers/moneyprinter/readiness"))
+          return pauseAt === "capabilities" ? pending : ok(capabilities);
+        if (url.endsWith("/talking-head/fake-generation-tasks/validate"))
+          return pauseAt === "preflight" ? pending : ok(validated);
+        if (url.endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST")
+          return pauseAt === "create" ? pending : ok(oldTask);
+        if (url.includes("/generation-tasks?pageSize=100")) return ok({ items: [] });
+        return ok([]);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      render(<App />);
+      expect(await screen.findByRole("option", { name: "发布预告片（版本 1）" })).toBeTruthy();
+      fireEvent.change(screen.getByLabelText("口播文案"), { target: { value: "旧项目机密文案" } });
+      fireEvent.click(screen.getByRole("button", { name: "从项目素材选择人物照片" }));
+      expect(await screen.findByRole("option", { name: /portrait\\.png/ })).toBeTruthy();
+      fireEvent.change(screen.getByLabelText("选择人物图片素材"), { target: { value: "image-version-1" } });
+      fireEvent.click(screen.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" }));
+
+      const awaitedUrl = pauseAt === "capabilities"
+        ? "/generation/providers/moneyprinter/capabilities"
+        : pauseAt === "preflight"
+          ? "/talking-head/fake-generation-tasks/validate"
+          : "/talking-head/fake-generation-tasks";
+      await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(awaitedUrl))).toBe(true));
+      fireEvent.change(screen.getByLabelText("选择项目"), { target: { value: "project-2" } });
+      await waitFor(() => expect((screen.getByLabelText("选择项目") as HTMLSelectElement).value).toBe("project-2"));
+      await act(async () => {
+        releasePending(ok(pauseAt === "capabilities" ? capabilities : pauseAt === "preflight" ? validated : oldTask));
+      });
+      const createCalls = fetchMock.mock.calls.filter(([url, init]) =>
+        String(url).endsWith("/talking-head/fake-generation-tasks") && init?.method === "POST"
+      );
+      expect(createCalls).toHaveLength(pauseAt === "create" ? 1 : 0);
+      expect(screen.queryByText(/FAKE-only 测试任务已入队/)).toBeNull();
+      expect(screen.queryByText(/old-project-task/)).toBeNull();
+    },
+  );
 
   test("keeps governance and timeline writes disabled for viewers", async () => {
     const material = {
