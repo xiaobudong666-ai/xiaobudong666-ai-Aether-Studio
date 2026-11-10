@@ -321,11 +321,26 @@ def generation_request(client, project, idempotency_key="default-generation-key"
 
 def create_task(client, project, key="generation-key-0001", **overrides):
     key_uuid = idempotency_uuid(key)
-    response = client.post(
-        f"/projects/{project['id']}/generation-tasks",
-        headers={"Idempotency-Key": key_uuid},
-        json=generation_request(client, project, idempotency_key=key, **overrides),
-    )
+    for attempt in range(2):
+        response = client.post(
+            f"/projects/{project['id']}/generation-tasks",
+            headers={"Idempotency-Key": key_uuid},
+            json=generation_request(client, project, idempotency_key=key, **overrides),
+        )
+        if response.status_code == 202:
+            return response.json()
+        # Capability snapshots are deliberately minute-bound. A minute rollover
+        # between GET capabilities and POST create is a legitimate fail-closed
+        # 409, not an API regression. Refresh once in this *success* helper only.
+        code = (
+            response.json().get("detail", {}).get("code")
+            if response.status_code == 409 else None
+        )
+        if attempt == 0 and code in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }:
+            continue
+        break
     assert response.status_code == 202, response.text
     return response.json()
 
