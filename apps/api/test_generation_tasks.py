@@ -4099,14 +4099,6 @@ def test_g72_same_tenant_nonproject_editor_requires_project_authorization(genera
     app.state.moneyprinter.assert_not_called()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "G72_OPEN: tenant editor without project membership/delegation can "
-        "read and cancel another owner's queued generation task; "
-        "policy/schema not approved, no production entitlement change"
-    ),
-)
 def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(generation_context):
     """Native negative: denial must cover existing task details and mutations, not just create.
 
@@ -4184,9 +4176,21 @@ def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(gen
         "audit_before": before,
         "audit_after": after,
     }
-    assert all(response.status_code in {403, 404} for response in (
+    assert all(response.status_code in {200, 202, 403, 404} for response in (
         listed, detailed, canceled
     )), observed
-    assert new_status == original_status and after == before, observed
+    # Keep setup/transport errors as hard FAIL, not XFAIL. Only a measured
+    # authorization disclosure or unauthorized state mutation is XFAIL.
+    denied = all(response.status_code in {403, 404} for response in (
+        listed, detailed, canceled
+    ))
+    unchanged = new_status == original_status and after == before
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+    if not denied or not unchanged:
+        pytest.xfail(
+            "G72_OPEN_NATIVE_AUTHZ: same-tenant non-project Editor still reaches "
+            "another owner's task; read/cancel and DB side effects observed: "
+            f"{observed}"
+        )
+    assert denied and unchanged, observed
