@@ -111,6 +111,30 @@ export default function App() {
   const savingProjectRef = useRef(false);
   const selectedProjectIdRef = useRef<string | null>(null);
   const projectDetailRequestIdRef = useRef(0);
+  // Never render an old tenant/actor/project's unsent oral-broadcast prompt.
+  const fakeEntryIdentityKey = JSON.stringify([
+    authUser?.tenant.id, authUser?.id, authUser?.role, currentProject?.id,
+  ]);
+  const [visibleFakeEntryIdentity, setVisibleFakeEntryIdentity] = useState(fakeEntryIdentityKey);
+  useEffect(() => {
+    setScriptText("");
+    setVisibleFakeEntryIdentity(fakeEntryIdentityKey);
+  }, [fakeEntryIdentityKey]);
+
+  // Fence the normal oral-broadcast entry by actor, project and revision.
+  const fakeEntryScopeKey = JSON.stringify([
+    authUser?.tenant.id, authUser?.id, authUser?.role, currentProject?.id, currentProject?.revision,
+  ]);
+  const fakeEntryScopeRef = useRef(fakeEntryScopeKey);
+  fakeEntryScopeRef.current = fakeEntryScopeKey;
+  const fakeEntrySequenceRef = useRef(0);
+
+  useEffect(() => {
+    // Invalidate old async callbacks and release the new scope's busy flag.
+    fakeEntrySequenceRef.current += 1;
+    setIsCreatingFakeTalkingHead(false);
+    setFakeTalkingHeadTaskId(null);
+  }, [fakeEntryScopeKey]);
 
   // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
@@ -235,6 +259,14 @@ export default function App() {
       projectDetailRequestIdRef.current === requestId
       && selectedProjectIdRef.current === id
     );
+    // During a cross-project detail GET, remove the old timeline/asset
+    // workspace and disable old-project exports/actions. Same-project conflict
+    // refreshes keep their draft/workspace instead.
+    if (currentProject?.id !== id) {
+      setCurrentProject(null);
+      setScriptText("");
+      setActionMessage(null);
+    }
     setAssetVersions([]);
     setSelectedAvatarAssetId("");
     setFakeTalkingHeadTaskId(null);
@@ -413,6 +445,7 @@ export default function App() {
   };
 
   const handleCreateFakeTalkingHead = async () => {
+    if (visibleFakeEntryIdentity !== fakeEntryIdentityKey) return;
     if (!canEdit) {
       setActionMessage("当前账号为只读权限，不能创建口播任务。");
       return;
@@ -439,6 +472,16 @@ export default function App() {
       return;
     }
 
+    const requestScope = fakeEntryScopeRef.current;
+    const requestSequence = ++fakeEntrySequenceRef.current;
+    const requestProjectId = currentProject.id;
+    const requestProjectLoadSequence = projectDetailRequestIdRef.current;
+    const isActiveSubmission = () => (
+      fakeEntrySequenceRef.current === requestSequence
+      && fakeEntryScopeRef.current === requestScope
+      && selectedProjectIdRef.current === requestProjectId
+      && projectDetailRequestIdRef.current === requestProjectLoadSequence
+    );
     setIsCreatingFakeTalkingHead(true);
     setFakeTalkingHeadTaskId(null);
     try {
@@ -454,6 +497,7 @@ export default function App() {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           const capabilities = await api.talkingHeadCapabilities();
+          if (!isActiveSubmission()) return;
           if (capabilities.mode !== "deterministic-fake" || !capabilities.enabled) {
             throw new Error("TALKING_HEAD_FAKE_DISABLED: 当前环境未显式启用隔离 FAKE-only 模式，未创建任务。");
           }
@@ -469,26 +513,36 @@ export default function App() {
             capabilitySnapshotHash: capabilities.snapshotHash,
             confirmSyntheticTestOnly: true,
           };
-          const preflight = await api.validateFakeTalkingHead(currentProject.id, body);
+          const preflight = await api.validateFakeTalkingHead(requestProjectId, body);
+          if (!isActiveSubmission()) return; // Do not enqueue for an abandoned project/actor.
           body.capabilitySnapshotHash = preflight.capabilitySnapshotHash;
-          task = await api.createFakeTalkingHead(currentProject.id, body);
+          task = await api.createFakeTalkingHead(requestProjectId, body);
+          if (!isActiveSubmission()) return; // Do not expose the old task in the new scope.
           break;
         } catch (error) {
+          if (!isActiveSubmission()) return;
           const staleSnapshot = error instanceof Error
             && /^(CAPABILITY_SNAPSHOT_UNKNOWN|CAPABILITY_SNAPSHOT_EXPIRED):/.test(error.message);
           if (attempt === 0 && staleSnapshot) continue;
           throw error;
         }
       }
+      if (!isActiveSubmission()) return;
       if (!task) throw new Error("口播 FAKE-only 任务未能完成预检并入队。");
       setFakeTalkingHeadTaskId(task.taskId);
       setActionMessage(
         `FAKE-only 测试任务已入队：${task.taskId}。当前只生成合成模拟样片，不是真实数字人口播，不可发布；可在“高级编辑”中的生成任务查看服务端状态。`,
       );
     } catch (error) {
-      setActionMessage(safeErrorMessage(error, "口播 FAKE-only 任务提交失败。"));
+      if (isActiveSubmission()) {
+        setActionMessage(safeErrorMessage(error, "口播 FAKE-only 任务提交失败。"));
+      }
     } finally {
-      setIsCreatingFakeTalkingHead(false);
+      // If project selection failed to load, there may be no scope rerender.
+      // Release this request's busy state, but never clear a newer request.
+      if (fakeEntrySequenceRef.current === requestSequence) {
+        setIsCreatingFakeTalkingHead(false);
+      }
     }
   };
 
@@ -855,7 +909,7 @@ export default function App() {
           </form>
           <select
             aria-label="选择项目"
-            value={currentProject?.id || ""}
+            value={selectedProjectIdRef.current || currentProject?.id || ""}
             onChange={(e) => fetchProjectDetail(e.target.value)}
             disabled={projects.length === 0}
           >
@@ -902,7 +956,8 @@ export default function App() {
               className="script-input"
               aria-label="口播文案"
               placeholder="输入你想让人物说的内容……"
-              value={scriptText}
+              value={visibleFakeEntryIdentity === fakeEntryIdentityKey ? scriptText : ""}
+              disabled={visibleFakeEntryIdentity !== fakeEntryIdentityKey}
               onChange={(event) => setScriptText(event.target.value)}
             />
             <div className="flow-extract">
@@ -998,6 +1053,7 @@ export default function App() {
               onClick={handleCreateFakeTalkingHead}
               disabled={
                 !canEdit || !currentProject || !scriptText.trim()
+                || visibleFakeEntryIdentity !== fakeEntryIdentityKey
                 || selectedAvatar !== "upload" || !selectedAvatarAssetId
                 || isCreatingFakeTalkingHead
               }
@@ -1008,7 +1064,7 @@ export default function App() {
               仅 1 秒、9:16、720p 合成测试样片；服务端重新核验图片 REMIX 授权。
               输出标记为模拟素材，不可发布，不会自动采纳或写入时间线。
             </p>
-            {fakeTalkingHeadTaskId && (
+            {fakeTalkingHeadTaskId && visibleFakeEntryIdentity === fakeEntryIdentityKey && (
               <p className="fake-only-task-id">
                 最近提交的任务：<code>{fakeTalkingHeadTaskId}</code>
               </p>
