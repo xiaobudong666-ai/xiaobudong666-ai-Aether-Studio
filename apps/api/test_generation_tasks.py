@@ -4099,28 +4099,28 @@ def test_g72_same_tenant_nonproject_editor_requires_project_authorization(genera
     app.state.moneyprinter.assert_not_called()
 
 
-def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(generation_context):
-    """Native negative: denial must cover existing task details and mutations, not just create.
+@pytest.mark.parametrize("operation", ["list", "detail", "cancel"])
+def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(
+    generation_context, operation
+):
+    """Independent native negatives for read and destructive task operations.
 
-    This intentionally remains XFAIL until an authoritative membership/delegation
-    contract is approved and implemented. A green job containing this XFAIL is
-    not authorization acceptance. No Provider or protected tenant is used.
+    A project-less tenant Editor is authenticated but is not authorized by any
+    project membership or delegated-admin contract. Only measured authorization
+    failure becomes XFAIL; setup, auth and unexpected errors are hard FAIL.
     """
     client, sessions, app, media = generation_context
-    project = create_project(client, "G72 private owner task cancel boundary")
-    task = create_task(client, project, key="g72-same-tenant-unauthorized-cancel")
+    project = create_project(client, f"G72 owner task boundary / {operation}")
+    task = create_task(client, project, key=f"g72-untrusted-project-{operation}")
     task_id = task["taskId"]
     password = secrets.token_urlsafe(24)
     now = datetime.datetime.now(datetime.timezone.utc)
 
     with sessions() as db:
         owned_project = db.get(DBProject, project["id"])
-        assert owned_project is not None
-        assert owned_project.owner_id is not None
+        assert owned_project is not None and owned_project.owner_id is not None
         original = db.get(DBGenerationTask, task_id)
-        assert original is not None
-        original_status = original.status
-        assert original_status == "QUEUED"
+        assert original is not None and original.status == "QUEUED"
         before = {
             "task_events": db.execute(select(func.count(DBGenerationEvent.id)).where(
                 DBGenerationEvent.generation_task_id == task_id
@@ -4132,8 +4132,8 @@ def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(gen
         db.add(DBUser(
             id=str(uuid.uuid4()),
             tenant_id=owned_project.tenant_id,
-            email="g72-foreign-project-editor@example.com",
-            display_name="G72 Foreign Project Editor",
+            email=f"g72-nonproject-{operation}@example.com",
+            display_name=f"G72 Nonproject Editor {operation}",
             password_hash=hash_password(password),
             role="editor",
             is_active=True,
@@ -4144,13 +4144,17 @@ def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(gen
 
     assert client.post("/auth/logout").status_code == 204
     login = client.post("/auth/login", json={
-        "email": "g72-foreign-project-editor@example.com", "password": password
+        "email": f"g72-nonproject-{operation}@example.com",
+        "password": password,
     })
     assert login.status_code == 200, login.text
     path = f"/projects/{project['id']}/generation-tasks"
-    listed = client.get(path, params={"pagination": "keyset"})
-    detailed = client.get(f"{path}/{task_id}")
-    canceled = client.post(f"{path}/{task_id}/cancel")
+    if operation == "list":
+        response = client.get(path, params={"pagination": "keyset"})
+    elif operation == "detail":
+        response = client.get(f"{path}/{task_id}")
+    else:
+        response = client.post(f"{path}/{task_id}/cancel")
 
     with sessions() as db:
         current = db.get(DBGenerationTask, task_id)
@@ -4163,34 +4167,22 @@ def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(gen
                 DBGenerationUsageEntry.task_id == task_id
             )).scalar_one(),
         }
-        new_status = current.status
+        observed = {
+            "operation": operation,
+            "http": response.status_code,
+            "task_status": current.status,
+            "before": before,
+            "after": after,
+        }
 
-    # The preceding responses are all collected before assertions, so the
-    # negative covers information exposure AND a potentially destructive write.
-    observed = {
-        "list": listed.status_code,
-        "detail": detailed.status_code,
-        "cancel": canceled.status_code,
-        "task_before": original_status,
-        "task_after": new_status,
-        "audit_before": before,
-        "audit_after": after,
-    }
-    assert all(response.status_code in {200, 202, 403, 404} for response in (
-        listed, detailed, canceled
-    )), observed
-    # Keep setup/transport errors as hard FAIL, not XFAIL. Only a measured
-    # authorization disclosure or unauthorized state mutation is XFAIL.
-    denied = all(response.status_code in {403, 404} for response in (
-        listed, detailed, canceled
-    ))
-    unchanged = new_status == original_status and after == before
+    assert response.status_code in {200, 202, 403, 404}, observed
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
-    if not denied or not unchanged:
+    denied = response.status_code in {403, 404}
+    no_write = current.status == "QUEUED" and after == before
+    if not denied or not no_write:
         pytest.xfail(
-            "G72_OPEN_NATIVE_AUTHZ: same-tenant non-project Editor still reaches "
-            "another owner's task; read/cancel and DB side effects observed: "
-            f"{observed}"
+            "G72_OPEN_NATIVE_SCOPE: ungranted project action not denied "
+            "and/or altered durable task state: " + repr(observed)
         )
-    assert denied and unchanged, observed
+    assert denied and no_write, observed
