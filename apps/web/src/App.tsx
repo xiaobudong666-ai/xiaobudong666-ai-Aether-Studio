@@ -259,11 +259,14 @@ export default function App() {
       projectDetailRequestIdRef.current === requestId
       && selectedProjectIdRef.current === id
     );
-    // Project selection begins before its detail request resolves. Clear
-    // previous-project unsent text and task status synchronously so neither
-    // can remain visible while the new project's response is pending.
-    setScriptText("");
-    setActionMessage(null);
+    // A different project must not show the prior project's unsent script or
+    // task-id notice while its detail GET is pending. Do not clear this state
+    // for a same-project revision-conflict refresh (saveProjectState reuses
+    // fetchProjectDetail), which is not an identity change.
+    if (currentProject?.id !== id) {
+      setScriptText("");
+      setActionMessage(null);
+    }
     setAssetVersions([]);
     setSelectedAvatarAssetId("");
     setFakeTalkingHeadTaskId(null);
