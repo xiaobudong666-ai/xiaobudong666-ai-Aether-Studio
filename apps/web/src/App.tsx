@@ -519,7 +519,11 @@ export default function App() {
         setActionMessage(safeErrorMessage(error, "口播 FAKE-only 任务提交失败。"));
       }
     } finally {
-      if (isActiveSubmission()) setIsCreatingFakeTalkingHead(false);
+      // If project selection failed to load, there may be no scope rerender.
+      // Release this request's busy state, but never clear a newer request.
+      if (fakeEntrySequenceRef.current === requestSequence) {
+        setIsCreatingFakeTalkingHead(false);
+      }
     }
   };
 
