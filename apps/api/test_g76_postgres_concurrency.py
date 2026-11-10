@@ -1992,3 +1992,160 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
         )
 
     app.state.moneyprinter.assert_not_called()
+
+def test_g70_g71_postgres_sigkill_after_sidecar_write_replay_storage_accounting(postgres_context):
+    """Expose durable duplicate quota after real SIGKILL (FAKE sidecar, isolated PostgreSQL).
+
+    This is NOT a native video-use Sidecar or host-crash proof. A separate API
+    interpreter writes the simulated Sidecar object, is killed before ACK, and
+    the same idempotent artifact is replayed. Known defect is XFAIL, not PASS.
+    """
+    import signal
+    import subprocess
+    import sys
+    import tempfile
+
+    if sys.platform != "linux":
+        pytest.skip("real SIGKILL requires Linux disposable runner")
+
+    owner_client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"g70-g71-real-os-process-kill-after-fake-sidecar-write"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id = task.tenant_id
+        before_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+
+    child_script = r'''
+import hashlib
+import os
+import time
+from io import BytesIO
+from pathlib import Path
+from fastapi import UploadFile
+from starlette.datastructures import Headers
+from sqlalchemy.orm import sessionmaker
+from app.database import build_engine
+from app.main import create_app
+from test_g76_postgres_concurrency import FakeMediaStore
+
+class PersistThenBlockFakeSidecar(FakeMediaStore):
+    def upload_media(self, project_id, filename, content_type, stream, *, idempotency_key=None, content_sha256=None):
+        payload = stream.read()
+        assert hashlib.sha256(payload).hexdigest() == content_sha256
+        Path(os.environ["AETHER_TEST_CRASH_MEDIA"]).write_bytes(payload)
+        Path(os.environ["AETHER_TEST_CRASH_READY"]).write_text("persisted-after-hold-commit")
+        while True:
+            time.sleep(0.2)
+
+engine = build_engine(os.environ["AETHER_TEST_POSTGRES_URL"])
+sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+def get_db():
+    db = sessions()
+    try:
+        yield db
+    finally:
+        db.close()
+app = create_app(
+    app_engine=engine,
+    db_dependency=get_db,
+    video_use_adapter=PersistThenBlockFakeSidecar(),
+    bootstrap_admin_password=os.environ["AETHER_TEST_CHILD_OWNER_PASSWORD"],
+    bootstrap_admin_email="g76-postgres-owner@example.com",
+    worker_token=os.environ["AETHER_TEST_CHILD_WORKER_TOKEN"],
+    cookie_secure=False,
+    enforce_csrf=True,
+    generation_provider_mode="deterministic-fake",
+)
+route = next(
+    x for x in app.routes
+    if getattr(x, "path", None) == "/internal/generation-tasks/{task_id}/artifact-intake"
+)
+with sessions() as db:
+    route.endpoint(
+        os.environ["AETHER_TEST_CRASH_TASK"],
+        providerArtifactId=os.environ["AETHER_TEST_CRASH_ARTIFACT"],
+        file=UploadFile(
+            file=BytesIO(b"g70-g71-real-os-process-kill-after-fake-sidecar-write"),
+            filename="synthetic-g70-g71.mp4",
+            headers=Headers({"content-type": "video/mp4"}),
+        ),
+        x_worker_token=os.environ["AETHER_TEST_CHILD_WORKER_TOKEN"],
+        x_worker_id=os.environ["AETHER_TEST_CRASH_WORKER"],
+        x_worker_lease_epoch=int(os.environ["AETHER_TEST_CRASH_EPOCH"]),
+        db=db,
+    )
+'''
+    with tempfile.TemporaryDirectory(prefix="aether-g70-oskill-fake-") as tempdir:
+        ready_file = Path(tempdir, "after-sidecar.ready")
+        media_file = Path(tempdir, "fake-sidecar.media")
+        child_env = os.environ.copy()
+        child_env.update({
+            "AETHER_TEST_CRASH_READY": str(ready_file),
+            "AETHER_TEST_CRASH_MEDIA": str(media_file),
+            "AETHER_TEST_CRASH_TASK": task_id,
+            "AETHER_TEST_CRASH_ARTIFACT": artifact_id,
+            "AETHER_TEST_CRASH_WORKER": headers["X-Worker-Id"],
+            "AETHER_TEST_CRASH_EPOCH": headers["X-Worker-Lease-Epoch"],
+            "AETHER_TEST_CHILD_WORKER_TOKEN": WORKER_TOKEN,
+            "AETHER_TEST_CHILD_OWNER_PASSWORD": OWNER_PASSWORD,
+        })
+        child = subprocess.Popen(
+            [sys.executable, "-u", "-c", child_script],
+            env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not ready_file.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not ready_file.exists():
+                if child.poll() is None:
+                    pytest.fail("child did not reach fake sidecar before timeout")
+                _, err = child.communicate(timeout=5)
+                pytest.fail(f"OS-kill setup failed before Sidecar: {err[-1200:]}")
+            assert child.poll() is None, "API child exited before SIGKILL"
+            assert media_file.read_bytes() == payload
+            os.kill(child.pid, signal.SIGKILL)
+            assert child.wait(timeout=10) == -signal.SIGKILL
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+            child.communicate(timeout=5)
+
+        # Verify committed reservation with a fresh independent PostgreSQL engine.
+        independent_engine = build_engine(os.environ["AETHER_TEST_POSTGRES_URL"])
+        try:
+            with Session(independent_engine) as db:
+                tenant = db.get(DBTenant, tenant_id)
+                assert tenant is not None
+                assert tenant.used_storage_bytes == before_bytes + len(payload)
+                assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                    DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+                )).scalar_one() == 0
+        finally:
+            independent_engine.dispose()
+
+        replay = _post_g70_g71_duplicate_intake(app, task_id, headers, artifact_id, payload)
+        assert replay.status_code == 201, replay.text
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, tenant_id)
+            assert task is not None and tenant is not None
+            assert task.status == "RIGHTS_BLOCKED"
+            assert task.asset_version_id is not None
+            assert db.execute(select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.id == task.asset_version_id,
+            )).scalar_one() == 1
+            actual_bytes = tenant.used_storage_bytes
+
+        if actual_bytes == before_bytes + 2 * len(payload):
+            pytest.xfail(
+                "CONFIRMED OPEN: API SIGKILL after FAKE Sidecar persisted left "
+                "unreceipted hold; retry double-counted one durable artifact"
+            )
+        assert actual_bytes == before_bytes + len(payload), (
+            "Crash and idempotent replay must account for one durable artifact"
+        )
