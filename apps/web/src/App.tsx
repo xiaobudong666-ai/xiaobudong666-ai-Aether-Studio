@@ -111,6 +111,20 @@ export default function App() {
   const savingProjectRef = useRef(false);
   const selectedProjectIdRef = useRef<string | null>(null);
   const projectDetailRequestIdRef = useRef(0);
+  // Fence the normal oral-broadcast entry by actor, project and revision.
+  const fakeEntryScopeKey = JSON.stringify([
+    authUser?.tenant.id, authUser?.id, authUser?.role, currentProject?.id, currentProject?.revision,
+  ]);
+  const fakeEntryScopeRef = useRef(fakeEntryScopeKey);
+  fakeEntryScopeRef.current = fakeEntryScopeKey;
+  const fakeEntrySequenceRef = useRef(0);
+
+  useEffect(() => {
+    // Invalidate old async callbacks and release the new scope's busy flag.
+    fakeEntrySequenceRef.current += 1;
+    setIsCreatingFakeTalkingHead(false);
+    setFakeTalkingHeadTaskId(null);
+  }, [fakeEntryScopeKey]);
 
   // Production uses the same-origin Nginx /api proxy. Local Vite mirrors it.
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
@@ -439,6 +453,16 @@ export default function App() {
       return;
     }
 
+    const requestScope = fakeEntryScopeRef.current;
+    const requestSequence = ++fakeEntrySequenceRef.current;
+    const requestProjectId = currentProject.id;
+    const requestProjectLoadSequence = projectDetailRequestIdRef.current;
+    const isActiveSubmission = () => (
+      fakeEntrySequenceRef.current === requestSequence
+      && fakeEntryScopeRef.current === requestScope
+      && selectedProjectIdRef.current === requestProjectId
+      && projectDetailRequestIdRef.current === requestProjectLoadSequence
+    );
     setIsCreatingFakeTalkingHead(true);
     setFakeTalkingHeadTaskId(null);
     try {
@@ -454,6 +478,7 @@ export default function App() {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           const capabilities = await api.talkingHeadCapabilities();
+          if (!isActiveSubmission()) return;
           if (capabilities.mode !== "deterministic-fake" || !capabilities.enabled) {
             throw new Error("TALKING_HEAD_FAKE_DISABLED: 当前环境未显式启用隔离 FAKE-only 模式，未创建任务。");
           }
@@ -469,26 +494,32 @@ export default function App() {
             capabilitySnapshotHash: capabilities.snapshotHash,
             confirmSyntheticTestOnly: true,
           };
-          const preflight = await api.validateFakeTalkingHead(currentProject.id, body);
+          const preflight = await api.validateFakeTalkingHead(requestProjectId, body);
+          if (!isActiveSubmission()) return; // Do not enqueue for an abandoned project/actor.
           body.capabilitySnapshotHash = preflight.capabilitySnapshotHash;
-          task = await api.createFakeTalkingHead(currentProject.id, body);
+          task = await api.createFakeTalkingHead(requestProjectId, body);
+          if (!isActiveSubmission()) return; // Do not expose the old task in the new scope.
           break;
         } catch (error) {
+          if (!isActiveSubmission()) return;
           const staleSnapshot = error instanceof Error
             && /^(CAPABILITY_SNAPSHOT_UNKNOWN|CAPABILITY_SNAPSHOT_EXPIRED):/.test(error.message);
           if (attempt === 0 && staleSnapshot) continue;
           throw error;
         }
       }
+      if (!isActiveSubmission()) return;
       if (!task) throw new Error("口播 FAKE-only 任务未能完成预检并入队。");
       setFakeTalkingHeadTaskId(task.taskId);
       setActionMessage(
         `FAKE-only 测试任务已入队：${task.taskId}。当前只生成合成模拟样片，不是真实数字人口播，不可发布；可在“高级编辑”中的生成任务查看服务端状态。`,
       );
     } catch (error) {
-      setActionMessage(safeErrorMessage(error, "口播 FAKE-only 任务提交失败。"));
+      if (isActiveSubmission()) {
+        setActionMessage(safeErrorMessage(error, "口播 FAKE-only 任务提交失败。"));
+      }
     } finally {
-      setIsCreatingFakeTalkingHead(false);
+      if (isActiveSubmission()) setIsCreatingFakeTalkingHead(false);
     }
   };
 
