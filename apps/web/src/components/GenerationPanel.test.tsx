@@ -235,4 +235,29 @@ describe("GenerationPanel server authority", () => {
     await waitFor(() => expect((screen.getByRole("button", { name: "执行服务端预检" }) as HTMLButtonElement).disabled).toBe(false));
     expect((screen.getByRole("button", { name: "提交生成" }) as HTMLButtonElement).disabled).toBe(true);
   });
+
+  test("G72 owner identity and project switch clears private unsent prompt and consent", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const props = { role: "owner" as const, tenantId: "tenant-1", assetVersions: [] };
+    const mounted = render(<GenerationPanel {...props} actorId="owner-1" project={project} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "SECRET_OWNER_ONE_PROMPT" } });
+    fireEvent.click(screen.getByLabelText("确认外部生成边界"));
+    mounted.rerender(<GenerationPanel {...props} actorId="owner-2" project={project} />);
+    expect(screen.queryByDisplayValue("SECRET_OWNER_ONE_PROMPT")).toBeNull();
+    expect((screen.getByLabelText("生成主题") as HTMLTextAreaElement).value).toBe("");
+    expect((screen.getByLabelText("确认外部生成边界") as HTMLInputElement).checked).toBe(false);
+    await screen.findByText(/服务端权威状态：可创建/);
+    fireEvent.change(screen.getByLabelText("生成主题"), { target: { value: "SECRET_OWNER_TWO_PROMPT" } });
+    fireEvent.click(screen.getByLabelText("确认外部生成边界"));
+    const nextProject: ProjectDTO = { ...project, id: "project-2", revision: 2 };
+    mounted.rerender(<GenerationPanel {...props} actorId="owner-2" project={nextProject} />);
+    expect(screen.queryByDisplayValue("SECRET_OWNER_TWO_PROMPT")).toBeNull();
+    expect((screen.getByLabelText("生成主题") as HTMLTextAreaElement).value).toBe("");
+    expect((screen.getByLabelText("确认外部生成边界") as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole("button", { name: "提交生成" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/generation-tasks") && init?.method === "POST")).toHaveLength(0);
+  });
+
 });
