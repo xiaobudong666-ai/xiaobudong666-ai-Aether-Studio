@@ -259,6 +259,14 @@ export default function App() {
       projectDetailRequestIdRef.current === requestId
       && selectedProjectIdRef.current === id
     );
+    // During a cross-project detail GET, remove the old timeline/asset
+    // workspace and disable old-project exports/actions. Same-project conflict
+    // refreshes keep their draft/workspace instead.
+    if (currentProject?.id !== id) {
+      setCurrentProject(null);
+      setScriptText("");
+      setActionMessage(null);
+    }
     setAssetVersions([]);
     setSelectedAvatarAssetId("");
     setFakeTalkingHeadTaskId(null);
@@ -901,7 +909,7 @@ export default function App() {
           </form>
           <select
             aria-label="选择项目"
-            value={currentProject?.id || ""}
+            value={selectedProjectIdRef.current || currentProject?.id || ""}
             onChange={(e) => fetchProjectDetail(e.target.value)}
             disabled={projects.length === 0}
           >

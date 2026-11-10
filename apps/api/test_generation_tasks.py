@@ -3666,6 +3666,100 @@ def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_con
 
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "G72 project-grant/Owner delegation contract is not approved or implemented: "
+        "tenant-wide editor access is currently accepted without an explicit project grant"
+    ),
+)
+@pytest.mark.parametrize("action", ["read", "preflight", "create"])
+def test_g72_unassigned_same_tenant_editor_is_denied_by_project_grant(
+    generation_context, action,
+):
+    """Approval-gated diagnostic only: prove the G72 per-project actor-scope gap.
+
+    A same-tenant editor, not the project's owner and without a recorded
+    project grant, must not infer access from the tenant-wide editor role.
+    This XFAIL does NOT implement a membership model or pick an Owner policy.
+    Once an authoritative issuer/delegation contract exists, replace the
+    XFAIL with a normal native denial/positive-grant/revocation regression.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 unassigned actor scope")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key=f"g72-unassigned-editor-{action}"
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    password = secrets.token_urlsafe(24)
+    editor_id = f"g72-unassigned-editor-{action}"
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        owner = db.get(DBProject, project["id"])
+        assert owner is not None and owner.owner_id != editor_id
+        db.add(DBUser(
+            id=editor_id,
+            tenant_id=tenant_id,
+            email=f"{editor_id}@example.com",
+            display_name="Unassigned Same-Tenant Editor",
+            password_hash=hash_password(password),
+            role="editor",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        ))
+        db.commit()
+
+    assert client.post("/auth/logout").status_code == 204
+    login = client.post(
+        "/auth/login",
+        json={"email": f"{editor_id}@example.com", "password": password},
+    )
+    assert login.status_code == 200, login.text
+    assert app.state.generation_provider_mode == "deterministic-fake"
+
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    if action == "read":
+        response = client.get(f"/projects/{project['id']}")
+        accepted_status = 200
+        expected_status = 404  # hide project identity from unassigned actors
+    else:
+        for attempt in range(2):
+            capabilities = client.get(
+                "/generation/providers/moneyprinter/capabilities"
+            )
+            assert capabilities.status_code == 200, capabilities.text
+            payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+            response = client.post(
+                base + ("/validate" if action == "preflight" else ""),
+                json=payload,
+            )
+            detail = response.json().get("detail", {}) if response.status_code == 409 else {}
+            if (
+                attempt == 0
+                and detail.get("code") in {
+                    "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+                }
+            ):
+                continue
+            break
+        accepted_status = 200 if action == "preflight" else 202
+        expected_status = 403
+
+    # The current implementation answers 200/202 because role + tenant
+    # matches; project.owner_id is not part of project_for_tenant().
+    # The strict XFAIL keeps this explicit, unclosed, and CI-visible.
+    assert response.status_code == expected_status, (
+        f"G72 unassigned same-tenant editor {action}: "
+        f"observed={response.status_code}, tenant-wide accepted={accepted_status}, "
+        f"expected fail-closed={expected_status}; "
+        "NO owner-approved project membership/delegation proof"
+    )
+    assert media.uploads == 0
+
+
+
 @pytest.fixture()
 def postgres_generation_context():
     database_url = (
