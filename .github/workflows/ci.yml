@@ -619,6 +619,50 @@ jobs:
           test "$media_count_after" = "$G70_MEDIA_COUNT_BEFORE"
           echo "Sidecar media object count unchanged by recovery: $media_count_after"
 
+      - name: SIGKILL disposable Sidecar and verify original FAKE media survives restart
+        # Diagnostic only: actual container SIGKILL + persistent bytes/hash, NOT
+        # API crash-after-upload quota reconciliation or protected-storage signoff.
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${COMPOSE_PROJECT_NAME:-}" == aether-g72-* ]] || { echo "Non-disposable Compose project"; exit 1; }
+          compose=(docker compose -f infra/docker/docker-compose.yml -f infra/docker/docker-compose.g72-fake-only.override.yml)
+          verify_media() {
+            "${compose[@]}" exec -T api python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          import httpx
+          assert os.environ.get("AETHER_FAKE_ONLY_NONPROD") == "true"
+          assert os.environ.get("AETHER_RUNTIME_STAGE") == "nonproduction"
+          assert os.environ.get("AETHER_GENERATION_PROVIDER_MODE") == "deterministic-fake"
+          state = json.loads(Path("/tmp/g70-g71-ci-fake-only-recovery-state.json").read_text(encoding="utf-8"))
+          assert state["fixtureKind"] == "SYNTHETIC_FAKE_ONLY" and state["providerCalls"] == 0
+          base = "http://video-use:8002"
+          path = f"/media/{state['projectId']}/{state['mediaId']}"
+          with httpx.Client(base_url=base, timeout=60, trust_env=False) as client:
+              inspection = client.get(path + "/inspect")
+              assert inspection.status_code == 200, inspection.text[:200]
+              actual = inspection.json()
+              assert actual["sha256"] == state["sha256"]
+              assert actual["sizeBytes"] == state["bytes"]
+              media = client.get(path)
+              assert media.status_code == 200, media.text[:200]
+              assert len(media.content) == state["bytes"]
+              assert hashlib.sha256(media.content).hexdigest() == state["sha256"]
+          print(json.dumps({"scope": "FAKE_ONLY_REAL_SIDECAR", "sha256": state["sha256"], "bytes": state["bytes"], "verified": True}), flush=True)
+          PY
+          }
+          verify_media
+          cid=$("${compose[@]}" ps -q video-use)
+          test -n "$cid"
+          before_started=$(docker inspect -f '{{.State.StartedAt}}' "$cid")
+          "${compose[@]}" kill -s SIGKILL video-use
+          "${compose[@]}" up -d --no-deps --wait --wait-timeout 180 video-use
+          after_started=$(docker inspect -f '{{.State.StartedAt}}' "$cid")
+          test "$before_started" != "$after_started" || { echo "Sidecar process did not restart"; exit 1; }
+          verify_media
+          echo "Real disposable Sidecar process SIGKILL and media readback verified; quota-on-API-SIGKILL remains OPEN."
+
       - name: Prove real Worker transfer failure, lost-ACK idempotency and Owner recovery (FAKE-only)
         shell: bash
         run: |
