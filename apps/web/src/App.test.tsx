@@ -381,6 +381,8 @@ describe("Aether Studio 中文工作台", () => {
     };
     let activeCapabilities = capabilities;
     let createAttempts = 0;
+    let releaseProjectTwo!: (response: Response) => void;
+    const pendingProjectTwo = new Promise<Response>((resolve) => { releaseProjectTwo = resolve; });
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
@@ -403,9 +405,7 @@ describe("Aether Studio 中文工作台", () => {
       if (url.endsWith("/projects/project-1/asset-versions")) {
         return { ok: true, status: 200, json: async () => [imageVersion] } as Response;
       }
-      if (url.endsWith("/projects/project-2")) {
-        return { ok: true, status: 200, json: async () => projectTwo } as Response;
-      }
+      if (url.endsWith("/projects/project-2")) return pendingProjectTwo;
       if (url.endsWith("/projects/project-1")) {
         return { ok: true, status: 200, json: async () => projectWithImage } as Response;
       }
@@ -495,7 +495,15 @@ describe("Aether Studio 中文工作台", () => {
     expect((screen.getByLabelText("口播文案") as HTMLTextAreaElement).value).toBe("");
     expect(screen.queryAllByText(/g72-fake-task-1/)).toHaveLength(0);
     expect(screen.queryByText(/FAKE-only 测试任务已入队/)).toBeNull();
-    await waitFor(() => expect((screen.getByLabelText("选择项目") as HTMLSelectElement).value).toBe("project-2"));
+    // Project 2's GET is still pending: do not leave project 1's export
+    // actions enabled or allow its workspace to be mistaken for project 2.
+    expect((screen.getByLabelText("选择项目") as HTMLSelectElement).value).toBe("project-2");
+    expect((screen.getByRole("button", { name: "导出 OpenCut 快照" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "导出 OpenReel 项目" }) as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => {
+      releaseProjectTwo({ ok: true, status: 200, json: async () => projectTwo } as Response);
+    });
+    await waitFor(() => expect((screen.getByRole("button", { name: "导出 OpenCut 快照" }) as HTMLButtonElement).disabled).toBe(false));
   });
 
   test.each(["capabilities", "preflight", "create"] as const)(

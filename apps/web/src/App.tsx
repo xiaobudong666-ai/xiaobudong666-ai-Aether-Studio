@@ -259,11 +259,11 @@ export default function App() {
       projectDetailRequestIdRef.current === requestId
       && selectedProjectIdRef.current === id
     );
-    // A different project must not show the prior project's unsent script or
-    // task-id notice while its detail GET is pending. Do not clear this state
-    // for a same-project revision-conflict refresh (saveProjectState reuses
-    // fetchProjectDetail), which is not an identity change.
+    // During a cross-project detail GET, remove the old timeline/asset
+    // workspace and disable old-project exports/actions. Same-project conflict
+    // refreshes keep their draft/workspace instead.
     if (currentProject?.id !== id) {
+      setCurrentProject(null);
       setScriptText("");
       setActionMessage(null);
     }
@@ -909,7 +909,7 @@ export default function App() {
           </form>
           <select
             aria-label="选择项目"
-            value={currentProject?.id || ""}
+            value={selectedProjectIdRef.current || currentProject?.id || ""}
             onChange={(e) => fetchProjectDetail(e.target.value)}
             disabled={projects.length === 0}
           >
