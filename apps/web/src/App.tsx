@@ -259,6 +259,11 @@ export default function App() {
       projectDetailRequestIdRef.current === requestId
       && selectedProjectIdRef.current === id
     );
+    // Project selection begins before its detail request resolves. Clear
+    // previous-project unsent text and task status synchronously so neither
+    // can remain visible while the new project's response is pending.
+    setScriptText("");
+    setActionMessage(null);
     setAssetVersions([]);
     setSelectedAvatarAssetId("");
     setFakeTalkingHeadTaskId(null);
