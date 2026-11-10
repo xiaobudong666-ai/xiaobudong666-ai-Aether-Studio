@@ -258,6 +258,8 @@ describe("GenerationPanel server authority", () => {
     expect((screen.getByLabelText("确认外部生成边界") as HTMLInputElement).checked).toBe(false);
     expect((screen.getByRole("button", { name: "提交生成" }) as HTMLButtonElement).disabled).toBe(true);
     expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/generation-tasks") && init?.method === "POST")).toHaveLength(0);
+    // Finish the newly scoped API load before the test disposes its component.
+    await screen.findByText(/服务端权威状态：可创建/);
   });
 
 });
