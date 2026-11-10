@@ -83,96 +83,12 @@ test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated e
   const projectId = await projectOption.getAttribute("value");
   expect(projectId).toBeTruthy();
 
-  // Pre-create a second disposable project so the completed FAKE task's
-  // previously visible script/task notice can be tested on a real selector
-  // transition without reloading (which would trivially clear SPA state).
+  // Prepare a second disposable project to exercise project-switch privacy
+  // in the live browser without relying on a full page reload.
   const secondProjectName = `G72-Privacy-Isolation-${Date.now()}`;
   await page.getByPlaceholder("输入新项目名称").fill(secondProjectName);
   await page.getByRole("button", { name: "创建项目" }).click();
-  const secondProjectOption = page.getByRole("option", { name: new RegExp(`^${secondProjectName}（版本 1）import { expect, test } from "@playwright/test";
-import { deflateSync } from "node:zlib";
-
-const password = process.env.AETHER_PLAYWRIGHT_PASSWORD;
-if (!password) throw new Error("AETHER_PLAYWRIGHT_PASSWORD must be set to the disposable Compose admin password");
-
-const apiBase = "http://127.0.0.1:5173/api";
-
-function crc32(buffer) {
-  let crc = 0xffffffff;
-  for (const byte of buffer) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
-    }
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(type, data) {
-  const typeBytes = Buffer.from(type, "ascii");
-  const length = Buffer.alloc(4);
-  length.writeUInt32BE(data.length, 0);
-  const checksum = Buffer.alloc(4);
-  checksum.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])), 0);
-  return Buffer.concat([length, typeBytes, data, checksum]);
-}
-
-function syntheticPng(width = 48, height = 48) {
-  const stride = width * 4 + 1;
-  const raw = Buffer.alloc(stride * height);
-  for (let y = 0; y < height; y += 1) {
-    const row = y * stride;
-    raw[row] = 0;
-    for (let x = 0; x < width; x += 1) {
-      const offset = row + 1 + x * 4;
-      raw[offset] = 72;
-      raw[offset + 1] = 128;
-      raw[offset + 2] = 184;
-      raw[offset + 3] = 255;
-    }
-  }
-  const header = Buffer.alloc(13);
-  header.writeUInt32BE(width, 0);
-  header.writeUInt32BE(height, 4);
-  header[8] = 8;
-  header[9] = 6;
-  header[10] = 0;
-  header[11] = 0;
-  header[12] = 0;
-  return Buffer.concat([
-    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    pngChunk("IHDR", header),
-    pngChunk("IDAT", deflateSync(raw)),
-    pngChunk("IEND", Buffer.alloc(0)),
-  ]);
-}
-
-async function signIn(page) {
-  await page.getByLabel("邮箱").fill("admin@aether.local");
-  await page.getByLabel("密码").fill(password);
-  await page.getByRole("button", { name: "登录" }).click();
-  await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
-}
-
-async function apiJson(page, path) {
-  const response = await page.request.get(`${apiBase}${path}`);
-  expect(response.ok(), `${path} returned ${response.status()}`).toBeTruthy();
-  return response.json();
-}
-
-test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated export denied", async ({ page }, testInfo) => {
-  test.setTimeout(420_000);
-  await page.goto("/");
-  await signIn(page);
-
-  const projectName = `G72-UI-Worker-${Date.now()}`;
-  await page.getByPlaceholder("输入新项目名称").fill(projectName);
-  await page.getByRole("button", { name: "创建项目" }).click();
-
-  const projectOption = page.getByRole("option", { name: new RegExp(`^${projectName}（版本 1）$`) });
-  await expect(projectOption).toHaveCount(1);
-  const projectId = await projectOption.getAttribute("value");
-) });
+  const secondProjectOption = page.getByRole("option", { name: new RegExp(`^${secondProjectName}（版本 1）$`) });
   await expect(secondProjectOption).toHaveCount(1);
   const secondProjectId = await secondProjectOption.getAttribute("value");
   expect(secondProjectId).toBeTruthy();
@@ -374,9 +290,8 @@ test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated e
     exportDenied: exportAttempt.status() === 403,
   }));
 
-  // Browser-level regression for G72 privacy: a project switch must clear
-  // the old unsent script and task-success notice without a page reload.
-  // This does not assert project-membership authorization or delegation.
+  // Regression: switching a live SPA selection clears prior prompt and
+  // old task-success notice. It does not prove project-member access policy.
   await expect(oralScript).toHaveValue("仅用于 G72 浏览器到 Worker 的非生产 FAKE 路由验收。");
   await expect(page.getByRole("status")).toContainText(created.taskId);
   const successfulCreatesBeforeSwitch = createResponses.filter((response) => response.status() === 202).length;
@@ -387,8 +302,6 @@ test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated e
   expect(createResponses.filter((response) => response.status() === 202)).toHaveLength(successfulCreatesBeforeSwitch);
   console.log(JSON.stringify({
     gate: "G72_BROWSER_PROJECT_SWITCH_PRIVACY_FAKE_ONLY",
-    oldProjectId: projectId,
-    newProjectId: secondProjectId,
     priorTaskIdCleared: true,
     priorUnsentScriptCleared: true,
     duplicateCreateAvoided: true,
