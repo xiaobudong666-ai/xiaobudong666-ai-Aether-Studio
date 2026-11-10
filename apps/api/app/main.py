@@ -3063,49 +3063,54 @@ def create_app(
             uuid.NAMESPACE_URL,
             f"aether-video-use:{task_project_id}:{artifact_idempotency_key}",
         ))
-        reservation = db.execute(
-            update(DBTenant)
-            .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
-            .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
-        )
-        if reservation.rowcount != 1:
-            db.rollback()
-            raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
-        db.commit()
-
-        duplicate_storage_release_event_id = str(uuid.uuid4())
-        duplicate_storage_release_requested = False
-
-        def release_duplicate_storage_reservation() -> None:
-            nonlocal duplicate_storage_release_requested
-            duplicate_storage_release_requested = True
-            existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
-            if existing_release is not None:
-                existing_bytes = int(
-                    (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
+        # One durable hold per task. Its receipt and tenant quota increment commit
+        # atomically, so a request-boundary abort cannot charge the retry twice.
+        hold_receipt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"aether-storage-hold:{task_id}"))
+        release_receipt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"aether-storage-release:{task_id}"))
+        stored_hold = db.get(DBGenerationEvent, hold_receipt_id)
+        if stored_hold is not None:
+            held = stored_hold.metadata_json or {}
+            if (
+                stored_hold.generation_task_id != task_id
+                or stored_hold.event_type != "STORAGE_RESERVATION_ACQUIRED"
+                or held.get("providerArtifactId") != providerArtifactId
+                or held.get("sha256") != digest.hexdigest()
+                or held.get("mediaId") != expected_media_id
+                or int(held.get("reservedStorageBytes") or -1) != upload_size
+            ):
+                db.rollback()
+                raise HTTPException(status_code=409, detail={
+                    "code": "STORAGE_RESERVATION_IDENTITY_MISMATCH",
+                    "message": "已有暂存凭据与此次产物身份不一致",
+                })
+            if db.get(DBGenerationEvent, release_receipt_id) is not None:
+                db.rollback()
+                raise HTTPException(status_code=409, detail={
+                    "code": "STORAGE_RESERVATION_ALREADY_RELEASED",
+                    "message": "原暂存凭据已释放，禁止重复入库",
+                })
+        else:
+            reservation = db.execute(
+                update(DBTenant)
+                .where(
+                    DBTenant.id == task_tenant_id,
+                    DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes,
                 )
-                if (
-                    existing_release.generation_task_id != task_id
-                    or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
-                    or existing_bytes != upload_size
-                ):
-                    raise RuntimeError("duplicate storage release receipt does not match this request")
-                return
-
-            attempt = current_generation_attempt(db, task)
+                .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
+            )
+            if reservation.rowcount != 1:
+                db.rollback()
+                raise HTTPException(status_code=429, detail={
+                    "code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限",
+                })
+            hold_attempt = current_generation_attempt(db, task)
             db.add(DBGenerationEvent(
-                id=duplicate_storage_release_event_id,
-                generation_task_id=task_id,
-                attempt_id=attempt.id if attempt is not None else None,
-                event_type="STORAGE_RESERVATION_RELEASED",
-                from_status=task.status,
-                to_status=task.status,
-                actor_type="SYSTEM",
-                actor_id="api",
+                id=hold_receipt_id, generation_task_id=task_id,
+                attempt_id=hold_attempt.id if hold_attempt is not None else None,
+                event_type="STORAGE_RESERVATION_ACQUIRED",
+                from_status=task.status, to_status=task.status,
+                actor_type="SYSTEM", actor_id="api",
                 metadata_json={
-                    "reasonCode": "DUPLICATE_ARTIFACT_INTAKE",
-                    "workerId": x_worker_id,
-                    "leaseEpoch": x_worker_lease_epoch,
                     "providerArtifactId": providerArtifactId,
                     "mediaId": expected_media_id,
                     "sha256": digest.hexdigest(),
@@ -3113,47 +3118,50 @@ def create_app(
                 },
                 created_at=utc_now(),
             ))
+        db.commit()
+
+        def release_storage_hold_once(reason_code: str) -> None:
+            """Release at most once; receipt and decrement share a transaction."""
+            existing = db.get(DBGenerationEvent, release_receipt_id)
+            if existing is not None:
+                metadata = existing.metadata_json or {}
+                if (
+                    existing.generation_task_id != task_id
+                    or existing.event_type != "STORAGE_RESERVATION_RELEASED"
+                    or int(metadata.get("reservedStorageBytes") or -1) != upload_size
+                ):
+                    raise RuntimeError("storage release receipt identity mismatch")
+                return
+            acquired = db.get(DBGenerationEvent, hold_receipt_id)
+            if acquired is None:
+                raise RuntimeError("storage reservation receipt missing")
             released = db.execute(
                 update(DBTenant)
                 .where(
                     DBTenant.id == task_tenant_id,
                     DBTenant.used_storage_bytes >= upload_size,
                 )
-                .values(
-                    used_storage_bytes=DBTenant.used_storage_bytes - upload_size,
-                    updated_at=utc_now(),
-                )
+                .values(used_storage_bytes=DBTenant.used_storage_bytes - upload_size, updated_at=utc_now())
             )
             if released.rowcount != 1:
-                raise RuntimeError("duplicate storage reservation cannot be reconciled safely")
-
-        def persist_duplicate_storage_reservation_release() -> None:
-            # The release receipt and aggregate decrement share one transaction.
-            # After an ambiguous commit result, read the receipt before retrying.
-            for retry_index in range(2):
-                try:
-                    release_duplicate_storage_reservation()
-                    db.commit()
-                    return
-                except Exception:
-                    db.rollback()
-                    existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
-                    if existing_release is not None:
-                        existing_bytes = int(
-                            (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
-                        )
-                        if (
-                            existing_release.generation_task_id != task_id
-                            or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
-                            or existing_bytes != upload_size
-                        ):
-                            raise RuntimeError("duplicate storage release receipt does not match this request")
-                        db.rollback()
-                        return
-                    db.rollback()
-                    if retry_index == 1:
-                        raise
-                    begin_serialized_write(db)
+                raise RuntimeError("storage reservation cannot be reconciled safely")
+            current_attempt = current_generation_attempt(db, task)
+            db.add(DBGenerationEvent(
+                id=release_receipt_id,
+                generation_task_id=task_id,
+                attempt_id=current_attempt.id if current_attempt is not None else None,
+                event_type="STORAGE_RESERVATION_RELEASED",
+                from_status=task.status, to_status=task.status,
+                actor_type="SYSTEM", actor_id="api",
+                metadata_json={
+                    "reasonCode": reason_code,
+                    "providerArtifactId": providerArtifactId,
+                    "mediaId": expected_media_id,
+                    "sha256": digest.hexdigest(),
+                    "reservedStorageBytes": upload_size,
+                },
+                created_at=utc_now(),
+            ))
 
         uploaded = None
         media_id = None
@@ -3186,14 +3194,7 @@ def create_app(
                 current_statement = current_statement.with_for_update()
             task = db.execute(current_statement).scalar_one_or_none()
             if task is None:
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == task_tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
-                )
+                release_storage_hold_once("ARTIFACT_INGEST_ABORTED")
                 db.commit()
                 raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
 
@@ -3219,7 +3220,8 @@ def create_app(
                     and existing_asset.sha256 == digest.hexdigest()
                 )
                 if same_ingest:
-                    persist_duplicate_storage_reservation_release()
+                    # All concurrent retries refer to the same durable hold.
+                    db.rollback()
                     return generation_task_response(
                         db, task, rights=generation_rights(db, task), include_history=True
                     )
@@ -3272,14 +3274,7 @@ def create_app(
                         task.media_id = media_id
                         task.provider_artifact_id = task.provider_artifact_id or providerArtifactId
                         task.updated_at = now
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == task.tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
-                )
+                release_storage_hold_once("ARTIFACT_INGEST_ABORTED")
                 add_generation_event(
                     db, task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
                     actor_type="SYSTEM", actor_id="api",
@@ -3383,34 +3378,6 @@ def create_app(
             raise
         except Exception as exc:
             db.rollback()
-            if duplicate_storage_release_requested:
-                existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
-                if existing_release is not None:
-                    existing_bytes = int(
-                        (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
-                    )
-                    if (
-                        existing_release.generation_task_id != task_id
-                        or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
-                        or existing_bytes != upload_size
-                    ):
-                        raise RuntimeError("duplicate storage release receipt does not match this request")
-                    db.rollback()
-                    duplicate_statement = (
-                        select(DBGenerationTask)
-                        .where(DBGenerationTask.id == task_id)
-                        .execution_options(populate_existing=True)
-                    )
-                    if app_engine.dialect.name != "sqlite":
-                        duplicate_statement = duplicate_statement.with_for_update()
-                    duplicate_task = db.execute(duplicate_statement).scalar_one_or_none()
-                    if duplicate_task is None:
-                        raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
-                    return generation_task_response(
-                        db, duplicate_task, rights=generation_rights(db, duplicate_task), include_history=True
-                    )
-                db.rollback()
-                raise
             begin_serialized_write(db)
             failed_statement = (
                 select(DBGenerationTask)
@@ -3421,14 +3388,7 @@ def create_app(
                 failed_statement = failed_statement.with_for_update()
             failed_task = db.execute(failed_statement).scalar_one_or_none()
             if failed_task is None:
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == task_tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
-                )
+                release_storage_hold_once("ARTIFACT_INGEST_ABORTED")
                 db.commit()
                 raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
 
@@ -3456,11 +3416,8 @@ def create_app(
                     and existing_asset.sha256 == digest.hexdigest()
                 )
                 if same_ingest:
-                    if uploaded is None:
-                        task = failed_task
-                        persist_duplicate_storage_reservation_release()
-                    else:
-                        db.rollback()
+                    # The original and retry share the same task-scoped hold.
+                    db.rollback()
                     return generation_task_response(
                         db, failed_task, rights=generation_rights(db, failed_task), include_history=True
                     )
@@ -3506,14 +3463,7 @@ def create_app(
                         failed_task.media_id = media_id
                         failed_task.provider_artifact_id = failed_task.provider_artifact_id or providerArtifactId
                         failed_task.updated_at = now
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == failed_task.tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
-                )
+                release_storage_hold_once("ARTIFACT_INGEST_ABORTED")
                 add_generation_event(
                     db, failed_task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
                     actor_type="SYSTEM", actor_id="api",
@@ -3568,14 +3518,7 @@ def create_app(
                     "originalUpstreamJobId": failed_task.upstream_job_id or "",
                     "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                 })
-            db.execute(
-                update(DBTenant)
-                .where(DBTenant.id == failed_task.tenant_id)
-                .values(used_storage_bytes=case(
-                    (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                    else_=0,
-                ))
-            )
+            release_storage_hold_once("ARTIFACT_INGEST_ABORTED")
             add_generation_event(
                 db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
                 actor_type="SYSTEM", actor_id="api", from_status=previous_status,
