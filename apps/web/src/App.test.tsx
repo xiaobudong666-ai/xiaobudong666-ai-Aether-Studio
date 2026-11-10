@@ -490,10 +490,10 @@ describe("Aether Studio 中文工作台", () => {
     )).toBe(false);
     // The previous project's successful task notice and unsent prompt must be
     // cleared as soon as project selection starts, before the next fetch settles.
-    expect(screen.queryByText(/g72-fake-task-1/)).toBeTruthy();
+    expect(screen.queryAllByText(/g72-fake-task-1/).length).toBeGreaterThan(0);
     fireEvent.change(screen.getByLabelText("选择项目"), { target: { value: "project-2" } });
     expect((screen.getByLabelText("口播文案") as HTMLTextAreaElement).value).toBe("");
-    expect(screen.queryByText(/g72-fake-task-1/)).toBeNull();
+    expect(screen.queryAllByText(/g72-fake-task-1/)).toHaveLength(0);
     expect(screen.queryByText(/FAKE-only 测试任务已入队/)).toBeNull();
     await waitFor(() => expect((screen.getByLabelText("选择项目") as HTMLSelectElement).value).toBe("project-2"));
   });
