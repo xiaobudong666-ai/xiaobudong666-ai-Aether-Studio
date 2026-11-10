@@ -1871,11 +1871,10 @@ def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_m
 def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_not_leak_storage_hold(
     postgres_context, monkeypatch
 ):
-    """Characterize the crash window after Sidecar success but before DB ingest commit.
+    """An in-process BaseException after Sidecar upload must not leak its quota hold.
 
-    SimulatedAbruptRequestExit bypasses the route's ordinary Exception compensation
-    path. This is a deterministic request-boundary interruption test, not an
-    operating-system process-kill or real Sidecar durability test.
+    The exception bypasses the ordinary Exception failure path. This is not
+    an operating-system process kill or durable crash-recovery proof.
     """
     class SimulatedAbruptRequestExit(BaseException):
         pass
@@ -1938,7 +1937,14 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
         assert interrupted_tenant is not None
         assert interrupted_task.status == "INGESTING"
         assert interrupted_task.asset_version_id is None
-        assert interrupted_tenant.used_storage_bytes == initial_storage_bytes + len(payload)
+        assert interrupted_tenant.used_storage_bytes == initial_storage_bytes
+        releases = list(db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalars())
+        assert len(releases) == 1
+        assert releases[0].metadata_json["reasonCode"] == "UPLOAD_INTERRUPTED"
+        assert releases[0].metadata_json["reservedStorageBytes"] == len(payload)
 
     monkeypatch.setattr(app.state.video_use, "upload_media", original_upload)
     retry = _post_g70_g71_duplicate_intake(
@@ -1974,24 +1980,15 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
         assert len(assets) == 1
         assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
         assert sum(row.event_type == "ARTIFACT_INGESTED" for row in events) == 1
-        assert sum(row.event_type == "STORAGE_RESERVATION_RELEASED" for row in events) == 0
+        assert sum(row.event_type == "STORAGE_RESERVATION_RELEASED" for row in events) == 1
         assert sum(row.kind == "RESERVED" for row in usage) == 1
         assert sum(row.kind == "SETTLED" for row in usage) == 1
         assert sum(row.kind == "RELEASED" for row in usage) == 0
 
         expected_storage_bytes = initial_storage_bytes + len(payload)
-        actual_storage_bytes = completed_tenant.used_storage_bytes
-        if actual_storage_bytes == expected_storage_bytes:
-            return
-        assert actual_storage_bytes == initial_storage_bytes + 2 * len(payload), (
-            "Unexpected storage accounting after abrupt request exit: "
-            f"initial={initial_storage_bytes}, actual={actual_storage_bytes}, "
-            f"payload={len(payload)}"
-        )
-        pytest.xfail(
-            "Confirmed request-boundary interruption leak: the first committed storage "
-            "hold survives the aborted request, and the retry adds a second hold for "
-            "the same idempotent Sidecar media identity. This is not an OS process-kill proof."
+        assert completed_tenant.used_storage_bytes == expected_storage_bytes, (
+            "Aborted request must compensate its own hold, and retry must reserve "
+            "exactly once for the single durable media object."
         )
 
     app.state.moneyprinter.assert_not_called()
