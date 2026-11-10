@@ -350,6 +350,7 @@ describe("Aether Studio 中文工作台", () => {
         type: "image", contentType: "image/png", sizeBytes: 100,
       }],
     };
+    const projectTwo = { ...createdProject, id: "project-2", name: "第二个项目", materials: [] };
     const imageVersion = {
       id: "image-version-1", projectId: "project-1", mediaId: "media-image-1",
       versionNo: 1, sha256: "c".repeat(64), mediaType: "image",
@@ -397,10 +398,13 @@ describe("Aether Studio 中文工作台", () => {
         } as Response;
       }
       if (url.endsWith("/projects") && (!init?.method || init.method === "GET")) {
-        return { ok: true, status: 200, json: async () => [projectWithImage] } as Response;
+        return { ok: true, status: 200, json: async () => [projectWithImage, projectTwo] } as Response;
       }
       if (url.endsWith("/projects/project-1/asset-versions")) {
         return { ok: true, status: 200, json: async () => [imageVersion] } as Response;
+      }
+      if (url.endsWith("/projects/project-2")) {
+        return { ok: true, status: 200, json: async () => projectTwo } as Response;
       }
       if (url.endsWith("/projects/project-1")) {
         return { ok: true, status: 200, json: async () => projectWithImage } as Response;
@@ -484,6 +488,14 @@ describe("Aether Studio 中文工作台", () => {
     expect(fetchMock.mock.calls.some(([input, init]) =>
       String(input).endsWith("/generation-tasks") && init?.method === "POST"
     )).toBe(false);
+    // The previous project's successful task notice and unsent prompt must be
+    // cleared as soon as project selection starts, before the next fetch settles.
+    expect(screen.queryByText(/g72-fake-task-1/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("选择项目"), { target: { value: "project-2" } });
+    expect((screen.getByLabelText("口播文案") as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByText(/g72-fake-task-1/)).toBeNull();
+    expect(screen.queryByText(/FAKE-only 测试任务已入队/)).toBeNull();
+    await waitFor(() => expect((screen.getByLabelText("选择项目") as HTMLSelectElement).value).toBe("project-2"));
   });
 
   test.each(["capabilities", "preflight", "create"] as const)(
