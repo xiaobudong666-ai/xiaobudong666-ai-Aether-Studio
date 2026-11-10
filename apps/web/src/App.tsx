@@ -111,6 +111,10 @@ export default function App() {
   const savingProjectRef = useRef(false);
   const selectedProjectIdRef = useRef<string | null>(null);
   const projectDetailRequestIdRef = useRef(0);
+  // A delayed callback must not cross an actor/tenant login boundary.
+  const actorScopeKey = JSON.stringify([authUser?.tenant.id, authUser?.id]);
+  const activeActorScopeRef = useRef(actorScopeKey);
+  activeActorScopeRef.current = actorScopeKey;
   // Never render an old tenant/actor/project's unsent oral-broadcast prompt.
   const fakeEntryIdentityKey = JSON.stringify([
     authUser?.tenant.id, authUser?.id, authUser?.role, currentProject?.id,
@@ -1114,6 +1118,13 @@ export default function App() {
                 project={currentProject}
                 assetVersions={assetVersions}
                 onProjectUpdated={(project) => {
+                  // G72: ignore a GenerationPanel result returned after project
+                  // selection, logout, or actor/tenant changes. Server-side
+                  // project grants and revocation remain separately gated.
+                  if (
+                    selectedProjectIdRef.current !== project.id
+                    || activeActorScopeRef.current !== actorScopeKey
+                  ) return;
                   setCurrentProject(project);
                   setProjects((previous) => previous.map((candidate) => candidate.id === project.id ? project : candidate));
                 }}
