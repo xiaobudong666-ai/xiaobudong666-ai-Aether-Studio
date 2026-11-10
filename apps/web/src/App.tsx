@@ -111,6 +111,16 @@ export default function App() {
   const savingProjectRef = useRef(false);
   const selectedProjectIdRef = useRef<string | null>(null);
   const projectDetailRequestIdRef = useRef(0);
+  // Never render an old tenant/actor/project's unsent oral-broadcast prompt.
+  const fakeEntryIdentityKey = JSON.stringify([
+    authUser?.tenant.id, authUser?.id, authUser?.role, currentProject?.id,
+  ]);
+  const [visibleFakeEntryIdentity, setVisibleFakeEntryIdentity] = useState(fakeEntryIdentityKey);
+  useEffect(() => {
+    setScriptText("");
+    setVisibleFakeEntryIdentity(fakeEntryIdentityKey);
+  }, [fakeEntryIdentityKey]);
+
   // Fence the normal oral-broadcast entry by actor, project and revision.
   const fakeEntryScopeKey = JSON.stringify([
     authUser?.tenant.id, authUser?.id, authUser?.role, currentProject?.id, currentProject?.revision,
@@ -427,6 +437,7 @@ export default function App() {
   };
 
   const handleCreateFakeTalkingHead = async () => {
+    if (visibleFakeEntryIdentity !== fakeEntryIdentityKey) return;
     if (!canEdit) {
       setActionMessage("当前账号为只读权限，不能创建口播任务。");
       return;
@@ -937,7 +948,8 @@ export default function App() {
               className="script-input"
               aria-label="口播文案"
               placeholder="输入你想让人物说的内容……"
-              value={scriptText}
+              value={visibleFakeEntryIdentity === fakeEntryIdentityKey ? scriptText : ""}
+              disabled={visibleFakeEntryIdentity !== fakeEntryIdentityKey}
               onChange={(event) => setScriptText(event.target.value)}
             />
             <div className="flow-extract">
@@ -1033,6 +1045,7 @@ export default function App() {
               onClick={handleCreateFakeTalkingHead}
               disabled={
                 !canEdit || !currentProject || !scriptText.trim()
+                || visibleFakeEntryIdentity !== fakeEntryIdentityKey
                 || selectedAvatar !== "upload" || !selectedAvatarAssetId
                 || isCreatingFakeTalkingHead
               }
@@ -1043,7 +1056,7 @@ export default function App() {
               仅 1 秒、9:16、720p 合成测试样片；服务端重新核验图片 REMIX 授权。
               输出标记为模拟素材，不可发布，不会自动采纳或写入时间线。
             </p>
-            {fakeTalkingHeadTaskId && (
+            {fakeTalkingHeadTaskId && visibleFakeEntryIdentity === fakeEntryIdentityKey && (
               <p className="fake-only-task-id">
                 最近提交的任务：<code>{fakeTalkingHeadTaskId}</code>
               </p>
