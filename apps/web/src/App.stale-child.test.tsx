@@ -29,8 +29,11 @@ vi.mock("./components/GenerationPanel", () => ({
 class FakeEventSource {
   onopen: (() => void) | null = null;
   onerror: (() => void) | null = null;
-  constructor(_url: string) {}
-  addEventListener(_name: string, _listener: (event: MessageEvent) => void) {}
+  constructor(url: string) { void url; }
+  addEventListener(name: string, listener: (event: MessageEvent) => void) {
+    void name;
+    void listener;
+  }
   close() {}
 }
 
