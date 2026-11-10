@@ -4023,3 +4023,77 @@ def test_g73_keyset_claim_scans_past_foreign_tenant_ineligible_queue_rows(genera
         assert foreign_claim_events == 0
 
     assert media.uploads == 0
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "G72_OPEN: no authoritative project membership/delegated-operation contract; "
+        "current tenant-wide editor access is not proof of project authorization"
+    ),
+)
+def test_g72_same_tenant_nonproject_editor_requires_project_authorization(generation_context):
+    """Nonproduction characterization: tenant role alone must not authorize another owner's project.
+
+    An expected XFAIL is an OPEN security acceptance gap, never a release-gate PASS.
+    No real Provider is called and there is no production identity or protected storage.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 owner private project / permission-negative")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-same-tenant-nonproject-editor"
+    )
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        owner_project = db.get(DBProject, project["id"])
+        assert owner_project is not None
+        db.add(DBUser(
+            id=str(uuid.uuid4()),
+            tenant_id=owner_project.tenant_id,
+            email="g72-nonproject-editor@example.com",
+            display_name="G72 Nonproject Editor",
+            password_hash=hash_password(password),
+            role="editor",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        ))
+        db.commit()
+        before = {
+            "tasks": db.execute(select(func.count(DBGenerationTask.id))).scalar_one(),
+            "events": db.execute(select(func.count(DBGenerationEvent.id))).scalar_one(),
+            "usage": db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one(),
+        }
+
+    assert client.post("/auth/logout").status_code == 204
+    login = client.post("/auth/login", json={
+        "email": "g72-nonproject-editor@example.com", "password": password
+    })
+    assert login.status_code == 200, login.text
+    # Bind a fresh capability snapshot to this authenticated editor rather than
+    # mistaking a time-bucket snapshot conflict for a permission denial.
+    cap = client.get("/generation/providers/moneyprinter/capabilities")
+    assert cap.status_code == 200, cap.text
+    payload["capabilitySnapshotHash"] = cap.json()["snapshotHash"]
+
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    project_read = client.get(f"/projects/{project['id']}")
+    preflight = client.post(base + "/validate", json=payload)
+    submitted = client.post(base, json=payload)
+    with sessions() as db:
+        after = {
+            "tasks": db.execute(select(func.count(DBGenerationTask.id))).scalar_one(),
+            "events": db.execute(select(func.count(DBGenerationEvent.id))).scalar_one(),
+            "usage": db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one(),
+        }
+
+    # All calls must fail closed with no task/usage changes once the Owner's
+    # project authorization contract is implemented and independently approved.
+    assert project_read.status_code in {403, 404}, project_read.text
+    assert preflight.status_code in {403, 404}, preflight.text
+    assert submitted.status_code in {403, 404}, submitted.text
+    assert after == before, (before, after)
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
