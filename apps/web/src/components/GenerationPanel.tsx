@@ -41,6 +41,8 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   // Bind async results and preflight authorization to the current actor/project.
   // Updating the ref during render closes the window before useEffect cleanup.
   const activeScope = JSON.stringify([tenantId, actorId, role, project?.id, project?.revision]);
+  // A new actor/project must never see the prior actor's unsent prompt or task state.
+  const identityScope = JSON.stringify([tenantId, actorId, role, project?.id]);
   const activeScopeRef = useRef(activeScope);
   activeScopeRef.current = activeScope;
   const preflightVersionRef = useRef(0);
@@ -61,6 +63,7 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
   const [preflightBody, setPreflightBody] = useState<ServerGenerationRequest | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [visibleScope, setVisibleScope] = useState(identityScope);
   const generationReady = Boolean(
     capabilities?.enabled
     && !capabilities.killSwitch?.disabled
@@ -81,6 +84,21 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
     setPreflightBody(null);
     idempotencyKeyRef.current = null;
   };
+
+  useEffect(() => {
+    // Reset unsent content and consent when the actor, role, tenant, or project changes.
+    // Keep the previous scope concealed until the reset has committed.
+    setPrompt("");
+    setConfirmed(false);
+    setAspect("9:16");
+    setVoiceName("en-US-JennyNeural");
+    setConcatMode("random");
+    setClipDuration(5);
+    setOutputCount(1);
+    setSelectedAssetIds([]);
+    setReferences([]);
+    setVisibleScope(identityScope);
+  }, [identityScope]);
 
   const loadServerState = useCallback(async (silent = false) => {
     const projectId = project?.id;
@@ -275,6 +293,11 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
       {!generationReady && <span>阻断原因：{capabilities?.reasonCode || capabilities?.killSwitch?.reasonCode || "READINESS_PENDING"}</span>}
     </>}
   </div>;
+
+  // Effects reset state after commit; conceal the previous identity's render synchronously.
+  if (visibleScope !== identityScope) return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
+    <span>项目或身份已切换，正在载入当前任务上下文。</span>
+  </section>;
 
   if (role === "viewer") return <section className="generation-entry" data-tenant={tenantId} data-actor={actorId}>
     <div><strong>AI 受治理生成</strong><span>当前为只读权限；任务来自服务端，不提供创建、取消、重试或采纳操作。</span></div>
