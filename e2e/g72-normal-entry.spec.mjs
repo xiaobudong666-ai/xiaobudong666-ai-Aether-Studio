@@ -122,11 +122,18 @@ test("G72 normal UI entry reaches the isolated FAKE Worker and keeps generated e
   await page.reload();
   await expect(page.getByRole("heading", { name: "输入内容" })).toBeVisible();
   await page.getByLabel("选择项目").selectOption(projectId);
-  await page.getByLabel("口播文案").fill("仅用于 G72 浏览器到 Worker 的非生产 FAKE 路由验收。");
+  await expect(page.getByLabel("选择项目")).toHaveValue(projectId);
   await page.getByRole("button", { name: "从项目素材选择人物照片" }).click();
   const assetPicker = page.getByLabel("选择人物图片素材");
   await expect(assetPicker.locator(`option[value="${assetVersionId}"]`)).toHaveCount(1);
   await assetPicker.selectOption(assetVersionId);
+  await expect(assetPicker).toHaveValue(assetVersionId);
+
+  // Enter the new project's script only after its asynchronous asset/context
+  // load has settled; the identity-scope guard must discard prior input.
+  const oralScript = page.getByLabel("口播文案");
+  await oralScript.fill("仅用于 G72 浏览器到 Worker 的非生产 FAKE 路由验收。");
+  await expect(oralScript).toHaveValue("仅用于 G72 浏览器到 Worker 的非生产 FAKE 路由验收。");
 
   const submit = page.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" });
   await expect(submit).toBeEnabled();
