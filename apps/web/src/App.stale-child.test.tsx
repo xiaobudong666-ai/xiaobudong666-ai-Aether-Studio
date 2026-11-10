@@ -167,7 +167,7 @@ describe("G72 old-session project list response fence", () => {
       expect(screen.queryByRole("option", { name: "私有项目一（版本 1）" })).toBeNull();
       expect(screen.getByRole("option", { name: "项目二（版本 1）" })).toBeTruthy();
       expect(screen.getByRole("button", { name: "退出登录" })).toBeTruthy();
-      expect(screen.getByText(/项目 1\\/50/)).toBeTruthy();
+      expect(screen.getByTitle("当前团队资源使用情况").textContent).toContain("项目 1/50");
     },
   );
 });
