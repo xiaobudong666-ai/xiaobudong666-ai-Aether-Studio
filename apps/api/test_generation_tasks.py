@@ -4097,3 +4097,96 @@ def test_g72_same_tenant_nonproject_editor_requires_project_authorization(genera
     assert after == before, (before, after)
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "G72_OPEN: tenant editor without project membership/delegation can "
+        "read and cancel another owner's queued generation task; "
+        "policy/schema not approved, no production entitlement change"
+    ),
+)
+def test_g72_same_tenant_nonproject_editor_cannot_read_or_cancel_owners_task(generation_context):
+    """Native negative: denial must cover existing task details and mutations, not just create.
+
+    This intentionally remains XFAIL until an authoritative membership/delegation
+    contract is approved and implemented. A green job containing this XFAIL is
+    not authorization acceptance. No Provider or protected tenant is used.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 private owner task cancel boundary")
+    task = create_task(client, project, key="g72-same-tenant-unauthorized-cancel")
+    task_id = task["taskId"]
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        owned_project = db.get(DBProject, project["id"])
+        assert owned_project is not None
+        assert owned_project.owner_id is not None
+        original = db.get(DBGenerationTask, task_id)
+        assert original is not None
+        original_status = original.status
+        assert original_status == "QUEUED"
+        before = {
+            "task_events": db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )).scalar_one(),
+            "task_usage": db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )).scalar_one(),
+        }
+        db.add(DBUser(
+            id=str(uuid.uuid4()),
+            tenant_id=owned_project.tenant_id,
+            email="g72-foreign-project-editor@example.com",
+            display_name="G72 Foreign Project Editor",
+            password_hash=hash_password(password),
+            role="editor",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        ))
+        db.commit()
+
+    assert client.post("/auth/logout").status_code == 204
+    login = client.post("/auth/login", json={
+        "email": "g72-foreign-project-editor@example.com", "password": password
+    })
+    assert login.status_code == 200, login.text
+    path = f"/projects/{project['id']}/generation-tasks"
+    listed = client.get(path, params={"pagination": "keyset"})
+    detailed = client.get(f"{path}/{task_id}")
+    canceled = client.post(f"{path}/{task_id}/cancel")
+
+    with sessions() as db:
+        current = db.get(DBGenerationTask, task_id)
+        assert current is not None
+        after = {
+            "task_events": db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )).scalar_one(),
+            "task_usage": db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )).scalar_one(),
+        }
+        new_status = current.status
+
+    # The preceding responses are all collected before assertions, so the
+    # negative covers information exposure AND a potentially destructive write.
+    observed = {
+        "list": listed.status_code,
+        "detail": detailed.status_code,
+        "cancel": canceled.status_code,
+        "task_before": original_status,
+        "task_after": new_status,
+        "audit_before": before,
+        "audit_after": after,
+    }
+    assert all(response.status_code in {403, 404} for response in (
+        listed, detailed, canceled
+    )), observed
+    assert new_status == original_status and after == before, observed
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
