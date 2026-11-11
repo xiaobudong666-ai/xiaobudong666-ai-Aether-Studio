@@ -2561,3 +2561,81 @@ def test_g72_postgres_fake_source_revocation_after_claim_blocks_artifact_without
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one() == settled_before == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("poisoned_request", [
+    ["legacy", "corrupt-talking-head-request"],
+    {"imageAssetId": ["wrong", "asset-id"], "sourceAssetSha256": "a" * 64},
+])
+def test_g72_postgres_claimed_legacy_malformed_source_intake_fails_closed(
+    postgres_context, poisoned_request,
+):
+    """FAKE-only: a previously leased, subsequently corrupted request must not 500.
+
+    A legacy or damaged persisted task can be leased on an older build.  The
+    intake boundary must reject the row before binding a list/dict as an SQL
+    asset ID, without altering bytes, usage, lease, or asset state.  This is
+    not a real Provider call or a new authorization policy.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    worker_id = "g72-pg-legacy-poison-worker"
+    claim = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claim.status_code == 200, claim.text
+    assert claim.json()["taskId"] == task_id
+    epoch = claim.json()["leaseEpoch"]
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        # Simulate a historical leased FAKE talking-head task whose durable
+        # request JSON was malformed after its lease was already issued.
+        task.provider = "deterministic-fake-talking-head"
+        task.request_json = poisoned_request
+        task.status = "RUNNING"
+        tenant_id = task.tenant_id
+        project_id = task.project_id
+        db.commit()
+        before_state = (task.status, task.lease_owner, task.lease_epoch)
+        before_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+        before_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+        before_entries = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(epoch),
+        },
+        data={"providerArtifactId": "g72-poisoned-legacy-intake"},
+        files={"file": ("synthetic.mp4", b"synthetic-test-only", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        assert (task.status, task.lease_owner, task.lease_epoch) == before_state
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == before_bytes
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == before_assets
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == before_entries
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == before_events
+    app.state.moneyprinter.assert_not_called()
