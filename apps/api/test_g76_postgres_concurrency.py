@@ -2297,3 +2297,125 @@ def test_g73_postgres_nested_talking_head_asset_id_poison_does_not_starve_claim(
         assert good.status == "SUBMITTING"
         assert good.lease_owner == "g73-postgres-nested-safe-worker"
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g75_postgres_ineligible_foreign_tenant_stale_fake_talking_head_cannot_transition_circuit(
+    postgres_context,
+):
+    """PostgreSQL: reject a foreign candidate before it may mutate that tenant's OPEN circuit.
+
+    The older foreign talking-head row carries a malformed, non-scalar imageAssetId.
+    A different tenant's valid FAKE task must still claim without committing a
+    foreign OPEN -> HALF_OPEN transition or issuing a false circuit event.
+    This uses a disposable PostgreSQL database and never calls a Provider.
+    """
+    client, sessions, app = postgres_context
+    healthy_task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    foreign_tenant_id = "g75-pg-ineligible-foreign"
+    foreign_task_id = str(uuid.uuid4())
+    old_at = now - datetime.timedelta(hours=2)
+    with sessions() as db:
+        healthy = db.get(DBGenerationTask, healthy_task_id)
+        assert healthy is not None
+        assert healthy.capability_snapshot_json["mode"] == "deterministic-fake"
+
+        tenant = DBTenant(
+            id=foreign_tenant_id, name="G75 PostgreSQL ineligible foreign",
+            slug=foreign_tenant_id, project_quota=50,
+            storage_quota_bytes=1024**3, used_storage_bytes=0,
+            concurrent_render_quota=2, monthly_render_seconds_quota=3600,
+            render_seconds_used=0, quota_period=now.strftime("%Y-%m"),
+            created_at=now, updated_at=now,
+        )
+        db.add(tenant)
+        db.flush()
+        user = DBUser(
+            id="g75-pg-ineligible-owner", tenant_id=foreign_tenant_id,
+            email="g75-pg-ineligible-owner@example.com",
+            display_name="G75 PostgreSQL foreign owner",
+            password_hash="synthetic-fixture-never-used-to-login",
+            role="owner", is_active=True, created_at=now, updated_at=now,
+        )
+        db.add(user)
+        db.flush()
+        project = DBProject(
+            id="g75-pg-ineligible-project", tenant_id=foreign_tenant_id,
+            owner_id=user.id, name="G75 stale FAKE talking head",
+            timeline={"version": "1.1", "output": None, "tracks": []},
+            materials=[], revision=1, created_at=now, updated_at=now,
+        )
+        db.add(project)
+        db.flush()
+        stale_request = dict(healthy.request_json)
+        stale_request.update({
+            "fakeTaskType": "talking-head",
+            "imageAssetId": ["not-a-scalar-id"],
+            "sourceAssetSha256": "0" * 64,
+        })
+        stale = DBGenerationTask(
+            id=foreign_task_id, tenant_id=foreign_tenant_id,
+            project_id=project.id, requested_by=user.id,
+            provider="deterministic-fake-talking-head", status="QUEUED",
+            progress=0, message="G75 malformed foreign candidate",
+            request_json=stale_request, request_hash=healthy.request_hash,
+            capability_snapshot_json=dict(healthy.capability_snapshot_json),
+            capability_snapshot_hash=healthy.capability_snapshot_hash,
+            idempotency_key=str(uuid.uuid4()), attempts=1, max_attempts=1,
+            lease_owner=None, lease_epoch=0, circuit_probe_epoch=None,
+            lease_expires_at=None, cancel_requested_at=None,
+            error_code=None, error_message=None,
+            created_at=old_at, updated_at=old_at,
+        )
+        db.add(stale)
+        db.flush()
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=foreign_task_id,
+            attempt_no=1, status="QUEUED", submission_started_at=None,
+            upstream_job_id=None, reconciliation_state="NOT_SUBMITTED",
+            error_code=None, error_message=None,
+            created_at=old_at, completed_at=None,
+        ))
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=foreign_tenant_id,
+            provider="moneyprinter", state="OPEN",
+            failure_timestamps_json=[old_at.isoformat()],
+            opened_at=old_at,
+            cooldown_until=now - datetime.timedelta(seconds=5),
+            half_open_task_id=None, probe_epoch=11,
+            half_open_lease_epoch=None, half_open_issuer=None,
+            disabled_reason_code=None, updated_at=old_at,
+        ))
+        db.commit()
+
+    worker_id = "g75-pg-cross-tenant-fake-worker"
+    with TestClient(app) as worker_client:
+        claimed = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+        )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy_task_id
+
+    with sessions() as db:
+        foreign = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == foreign_tenant_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        stale_after = db.get(DBGenerationTask, foreign_task_id)
+        healthy_after = db.get(DBGenerationTask, healthy_task_id)
+        assert foreign.state == "OPEN"
+        assert foreign.probe_epoch == 11
+        assert foreign.half_open_task_id is None
+        assert stale_after.status == "QUEUED"
+        assert stale_after.lease_owner is None
+        assert stale_after.lease_epoch == 0
+        assert healthy_after.status == "SUBMITTING"
+        assert healthy_after.lease_owner == worker_id
+        assert db.execute(select(func.count(DBGenerationProviderEvent.id)).where(
+            DBGenerationProviderEvent.tenant_id == foreign_tenant_id,
+            DBGenerationProviderEvent.event_type == "CIRCUIT_HALF_OPENED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
