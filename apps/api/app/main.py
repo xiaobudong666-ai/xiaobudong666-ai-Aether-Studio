@@ -3339,6 +3339,42 @@ def create_app(
                 invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
                 invalid_message = "上传期间任务状态已改变"
 
+            # The initial FAKE talking-head rights check precedes a network
+            # upload and its committed storage reservation. A REMIX revocation
+            # may commit while that upload is in flight. Re-read the persisted
+            # source and rights in the final serialized artifact transaction:
+            # never ingest/settle bytes against rights already revoked.
+            if invalid_code is None and task.provider == "deterministic-fake-talking-head":
+                current_request = task.request_json
+                if not isinstance(current_request, dict):
+                    invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
+                    invalid_message = "上传期间口播任务请求结构异常，模拟产物隔离"
+                else:
+                    current_source_id = current_request.get("imageAssetId")
+                    current_source_hash = current_request.get("sourceAssetSha256")
+                    if (
+                        not isinstance(current_source_id, str) or not current_source_id
+                        or not isinstance(current_source_hash, str) or not current_source_hash
+                    ):
+                        invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
+                        invalid_message = "上传期间口播素材字段异常，模拟产物隔离"
+                    else:
+                        current_source = db.execute(select(DBAssetVersion).where(
+                            DBAssetVersion.id == current_source_id,
+                            DBAssetVersion.tenant_id == task.tenant_id,
+                            DBAssetVersion.project_id == task.project_id,
+                        )).scalar_one_or_none()
+                        if (
+                            current_source is None
+                            or current_source.media_type != "image"
+                            or current_source.sha256 != current_source_hash
+                            or not rights_decision(
+                                latest_rights_snapshot(db, current_source.id, "REMIX"), now
+                            )["allowed"]
+                        ):
+                            invalid_code = "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+                            invalid_message = "上传期间口播素材授权或版本失效，模拟产物隔离"
+
             if invalid_code:
                 attempt = current_generation_attempt(db, task)
                 orphan_size = int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size
