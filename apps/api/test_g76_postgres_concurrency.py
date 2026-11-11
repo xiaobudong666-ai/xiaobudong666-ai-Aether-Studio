@@ -2503,6 +2503,32 @@ def test_g72_postgres_fake_source_revocation_after_claim_blocks_artifact_without
     assert claim.status_code == 200, claim.text
     assert claim.json()["taskId"] == task_id
     lease_epoch = claim.json()["leaseEpoch"]
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(lease_epoch),
+    }
+    running = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "RUNNING", "progress": 10,
+            "message": "synthetic G72 rights revocation race",
+            "upstreamJobId": "g72-synthetic-revoke-upstream",
+        },
+    )
+    assert running.status_code == 200, running.text
+    ingesting = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers=worker_headers,
+        json={
+            "status": "INGESTING", "progress": 95,
+            "message": "synthetic G72 artifact upload",
+            "upstreamJobId": "g72-synthetic-revoke-upstream",
+            "providerArtifactId": "g72-pg-synthetic-revoked-artifact",
+        },
+    )
+    assert ingesting.status_code == 200, ingesting.text
 
     with sessions() as db:
         current = db.get(DBGenerationTask, task_id)
