@@ -1672,7 +1672,7 @@ def test_g70_g71_owner_recovery_invalid_sidecar_probe_is_422_and_keeps_held(
 
 
 
-@pytest.mark.parametrize("invalid_size", ["invalid-size", []])
+@pytest.mark.parametrize("invalid_size", ["invalid-size", {"malformed": True}])
 def test_g70_g71_recovery_conflicting_material_invalid_size_is_409_not_500(
     generation_context, invalid_size
 ):
