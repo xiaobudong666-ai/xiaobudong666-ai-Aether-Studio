@@ -2159,19 +2159,23 @@ def test_g73_postgres_poisoned_queue_does_not_starve_healthy_fake_claim(postgres
     client, sessions, app = postgres_context
     bad_snapshot_id = _create_task(client)
     bad_request_id = _create_task(client)
+    bad_generic_request_id = _create_task(client)
     healthy_id = _create_task(client)
     now = datetime.datetime.now(datetime.timezone.utc)
 
     with sessions() as db:
         first = db.get(DBGenerationTask, bad_snapshot_id)
         second = db.get(DBGenerationTask, bad_request_id)
+        third = db.get(DBGenerationTask, bad_generic_request_id)
         healthy = db.get(DBGenerationTask, healthy_id)
-        assert first is not None and second is not None and healthy is not None
-        first.created_at = now - datetime.timedelta(minutes=3)
+        assert all(row is not None for row in (first, second, third, healthy))
+        first.created_at = now - datetime.timedelta(minutes=4)
         first.capability_snapshot_json = ["legacy", "bad-snapshot"]
-        second.created_at = now - datetime.timedelta(minutes=2)
+        second.created_at = now - datetime.timedelta(minutes=3)
         second.provider = "deterministic-fake-talking-head"
         second.request_json = ["legacy", "bad-talking-head-request"]
+        third.created_at = now - datetime.timedelta(minutes=2)
+        third.request_json = ["legacy", "bad-generic-fake-request"]
         healthy.created_at = now - datetime.timedelta(minutes=1)
         db.commit()
 
@@ -2188,7 +2192,7 @@ def test_g73_postgres_poisoned_queue_does_not_starve_healthy_fake_claim(postgres
     assert claimed.json()["leaseEpoch"] == 1
 
     with sessions() as db:
-        for poisoned_id in (bad_snapshot_id, bad_request_id):
+        for poisoned_id in (bad_snapshot_id, bad_request_id, bad_generic_request_id):
             poisoned = db.get(DBGenerationTask, poisoned_id)
             assert poisoned.status == "QUEUED"
             assert poisoned.lease_owner is None

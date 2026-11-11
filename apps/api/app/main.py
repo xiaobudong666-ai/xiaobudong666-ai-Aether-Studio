@@ -2702,15 +2702,18 @@ def create_app(
             candidate_snapshot = candidate.capability_snapshot_json
             if not isinstance(candidate_snapshot, dict):
                 continue
+            # G73: any provider mode can inherit legacy/corrupt JSON.  Do
+            # not lease a task whose request cannot be consumed by a Worker.
+            candidate_request = candidate.request_json
+            if not isinstance(candidate_request, dict):
+                continue
             candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
             if candidate.provider == "deterministic-fake-talking-head":
                 # Recheck the immutable image version and latest REMIX rights
                 # when a Worker claims a FAKE-only task; NEVER allow a real mode.
-                stored = candidate.request_json
-                if not isinstance(stored, dict):
-                    continue
+                stored = candidate_request
                 if candidate_mode != "deterministic-fake" or stored.get("fakeTaskType") != "talking-head":
                     continue
                 source = db.execute(select(DBAssetVersion).where(

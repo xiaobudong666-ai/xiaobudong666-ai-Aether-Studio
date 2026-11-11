@@ -4238,20 +4238,25 @@ def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(gener
     project = create_project(client, "G73 fail-closed legacy queue")
     malformed_snapshot = create_task(client, project, key="g73-poisoned-snapshot")
     malformed_request = create_task(client, project, key="g73-poisoned-talk-request")
+    malformed_generic = create_task(client, project, key="g73-poisoned-fake-request")
     healthy = create_task(client, project, key="g73-healthy-after-poisoned")
     now = datetime.datetime.now(datetime.timezone.utc)
 
     with sessions() as db:
         first = db.get(DBGenerationTask, malformed_snapshot["taskId"])
         second = db.get(DBGenerationTask, malformed_request["taskId"])
+        third = db.get(DBGenerationTask, malformed_generic["taskId"])
         eligible = db.get(DBGenerationTask, healthy["taskId"])
-        assert first is not None and second is not None and eligible is not None
-        first.created_at = now - datetime.timedelta(minutes=3)
+        assert all(row is not None for row in (first, second, third, eligible))
+        first.created_at = now - datetime.timedelta(minutes=4)
         first.capability_snapshot_json = ["malformed", "legacy", "snapshot"]
-        second.created_at = now - datetime.timedelta(minutes=2)
+        second.created_at = now - datetime.timedelta(minutes=3)
         # Exercise FAKE talking-head input validation before image/rights lookup.
         second.provider = "deterministic-fake-talking-head"
         second.request_json = ["malformed", "legacy", "request"]
+        third.created_at = now - datetime.timedelta(minutes=2)
+        # Ordinary deterministic-fake tasks must obey the same fail-closed fence.
+        third.request_json = ["malformed", "generic-fake", "request"]
         eligible.created_at = now - datetime.timedelta(minutes=1)
         db.commit()
 
@@ -4262,7 +4267,10 @@ def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(gener
     assert claimed.json()["leaseEpoch"] == 1
 
     with sessions() as db:
-        for poisoned_id in (malformed_snapshot["taskId"], malformed_request["taskId"]):
+        for poisoned_id in (
+            malformed_snapshot["taskId"], malformed_request["taskId"],
+            malformed_generic["taskId"],
+        ):
             poisoned = db.get(DBGenerationTask, poisoned_id)
             assert poisoned.status == "QUEUED"
             assert poisoned.lease_owner is None
