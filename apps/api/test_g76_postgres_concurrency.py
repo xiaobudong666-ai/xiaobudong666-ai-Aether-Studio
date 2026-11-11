@@ -2149,3 +2149,57 @@ with sessions() as db:
         assert actual_bytes == before_bytes + len(payload), (
             "Crash and idempotent replay must account for one durable artifact"
         )
+
+def test_g73_postgres_poisoned_queue_does_not_starve_healthy_fake_claim(postgres_context):
+    """A corrupt persisted JSON payload must not starve independent FAKE Worker claims.
+
+    Runs on disposable native PostgreSQL; no Provider, production data, or
+    financial/reconciliation writes are authorized by this test.
+    """
+    client, sessions, app = postgres_context
+    bad_snapshot_id = _create_task(client)
+    bad_request_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        first = db.get(DBGenerationTask, bad_snapshot_id)
+        second = db.get(DBGenerationTask, bad_request_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        assert first is not None and second is not None and healthy is not None
+        first.created_at = now - datetime.timedelta(minutes=3)
+        first.capability_snapshot_json = ["legacy", "bad-snapshot"]
+        second.created_at = now - datetime.timedelta(minutes=2)
+        second.provider = "deterministic-fake-talking-head"
+        second.request_json = ["legacy", "bad-talking-head-request"]
+        healthy.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    with TestClient(app) as worker_client:
+        claimed = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "g73-postgres-poison-safe-worker",
+            },
+        )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy_id
+    assert claimed.json()["leaseEpoch"] == 1
+
+    with sessions() as db:
+        for poisoned_id in (bad_snapshot_id, bad_request_id):
+            poisoned = db.get(DBGenerationTask, poisoned_id)
+            assert poisoned.status == "QUEUED"
+            assert poisoned.lease_owner is None
+            assert poisoned.lease_epoch == 0
+            assert db.execute(
+                select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == poisoned_id,
+                    DBGenerationEvent.event_type == "TASK_CLAIMED",
+                )
+            ).scalar_one() == 0
+        eligible = db.get(DBGenerationTask, healthy_id)
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-postgres-poison-safe-worker"
+    app.state.moneyprinter.assert_not_called()
