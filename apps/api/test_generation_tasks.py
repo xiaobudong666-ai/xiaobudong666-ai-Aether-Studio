@@ -4227,3 +4227,55 @@ def test_g73_keyset_claim_scans_past_foreign_tenant_ineligible_queue_rows(genera
         assert foreign_claim_events == 0
 
     assert media.uploads == 0
+
+def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(generation_context):
+    """Malformed legacy task JSON cannot take down every FAKE Worker claim.
+
+    Both malformed entries are already persisted; this test must not rewrite
+    old financial reservations, repair protected storage, or invoke a Provider.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 fail-closed legacy queue")
+    malformed_snapshot = create_task(client, project, key="g73-poisoned-snapshot")
+    malformed_request = create_task(client, project, key="g73-poisoned-talk-request")
+    healthy = create_task(client, project, key="g73-healthy-after-poisoned")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        first = db.get(DBGenerationTask, malformed_snapshot["taskId"])
+        second = db.get(DBGenerationTask, malformed_request["taskId"])
+        eligible = db.get(DBGenerationTask, healthy["taskId"])
+        assert first is not None and second is not None and eligible is not None
+        first.created_at = now - datetime.timedelta(minutes=3)
+        first.capability_snapshot_json = ["malformed", "legacy", "snapshot"]
+        second.created_at = now - datetime.timedelta(minutes=2)
+        # Exercise FAKE talking-head input validation before image/rights lookup.
+        second.provider = "deterministic-fake-talking-head"
+        second.request_json = ["malformed", "legacy", "request"]
+        eligible.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    claimed = claim(client, worker_id="g73-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+    assert claimed.json()["providerMode"] == "deterministic-fake"
+    assert claimed.json()["leaseEpoch"] == 1
+
+    with sessions() as db:
+        for poisoned_id in (malformed_snapshot["taskId"], malformed_request["taskId"]):
+            poisoned = db.get(DBGenerationTask, poisoned_id)
+            assert poisoned.status == "QUEUED"
+            assert poisoned.lease_owner is None
+            assert poisoned.lease_epoch == 0
+            poisoned_claims = db.execute(
+                select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == poisoned_id,
+                    DBGenerationEvent.event_type == "TASK_CLAIMED",
+                )
+            ).scalar_one()
+            assert poisoned_claims == 0
+        live = db.get(DBGenerationTask, healthy["taskId"])
+        assert live.status == "SUBMITTING"
+        assert live.lease_owner == "g73-safe-worker"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
