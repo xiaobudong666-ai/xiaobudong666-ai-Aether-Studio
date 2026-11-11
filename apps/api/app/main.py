@@ -2728,14 +2728,24 @@ def create_app(
                 stored = candidate_request
                 if candidate_mode != "deterministic-fake" or stored.get("fakeTaskType") != "talking-head":
                     continue
+                # Corrupt nested JSON may be a list/dict even when the outer
+                # request is a dict. Never bind it as an asset identifier: a
+                # DBAPI type error would starve later healthy Worker claims.
+                image_asset_id = stored.get("imageAssetId")
+                source_sha256 = stored.get("sourceAssetSha256")
+                if (
+                    not isinstance(image_asset_id, str) or not image_asset_id
+                    or not isinstance(source_sha256, str) or not source_sha256
+                ):
+                    continue
                 source = db.execute(select(DBAssetVersion).where(
-                    DBAssetVersion.id == stored.get("imageAssetId"),
+                    DBAssetVersion.id == image_asset_id,
                     DBAssetVersion.project_id == candidate.project_id,
                     DBAssetVersion.tenant_id == candidate.tenant_id,
                 )).scalar_one_or_none()
                 if (
                     source is None or source.media_type != "image"
-                    or source.sha256 != stored.get("sourceAssetSha256")
+                    or source.sha256 != source_sha256
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
