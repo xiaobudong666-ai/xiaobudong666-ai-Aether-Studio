@@ -1672,6 +1672,64 @@ def test_g70_g71_owner_recovery_invalid_sidecar_probe_is_422_and_keeps_held(
 
 
 
+@pytest.mark.parametrize("invalid_size", ["invalid-size", []])
+def test_g70_g71_recovery_conflicting_material_invalid_size_is_409_not_500(
+    generation_context, invalid_size
+):
+    """Corrupt pre-existing project material cannot crash Owner orphan recovery."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-recovery-material-conflict")
+    task = create_task(client, project, key="g70-recovery-material-conflict")
+    task_id = task["taskId"]
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        project_row.materials = [{
+            "id": media_id,
+            "name": "preexisting-conflicting-media",
+            "url": f"/api/video-use/media/{project['id']}/{media_id}",
+            "type": "video",
+            "sizeBytes": invalid_size,
+        }]
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner refuses corrupt preexisting project material"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        tenant = db.get(DBTenant, stored.tenant_id)
+        project_row = db.get(DBProject, project["id"])
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0
+        assert project_row.materials[0]["sizeBytes"] == invalid_size
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"SETTLED", "RELEASED"} for entry in usage)
+
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_owner(generation_context):
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-recovery-owner-and-tenant-scope")
