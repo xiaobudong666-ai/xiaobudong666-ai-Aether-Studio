@@ -2620,6 +2620,111 @@ def test_g72_postgres_fake_source_revocation_after_claim_blocks_artifact_without
     app.state.moneyprinter.assert_not_called()
 
 
+
+def test_g72_postgres_remix_expires_during_fake_upload_releases_storage_without_settlement(
+    postgres_context, monkeypatch,
+):
+    """Actual PostgreSQL FAKE-only expiry at the upload/final-commit boundary.
+
+    The source's REMIX evidence is valid when Worker starts intake but expires
+    while the test-only media adapter writes bytes. A final rights recheck must
+    reject the artifact, undo only this upload's quota hold and never settle.
+    No real clock sleeping, Provider call, policy or protected schema change.
+    """
+    from app import main as api_main
+
+    owner, sessions, app = postgres_context
+    task_id = _create_task(owner)
+    worker_id = "g72-expiring-remix-worker"
+    claimed = owner.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    lease_epoch = claimed.json()["leaseEpoch"]
+
+    before_expiry = datetime.datetime.now(datetime.timezone.utc)
+    expires_at = before_expiry + datetime.timedelta(seconds=45)
+    source_id = str(uuid.uuid4())
+    source_sha = "e" * 64
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id, tenant_id, requested_by = task.project_id, task.tenant_id, task.requested_by
+        task.provider = "deterministic-fake-talking-head"
+        task.request_json = {"imageAssetId": source_id, "sourceAssetSha256": source_sha}
+        task.status = "RUNNING"
+        # Keep the lease alive during synthetic time advance: the denial
+        # must be attributable to REMIX expiry rather than lease expiry.
+        task.lease_expires_at = before_expiry + datetime.timedelta(hours=2)
+        db.add(DBAssetVersion(
+            id=source_id, tenant_id=tenant_id, project_id=project_id,
+            media_id=f"g72-expiry-source-{source_id}", version_no=1,
+            sha256=source_sha, media_type="image", content_type="image/png",
+            size_bytes=53, probe_json={"image": {"width": 16, "height": 16}},
+            created_by=requested_by, created_at=before_expiry,
+        ))
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=project_id,
+            asset_version_id=source_id, status="ALLOWED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=expires_at,
+            evidence_ref="g72-fake-expiry-evidence",
+            captured_by=requested_by, captured_at=before_expiry,
+        ))
+        db.commit()
+        initial_storage = db.get(DBTenant, tenant_id).used_storage_bytes
+        initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+        initial_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        before_lease = (task.lease_owner, task.lease_epoch, task.status)
+    assert initial_assets == 1 and initial_settled == 0
+
+    clock = {"now": before_expiry}
+    monkeypatch.setattr(api_main, "utc_now", lambda: clock["now"])
+    real_upload = app.state.video_use.upload_media
+    uploads = []
+
+    def expire_during_upload(*args, **kwargs):
+        uploaded = real_upload(*args, **kwargs)
+        uploads.append(uploaded["mediaId"])
+        clock["now"] = expires_at + datetime.timedelta(seconds=1)
+        return uploaded
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", expire_during_upload)
+    rejected = owner.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(lease_epoch),
+        },
+        data={"providerArtifactId": "g72-synthetic-rights-expired"},
+        files={"file": ("synthetic.mp4", b"synthetic-expiry-bytes", "video/mp4")},
+    )
+    assert uploads, "Test did not reach the fake media upload boundary"
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+
+    with sessions() as db:
+        after_task = db.get(DBGenerationTask, task_id)
+        assert (after_task.lease_owner, after_task.lease_epoch, after_task.status) == before_lease
+        assert after_task.asset_version_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == initial_assets
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == initial_settled
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_storage
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("poisoned_request", [
     ["legacy", "corrupt-talking-head-request"],
     {"imageAssetId": ["wrong", "asset-id"], "sourceAssetSha256": "a" * 64},
