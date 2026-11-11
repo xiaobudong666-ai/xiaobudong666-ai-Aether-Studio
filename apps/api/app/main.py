@@ -2696,13 +2696,21 @@ def create_app(
         task: DBGenerationTask | None = None
         claim_attestation: DBGenerationProviderAttestation | None = None
         for candidate in iter_claim_candidates():
-            candidate_mode = candidate.capability_snapshot_json.get("mode")
+            # G73: legacy/corrupt JSON may still appear in the durable queue.
+            # A single malformed row must not crash every Worker claim or starve
+            # later healthy tasks. Never claim it or mutate its lease/usage.
+            candidate_snapshot = candidate.capability_snapshot_json
+            if not isinstance(candidate_snapshot, dict):
+                continue
+            candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
             if candidate.provider == "deterministic-fake-talking-head":
                 # Recheck the immutable image version and latest REMIX rights
                 # when a Worker claims a FAKE-only task; NEVER allow a real mode.
-                stored = candidate.request_json or {}
+                stored = candidate.request_json
+                if not isinstance(stored, dict):
+                    continue
                 if candidate_mode != "deterministic-fake" or stored.get("fakeTaskType") != "talking-head":
                     continue
                 source = db.execute(select(DBAssetVersion).where(
