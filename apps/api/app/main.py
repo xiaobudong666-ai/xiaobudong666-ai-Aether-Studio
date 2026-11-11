@@ -2749,27 +2749,6 @@ def create_app(
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
-            candidate_circuit = generation_circuit(db, candidate.tenant_id, create=True, for_update=True)
-            if candidate_circuit is not None:
-                if candidate_circuit.state == "DISABLED":
-                    continue
-                if candidate_circuit.state == "OPEN":
-                    cooldown_until = _as_utc(candidate_circuit.cooldown_until)
-                    if cooldown_until is None or now < cooldown_until:
-                        continue
-                    candidate_circuit.state = "HALF_OPEN"
-                    candidate_circuit.half_open_task_id = None
-                    candidate_circuit.half_open_lease_epoch = None
-                    candidate_circuit.half_open_issuer = None
-                    candidate_circuit.updated_at = now
-                    add_provider_event(
-                        db, tenant_id=candidate.tenant_id,
-                        event_type="CIRCUIT_HALF_OPENED", actor_type="SYSTEM",
-                        actor_id="api", now=now,
-                    )
-                if candidate_circuit.state == "HALF_OPEN":
-                    if candidate_circuit.half_open_task_id not in {None, candidate.id}:
-                        continue
             if candidate_mode == "moneyprinter":
                 config = published_generation_config(db, candidate.tenant_id)
                 if (
@@ -2810,6 +2789,31 @@ def create_app(
                     continue
             elif candidate_mode != "deterministic-fake":
                 continue
+            # G75: only an eligible, attested candidate may advance a
+            # tenant's OPEN circuit to HALF_OPEN. An ineligible foreign
+            # tenant candidate must never change circuit state merely because
+            # another tenant's Worker claim commits this transaction.
+            candidate_circuit = generation_circuit(db, candidate.tenant_id, create=True, for_update=True)
+            if candidate_circuit is not None:
+                if candidate_circuit.state == "DISABLED":
+                    continue
+                if candidate_circuit.state == "OPEN":
+                    cooldown_until = _as_utc(candidate_circuit.cooldown_until)
+                    if cooldown_until is None or now < cooldown_until:
+                        continue
+                    candidate_circuit.state = "HALF_OPEN"
+                    candidate_circuit.half_open_task_id = None
+                    candidate_circuit.half_open_lease_epoch = None
+                    candidate_circuit.half_open_issuer = None
+                    candidate_circuit.updated_at = now
+                    add_provider_event(
+                        db, tenant_id=candidate.tenant_id,
+                        event_type="CIRCUIT_HALF_OPENED", actor_type="SYSTEM",
+                        actor_id="api", now=now,
+                    )
+                if candidate_circuit.state == "HALF_OPEN":
+                    if candidate_circuit.half_open_task_id not in {None, candidate.id}:
+                        continue
             task = candidate
             break
         if task is None:
