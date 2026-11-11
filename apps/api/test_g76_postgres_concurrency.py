@@ -2421,8 +2421,9 @@ def test_g75_postgres_ineligible_foreign_tenant_stale_fake_talking_head_cannot_t
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("revoke_during_upload", [False, True])
 def test_g72_postgres_fake_source_revocation_after_claim_blocks_artifact_without_usage(
-    postgres_context,
+    postgres_context, monkeypatch, revoke_during_upload,
 ):
     """PG FAKE-only: rights revocation after Worker claim must block artifact intake.
 
@@ -2520,27 +2521,57 @@ def test_g72_postgres_fake_source_revocation_after_claim_blocks_artifact_without
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one()
-        db.add(DBRightsSnapshot(
-            id=str(uuid.uuid4()), tenant_id=tenant_id,
-            project_id=project["id"], asset_version_id=asset_id,
-            status="REVOKED", purpose="REMIX", territory="TEST",
-            valid_from=None, valid_until=None,
-            evidence_ref="g72-pg-revoked-synthetic", captured_by=current.requested_by,
-            captured_at=datetime.datetime.now(datetime.timezone.utc)
-                        + datetime.timedelta(seconds=1),
-        ))
+        requested_by = current.requested_by
         db.commit()
 
-    rejected = client.post(
-        f"/internal/generation-tasks/{task_id}/artifact-intake",
-        headers={
-            "X-Worker-Token": WORKER_TOKEN,
-            "X-Worker-Id": worker_id,
-            "X-Worker-Lease-Epoch": str(lease_epoch),
-        },
-        data={"providerArtifactId": "g72-pg-synthetic-revoked-artifact"},
-        files={"file": ("g72-synthetic.mp4", b"g72-revoked-synthetic-bytes", "video/mp4")},
-    )
+    def revoke_now():
+        with sessions() as db:
+            db.add(DBRightsSnapshot(
+                id=str(uuid.uuid4()), tenant_id=tenant_id,
+                project_id=project["id"], asset_version_id=asset_id,
+                status="REVOKED", purpose="REMIX", territory="TEST",
+                valid_from=None, valid_until=None,
+                evidence_ref="g72-pg-revoked-synthetic", captured_by=requested_by,
+                captured_at=datetime.datetime.now(datetime.timezone.utc)
+                            + datetime.timedelta(seconds=1),
+            ))
+            db.commit()
+
+    def intake():
+        with TestClient(app) as worker_client:
+            return worker_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers={
+                    "X-Worker-Token": WORKER_TOKEN,
+                    "X-Worker-Id": worker_id,
+                    "X-Worker-Lease-Epoch": str(lease_epoch),
+                },
+                data={"providerArtifactId": "g72-pg-synthetic-revoked-artifact"},
+                files={"file": ("g72-synthetic.mp4", b"g72-revoked-synthetic-bytes", "video/mp4")},
+            )
+
+    if revoke_during_upload:
+        original_upload = app.state.video_use.upload_media
+        upload_started, permit_upload = Event(), Event()
+
+        def hold_upload(*args, **kwargs):
+            upload_started.set()
+            assert permit_upload.wait(timeout=12), "timed out waiting for rights revocation"
+            return original_upload(*args, **kwargs)
+
+        monkeypatch.setattr(app.state.video_use, "upload_media", hold_upload)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(intake)
+            try:
+                assert upload_started.wait(timeout=12), "artifact intake never reached the FAKE Sidecar"
+                revoke_now()  # Durable revocation commits during the in-flight upload.
+            finally:
+                permit_upload.set()
+            rejected = future.result(timeout=20)
+    else:
+        revoke_now()
+        rejected = intake()
+
     assert rejected.status_code == 409, rejected.text
     assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
 
