@@ -2536,11 +2536,19 @@ def create_app(
             "sizeBytes": actual_size,
         }
         if existing_material is not None:
+            # Materials are untrusted project JSON. Malformed legacy sizes must
+            # fail closed as a conflict instead of raising an unhandled 500.
+            try:
+                existing_material_size = int(existing_material.get("sizeBytes") or 0)
+            except (TypeError, ValueError, OverflowError):
+                existing_material_size = -1
             if (
                 existing_material.get("url") != material["url"]
                 or existing_material.get("type") != "video"
-                or int(existing_material.get("sizeBytes") or 0) != actual_size
+                or existing_material_size != actual_size
             ):
+                # Undo the provisional quota increment before refusing recovery.
+                db.rollback()
                 raise HTTPException(
                     status_code=409,
                     detail={
