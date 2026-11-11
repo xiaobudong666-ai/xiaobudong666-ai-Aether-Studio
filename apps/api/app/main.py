@@ -3052,7 +3052,27 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         if task.provider == "deterministic-fake-talking-head":
-            source_id = (task.request_json or {}).get("imageAssetId")
+            # A task leased on a previous build can contain malformed durable
+            # request JSON. Refuse intake before querying with a non-scalar
+            # source ID; do not mutate the lease, storage, or usage ledger.
+            stored_request = task.request_json
+            if not isinstance(stored_request, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                            "message": "口播任务请求结构异常，模拟产物已隔离"},
+                )
+            source_id = stored_request.get("imageAssetId")
+            source_sha256 = stored_request.get("sourceAssetSha256")
+            if (
+                not isinstance(source_id, str) or not source_id
+                or not isinstance(source_sha256, str) or not source_sha256
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                            "message": "口播素材字段异常，模拟产物已隔离"},
+                )
             source = db.execute(select(DBAssetVersion).where(
                 DBAssetVersion.id == source_id,
                 DBAssetVersion.tenant_id == task.tenant_id,
@@ -3060,7 +3080,7 @@ def create_app(
             )).scalar_one_or_none()
             if (
                 source is None or source.media_type != "image"
-                or source.sha256 != (task.request_json or {}).get("sourceAssetSha256")
+                or source.sha256 != source_sha256
                 or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), utc_now())["allowed"]
             ):
                 raise HTTPException(
