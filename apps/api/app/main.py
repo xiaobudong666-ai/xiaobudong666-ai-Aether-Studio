@@ -2354,10 +2354,18 @@ def create_app(
                     "message": "孤儿媒资大小超出原任务允许范围",
                 },
             )
+        # Sidecar probe data is untrusted. A malformed numeric dimension must
+        # fail closed with a stable 422, not raise ValueError/TypeError as 500
+        # during Owner-only orphan recovery (while usage remains HELD).
+        try:
+            probed_width = int(video_metadata.get("width") or 0) if isinstance(video_metadata, dict) else 0
+            probed_height = int(video_metadata.get("height") or 0) if isinstance(video_metadata, dict) else 0
+        except (TypeError, ValueError, OverflowError):
+            probed_width = probed_height = 0
         if (
             not isinstance(video_metadata, dict)
-            or int(video_metadata.get("width") or 0) <= 0
-            or int(video_metadata.get("height") or 0) <= 0
+            or probed_width <= 0
+            or probed_height <= 0
             or not math.isfinite(duration_seconds)
             or not (0 < duration_seconds <= 86_400)
         ):
