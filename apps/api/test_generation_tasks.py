@@ -4331,3 +4331,44 @@ def test_g73_missing_current_attempt_does_not_starve_healthy_fake_worker(generat
 
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g73_nested_talking_head_asset_id_poison_does_not_starve_fake_worker(generation_context):
+    """A list-valued imageAssetId must not enter a SQL bind or block the queue."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 nested-JSON poison isolation")
+    poisoned = create_task(client, project, key="g73-nested-poison")
+    healthy = create_task(client, project, key="g73-nested-healthy")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        bad.provider = "deterministic-fake-talking-head"
+        bad.request_json = {
+            "fakeTaskType": "talking-head",
+            "imageAssetId": ["legacy", "bad-nested-asset-identifier"],
+            "sourceAssetSha256": "0" * 64,
+        }
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    result = claim(client, worker_id="g73-nested-safe-worker")
+    assert result.status_code == 200, result.text
+    assert result.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None and bad.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == bad.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g73-nested-safe-worker"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
