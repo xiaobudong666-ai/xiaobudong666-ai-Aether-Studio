@@ -2696,3 +2696,147 @@ def test_g72_postgres_claimed_legacy_malformed_source_intake_fails_closed(
             DBGenerationEvent.generation_task_id == task_id,
         )).scalar_one() == before_events
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(postgres_context, monkeypatch):
+    """Expose the final REMIX SELECT -> artifact/SETTLED COMMIT race, FAKE-only.
+
+    The Owner posts a real rights snapshot in a separate PostgreSQL session
+    after the Worker has read ALLOWED in its final transaction but before the
+    Worker is allowed to commit. The expected release contract is fail-closed.
+    The precisely reproduced unsafe 201 + asset + SETTLED is a strict,
+    evidence-backed XFAIL, not acceptance or authorization to change policy.
+    """
+    from app import main as api_main
+
+    owner, sessions, app = postgres_context
+    task_id = _create_task(owner)
+    worker_id = "g72-final-read-revocation-probe"
+    claimed = owner.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+    asset_id = str(uuid.uuid4())
+    source_digest = "c" * 64
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id, tenant_id, requested_by = task.project_id, task.tenant_id, task.requested_by
+        db.add(DBAssetVersion(
+            id=asset_id, tenant_id=tenant_id, project_id=project_id,
+            media_id=f"g72-final-race-source-{asset_id}", version_no=1,
+            sha256=source_digest, media_type="image", content_type="image/png",
+            size_bytes=41, probe_json={"image": {"width": 16, "height": 16}},
+            created_by=requested_by, created_at=now,
+        ))
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=project_id,
+            asset_version_id=asset_id, status="ALLOWED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="g72-final-race-initial-allow",
+            captured_by=requested_by, captured_at=now,
+        ))
+        # This probe isolates the final-intake serialization contract.
+        # The existing normal entry -> FAKE Worker route is tested separately.
+        task.provider = "deterministic-fake-talking-head"
+        task.request_json = {"imageAssetId": asset_id, "sourceAssetSha256": source_digest}
+        task.status = "RUNNING"
+        db.commit()
+        base_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+        base_settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        base_usage = db.get(DBTenant, tenant_id).used_storage_bytes
+        db.rollback()
+    assert base_assets == 1 and base_settled == 0
+
+    uploaded, final_read, resume = Event(), Event(), Event()
+    original_upload = app.state.video_use.upload_media
+    original_decision = api_main.rights_decision
+
+    def fake_upload(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        uploaded.set()
+        return result
+
+    def hold_after_final_rights_read(snapshot, at):
+        decision = original_decision(snapshot, at)
+        if (
+            uploaded.is_set() and not final_read.is_set()
+            and snapshot is not None and snapshot.asset_version_id == asset_id
+            and snapshot.purpose == "REMIX" and snapshot.status == "ALLOWED"
+        ):
+            assert decision["allowed"] is True
+            final_read.set()
+            assert resume.wait(timeout=20), "final-rights-read probe release timed out"
+        return decision
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", fake_upload)
+    monkeypatch.setattr(api_main, "rights_decision", hold_after_final_rights_read)
+
+    def worker_intake():
+        with TestClient(app) as worker:
+            return worker.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers={
+                    "X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id,
+                    "X-Worker-Lease-Epoch": str(epoch),
+                },
+                data={"providerArtifactId": "g72-final-read-commit-race"},
+                files={"file": ("synthetic.mp4", b"fake-only-g72-final-race", "video/mp4")},
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(worker_intake)
+        try:
+            assert final_read.wait(timeout=15), (
+                "Worker did not reach final REMIX decision after FAKE upload"
+            )
+            # Independent authenticated Owner request, committed while the
+            # Worker is stopped AFTER its latest rights SELECT.
+            revoke = owner.post(
+                f"/projects/{project_id}/asset-versions/{asset_id}/rights-snapshots",
+                json={
+                    "status": "REVOKED", "purpose": "REMIX",
+                    "territory": "TEST", "evidenceRef": "g72-final-race-owner-revoke",
+                },
+            )
+            assert revoke.status_code == 201, revoke.text
+        finally:
+            resume.set()
+        response = future.result(timeout=25)
+
+    with sessions() as db:
+        latest = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id,
+            DBRightsSnapshot.purpose == "REMIX",
+        ).order_by(DBRightsSnapshot.captured_at.desc()).limit(1)).scalar_one()
+        asset_count = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+        settled_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        usage_after = db.get(DBTenant, tenant_id).used_storage_bytes
+        task_after = db.get(DBGenerationTask, task_id)
+        task_state = task_after.status
+    assert latest.status == "REVOKED", "Owner revocation did not persist"
+    if response.status_code == 201 and asset_count == 2 and settled_count == 1:
+        pytest.xfail(
+            "CONFIRMED OPEN G72 post-read/pre-commit race: Owner REVOCATION "
+            "persisted before worker RESUME; HTTP 201, one new asset and "
+            "SETTLED usage committed from an earlier ALLOWED snapshot"
+        )
+    assert response.status_code == 409, response.text
+    assert asset_count == 1 and settled_count == 0
+    assert usage_after == base_usage
+    assert task_state != "RIGHTS_BLOCKED"
+    app.state.moneyprinter.assert_not_called()
