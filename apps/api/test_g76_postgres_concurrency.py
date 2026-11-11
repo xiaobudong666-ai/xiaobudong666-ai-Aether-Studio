@@ -2251,3 +2251,49 @@ def test_g73_postgres_missing_current_attempt_does_not_starve_healthy_claim(post
         assert healthy.status == "SUBMITTING"
         assert healthy.lease_owner == "g73-postgres-missing-attempt-safe-worker"
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g73_postgres_nested_talking_head_asset_id_poison_does_not_starve_claim(postgres_context):
+    """Native disposable PostgreSQL must never bind a list-valued image ID."""
+    client, sessions, app = postgres_context
+    poisoned_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned_id)
+        good = db.get(DBGenerationTask, healthy_id)
+        assert bad is not None and good is not None
+        bad.provider = "deterministic-fake-talking-head"
+        bad.request_json = {
+            "fakeTaskType": "talking-head",
+            "imageAssetId": ["legacy", "bad-nested-asset-identifier"],
+            "sourceAssetSha256": "0" * 64,
+        }
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    with TestClient(app) as worker_client:
+        result = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "g73-postgres-nested-safe-worker",
+            },
+        )
+    assert result.status_code == 200, result.text
+    assert result.json()["taskId"] == healthy_id
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned_id)
+        good = db.get(DBGenerationTask, healthy_id)
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None and bad.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == poisoned_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g73-postgres-nested-safe-worker"
+    app.state.moneyprinter.assert_not_called()
