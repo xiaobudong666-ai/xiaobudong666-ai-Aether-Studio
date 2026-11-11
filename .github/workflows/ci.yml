@@ -758,7 +758,7 @@ jobs:
       - name: Install frontend dependencies and Chromium for G72 browser integration
         run: |
           pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright install chromium
 
       - name: Verify G72 normal UI entry reaches the actual FAKE-only Worker
         shell: bash
