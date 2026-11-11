@@ -1620,6 +1620,58 @@ def test_g70_g71_owner_recovery_rejects_orphan_hash_mismatch(generation_context)
 
 
 
+@pytest.mark.parametrize(
+    ("dimension", "malformed_value"),
+    [("width", "not-a-width"), ("height", [])],
+)
+def test_g70_g71_owner_recovery_invalid_sidecar_probe_is_422_and_keeps_held(
+    generation_context, dimension, malformed_value
+):
+    """Untrusted Sidecar dimensions cannot crash Owner recovery or alter HELD."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, f"g70-malformed-sidecar-{dimension}")
+    task = create_task(client, project, key=f"g70-malformed-sidecar-{dimension}")
+    task_id = task["taskId"]
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    media_store.media_objects[(project["id"], media_id)]["metadata"]["video"][
+        dimension
+    ] = malformed_value
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner validates corrupted sidecar probe without retry"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_PROBE_INVALID"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        tenant = db.get(DBTenant, stored.tenant_id)
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0
+        assert sum(1 for item in usage if item.kind == "RESERVED") == 1
+        assert all(item.kind not in {"RELEASED", "SETTLED"} for item in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+
 def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_owner(generation_context):
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-recovery-owner-and-tenant-scope")
