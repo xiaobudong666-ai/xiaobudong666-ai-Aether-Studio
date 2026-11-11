@@ -2699,13 +2699,15 @@ def test_g72_postgres_claimed_legacy_malformed_source_intake_fails_closed(
 
 
 def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(postgres_context, monkeypatch):
-    """Expose the final REMIX SELECT -> artifact/SETTLED COMMIT race, FAKE-only.
+    """Probe REMIX rights/worker-commit linearization without test-side deadlock.
 
-    The Owner posts a real rights snapshot in a separate PostgreSQL session
-    after the Worker has read ALLOWED in its final transaction but before the
-    Worker is allowed to commit. The expected release contract is fail-closed.
-    The precisely reproduced unsafe 201 + asset + SETTLED is a strict,
-    evidence-backed XFAIL, not acceptance or authorization to change policy.
+    Owner revocation starts after Worker's last ALLOWED read. When a future
+    shared transaction lock serializes the endpoints, the Owner POST may wait
+    for Worker's commit: do not synchronously wait for Owner before resuming.
+    The forbidden sequence remains Owner 201 *before worker resume* followed
+    by Worker 201 + new asset + SETTLED; only that proven sequence is XFAIL.
+    The legitimate worker-first and revocation-first orders are both checked.
+    FAKE-only, disposable PostgreSQL; no rights/storage policy modification.
     """
     from app import main as api_main
 
@@ -2793,25 +2795,40 @@ def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(po
                 files={"file": ("synthetic.mp4", b"fake-only-g72-final-race", "video/mp4")},
             )
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(worker_intake)
+    revoke_started, revoke_finished = Event(), Event()
+
+    def owner_revoke():
+        revoke_started.set()
         try:
-            assert final_read.wait(timeout=15), (
-                "Worker did not reach final REMIX decision after FAKE upload"
-            )
-            # Independent authenticated Owner request, committed while the
-            # Worker is stopped AFTER its latest rights SELECT.
-            revoke = owner.post(
+            return owner.post(
                 f"/projects/{project_id}/asset-versions/{asset_id}/rights-snapshots",
                 json={
                     "status": "REVOKED", "purpose": "REMIX",
                     "territory": "TEST", "evidenceRef": "g72-final-race-owner-revoke",
                 },
             )
-            assert revoke.status_code == 201, revoke.text
+        finally:
+            revoke_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future = pool.submit(worker_intake)
+        revoke_future = None
+        revoke_committed_before_worker_resume = False
+        try:
+            assert final_read.wait(timeout=15), (
+                "Worker did not reach final REMIX decision after FAKE upload"
+            )
+            revoke_future = pool.submit(owner_revoke)
+            assert revoke_started.wait(timeout=5), "Owner revocation never started"
+            # Bounded observation: a correctly serialized Owner writer can
+            # block on Worker's source lock; never wait indefinitely here.
+            revoke_committed_before_worker_resume = revoke_finished.wait(timeout=3)
         finally:
             resume.set()
         response = future.result(timeout=25)
+        assert revoke_future is not None
+        revoke = revoke_future.result(timeout=25)
+        assert revoke.status_code == 201, revoke.text
 
     with sessions() as db:
         latest = db.execute(select(DBRightsSnapshot).where(
@@ -2829,14 +2846,26 @@ def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(po
         task_after = db.get(DBGenerationTask, task_id)
         task_state = task_after.status
     assert latest.status == "REVOKED", "Owner revocation did not persist"
-    if response.status_code == 201 and asset_count == 2 and settled_count == 1:
+    if revoke_committed_before_worker_resume and response.status_code == 201 and asset_count == 2 and settled_count == 1:
         pytest.xfail(
-            "CONFIRMED OPEN G72 post-read/pre-commit race: Owner REVOCATION "
-            "persisted before worker RESUME; HTTP 201, one new asset and "
-            "SETTLED usage committed from an earlier ALLOWED snapshot"
+            "CONFIRMED OPEN G72 post-read/pre-commit race: Owner REVOKED 201 "
+            "completed before Worker resume, but Worker committed 201 + "
+            "asset + SETTLED from stale ALLOWED rights"
         )
-    assert response.status_code == 409, response.text
-    assert asset_count == 1 and settled_count == 0
-    assert usage_after == base_usage
+    if revoke_committed_before_worker_resume:
+        # Revocation-first: Worker must refuse artifact and settlement.
+        assert response.status_code == 409, response.text
+        assert asset_count == 1 and settled_count == 0
+        assert usage_after == base_usage
+    else:
+        # Worker-first is permitted if Owner's revoke could not commit before
+        # Worker was released. Also accept a late revoke-before-intake 409.
+        assert response.status_code in (201, 409), response.text
+        if response.status_code == 201:
+            assert asset_count == 2 and settled_count == 1
+            assert usage_after >= base_usage
+        else:
+            assert asset_count == 1 and settled_count == 0
+            assert usage_after == base_usage
     assert task_state != "RIGHTS_BLOCKED"
     app.state.moneyprinter.assert_not_called()
