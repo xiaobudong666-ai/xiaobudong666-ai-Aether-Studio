@@ -4372,3 +4372,107 @@ def test_g73_nested_talking_head_asset_id_poison_does_not_starve_fake_worker(gen
         assert good.lease_owner == "g73-nested-safe-worker"
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g75_ineligible_foreign_tenant_open_circuit_remains_open_after_other_tenant_claim(
+    provider_control_context,
+):
+    """A wrong-config queued task must not consume a foreign tenant's cooldown.
+
+    Reproduces a scheduler ordering bug: candidate OPEN -> HALF_OPEN happened
+    before its published config and worker attestation were checked, then a
+    different tenant's valid claim committed that stale transition. All
+    Provider credentials/attestations here are synthetic; no adapter call.
+    """
+    client, sessions, app, _engine = provider_control_context
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    project = create_project(client, "G75 healthy own tenant")
+    eligible = create_task(client, project, key="g75-foreign-open-valid-tenant")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    foreign_id = "g75-foreign-expired-open-tenant"
+    task_id = str(uuid.uuid4())
+
+    with sessions() as db:
+        eligible_row = db.get(DBGenerationTask, eligible["taskId"])
+        assert eligible_row is not None
+        foreign_tenant = DBTenant(
+            id=foreign_id, name="G75 Foreign Circuit Tenant", slug=foreign_id,
+            project_quota=50, storage_quota_bytes=1024**3,
+            used_storage_bytes=0, concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600, render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"), created_at=now, updated_at=now,
+        )
+        foreign_owner = DBUser(
+            id="g75-foreign-owner", tenant_id=foreign_id,
+            email="g75-foreign-owner@example.com",
+            display_name="G75 Foreign Owner", password_hash=hash_password("unused-g75-fixture"),
+            role="owner", is_active=True, created_at=now, updated_at=now,
+        )
+        foreign_project = DBProject(
+            id="g75-foreign-project", tenant_id=foreign_id,
+            owner_id=foreign_owner.id, name="Foreign ineligible G75 project",
+            timeline={"version": "1.1", "output": None, "tracks": []},
+            materials=[], revision=1, created_at=now, updated_at=now,
+        )
+        older = now - datetime.timedelta(days=1)
+        stale_task = DBGenerationTask(
+            id=task_id, tenant_id=foreign_id, project_id=foreign_project.id,
+            requested_by=foreign_owner.id, provider="moneyprinter", status="QUEUED",
+            progress=0, message="G75 synthetic stale-config candidate",
+            request_json=dict(eligible_row.request_json),
+            request_hash=eligible_row.request_hash,
+            capability_snapshot_json={
+                **dict(eligible_row.capability_snapshot_json),
+                "configVersionId": "g75-nonexistent-published-config",
+            },
+            capability_snapshot_hash=eligible_row.capability_snapshot_hash,
+            idempotency_key=idempotency_uuid("g75-foreign-stale-config"),
+            attempts=1, max_attempts=1, lease_owner=None, lease_epoch=0,
+            circuit_probe_epoch=None, lease_expires_at=None,
+            cancel_requested_at=None, error_code=None, error_message=None,
+            created_at=older, updated_at=older,
+        )
+        attempt = DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=1, status="QUEUED", submission_started_at=None,
+            upstream_job_id=None, reconciliation_state="NOT_SUBMITTED",
+            error_code=None, error_message=None, created_at=older, completed_at=None,
+        )
+        foreign_circuit = DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=foreign_id, provider="moneyprinter",
+            state="OPEN", failure_timestamps_json=[older.isoformat()],
+            opened_at=older, cooldown_until=now - datetime.timedelta(seconds=5),
+            half_open_task_id=None, probe_epoch=4, half_open_lease_epoch=None,
+            half_open_issuer=None, disabled_reason_code=None, updated_at=older,
+        )
+        db.add_all([foreign_tenant, foreign_owner, foreign_project, stale_task, attempt, foreign_circuit])
+        db.commit()
+
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible["taskId"]
+
+    with sessions() as db:
+        foreign = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == foreign_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        assert foreign.state == "OPEN", (
+            "Ineligible foreign tenant must not transition to HALF_OPEN "
+            "when another tenant's valid Worker claim commits"
+        )
+        assert foreign.probe_epoch == 4
+        assert foreign.half_open_task_id is None
+        assert db.get(DBGenerationTask, task_id).lease_owner is None
+        stale_half_open_events = db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.tenant_id == foreign_id,
+                DBGenerationProviderEvent.event_type == "CIRCUIT_HALF_OPENED",
+            )
+        ).scalar_one()
+        assert stale_half_open_events == 0
+    app.state.moneyprinter.assert_not_called()
