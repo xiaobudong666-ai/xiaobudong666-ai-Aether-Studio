@@ -2419,3 +2419,145 @@ def test_g75_postgres_ineligible_foreign_tenant_stale_fake_talking_head_cannot_t
             DBGenerationProviderEvent.event_type == "CIRCUIT_HALF_OPENED",
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_postgres_fake_source_revocation_after_claim_blocks_artifact_without_usage(
+    postgres_context,
+):
+    """PG FAKE-only: rights revocation after Worker claim must block artifact intake.
+
+    Exercising native HTTP, persisted task/rights/usage, and a disposable
+    PostgreSQL 16.6 service does not authorize any real Provider invocation.
+    """
+    client, sessions, app = postgres_context
+    project_reply = client.post(
+        "/projects", json={"name": "G72 PG rights revoke after claim"}
+    )
+    assert project_reply.status_code == 201, project_reply.text
+    project = project_reply.json()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    asset_id = str(uuid.uuid4())
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        assert project_row is not None
+        db.add(DBAssetVersion(
+            id=asset_id, tenant_id=project_row.tenant_id,
+            project_id=project_row.id, media_id=f"g72-revocation-{asset_id}",
+            version_no=1, sha256="b" * 64, media_type="image",
+            content_type="image/png", size_bytes=101,
+            probe_json={"image": {"width": 48, "height": 48}},
+            created_by=project_row.owner_id, created_at=now,
+        ))
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=project_row.tenant_id,
+            project_id=project_row.id, asset_version_id=asset_id,
+            status="ALLOWED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="g72-pg-allowed-synthetic",
+            captured_by=project_row.owner_id, captured_at=now,
+        ))
+        db.commit()
+
+    key = str(uuid.uuid4())
+    body = {
+        "text": "offline rights revocation check",
+        "durationSeconds": 1,
+        "aspectRatio": "9:16",
+        "resolution": "720p",
+        "voiceId": "synthetic-seed",
+        "imageAssetVersionId": asset_id,
+        "idempotencyKey": key,
+        "expectedProjectRevision": project["revision"],
+        "confirmSyntheticTestOnly": True,
+    }
+    endpoint = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        cap = client.get("/generation/providers/moneyprinter/capabilities")
+        assert cap.status_code == 200, cap.text
+        body["capabilitySnapshotHash"] = cap.json()["snapshotHash"]
+        preflight = client.post(endpoint + "/validate", json=body)
+        if preflight.status_code == 409 and preflight.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }:
+            continue
+        assert preflight.status_code == 200, preflight.text
+        body["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        created = client.post(endpoint, json=body)
+        if created.status_code == 202:
+            break
+        if created.status_code != 409 or created.json().get("detail", {}).get("code") not in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }:
+            break
+    assert created is not None and created.status_code == 202, (
+        created.text if created is not None else "G72 fake creation was not attempted"
+    )
+    task_id = created.json()["taskId"]
+    worker_id = "g72-pg-revoke-claimed-worker"
+    claim = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claim.status_code == 200, claim.text
+    assert claim.json()["taskId"] == task_id
+    lease_epoch = claim.json()["leaseEpoch"]
+
+    with sessions() as db:
+        current = db.get(DBGenerationTask, task_id)
+        assert current is not None
+        tenant_id = current.tenant_id
+        state_before = (current.status, current.lease_owner, current.lease_epoch)
+        assets_before = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one()
+        used_before = db.get(DBTenant, tenant_id).used_storage_bytes
+        reserved_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        settled_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=tenant_id,
+            project_id=project["id"], asset_version_id=asset_id,
+            status="REVOKED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="g72-pg-revoked-synthetic", captured_by=current.requested_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(lease_epoch),
+        },
+        data={"providerArtifactId": "g72-pg-synthetic-revoked-artifact"},
+        files={"file": ("g72-synthetic.mp4", b"g72-revoked-synthetic-bytes", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        assert (task.status, task.lease_owner, task.lease_epoch) == state_before
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one() == assets_before == 1
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == used_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == reserved_before == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == settled_before == 0
+    app.state.moneyprinter.assert_not_called()
