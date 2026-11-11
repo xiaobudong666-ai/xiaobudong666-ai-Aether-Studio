@@ -2207,3 +2207,47 @@ def test_g73_postgres_poisoned_queue_does_not_starve_healthy_fake_claim(postgres
         assert eligible.status == "SUBMITTING"
         assert eligible.lease_owner == "g73-postgres-poison-safe-worker"
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g73_postgres_missing_current_attempt_does_not_starve_healthy_claim(postgres_context):
+    """Native PostgreSQL must skip an orphan attempt pointer without leasing it."""
+    client, sessions, app = postgres_context
+    damaged_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        assert damaged is not None and healthy is not None
+        damaged.attempts += 1
+        damaged.created_at = now - datetime.timedelta(minutes=2)
+        healthy.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    with TestClient(app) as worker_client:
+        result = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "g73-postgres-missing-attempt-safe-worker",
+            },
+        )
+    assert result.status_code == 200, result.text
+    assert result.json()["taskId"] == healthy_id
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        assert damaged.status == "QUEUED"
+        assert damaged.lease_owner is None
+        assert damaged.lease_epoch == 0
+        assert db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == damaged_id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one() == 0
+        assert healthy.status == "SUBMITTING"
+        assert healthy.lease_owner == "g73-postgres-missing-attempt-safe-worker"
+    app.state.moneyprinter.assert_not_called()

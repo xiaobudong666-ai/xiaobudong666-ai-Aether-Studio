@@ -4287,3 +4287,47 @@ def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(gener
         assert live.lease_owner == "g73-safe-worker"
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g73_missing_current_attempt_does_not_starve_healthy_fake_worker(generation_context):
+    """A queued legacy row without its current attempt must never block the Worker.
+
+    Simulate a historical mismatch by advancing the task attempt pointer in an
+    isolated SQLite fixture. Do not delete or rewrite any actual usage ledger.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 missing-attempt fail-closed")
+    damaged = create_task(client, project, key="g73-missing-attempt")
+    healthy = create_task(client, project, key="g73-healthy-after-missing-attempt")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, damaged["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        bad.attempts += 1
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    result = claim(client, worker_id="g73-missing-attempt-safe-worker")
+    assert result.status_code == 200, result.text
+    assert result.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, damaged["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None
+        assert bad.lease_epoch == 0
+        assert db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == bad.id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one() == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g73-missing-attempt-safe-worker"
+
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
