@@ -637,6 +637,17 @@ def create_app(
             or request.get("imageAssetVersionId") != source_id
         ):
             return False
+        # G72: the authenticated typed request was hashed before internal
+        # FAKE routing fields were appended. The immutable image receipt
+        # alone does not bind the script/duration or other user choices.
+        # Reject changed persisted user fields at Worker claim, pre-upload
+        # and final intake without writing usage, assets or audit storage.
+        original_request_fields = {
+            field: request.get(field)
+            for field in TalkingHeadFakeGenerationRequest.model_fields
+        }
+        if generation_request_hash(original_request_fields) != task.request_hash:
+            return False
         created = db.execute(
             select(DBGenerationEvent)
             .where(
