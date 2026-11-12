@@ -2775,6 +2775,16 @@ def create_app(
             candidate_policy = candidate_snapshot.get("providerPolicy")
             if candidate_policy is not None and not isinstance(candidate_policy, dict):
                 continue
+            # G73: a persisted snapshot may have an invalid quota object even
+            # when its outer JSON is valid. Never lease such an artifact:
+            # final intake must not interpret malformed limits after Sidecar
+            # persistence. This validates shape only; no quota is altered.
+            candidate_quota = candidate_snapshot.get("quota")
+            if not isinstance(candidate_quota, dict):
+                continue
+            generated_seconds_limit = candidate_quota.get("monthlyGeneratedSecondsLimit")
+            if type(generated_seconds_limit) is not int or generated_seconds_limit <= 0:
+                continue
             # G73: any provider mode can inherit legacy/corrupt JSON.  Do
             # not lease a task whose request cannot be consumed by a Worker.
             candidate_request = candidate.request_json
