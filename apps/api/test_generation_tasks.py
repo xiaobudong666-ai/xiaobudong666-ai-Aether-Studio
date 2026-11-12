@@ -4817,3 +4817,64 @@ def test_g70_g71_recovery_malformed_sidecar_inspection_preserves_held(
     assert media_store.uploads == 0
     assert media_store.inspections == 1
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("malformed_materials", [
+    {"unexpected": "object-instead-of-array"},
+    "string-instead-of-array",
+    17,
+    ["not-an-object-row"],
+    [{"id": "other-valid-material"}, None],
+])
+def test_g70_g71_recovery_corrupt_materials_root_or_entry_preserves_held(
+    generation_context, malformed_materials
+):
+    """FAKE-only: malformed project materials cannot be silently rewritten.
+
+    This tests the Owner self-service recovery gate only. No Provider or
+    protected-store policy is changed; no new asset, quota or settlement entry.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-invalid-materials-json")
+    task = create_task(client, project, key="g70-g71-invalid-materials-json")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        project_row.materials = malformed_materials
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner must reconcile malformed project materials first"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        asset_count = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert asset_count == 0 and recovery_count == 0
+        assert db.get(DBProject, project["id"]).materials == malformed_materials
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
