@@ -5011,6 +5011,49 @@ def test_g70_g71_recovery_corrupt_materials_root_or_entry_preserves_held(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("bad_limit", ["bad-number", None, False, 0, -1, [], {}])
+def test_g73_corrupt_published_artifact_byte_ceiling_is_not_leased(
+    provider_control_context, bad_limit,
+):
+    """FAKE-only disposable DB: malformed persisted byte policy cannot lease a Worker.
+
+    This corrupts only synthetic storage, after authentic config and task creation;
+    it does not edit protected policies or contact a real Provider.
+    """
+    client, sessions, app, engine = provider_control_context
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    project = create_project(client, "G73 persisted artifact limit corruption")
+    task = create_task(client, project, key="g73-invalid-artifact-byte-limit")
+    with sessions() as db:
+        config_row = db.get(DBGenerationProviderConfigVersion, config["id"])
+        assert config_row is not None and config_row.policy_json["maxArtifactBytes"] > 0
+        corrupt_policy = {**config_row.policy_json, "maxArtifactBytes": bad_limit}
+    # Bypass ORM immutability in disposable test DB only.
+    with engine.begin() as connection:
+        assert connection.execute(
+            DBGenerationProviderConfigVersion.__table__.update()
+            .where(DBGenerationProviderConfigVersion.id == config["id"])
+            .values(policy_json=corrupt_policy)
+        ).rowcount == 1
+    readiness = client.get("/generation/providers/moneyprinter/readiness")
+    assert readiness.status_code == 200, readiness.text
+    assert readiness.json()["enabled"] is False
+    assert readiness.json()["reasonCode"] == "OWNER_POLICY_INVALID"
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 204, claimed.text
+    with sessions() as db:
+        persisted = db.get(DBGenerationTask, task["taskId"])
+        assert persisted is not None and persisted.status == "QUEUED"
+        assert persisted.lease_owner is None and persisted.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == persisted.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("bad_policy", [[], "legacy-corrupt-policy", 42, None])
 def test_g73_malformed_published_policy_root_fails_closed_without_claim(
     provider_control_context, bad_policy,

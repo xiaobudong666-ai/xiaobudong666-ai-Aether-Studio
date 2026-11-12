@@ -12,6 +12,7 @@ from app.main import (
     attest_worker_provider,
     initialize_worker,
     process_generation_task,
+    private_canary_policy_valid,
 )
 from app.moneyprinter_adapter import ADAPTER_VERSION, UPSTREAM_PIN, MoneyPrinterTurboAdapter
 
@@ -330,3 +331,39 @@ def test_worker_stops_without_overwriting_queue_governance(code, expected_status
     }
     queue.transition.assert_not_called()
     provider.get_task_status.assert_not_called()
+
+@pytest.mark.parametrize("bad_limit", ["bad-number", None, False, 0, -1, [], {}])
+def test_g73_worker_corrupt_artifact_ceiling_refused_before_provider_call(
+    monkeypatch, bad_limit,
+):
+    """Second fence rejects a poisoned claim without a Provider request."""
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
+    monkeypatch.setenv("AETHER_GENERATION_CONFIG_VERSION_ID", "config-1")
+    monkeypatch.setenv("AETHER_GENERATION_POLICY_HASH", "a" * 64)
+    monkeypatch.setenv("AETHER_GENERATION_CREDENTIAL_STATE", "PRESENT")
+    monkeypatch.setenv("AETHER_GENERATION_NETWORK_ISOLATION", "ENFORCED")
+    monkeypatch.setenv("AETHER_GENERATION_CANARY_PROFILE", "private-one-task-v1")
+    provider = MoneyPrinterTurboAdapter(api_url="http://moneyprinter-sidecar:8080")
+    provider.generate_video = MagicMock()
+    queue = queue_mock()
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=2)
+    policy = {
+        "enabledIntent": True, "concurrentTaskLimit": 1,
+        "monthlyRequestLimit": 1, "monthlyGeneratedSecondsLimit": 10,
+        "maxClipDurationSeconds": 10, "maxOutputs": 1,
+        "artifactPathPrefixes": ["/tasks/"], "maxArtifactBytes": bad_limit,
+    }
+    assert private_canary_policy_valid(policy) is False
+    task = claimed_task(
+        providerMode="moneyprinter", configVersionId="config-1",
+        policyHash="a" * 64, providerPolicy=policy,
+        workerProof={
+            "expiresAt": expires.isoformat().replace("+00:00", "Z"),
+            "adapterVersion": ADAPTER_VERSION, "upstreamPin": UPSTREAM_PIN,
+            "credentialState": "PRESENT", "networkIsolation": "ENFORCED",
+            "canaryProfile": "private-one-task-v1",
+        },
+    )
+    result = process_generation_task(components(provider, queue), task, poll_interval=0)
+    assert result["error_code"] == "WORKER_PROOF_MISMATCH"
+    provider.generate_video.assert_not_called()

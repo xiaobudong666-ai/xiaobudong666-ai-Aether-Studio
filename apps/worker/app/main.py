@@ -135,6 +135,9 @@ def private_canary_policy_valid(policy: dict) -> bool:
             and 1 <= int(policy.get("maxClipDurationSeconds") or 0) <= 10
             and int(policy.get("maxOutputs") or 0) == 1
             and policy.get("artifactPathPrefixes") == ["/tasks/"]
+            # G73 fail-closed on corrupt persisted byte ceiling. No new threshold.
+            and type(policy.get("maxArtifactBytes")) is int
+            and policy["maxArtifactBytes"] > 0
         )
     except (TypeError, ValueError):
         return False
