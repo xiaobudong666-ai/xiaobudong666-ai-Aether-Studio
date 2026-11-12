@@ -620,6 +620,47 @@ def create_app(
             }
         return decision
 
+    def fake_talking_head_creation_evidence_matches(
+        db: Session, task: DBGenerationTask, request: dict
+    ) -> bool:
+        """Bind a FAKE-only Worker task to its original append-only create receipt.
+
+        The request row may be edited after creation/claim. A self-consistent
+        replacement image ID + SHA + version list is not sufficient proof of
+        the image the authenticated user actually submitted.
+        """
+        source_id = request.get("imageAssetId")
+        source_sha = request.get("sourceAssetSha256")
+        if (
+            not isinstance(source_id, str) or not source_id
+            or not isinstance(source_sha, str) or not source_sha
+            or request.get("imageAssetVersionId") != source_id
+        ):
+            return False
+        created = db.execute(
+            select(DBGenerationEvent)
+            .where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.event_type == "TASK_CREATED",
+            )
+            .order_by(DBGenerationEvent.created_at.asc(), DBGenerationEvent.id.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if (
+            created is None
+            or created.actor_type != "USER"
+            or created.actor_id != task.requested_by
+            or not isinstance(created.metadata_json, dict)
+        ):
+            return False
+        evidence = created.metadata_json
+        return (
+            evidence.get("fakeOnly") is True
+            and evidence.get("simulatedOutput") is True
+            and evidence.get("inputAssetVersionId") == source_id
+            and evidence.get("sourceAssetSha256") == source_sha
+        )
+
     def generated_asset_export_rights(
         db: Session, asset: DBAssetVersion
     ) -> dict | None:
@@ -2848,6 +2889,8 @@ def create_app(
                 # Worker or its eventual artifact evidence.
                 if stored.get("inputAssetVersionIds") != [image_asset_id]:
                     continue
+                if not fake_talking_head_creation_evidence_matches(db, candidate, stored):
+                    continue
                 source = db.execute(select(DBAssetVersion).where(
                     DBAssetVersion.id == image_asset_id,
                     DBAssetVersion.project_id == candidate.project_id,
@@ -3195,6 +3238,7 @@ def create_app(
                 or type(stored_request.get("outputCount")) is not int
                 or stored_request["outputCount"] != 1
                 or stored_request.get("inputAssetVersionIds") != [source_id]
+                or not fake_talking_head_creation_evidence_matches(db, task, stored_request)
             ):
                 raise HTTPException(
                     status_code=409,
@@ -3494,6 +3538,7 @@ def create_app(
                         or type(current_request.get("outputCount")) is not int
                         or current_request["outputCount"] != 1
                         or current_request.get("inputAssetVersionIds") != [current_source_id]
+                        or not fake_talking_head_creation_evidence_matches(db, task, current_request)
                     ):
                         # Sidecar upload ends the first DB transaction. Recheck
                         # the complete FAKE-only promise after reacquiring the
