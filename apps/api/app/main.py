@@ -2539,6 +2539,22 @@ def create_app(
                 },
             )
 
+        # G70/G71: legacy project materials must be an array of object rows.
+        # Treat an invalid JSON shape as conflicting evidence before *any*
+        # quota/asset mutation. Converting a dict or string with list(...) can
+        # silently append corrupt rows and publish an unrecoverable media list.
+        if project.materials is not None and (
+            not isinstance(project.materials, list)
+            or any(not isinstance(item, dict) for item in project.materials)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_INVALID",
+                    "message": "项目现存素材列表格式异常，保持 HELD，需人工核对",
+                },
+            )
+
         storage_reservation = db.execute(
             update(DBTenant)
             .where(
