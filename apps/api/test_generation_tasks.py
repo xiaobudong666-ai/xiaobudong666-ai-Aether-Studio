@@ -4896,11 +4896,16 @@ def test_g73_malformed_published_policy_root_fails_closed_without_claim(
     project = create_project(client, "G73 malformed published policy")
     task = create_task(client, project, key="g73-malformed-published-policy")
 
-    with sessions() as db:
-        persisted_config = db.get(DBGenerationProviderConfigVersion, config["id"])
-        assert persisted_config is not None
-        persisted_config.policy_json = bad_policy
-        db.commit()
+    # Inject synthetic corruption through the disposable fixture's DB connection.
+    # Published provider config versions are deliberately immutable via ORM events;
+    # exercising an unsupported production policy edit is NOT the behavior tested.
+    with _engine.begin() as connection:
+        result = connection.execute(
+            DBGenerationProviderConfigVersion.__table__.update()
+            .where(DBGenerationProviderConfigVersion.id == config["id"])
+            .values(policy_json=bad_policy)
+        )
+        assert result.rowcount == 1
 
     readiness = client.get("/generation/providers/moneyprinter/readiness")
     assert readiness.status_code == 200, readiness.text
