@@ -5392,16 +5392,24 @@ def test_g72_fake_source_swap_must_match_authenticated_create_receipt(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("field,new_value", [
+    ("text", "FAKE-only tampered script never approved by the owner"),
+    ("videoSubject", "FAKE-only substituted Worker narration"),
+    ("videoAspect", "16:9"),
+    ("videoClipDuration", 999),
+    ("voiceId", "unexpected-voice"),
+    ("videoClipDuration", True),
+])
 @pytest.mark.parametrize("phase", ["before_claim", "after_claim", "during_upload"])
-def test_g72_fake_script_change_must_match_authenticated_request_digest(
-    generation_context, monkeypatch, phase,
+def test_g72_fake_typed_or_worker_alias_drift_is_rejected(
+    generation_context, monkeypatch, phase, field, new_value,
 ):
-    """G72: typed FAKE user script must remain bound to request_hash.
+    """G72: original user text and all Worker aliases must remain consistent.
 
-    TASK_CREATED source evidence alone did not cover the owner's actual
-    synthetic script and duration. Even a still-REMIX-allowed original image
-    must not make a changed script eligible for Worker lease or intake.
-    This uses isolated FAKE data and changes no authorization policy.
+    The typed request hash covers the owner's text/duration, but cannot by
+    itself detect a change to derived Worker-only fields such as videoSubject
+    and voiceId. Isolated FAKE-only lifecycle tests reject drift at claim,
+    pre-upload and final intake without touching provider/storage policy.
     """
     client, sessions, app, media = generation_context
     project = create_project(client, "G72 immutable script receipt " + phase)
@@ -5419,7 +5427,7 @@ def test_g72_fake_script_change_must_match_authenticated_request_digest(
         original = db.get(DBGenerationTask, task_id)
         assert original is not None
         original_hash = original.request_hash
-        original_text = original.request_json["text"]
+        original_field_value = original.request_json[field]
         storage_before = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
 
     def change_script_after_creation():
@@ -5427,9 +5435,9 @@ def test_g72_fake_script_change_must_match_authenticated_request_digest(
             task = db.get(DBGenerationTask, task_id)
             task.request_json = {
                 **task.request_json,
-                "text": "FAKE-only tampered script never approved by the owner",
+                field: new_value,
             }
-            assert task.request_json["text"] != original_text
+            assert task.request_json[field] != original_field_value
             assert task.request_hash == original_hash
             db.commit()
 
