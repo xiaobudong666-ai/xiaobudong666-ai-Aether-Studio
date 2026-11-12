@@ -132,21 +132,28 @@ PRIVATE_CANARY_PROFILE = "private-one-task-v1"
 
 def private_canary_policy_valid(policy: dict) -> bool:
     """Return true only for the bounded, pinned one-task canary policy."""
-    try:
-        return (
-            bool(policy.get("enabledIntent"))
-            and int(policy.get("concurrentTaskLimit") or 0) == 1
-            and int(policy.get("monthlyRequestLimit") or 0) == 1
-            and 1 <= int(policy.get("monthlyGeneratedSecondsLimit") or 0) <= 10
-            and 1 <= int(policy.get("maxClipDurationSeconds") or 0) <= 10
-            and int(policy.get("maxOutputs") or 0) == 1
-            and policy.get("artifactPathPrefixes") == ["/tasks/"]
-            # G73 fail-closed on corrupt persisted byte ceiling. No new threshold.
-            and type(policy.get("maxArtifactBytes")) is int
-            and policy["maxArtifactBytes"] > 0
-        )
-    except (TypeError, ValueError):
+    # G73: persisted policy values are untrusted until checked for exact types.
+    # int(True), int("1") and int(1.9) would silently turn a malformed policy
+    # into a valid one-task canary and could permit an unintended Worker lease.
+    # This is read-only validation: do not normalize or persist Owner policy.
+    if not isinstance(policy, dict):
         return False
+    return (
+        policy.get("enabledIntent") is True
+        and type(policy.get("concurrentTaskLimit")) is int
+        and policy["concurrentTaskLimit"] == 1
+        and type(policy.get("monthlyRequestLimit")) is int
+        and policy["monthlyRequestLimit"] == 1
+        and type(policy.get("monthlyGeneratedSecondsLimit")) is int
+        and 1 <= policy["monthlyGeneratedSecondsLimit"] <= 10
+        and type(policy.get("maxClipDurationSeconds")) is int
+        and 1 <= policy["maxClipDurationSeconds"] <= 10
+        and type(policy.get("maxOutputs")) is int
+        and policy["maxOutputs"] == 1
+        and policy.get("artifactPathPrefixes") == ["/tasks/"]
+        and type(policy.get("maxArtifactBytes")) is int
+        and policy["maxArtifactBytes"] > 0
+    )
 
 
 def attestation_canary_proof(
