@@ -904,6 +904,13 @@ def create_app(
                 reason_code = "GENERATION_CIRCUIT_OPEN"
                 healthy = False
 
+        # G73: a structurally corrupted *published* policy may have failed
+        # the canary gate, but quota/snapshot serializers still cast its raw
+        # fields. A disabled readiness response must be safe to construct.
+        # Use synthetic fallback values for reporting only; never change the
+        # persisted Owner policy, create a lease, or enable the Provider.
+        if mode == "moneyprinter" and not private_canary_policy_valid(policy):
+            policy = DEFAULT_FAKE_POLICY
         quota = quota_summary(db, tenant_id, policy, now)
         snapshot = build_capability_snapshot(
             mode if healthy else "disabled",

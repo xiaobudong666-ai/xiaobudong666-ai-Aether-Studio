@@ -5040,7 +5040,7 @@ def test_g73_corrupt_published_artifact_byte_ceiling_is_not_leased(
     readiness = client.get("/generation/providers/moneyprinter/readiness")
     assert readiness.status_code == 200, readiness.text
     assert readiness.json()["enabled"] is False
-    assert readiness.json()["reasonCode"] == "OWNER_POLICY_INVALID"
+    assert readiness.json()["reasonCode"] == "CANARY_POLICY_MISMATCH"
     claimed = claim(client, worker_id="worker-proof")
     assert claimed.status_code == 204, claimed.text
     with sessions() as db:
