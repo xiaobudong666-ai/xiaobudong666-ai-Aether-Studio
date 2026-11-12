@@ -5266,3 +5266,127 @@ def test_g72_midupload_fake_promise_poison_is_rejected_at_final_commit(
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 1
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["before_claim", "after_claim", "during_upload"])
+def test_g72_fake_source_swap_must_match_authenticated_create_receipt(
+    generation_context, monkeypatch, phase,
+):
+    """Correlated replacement with another REMIX-allowed image is still a forgery.
+
+    All four persisted request fields are made mutually consistent, and the
+    replacement asset has its own currently ALLOWED REMIX evidence. The
+    authenticated TASK_CREATED receipt must nevertheless remain the source of
+    truth through Worker claim, pre-upload and final upload transaction.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 immutable original-source receipt " + phase)
+    original_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, original_id, key="g72-receipt-source-swap-" + phase,
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+
+    with sessions() as db:
+        original = db.get(DBAssetVersion, original_id)
+        assert original is not None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        replacement = DBAssetVersion(
+            id=str(uuid.uuid4()), tenant_id=original.tenant_id,
+            project_id=original.project_id, media_id="fake-replacement-" + phase,
+            version_no=1, sha256="b" * 64, media_type="image",
+            content_type="image/png", size_bytes=100, probe_json={},
+            created_by=original.created_by, created_at=now,
+        )
+        db.add(replacement)
+        db.flush()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=original.tenant_id,
+            project_id=original.project_id, asset_version_id=replacement.id,
+            status="ALLOWED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="synthetic-replacement-only", captured_by=original.created_by,
+            captured_at=now,
+        ))
+        db.commit()
+        replacement_id = replacement.id
+
+    def poison_request():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task is not None
+            task.request_json = {
+                **task.request_json,
+                "imageAssetVersionId": replacement_id,
+                "imageAssetId": replacement_id,
+                "sourceAssetSha256": "b" * 64,
+                "inputAssetVersionIds": [replacement_id],
+            }
+            db.commit()
+
+    with sessions() as db:
+        old_storage = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+
+    if phase == "before_claim":
+        poison_request()
+        denied = claim(client, worker_id="worker-a")
+        assert denied.status_code == 204, denied.text
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )).scalar_one() == 0
+        assert media.uploads == 0
+    else:
+        leased = claim(client, worker_id="worker-a")
+        assert leased.status_code == 200, leased.text
+        assert leased.json()["taskId"] == task_id
+        assert transition(
+            client, task_id, "RUNNING",
+            upstreamJobId="fake-receipt-upstream",
+        ).status_code == 200
+        assert transition(
+            client, task_id, "INGESTING", progress=95,
+            upstreamJobId="fake-receipt-upstream",
+            providerArtifactId="fake-receipt-artifact",
+        ).status_code == 200
+        if phase == "after_claim":
+            poison_request()
+        else:
+            actual_upload = media.upload_media
+            def persist_then_swap(*args, **kwargs):
+                result = actual_upload(*args, **kwargs)
+                poison_request()
+                return result
+            monkeypatch.setattr(media, "upload_media", persist_then_swap)
+        denied = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "worker-a",
+                "X-Worker-Lease-Epoch": str(leased.json()["leaseEpoch"]),
+            },
+            data={"providerArtifactId": "fake-receipt-artifact"},
+            files={"file": ("fake.mp4", b"fake-receipt-media", "video/mp4")},
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+        assert media.uploads == (1 if phase == "during_upload" else 0)
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task.asset_version_id is None
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one() == 0
+
+    with sessions() as db:
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == old_storage
+    app.state.moneyprinter.assert_not_called()
