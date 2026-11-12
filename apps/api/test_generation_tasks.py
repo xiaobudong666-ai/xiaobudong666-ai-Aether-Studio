@@ -4761,3 +4761,59 @@ def test_g70_g71_recovery_corrupt_snapshot_root_is_fail_closed(generation_contex
     assert media_store.uploads == 0
     assert media_store.inspections == 1
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_inspection", [None, [], "malformed-sidecar-response", False, 7])
+def test_g70_g71_recovery_malformed_sidecar_inspection_preserves_held(
+    generation_context, monkeypatch, bad_inspection
+):
+    """FAKE-only: a non-object Sidecar inspection is not recoverable media proof.
+
+    A malformed external response must return a stable error while keeping the
+    original task FAILED/HELD, its one RESERVED usage and zero new assets.
+    This test does not call Provider or alter protected storage policies.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-malformed-sidecar-inspection")
+    task = create_task(client, project, key="g70-g71-sidecar-inspection-root")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+
+    def invalid_inspection(_project_id, _media_id):
+        media_store.inspections += 1
+        return bad_inspection
+
+    monkeypatch.setattr(media_store, "inspect_media", invalid_inspection)
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checks malformed Sidecar receipt before recovery"},
+    )
+    assert response.status_code == 502, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_INSPECTION_UNAVAILABLE"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        asset_count = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert asset_count == 0 and recovery_count == 0
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
