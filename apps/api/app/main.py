@@ -2322,11 +2322,16 @@ def create_app(
         # Historical snapshots can contain non-object providerPolicy JSON.
         # Owner recovery must refuse malformed policy evidence before changing
         # any media, quota or settlement state (no Provider call).
-        raw_provider_policy = (
-            task.capability_snapshot_json.get("providerPolicy")
-            if isinstance(task.capability_snapshot_json, dict)
-            else None
-        )
+        raw_snapshot = task.capability_snapshot_json
+        if not isinstance(raw_snapshot, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_POLICY_INVALID",
+                    "message": "原任务生成快照证据格式异常，保持 HELD，需人工核对",
+                },
+            )
+        raw_provider_policy = raw_snapshot.get("providerPolicy")
         if raw_provider_policy is not None and not isinstance(raw_provider_policy, dict):
             raise HTTPException(
                 status_code=409,
