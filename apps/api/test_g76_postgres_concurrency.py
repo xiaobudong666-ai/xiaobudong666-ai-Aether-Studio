@@ -169,6 +169,82 @@ def _create_task(client: TestClient) -> str:
     return response.json()["taskId"]
 
 
+
+def _g72_create_claimed_typed_fake_source(
+    client, sessions, worker_id: str, *, source_sha: str,
+    valid_until: datetime.datetime | None = None,
+):
+    """Real typed FAKE creation/claim on disposable PG, not a converted paid task.
+
+    This preserves append-only authenticated TASK_CREATED evidence; the two
+    upload-race tests must not rewrite the creation log or bypass its guard.
+    """
+    project_response = client.post(
+        "/projects", json={"name": "G72 PG native source " + str(uuid.uuid4())},
+    )
+    assert project_response.status_code == 201, project_response.text
+    project = project_response.json()
+    with sessions() as db:
+        row = db.get(DBProject, project["id"])
+        assert row is not None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        source_id = str(uuid.uuid4())
+        tenant_id, requested_by = row.tenant_id, row.owner_id
+        db.add(DBAssetVersion(
+            id=source_id, tenant_id=tenant_id, project_id=row.id,
+            media_id="g72-fake-source-" + source_id, version_no=1,
+            sha256=source_sha, media_type="image", content_type="image/png",
+            size_bytes=53, probe_json={"image": {"width": 16, "height": 16}},
+            created_by=requested_by, created_at=now,
+        ))
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=row.id,
+            asset_version_id=source_id, status="ALLOWED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=valid_until,
+            evidence_ref="g72-typed-fake-disposable-only",
+            captured_by=requested_by, captured_at=now,
+        ))
+        db.commit()
+
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    payload = {
+        "text": "synthetic PG concurrency proof", "durationSeconds": 1,
+        "aspectRatio": "9:16", "resolution": "720p",
+        "voiceId": "synthetic-seed", "imageAssetVersionId": source_id,
+        "idempotencyKey": str(uuid.uuid4()),
+        "expectedProjectRevision": project["revision"],
+        "confirmSyntheticTestOnly": True,
+    }
+    created = None
+    stale = {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}
+    for _ in range(4):
+        capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+        assert capabilities.status_code == 200, capabilities.text
+        payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+        preflight = client.post(path + "/validate", json=payload)
+        if preflight.status_code != 200:
+            if preflight.json().get("detail", {}).get("code") in stale:
+                continue
+            pytest.fail("Typed G72 PG preflight: " + preflight.text)
+        payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        if created.json().get("detail", {}).get("code") not in stale:
+            break
+    assert created is not None and created.status_code == 202, (
+        created.text if created is not None else "Typed G72 task was not created"
+    )
+    task_id = created.json()["taskId"]
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    return task_id, source_id, project["id"], tenant_id, requested_by, claimed.json()["leaseEpoch"]
+
+
 def _wait_until_postgres_reports_lock_wait(
     sessions, table_name: str = "generation_tasks", timeout_seconds: float = 8.0
 ) -> bool:
@@ -2634,62 +2710,20 @@ def test_g72_postgres_remix_expires_during_fake_upload_releases_storage_without_
     from app import main as api_main
 
     owner, sessions, app = postgres_context
-    task_id = _create_task(owner)
     worker_id = "g72-expiring-remix-worker"
-    claimed = owner.post(
-        "/internal/generation-tasks/claim",
-        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
-    )
-    assert claimed.status_code == 200, claimed.text
-    assert claimed.json()["taskId"] == task_id
-    lease_epoch = claimed.json()["leaseEpoch"]
-
     before_expiry = datetime.datetime.now(datetime.timezone.utc)
     expires_at = before_expiry + datetime.timedelta(seconds=45)
-    source_id = str(uuid.uuid4())
-    source_sha = "e" * 64
+    task_id, source_id, project_id, tenant_id, requested_by, lease_epoch = (
+        _g72_create_claimed_typed_fake_source(
+            owner, sessions, worker_id, source_sha="e" * 64,
+            valid_until=expires_at,
+        )
+    )
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
-        project_id, tenant_id, requested_by = task.project_id, task.tenant_id, task.requested_by
-        task.provider = "deterministic-fake-talking-head"
-        task.request_json = {
-            "fakeTaskType": "talking-head", "simulatedOutput": True,
-            "publishable": False, "confirmSyntheticTestOnly": True,
-            "outputCount": 1, "inputAssetVersionIds": [source_id],
-            "imageAssetVersionId": source_id,
-            "imageAssetId": source_id, "sourceAssetSha256": source_sha,
-        }
-        # This legacy synthetic diagnostic changes a moneyprinter fixture into
-        # FAKE. Match the typed creation receipt as well, otherwise the new
-        # fail-closed origin guard correctly denies the probe before upload.
-        created_event = db.execute(select(DBGenerationEvent).where(
-            DBGenerationEvent.generation_task_id == task_id,
-            DBGenerationEvent.event_type == "TASK_CREATED",
-        )).scalar_one()
-        created_event.metadata_json = {
-            **created_event.metadata_json,
-            "fakeOnly": True, "simulatedOutput": True,
-            "inputAssetVersionId": source_id, "sourceAssetSha256": source_sha,
-        }
         task.status = "RUNNING"
-        # Keep the lease alive during synthetic time advance: the denial
-        # must be attributable to REMIX expiry rather than lease expiry.
         task.lease_expires_at = before_expiry + datetime.timedelta(hours=2)
-        db.add(DBAssetVersion(
-            id=source_id, tenant_id=tenant_id, project_id=project_id,
-            media_id=f"g72-expiry-source-{source_id}", version_no=1,
-            sha256=source_sha, media_type="image", content_type="image/png",
-            size_bytes=53, probe_json={"image": {"width": 16, "height": 16}},
-            created_by=requested_by, created_at=before_expiry,
-        ))
-        db.add(DBRightsSnapshot(
-            id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=project_id,
-            asset_version_id=source_id, status="ALLOWED", purpose="REMIX",
-            territory="TEST", valid_from=None, valid_until=expires_at,
-            evidence_ref="g72-fake-expiry-evidence",
-            captured_by=requested_by, captured_at=before_expiry,
-        ))
         db.commit()
         initial_storage = db.get(DBTenant, tenant_id).used_storage_bytes
         initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
@@ -2835,58 +2869,16 @@ def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(po
     from app import main as api_main
 
     owner, sessions, app = postgres_context
-    task_id = _create_task(owner)
     worker_id = "g72-final-read-revocation-probe"
-    claimed = owner.post(
-        "/internal/generation-tasks/claim",
-        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
-    )
-    assert claimed.status_code == 200, claimed.text
-    assert claimed.json()["taskId"] == task_id
-    epoch = claimed.json()["leaseEpoch"]
-    asset_id = str(uuid.uuid4())
     source_digest = "c" * 64
-    now = datetime.datetime.now(datetime.timezone.utc)
+    task_id, asset_id, project_id, tenant_id, requested_by, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            owner, sessions, worker_id, source_sha=source_digest,
+        )
+    )
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
-        project_id, tenant_id, requested_by = task.project_id, task.tenant_id, task.requested_by
-        db.add(DBAssetVersion(
-            id=asset_id, tenant_id=tenant_id, project_id=project_id,
-            media_id=f"g72-final-race-source-{asset_id}", version_no=1,
-            sha256=source_digest, media_type="image", content_type="image/png",
-            size_bytes=41, probe_json={"image": {"width": 16, "height": 16}},
-            created_by=requested_by, created_at=now,
-        ))
-        db.add(DBRightsSnapshot(
-            id=str(uuid.uuid4()), tenant_id=tenant_id, project_id=project_id,
-            asset_version_id=asset_id, status="ALLOWED", purpose="REMIX",
-            territory="TEST", valid_from=None, valid_until=None,
-            evidence_ref="g72-final-race-initial-allow",
-            captured_by=requested_by, captured_at=now,
-        ))
-        # This probe isolates the final-intake serialization contract.
-        # The existing normal entry -> FAKE Worker route is tested separately.
-        task.provider = "deterministic-fake-talking-head"
-        task.request_json = {
-            "fakeTaskType": "talking-head", "simulatedOutput": True,
-            "publishable": False, "confirmSyntheticTestOnly": True,
-            "outputCount": 1, "inputAssetVersionIds": [asset_id],
-            "imageAssetVersionId": asset_id,
-            "imageAssetId": asset_id, "sourceAssetSha256": source_digest,
-        }
-        # Preserve the intended PostgreSQL final-rights-race diagnostic:
-        # its synthetic converted task must carry the same create receipt
-        # a real typed FAKE route persists before testing final serialization.
-        created_event = db.execute(select(DBGenerationEvent).where(
-            DBGenerationEvent.generation_task_id == task_id,
-            DBGenerationEvent.event_type == "TASK_CREATED",
-        )).scalar_one()
-        created_event.metadata_json = {
-            **created_event.metadata_json,
-            "fakeOnly": True, "simulatedOutput": True,
-            "inputAssetVersionId": asset_id, "sourceAssetSha256": source_digest,
-        }
         task.status = "RUNNING"
         db.commit()
         base_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
