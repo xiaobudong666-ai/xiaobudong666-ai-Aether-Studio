@@ -752,7 +752,10 @@ def create_app(
         config = published_generation_config(db, tenant_id)
         circuit = generation_circuit(db, tenant_id, for_update=True)
         circuit_state = circuit.state if circuit is not None else "CLOSED"
-        policy = config.policy_json if config is not None else DEFAULT_FAKE_POLICY
+        # A persisted published policy can be malformed in legacy/partially recovered data.
+        # Never let corrupt JSON crash readiness or authorize a Provider claim.
+        config_policy = config.policy_json if config is not None and isinstance(config.policy_json, dict) else None
+        policy = config_policy if config_policy is not None else DEFAULT_FAKE_POLICY
         reason_code: str | None = None
         attestation: DBGenerationProviderAttestation | None = None
         healthy = True
@@ -764,7 +767,10 @@ def create_app(
             if config is None:
                 reason_code = "OWNER_CONFIG_MISSING"
                 healthy = False
-            elif not bool(config.policy_json.get("enabledIntent")):
+            elif config_policy is None:
+                reason_code = "OWNER_POLICY_INVALID"
+                healthy = False
+            elif not bool(config_policy.get("enabledIntent")):
                 reason_code = "OWNER_POLICY_DISABLED"
                 healthy = False
             else:
@@ -802,7 +808,7 @@ def create_app(
                 elif attestation_canary_proof(attestation)[2] != PRIVATE_CANARY_PROFILE:
                     reason_code = "WORKER_CANARY_PROFILE_MISMATCH"
                     healthy = False
-                elif not private_canary_policy_valid(config.policy_json):
+                elif not private_canary_policy_valid(config_policy):
                     reason_code = "CANARY_POLICY_MISMATCH"
                     healthy = False
                 elif not attestation.healthy:
@@ -853,7 +859,7 @@ def create_app(
             "canaryProfile": canary_profile,
             "ownerPolicy": {
                 "published": config is not None,
-                "enabledIntent": bool(config and config.policy_json.get("enabledIntent")),
+                "enabledIntent": bool(config_policy and config_policy.get("enabledIntent")),
             },
             "workerProof": {
                 "present": attestation is not None,
@@ -2816,6 +2822,7 @@ def create_app(
                     config is None
                     or config.id != candidate.capability_snapshot_json.get("configVersionId")
                     or config.policy_hash != candidate.capability_snapshot_json.get("policyHash")
+                    or not isinstance(config.policy_json, dict)
                     or not config.policy_json.get("enabledIntent")
                 ):
                     continue
