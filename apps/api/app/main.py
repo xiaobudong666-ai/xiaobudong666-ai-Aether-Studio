@@ -2843,6 +2843,11 @@ def create_app(
                     or not isinstance(source_sha256, str) or not source_sha256
                 ):
                     continue
+                # Preserve the original single immutable image version in the
+                # typed FAKE-only request. A forged list must not reach the
+                # Worker or its eventual artifact evidence.
+                if stored.get("inputAssetVersionIds") != [image_asset_id]:
+                    continue
                 source = db.execute(select(DBAssetVersion).where(
                     DBAssetVersion.id == image_asset_id,
                     DBAssetVersion.project_id == candidate.project_id,
