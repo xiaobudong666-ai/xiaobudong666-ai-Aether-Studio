@@ -5055,3 +5055,81 @@ def test_g73_malformed_published_policy_root_fails_closed_without_claim(
         )).scalar_one()
         assert claimed_events == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("simulatedOutput", False),
+    ("publishable", True),
+    ("confirmSyntheticTestOnly", False),
+    ("outputCount", 4),
+    ("inputAssetVersionIds", ["other-immutable-asset"]),
+])
+def test_g72_poisoned_persisted_fake_labels_are_not_leased(
+    generation_context, monkeypatch, field, bad_value,
+):
+    """A typed FAKE talking-head row must keep consent, nonpublishability and source binding.
+
+    This uses actual FastAPI+disposable SQLite tasks and synthetic REMIX rights.
+    A malformed older task must not receive a lease, create an audit claim,
+    consume usage, or starve a later healthy deterministic-FAKE task.
+    It does not establish Owner project grants or the revoke/commit race.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 2)
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 persisted FAKE-only claim fence")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        payload = _g72_fake_payload(
+            client, project, asset_id, key="g72-guard-" + field,
+        )
+        preview = client.post(path + "/validate", json=payload)
+        assert preview.status_code == 200, preview.text
+        payload["capabilitySnapshotHash"] = preview.json()["capabilitySnapshotHash"]
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        assert created.status_code == 409, created.text
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created is not None and created.status_code == 202, (
+        created.text if created is not None else "FAKE typed creation not reached"
+    )
+    poisoned_id = created.json()["taskId"]
+    healthy = create_task(client, project, key="g72-safe-after-" + field)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned_id)
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        assert bad.provider == "deterministic-fake-talking-head"
+        bad.request_json = {**bad.request_json, field: bad_value}
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        storage_before = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    response = claim(client, worker_id="g72-fake-contract-worker")
+    assert response.status_code == 200, response.text
+    assert response.json()["taskId"] == healthy["taskId"]
+    assert response.json()["providerMode"] == "deterministic-fake"
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned_id)
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None and bad.lease_epoch == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g72-fake-contract-worker"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == storage_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == poisoned_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
