@@ -4282,12 +4282,15 @@ def test_g73_keyset_claim_scans_past_foreign_tenant_ineligible_queue_rows(genera
 
     assert media.uploads == 0
 
-def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(generation_context):
+def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(generation_context, monkeypatch):
     """Malformed legacy task JSON cannot take down every FAKE Worker claim.
 
-    Both malformed entries are already persisted; this test must not rewrite
-    old financial reservations, repair protected storage, or invoke a Provider.
+    Synthetic fixture contains five queued tasks. Expand ONLY the disposable
+    FAKE concurrency capacity; do not change real policy or financial ledgers.
     """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 5)
     client, sessions, app, media_store = generation_context
     project = create_project(client, "G73 fail-closed legacy queue")
     malformed_snapshot = create_task(client, project, key="g73-poisoned-snapshot")
