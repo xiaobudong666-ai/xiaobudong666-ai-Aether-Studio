@@ -4415,6 +4415,62 @@ def test_g73_corrupt_snapshot_quota_does_not_lease_or_starve_healthy_worker(
     app.state.moneyprinter.assert_not_called()
 
 
+
+@pytest.mark.parametrize("poisoned_provider, forged_fake_marker", [
+    ("moneyprinter", True),
+    ("unexpected-provider", False),
+])
+def test_g72_g73_fake_route_cannot_claim_forged_provider_or_marker(
+    generation_context, monkeypatch, poisoned_provider, forged_fake_marker,
+):
+    """A legacy row cannot bypass the talking-head FAKE-only rights route.
+
+    An ordinary moneyprinter task is still claimable in deterministic-fake
+    mode. The poisoned row must neither lease nor consume usage; this is a
+    disposable SQLite fixture, not a protected policy or Provider change.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 2)
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G72/G73 fake-route discriminant")
+    poisoned = create_task(client, project, key=f"g72-g73-poison-{poisoned_provider}")
+    healthy = create_task(client, project, key=f"g72-g73-safe-{poisoned_provider}")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        bad.provider = poisoned_provider
+        if forged_fake_marker:
+            bad.request_json = {**bad.request_json, "fakeTaskType": "talking-head"}
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+
+    claimed = claim(client, worker_id="g72-g73-fake-route-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+    assert claimed.json()["providerMode"] == "deterministic-fake"
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None and bad.lease_epoch == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g72-g73-fake-route-safe-worker"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == bad.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_missing_current_attempt_does_not_starve_healthy_fake_worker(generation_context):
     """A queued legacy row without its current attempt must never block the Worker.
 

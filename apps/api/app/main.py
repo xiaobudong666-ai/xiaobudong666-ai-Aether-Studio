@@ -2805,6 +2805,15 @@ def create_app(
             candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
+            # G72/G73: the normal Provider path must not launder a persisted
+            # FAKE talking-head request around its source/REMIX rights fence.
+            # Legitimate nonproduction moneyprinter tasks retain FAKE mode;
+            # only unknown providers or the fake-only marker on moneyprinter
+            # are rejected. Never advance a lease or call an external Provider.
+            if candidate.provider not in {"moneyprinter", "deterministic-fake-talking-head"}:
+                continue
+            if candidate.provider == "moneyprinter" and candidate_request.get("fakeTaskType") is not None:
+                continue
             if candidate.provider == "deterministic-fake-talking-head":
                 # Recheck the immutable image version and latest REMIX rights
                 # when a Worker claims a FAKE-only task; NEVER allow a real mode.
