@@ -2302,6 +2302,17 @@ def create_app(
                 },
             ) from exc
 
+        # G70/G71: a malformed Sidecar inspection JSON root is not proof
+        # that an orphan is recoverable. Preserve HELD/usage unchanged and
+        # return a stable upstream-inspection failure instead of HTTP 500.
+        if not isinstance(inspected, dict):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_INSPECTION_UNAVAILABLE",
+                    "message": "孤儿媒资校验响应格式异常，任务继续保持 HELD",
+                },
+            )
         actual_sha256 = str(inspected.get("sha256") or "").lower()
         try:
             actual_size = int(inspected.get("sizeBytes") or 0)
