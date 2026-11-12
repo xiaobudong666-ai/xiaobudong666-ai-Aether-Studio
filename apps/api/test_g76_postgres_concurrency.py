@@ -2653,7 +2653,12 @@ def test_g72_postgres_remix_expires_during_fake_upload_releases_storage_without_
         assert task is not None
         project_id, tenant_id, requested_by = task.project_id, task.tenant_id, task.requested_by
         task.provider = "deterministic-fake-talking-head"
-        task.request_json = {"imageAssetId": source_id, "sourceAssetSha256": source_sha}
+        task.request_json = {
+            "fakeTaskType": "talking-head", "simulatedOutput": True,
+            "publishable": False, "confirmSyntheticTestOnly": True,
+            "outputCount": 1, "inputAssetVersionIds": [source_id],
+            "imageAssetId": source_id, "sourceAssetSha256": source_sha,
+        }
         task.status = "RUNNING"
         # Keep the lease alive during synthetic time advance: the denial
         # must be attributable to REMIX expiry rather than lease expiry.
@@ -2850,7 +2855,12 @@ def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(po
         # This probe isolates the final-intake serialization contract.
         # The existing normal entry -> FAKE Worker route is tested separately.
         task.provider = "deterministic-fake-talking-head"
-        task.request_json = {"imageAssetId": asset_id, "sourceAssetSha256": source_digest}
+        task.request_json = {
+            "fakeTaskType": "talking-head", "simulatedOutput": True,
+            "publishable": False, "confirmSyntheticTestOnly": True,
+            "outputCount": 1, "inputAssetVersionIds": [asset_id],
+            "imageAssetId": asset_id, "sourceAssetSha256": source_digest,
+        }
         task.status = "RUNNING"
         db.commit()
         base_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
