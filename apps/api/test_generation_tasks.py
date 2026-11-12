@@ -4595,6 +4595,71 @@ def test_g72_admin_without_delegation_read_preflight_diagnostic(generation_conte
     assert response.status_code in (403, 404), response.text
 
 
+
+@pytest.mark.parametrize("bad_limit", [
+    "unlimited", {"bytes": 1024}, [1024], False, 0, None, 1.5, -3,
+    2 * 1024**3 + 1,
+])
+def test_g70_g71_recovery_corrupt_nested_artifact_limit_is_fail_closed(
+    generation_context, bad_limit
+):
+    """Persisted malformed maxArtifactBytes cannot silently widen recovery limit.
+
+    This is Owner self-service and FAKE-only; malformed historical evidence must
+    remain HELD for explicit reconciliation, without a Provider retry or storage
+    ledger change. An absent limit remains a separate compatibility case.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-malformed-nested-policy")
+    task = create_task(
+        client, project, key="g70-g71-malformed-limit-" + str(bad_limit)
+    )
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        snapshot = dict(row.capability_snapshot_json)
+        policy = dict(snapshot.get("providerPolicy") or {})
+        policy["maxArtifactBytes"] = bad_limit
+        snapshot["providerPolicy"] = policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner verifies immutable invalid size limit before recovery"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        asset_count = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert asset_count == 0 and recovery_count == 0
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("bad_policy", [[], ["legacy-policy"], "invalid-policy"])
 def test_g70_g71_recovery_corrupt_snapshot_policy_is_fail_closed(generation_context, bad_policy):
     """Corrupt persisted provider policy must not turn Owner recovery into a 500 or a quota mutation."""
