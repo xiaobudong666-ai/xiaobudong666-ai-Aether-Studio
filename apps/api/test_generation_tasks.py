@@ -5133,3 +5133,136 @@ def test_g72_poisoned_persisted_fake_labels_are_not_leased(
         )).scalar_one() == 0
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("fakeTaskType", "normal-generation"),
+    ("simulatedOutput", False),
+    ("publishable", True),
+    ("confirmSyntheticTestOnly", False),
+    ("outputCount", 4),
+    ("inputAssetVersionIds", ["forged-input-version"]),
+])
+def test_g72_postclaim_fake_promise_poison_rejected_before_sidecar(
+    generation_context, field, bad_value,
+):
+    """FAKE-only lease does not authorize intake after persisted consent/labels drift.
+
+    Nonproduction FastAPI + disposable SQLite; deliberately edits a test row,
+    without modifying policy, Provider, protected store or actual customer data.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 postclaim fake contract")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, image_id, key="g72-postclaim-" + field,
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    leased = claim(client, worker_id="worker-a")
+    assert leased.status_code == 200, leased.text
+    assert leased.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="fake-g72-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-g72-upstream",
+        providerArtifactId="fake-g72-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        task.request_json = {**task.request_json, field: bad_value}
+        before_storage = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+        db.commit()
+
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "fake-g72-artifact"},
+        files={"file": ("fake.mp4", b"g72-synthetic-test-media", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+    assert media.uploads == 0
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.asset_version_id is None
+        assert task.status == "INGESTING"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == before_storage
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_midupload_fake_promise_poison_is_rejected_at_final_commit(
+    generation_context, monkeypatch,
+):
+    """A changed publishable flag during Sidecar upload must not settle or ingest."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 midupload fake contract")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, image_id, key="g72-midupload-promise-drift",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    leased = claim(client, worker_id="worker-a")
+    assert leased.status_code == 200, leased.text
+    assert leased.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="fake-midupload-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-midupload-upstream",
+        providerArtifactId="fake-midupload-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        before_storage = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+
+    actual_upload = media.upload_media
+
+    def persist_then_poison(*args, **kwargs):
+        uploaded = actual_upload(*args, **kwargs)
+        # The API already committed its temporary storage reservation; this
+        # independent transaction models a persisted row changed in flight.
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            task.request_json = {**task.request_json, "publishable": True}
+            db.commit()
+        return uploaded
+
+    monkeypatch.setattr(media, "upload_media", persist_then_poison)
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "fake-midupload-artifact"},
+        files={"file": ("fake.mp4", b"g72-synthetic-test-media", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+    assert media.uploads == 1
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.asset_version_id is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == before_storage
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
