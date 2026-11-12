@@ -71,6 +71,34 @@ describe("GenerationPanel server authority", () => {
     expect(screen.queryByRole("button", { name: "打开生成任务" })).toBeNull();
   });
 
+  test.each(["owner", "editor", "viewer"] as const)(
+    "G70/G71 failed artifact intake requires Owner verification, never offers direct retry to %s",
+    async (role) => {
+      const failedTask: ServerGenerationTask = {
+        ...queuedTask, status: "FAILED", storedStatus: "FAILED",
+        errorCode: "ARTIFACT_INGEST_FAILED", errorMessage: "synthetic sidecar transfer interrupted",
+      };
+      const fetchMock = installFetch([failedTask]);
+      render(<GenerationPanel role={role} tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+      if (role !== "viewer") fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+      expect(await screen.findByText("server-generation-1")).toBeTruthy();
+      expect(screen.getByText(/原始产物转存失败，禁止直接重试或重新生成/)).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/retry"))).toHaveLength(0);
+    },
+  );
+
+  test("unrelated retryable failures still offer a retry button", async () => {
+    installFetch([{
+      ...queuedTask, status: "FAILED", storedStatus: "FAILED",
+      errorCode: "PROVIDER_TEMPORARY_FAILURE", errorMessage: "synthetic transient error",
+    }]);
+    render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+    expect(await screen.findByRole("button", { name: "重试" })).toBeTruthy();
+    expect(screen.queryByText(/原始产物转存失败，禁止直接重试或重新生成/)).toBeNull();
+  });
+
   test("preflight and submit use server APIs without a local run action", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
