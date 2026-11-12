@@ -648,6 +648,19 @@ def create_app(
         }
         if generation_request_hash(original_request_fields) != task.request_hash:
             return False
+        # G72: typed user choices are copied into Worker-facing fields at
+        # creation. Those derived values are NOT part of the typed request
+        # hash. A corrupted row could leave text/duration intact while
+        # changing the actual video sent to the FAKE Worker. Bind the copies
+        # to the same original choices before claim, upload and final intake.
+        if (
+            request.get("videoSubject") != original_request_fields["text"]
+            or request.get("videoAspect") != "9:16"
+            or type(request.get("videoClipDuration")) is not int
+            or request.get("videoClipDuration") != original_request_fields["durationSeconds"]
+            or request.get("voiceId") != "synthetic-seed"
+        ):
+            return False
         created = db.execute(
             select(DBGenerationEvent)
             .where(
