@@ -5011,11 +5011,25 @@ def test_g70_g71_recovery_corrupt_materials_root_or_entry_preserves_held(
     app.state.moneyprinter.assert_not_called()
 
 
-@pytest.mark.parametrize("bad_limit", ["bad-number", None, False, 0, -1, [], {}])
-def test_g73_corrupt_published_artifact_byte_ceiling_is_not_leased(
-    provider_control_context, bad_limit,
+@pytest.mark.parametrize(("policy_field", "bad_value"), [
+    ("maxArtifactBytes", "bad-number"), ("maxArtifactBytes", None),
+    ("maxArtifactBytes", False), ("maxArtifactBytes", 0),
+    ("maxArtifactBytes", -1), ("maxArtifactBytes", []),
+    ("maxArtifactBytes", {}),
+    # Values which int(...) used to coerce must never qualify a live canary.
+    ("enabledIntent", "false"), ("enabledIntent", 1),
+    ("concurrentTaskLimit", True), ("concurrentTaskLimit", "1"),
+    ("concurrentTaskLimit", 1.9),
+    ("monthlyRequestLimit", True), ("monthlyRequestLimit", "1"),
+    ("monthlyGeneratedSecondsLimit", "10"),
+    ("monthlyGeneratedSecondsLimit", 9.9),
+    ("maxClipDurationSeconds", "10"), ("maxClipDurationSeconds", 5.9),
+    ("maxOutputs", True), ("maxOutputs", "1"),
+])
+def test_g73_corrupt_published_canary_policy_is_not_leased(
+    provider_control_context, policy_field, bad_value,
 ):
-    """FAKE-only disposable DB: malformed persisted byte policy cannot lease a Worker.
+    """FAKE-only disposable DB: malformed persisted canary policy never leases a Worker.
 
     This corrupts only synthetic storage, after authentic config and task creation;
     it does not edit protected policies or contact a real Provider.
@@ -5029,7 +5043,7 @@ def test_g73_corrupt_published_artifact_byte_ceiling_is_not_leased(
     with sessions() as db:
         config_row = db.get(DBGenerationProviderConfigVersion, config["id"])
         assert config_row is not None and config_row.policy_json["maxArtifactBytes"] > 0
-        corrupt_policy = {**config_row.policy_json, "maxArtifactBytes": bad_limit}
+        corrupt_policy = {**config_row.policy_json, policy_field: bad_value}
     # Bypass ORM immutability in disposable test DB only.
     with engine.begin() as connection:
         assert connection.execute(
