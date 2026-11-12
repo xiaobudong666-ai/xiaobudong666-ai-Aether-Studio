@@ -4708,3 +4708,56 @@ def test_g70_g71_recovery_corrupt_snapshot_policy_is_fail_closed(generation_cont
     assert media_store.uploads == 0
     assert media_store.inspections == 1
     app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize(
+    "bad_snapshot", [[], ["legacy-snapshot"], "legacy-snapshot", 12, False, None],
+)
+def test_g70_g71_recovery_corrupt_snapshot_root_is_fail_closed(generation_context, bad_snapshot):
+    """Non-object persisted capability snapshot is not evidence of a missing limit.
+
+    A corrupt JSON root must not fall back to the global upload cap. Preserve
+    HELD and original reservation; never create a recovered asset or call Provider.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-invalid-snapshot-root")
+    task = create_task(client, project, key="g70-g71-invalid-root")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        row.capability_snapshot_json = bad_snapshot
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checks malformed immutable snapshot root before recovery"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0 and recovery_events == 0
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
