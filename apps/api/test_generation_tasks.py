@@ -35,6 +35,7 @@ from app.models import (
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 
 OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
@@ -5441,8 +5442,15 @@ def test_g72_fake_typed_or_worker_alias_drift_is_rejected(
                 task.request_json[field] != original_field_value
                 or type(task.request_json[field]) is not type(original_field_value)
             )
+            # SQLAlchemy compares Python dicts by value; True == 1, so an
+            # assigned JSON object with only int -> bool drift could be
+            # mistaken for unchanged without explicitly marking it dirty.
+            flag_modified(task, "request_json")
             assert task.request_hash == original_hash
             db.commit()
+        with sessions() as db:
+            persisted = db.get(DBGenerationTask, task_id).request_json[field]
+            assert persisted == new_value and type(persisted) is type(new_value)
 
     if phase == "before_claim":
         change_script_after_creation()
