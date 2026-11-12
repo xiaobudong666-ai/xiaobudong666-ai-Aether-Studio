@@ -2657,7 +2657,20 @@ def test_g72_postgres_remix_expires_during_fake_upload_releases_storage_without_
             "fakeTaskType": "talking-head", "simulatedOutput": True,
             "publishable": False, "confirmSyntheticTestOnly": True,
             "outputCount": 1, "inputAssetVersionIds": [source_id],
+            "imageAssetVersionId": source_id,
             "imageAssetId": source_id, "sourceAssetSha256": source_sha,
+        }
+        # This legacy synthetic diagnostic changes a moneyprinter fixture into
+        # FAKE. Match the typed creation receipt as well, otherwise the new
+        # fail-closed origin guard correctly denies the probe before upload.
+        created_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        created_event.metadata_json = {
+            **created_event.metadata_json,
+            "fakeOnly": True, "simulatedOutput": True,
+            "inputAssetVersionId": source_id, "sourceAssetSha256": source_sha,
         }
         task.status = "RUNNING"
         # Keep the lease alive during synthetic time advance: the denial
@@ -2859,7 +2872,20 @@ def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(po
             "fakeTaskType": "talking-head", "simulatedOutput": True,
             "publishable": False, "confirmSyntheticTestOnly": True,
             "outputCount": 1, "inputAssetVersionIds": [asset_id],
+            "imageAssetVersionId": asset_id,
             "imageAssetId": asset_id, "sourceAssetSha256": source_digest,
+        }
+        # Preserve the intended PostgreSQL final-rights-race diagnostic:
+        # its synthetic converted task must carry the same create receipt
+        # a real typed FAKE route persists before testing final serialization.
+        created_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        created_event.metadata_json = {
+            **created_event.metadata_json,
+            "fakeOnly": True, "simulatedOutput": True,
+            "inputAssetVersionId": asset_id, "sourceAssetSha256": source_digest,
         }
         task.status = "RUNNING"
         db.commit()
