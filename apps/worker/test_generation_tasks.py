@@ -332,9 +332,23 @@ def test_worker_stops_without_overwriting_queue_governance(code, expected_status
     queue.transition.assert_not_called()
     provider.get_task_status.assert_not_called()
 
-@pytest.mark.parametrize("bad_limit", ["bad-number", None, False, 0, -1, [], {}])
-def test_g73_worker_corrupt_artifact_ceiling_refused_before_provider_call(
-    monkeypatch, bad_limit,
+@pytest.mark.parametrize(("policy_field", "bad_value"), [
+    ("maxArtifactBytes", "bad-number"), ("maxArtifactBytes", None),
+    ("maxArtifactBytes", False), ("maxArtifactBytes", 0),
+    ("maxArtifactBytes", -1), ("maxArtifactBytes", []),
+    ("maxArtifactBytes", {}),
+    # Values which int(...) used to coerce must never qualify a live canary.
+    ("enabledIntent", "false"), ("enabledIntent", 1),
+    ("concurrentTaskLimit", True), ("concurrentTaskLimit", "1"),
+    ("concurrentTaskLimit", 1.9),
+    ("monthlyRequestLimit", True), ("monthlyRequestLimit", "1"),
+    ("monthlyGeneratedSecondsLimit", "10"),
+    ("monthlyGeneratedSecondsLimit", 9.9),
+    ("maxClipDurationSeconds", "10"), ("maxClipDurationSeconds", 5.9),
+    ("maxOutputs", True), ("maxOutputs", "1"),
+])
+def test_g73_worker_corrupt_canary_policy_refused_before_provider_call(
+    monkeypatch, policy_field, bad_value,
 ):
     """Second fence rejects a poisoned claim without a Provider request."""
     monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
@@ -351,8 +365,9 @@ def test_g73_worker_corrupt_artifact_ceiling_refused_before_provider_call(
         "enabledIntent": True, "concurrentTaskLimit": 1,
         "monthlyRequestLimit": 1, "monthlyGeneratedSecondsLimit": 10,
         "maxClipDurationSeconds": 10, "maxOutputs": 1,
-        "artifactPathPrefixes": ["/tasks/"], "maxArtifactBytes": bad_limit,
+        "artifactPathPrefixes": ["/tasks/"], "maxArtifactBytes": 1024,
     }
+    policy[policy_field] = bad_value
     assert private_canary_policy_valid(policy) is False
     task = claimed_task(
         providerMode="moneyprinter", configVersionId="config-1",
@@ -367,3 +382,9 @@ def test_g73_worker_corrupt_artifact_ceiling_refused_before_provider_call(
     result = process_generation_task(components(provider, queue), task, poll_interval=0)
     assert result["error_code"] == "WORKER_PROOF_MISMATCH"
     provider.generate_video.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_root", [["corrupt-policy"], "legacy-policy", 1])
+def test_g73_worker_rejects_nonobject_claim_policy_root(bad_root):
+    """Claim-provided policy JSON root must never be coercible to an active canary."""
+    assert private_canary_policy_valid(bad_root) is False
