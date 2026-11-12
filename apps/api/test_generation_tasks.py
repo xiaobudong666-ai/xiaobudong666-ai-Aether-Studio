@@ -5390,3 +5390,105 @@ def test_g72_fake_source_swap_must_match_authenticated_create_receipt(
     with sessions() as db:
         assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == old_storage
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["before_claim", "after_claim", "during_upload"])
+def test_g72_fake_script_change_must_match_authenticated_request_digest(
+    generation_context, monkeypatch, phase,
+):
+    """G72: typed FAKE user script must remain bound to request_hash.
+
+    TASK_CREATED source evidence alone did not cover the owner's actual
+    synthetic script and duration. Even a still-REMIX-allowed original image
+    must not make a changed script eligible for Worker lease or intake.
+    This uses isolated FAKE data and changes no authorization policy.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 immutable script receipt " + phase)
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, image_id, key="g72-script-binding-" + phase,
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=payload,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    with sessions() as db:
+        original = db.get(DBGenerationTask, task_id)
+        assert original is not None
+        original_hash = original.request_hash
+        original_text = original.request_json["text"]
+        storage_before = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+
+    def change_script_after_creation():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            task.request_json = {
+                **task.request_json,
+                "text": "FAKE-only tampered script never approved by the owner",
+            }
+            assert task.request_json["text"] != original_text
+            assert task.request_hash == original_hash
+            db.commit()
+
+    if phase == "before_claim":
+        change_script_after_creation()
+        response = claim(client, worker_id="worker-a")
+        assert response.status_code == 204, response.text
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )).scalar_one() == 0
+        assert media.uploads == 0
+    else:
+        leased = claim(client, worker_id="worker-a")
+        assert leased.status_code == 200, leased.text
+        assert leased.json()["taskId"] == task_id
+        assert transition(
+            client, task_id, "RUNNING", upstreamJobId="fake-script-upstream",
+        ).status_code == 200
+        assert transition(
+            client, task_id, "INGESTING", progress=95,
+            upstreamJobId="fake-script-upstream",
+            providerArtifactId="fake-script-artifact",
+        ).status_code == 200
+        if phase == "after_claim":
+            change_script_after_creation()
+        else:
+            upload = media.upload_media
+
+            def persist_then_change(*args, **kwargs):
+                result = upload(*args, **kwargs)
+                change_script_after_creation()
+                return result
+
+            monkeypatch.setattr(media, "upload_media", persist_then_change)
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "worker-a",
+                "X-Worker-Lease-Epoch": str(leased.json()["leaseEpoch"]),
+            },
+            data={"providerArtifactId": "fake-script-artifact"},
+            files={"file": ("fake.mp4", b"fake-script-media", "video/mp4")},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+        assert media.uploads == (1 if phase == "during_upload" else 0)
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.request_hash == original_hash
+        assert row.asset_version_id is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == storage_before
+    app.state.moneyprinter.assert_not_called()
