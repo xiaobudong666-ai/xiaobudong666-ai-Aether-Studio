@@ -3184,6 +3184,23 @@ def create_app(
                     detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
                             "message": "口播素材字段异常，模拟产物已隔离"},
                 )
+            # G72: claim-time FAKE-only consent/nonpublication/input binding
+            # must remain true at intake, even for a row changed after lease.
+            # Reject before any storage reservation or Sidecar upload.
+            if (
+                stored_request.get("fakeTaskType") != "talking-head"
+                or stored_request.get("simulatedOutput") is not True
+                or stored_request.get("publishable") is not False
+                or stored_request.get("confirmSyntheticTestOnly") is not True
+                or type(stored_request.get("outputCount")) is not int
+                or stored_request["outputCount"] != 1
+                or stored_request.get("inputAssetVersionIds") != [source_id]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                            "message": "口播FAKE任务持久合约已变化，模拟产物已隔离"},
+                )
             source = db.execute(select(DBAssetVersion).where(
                 DBAssetVersion.id == source_id,
                 DBAssetVersion.tenant_id == task.tenant_id,
@@ -3469,6 +3486,20 @@ def create_app(
                     ):
                         invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
                         invalid_message = "上传期间口播素材字段异常，模拟产物隔离"
+                    elif (
+                        current_request.get("fakeTaskType") != "talking-head"
+                        or current_request.get("simulatedOutput") is not True
+                        or current_request.get("publishable") is not False
+                        or current_request.get("confirmSyntheticTestOnly") is not True
+                        or type(current_request.get("outputCount")) is not int
+                        or current_request["outputCount"] != 1
+                        or current_request.get("inputAssetVersionIds") != [current_source_id]
+                    ):
+                        # Sidecar upload ends the first DB transaction. Recheck
+                        # the complete FAKE-only promise after reacquiring the
+                        # final write lock, before committing asset or usage.
+                        invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
+                        invalid_message = "上传期间口播FAKE持久合约已变化，模拟产物隔离"
                     else:
                         current_source = db.execute(select(DBAssetVersion).where(
                             DBAssetVersion.id == current_source_id,
