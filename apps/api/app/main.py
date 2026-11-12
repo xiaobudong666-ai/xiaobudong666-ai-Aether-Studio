@@ -2319,11 +2319,23 @@ def create_app(
             ) if isinstance(probe_metadata, dict) else 0
         except (TypeError, ValueError):
             duration_seconds = 0
-        provider_policy = (
-            task.capability_snapshot_json.get("providerPolicy") or {}
+        # Historical snapshots can contain non-object providerPolicy JSON.
+        # Owner recovery must refuse malformed policy evidence before changing
+        # any media, quota or settlement state (no Provider call).
+        raw_provider_policy = (
+            task.capability_snapshot_json.get("providerPolicy")
             if isinstance(task.capability_snapshot_json, dict)
-            else {}
+            else None
         )
+        if raw_provider_policy is not None and not isinstance(raw_provider_policy, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_POLICY_INVALID",
+                    "message": "原任务生成策略证据格式异常，保持 HELD，需人工核对",
+                },
+            )
+        provider_policy = raw_provider_policy or {}
         try:
             policy_max_bytes = int(provider_policy.get("maxArtifactBytes") or max_upload_bytes)
         except (TypeError, ValueError):

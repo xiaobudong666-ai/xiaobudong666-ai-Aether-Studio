@@ -4594,3 +4594,52 @@ def test_g72_admin_without_delegation_read_preflight_diagnostic(generation_conte
         )
     assert response.status_code in (403, 404), response.text
 
+
+@pytest.mark.parametrize("bad_policy", [[], ["legacy-policy"], "invalid-policy"])
+def test_g70_g71_recovery_corrupt_snapshot_policy_is_fail_closed(generation_context, bad_policy):
+    """Corrupt persisted provider policy must not turn Owner recovery into a 500 or a quota mutation."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-malformed-snapshot-policy")
+    task = create_task(client, project, key="g70-g71-bad-policy-" + str(type(bad_policy).__name__))
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        snapshot = dict(row.capability_snapshot_json)
+        snapshot["providerPolicy"] = bad_policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    result = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Inspect malformed legacy policy without changing held usage"},
+    )
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        entries = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0 and recovery_events == 0
+        assert sum(e.kind == "RESERVED" for e in entries) == 1
+        assert not any(e.kind in {"RELEASED", "SETTLED"} for e in entries)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
