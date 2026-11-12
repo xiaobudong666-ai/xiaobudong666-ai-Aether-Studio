@@ -2336,10 +2336,27 @@ def create_app(
                 },
             )
         provider_policy = raw_provider_policy or {}
-        try:
-            policy_max_bytes = int(provider_policy.get("maxArtifactBytes") or max_upload_bytes)
-        except (TypeError, ValueError):
+        # Missing historical limit retains the existing global upload cap.
+        # A present but malformed stored limit is NOT evidence of a larger
+        # allowance. Never silently fall back to the global cap in that case.
+        if "maxArtifactBytes" not in provider_policy:
             policy_max_bytes = max_upload_bytes
+        else:
+            raw_limit = provider_policy["maxArtifactBytes"]
+            try:
+                if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)):
+                    raise ValueError("maxArtifactBytes is not an integer")
+                policy_max_bytes = int(raw_limit)
+                if not (1 <= policy_max_bytes <= 2 * 1024**3):
+                    raise ValueError("maxArtifactBytes exceeds schema bounds")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_RECOVERY_POLICY_INVALID",
+                        "message": "原任务产物大小策略证据异常，保持 HELD，需人工核对",
+                    },
+                ) from exc
 
         if (
             inspected.get("projectId") != project_id
