@@ -4354,6 +4354,67 @@ def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(gener
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("bad_quota", [
+    ["malformed", "quota"],
+    {"monthlyGeneratedSecondsLimit": ["corrupt"]},
+    {"monthlyGeneratedSecondsLimit": 0},
+    {"monthlyGeneratedSecondsLimit": True},
+    {"monthlyGeneratedSecondsLimit": -3},
+])
+def test_g73_corrupt_snapshot_quota_does_not_lease_or_starve_healthy_worker(
+    generation_context, monkeypatch, bad_quota,
+):
+    """Corrupt historical quota cannot reach the Worker or its Sidecar.
+
+    Only disposable FAKE fixtures change. No Provider, Owner policy, protected
+    ledger, production configuration or persisted approval is modified.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 2)
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 malformed durable quota fail-closed")
+    poisoned = create_task(client, project, key="g73-corrupt-quota")
+    healthy = create_task(client, project, key="g73-healthy-after-quota")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, poisoned["taskId"])
+        eligible = db.get(DBGenerationTask, healthy["taskId"])
+        assert damaged is not None and eligible is not None
+        damaged.capability_snapshot_json = {
+            **damaged.capability_snapshot_json, "quota": bad_quota,
+        }
+        damaged.created_at = now - datetime.timedelta(minutes=2)
+        eligible.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+        initial_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+
+    claimed = claim(client, worker_id="g73-quota-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, poisoned["taskId"])
+        eligible = db.get(DBGenerationTask, healthy["taskId"])
+        assert damaged.status == "QUEUED"
+        assert damaged.lease_owner is None
+        assert damaged.lease_epoch == 0
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-quota-safe-worker"
+        assert db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one() == initial_usage
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == poisoned["taskId"],
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_missing_current_attempt_does_not_starve_healthy_fake_worker(generation_context):
     """A queued legacy row without its current attempt must never block the Worker.
 
