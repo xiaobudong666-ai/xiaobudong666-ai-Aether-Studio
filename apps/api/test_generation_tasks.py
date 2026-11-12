@@ -4530,3 +4530,67 @@ def test_g75_ineligible_foreign_tenant_open_circuit_remains_open_after_other_ten
         ).scalar_one()
         assert stale_half_open_events == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["project_read", "talking_head_preflight"])
+def test_g72_admin_without_delegation_read_preflight_diagnostic(generation_context, action):
+    """FAKE-only diagnostic of same-tenant admin impersonation without delegation.
+
+    Existing G72 create-denial covers writes; neither project read nor preflight
+    should be treated as verified project-scoped delegation merely because a
+    tenant-wide admin role exists. This does not choose an Owner policy, alter
+    credentials, grant access, change protected storage, or call a Provider.
+    A 200 response is retained as an explicit open XFAIL after side effects
+    have been checked; do not treat that as acceptance.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 admin read/preflight scope diagnostic")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-admin-no-delegation-" + action
+    )
+    password = secrets.token_urlsafe(24)
+    email = "g72-admin-scope-" + action + "@example.com"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        project_row = db.get(DBProject, project["id"])
+        assert project_row is not None
+        admin_id = str(uuid.uuid4())
+        assert project_row.owner_id != admin_id
+        db.add(DBUser(
+            id=admin_id, tenant_id=tenant_id, email=email,
+            display_name="G72 Unassigned Tenant Admin",
+            password_hash=hash_password(password), role="admin",
+            is_active=True, created_at=now, updated_at=now,
+        ))
+        db.commit()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        before_assets = db.execute(select(func.count(DBAssetVersion.id))).scalar_one()
+
+    assert client.post("/auth/logout").status_code == 204
+    logged_in = client.post("/auth/login", json={"email": email, "password": password})
+    assert logged_in.status_code == 200, logged_in.text
+    if action == "project_read":
+        response = client.get(f"/projects/{project['id']}")
+    else:
+        response = client.post(
+            f"/projects/{project['id']}/talking-head/fake-generation-tasks/validate",
+            json=payload,
+        )
+
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == before_tasks
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == before_usage
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == before_assets
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+    if response.status_code == 200:
+        pytest.xfail(
+            "G72 OPEN POLICY-GATED: same-tenant admin without project delegation "
+            f"was accepted for {action}; no Owner-approved grant/issuer contract"
+        )
+    assert response.status_code in (403, 404), response.text
+
