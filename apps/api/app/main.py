@@ -2820,6 +2820,19 @@ def create_app(
                 stored = candidate_request
                 if candidate_mode != "deterministic-fake" or stored.get("fakeTaskType") != "talking-head":
                     continue
+                # G72 FAKE-only promises are persisted by the typed Owner
+                # creation route. Refuse poisoned/legacy rows that attempt to
+                # relabel simulated work as publishable, omit explicit consent,
+                # or mutate the single-output contract before any Worker lease.
+                # This is a nonproduction safety fence, not an Owner policy change.
+                if (
+                    stored.get("simulatedOutput") is not True
+                    or stored.get("publishable") is not False
+                    or stored.get("confirmSyntheticTestOnly") is not True
+                    or type(stored.get("outputCount")) is not int
+                    or stored["outputCount"] != 1
+                ):
+                    continue
                 # Corrupt nested JSON may be a list/dict even when the outer
                 # request is a dict. Never bind it as an asset identifier: a
                 # DBAPI type error would starve later healthy Worker claims.
