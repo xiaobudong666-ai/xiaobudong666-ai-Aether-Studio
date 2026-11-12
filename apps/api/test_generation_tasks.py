@@ -2711,6 +2711,60 @@ def test_g72_native_fake_rights_revoke_after_enqueue_blocks_claim(generation_con
     assert before_settled == after_settled == 0
 
 
+
+
+def test_g72_preflight_success_does_not_authorize_create_after_revocation(generation_context):
+    """A stale successful FAKE-only preview is never an authorization grant.
+
+    Native HTTP + database negative case, not the unresolved final
+    rights-read versus commit concurrency test. No real Provider or production.
+    """
+    client, sessions, app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-stale-preflight-after-revoke"
+    )
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    preview = client.post(path + "/validate", json=payload)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["allowed"] is True
+    payload["capabilitySnapshotHash"] = preview.json()["capabilitySnapshotHash"]
+
+    with sessions() as db:
+        prior = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.project_id == project["id"]
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=prior.tenant_id,
+            project_id=prior.project_id, asset_version_id=asset_id,
+            status="REVOKED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="synthetic-post-preview-revocation",
+            captured_by=prior.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+
+    # The client replays the old approved preview; POST must recheck live rights.
+    rejected = client.post(path, json=payload)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_VISUAL_RIGHTS_BLOCKED"
+    fresh_preview = client.post(path + "/validate", json=payload)
+    assert fresh_preview.status_code == 409, fresh_preview.text
+    assert fresh_preview.json()["detail"]["code"] == "FAKE_VISUAL_RIGHTS_BLOCKED"
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.project_id == project["id"]
+        )).scalar_one() == before_tasks
+    assert claim(client).status_code == 204
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g72_native_fake_revoked_input_rejected_at_artifact_intake(generation_context):
     client, sessions, _app, media = generation_context
     project = create_project(client)
