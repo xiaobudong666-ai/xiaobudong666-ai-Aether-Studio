@@ -5437,7 +5437,10 @@ def test_g72_fake_typed_or_worker_alias_drift_is_rejected(
                 **task.request_json,
                 field: new_value,
             }
-            assert task.request_json[field] != original_field_value
+            assert (
+                task.request_json[field] != original_field_value
+                or type(task.request_json[field]) is not type(original_field_value)
+            )
             assert task.request_hash == original_hash
             db.commit()
 
