@@ -4293,6 +4293,7 @@ def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(gener
     malformed_snapshot = create_task(client, project, key="g73-poisoned-snapshot")
     malformed_request = create_task(client, project, key="g73-poisoned-talk-request")
     malformed_generic = create_task(client, project, key="g73-poisoned-fake-request")
+    malformed_nested_policy = create_task(client, project, key="g73-poisoned-nested-policy")
     healthy = create_task(client, project, key="g73-healthy-after-poisoned")
     now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -4300,17 +4301,24 @@ def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(gener
         first = db.get(DBGenerationTask, malformed_snapshot["taskId"])
         second = db.get(DBGenerationTask, malformed_request["taskId"])
         third = db.get(DBGenerationTask, malformed_generic["taskId"])
+        fourth = db.get(DBGenerationTask, malformed_nested_policy["taskId"])
         eligible = db.get(DBGenerationTask, healthy["taskId"])
-        assert all(row is not None for row in (first, second, third, eligible))
+        assert all(row is not None for row in (first, second, third, fourth, eligible))
         first.created_at = now - datetime.timedelta(minutes=4)
         first.capability_snapshot_json = ["malformed", "legacy", "snapshot"]
         second.created_at = now - datetime.timedelta(minutes=3)
         # Exercise FAKE talking-head input validation before image/rights lookup.
         second.provider = "deterministic-fake-talking-head"
         second.request_json = ["malformed", "legacy", "request"]
-        third.created_at = now - datetime.timedelta(minutes=2)
+        third.created_at = now - datetime.timedelta(minutes=3)
         # Ordinary deterministic-fake tasks must obey the same fail-closed fence.
         third.request_json = ["malformed", "generic-fake", "request"]
+        fourth.created_at = now - datetime.timedelta(minutes=2)
+        # Historical nested policy corruption must not reach the Worker.
+        fourth.capability_snapshot_json = {
+            **fourth.capability_snapshot_json,
+            "providerPolicy": ["legacy", "corrupt", "policy"],
+        }
         eligible.created_at = now - datetime.timedelta(minutes=1)
         db.commit()
 
@@ -4323,7 +4331,7 @@ def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(gener
     with sessions() as db:
         for poisoned_id in (
             malformed_snapshot["taskId"], malformed_request["taskId"],
-            malformed_generic["taskId"],
+            malformed_generic["taskId"], malformed_nested_policy["taskId"],
         ):
             poisoned = db.get(DBGenerationTask, poisoned_id)
             assert poisoned.status == "QUEUED"

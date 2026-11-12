@@ -2769,6 +2769,12 @@ def create_app(
             candidate_snapshot = candidate.capability_snapshot_json
             if not isinstance(candidate_snapshot, dict):
                 continue
+            # G73: reject corrupt nested policy before leasing any mode. A
+            # malformed legacy policy cannot be safely consumed by a Worker.
+            # Missing policy retains the existing historical compatibility path.
+            candidate_policy = candidate_snapshot.get("providerPolicy")
+            if candidate_policy is not None and not isinstance(candidate_policy, dict):
+                continue
             # G73: any provider mode can inherit legacy/corrupt JSON.  Do
             # not lease a task whose request cannot be consumed by a Worker.
             candidate_request = candidate.request_json
