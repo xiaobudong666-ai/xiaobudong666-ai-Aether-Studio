@@ -4878,3 +4878,47 @@ def test_g70_g71_recovery_corrupt_materials_root_or_entry_preserves_held(
     assert media_store.uploads == 0
     assert media_store.inspections == 1
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_policy", [[], "legacy-corrupt-policy", 42, None])
+def test_g73_malformed_published_policy_root_fails_closed_without_claim(
+    provider_control_context, bad_policy,
+):
+    """Nonproduction native DB: corrupt published JSON cannot crash a Worker claim.
+
+    The valid task/attestation are created before synthetic database corruption;
+    neither this test nor the repair changes any Owner policy or Provider.
+    """
+    client, sessions, app, _engine = provider_control_context
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    project = create_project(client, "G73 malformed published policy")
+    task = create_task(client, project, key="g73-malformed-published-policy")
+
+    with sessions() as db:
+        persisted_config = db.get(DBGenerationProviderConfigVersion, config["id"])
+        assert persisted_config is not None
+        persisted_config.policy_json = bad_policy
+        db.commit()
+
+    readiness = client.get("/generation/providers/moneyprinter/readiness")
+    assert readiness.status_code == 200, readiness.text
+    assert readiness.json()["enabled"] is False
+    assert readiness.json()["reasonCode"] == "OWNER_POLICY_INVALID"
+    assert readiness.json()["ownerPolicy"]["enabledIntent"] is False
+
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 204, claimed.text
+    with sessions() as db:
+        persisted = db.get(DBGenerationTask, task["taskId"])
+        assert persisted is not None
+        assert persisted.status == "QUEUED"
+        assert persisted.lease_owner is None
+        assert persisted.lease_epoch == 0
+        claimed_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == persisted.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one()
+        assert claimed_events == 0
+    app.state.moneyprinter.assert_not_called()
