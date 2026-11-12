@@ -14,6 +14,8 @@ import pytest
 from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import create_app
+from app.generation_tasks import request_hash as generation_request_hash
+from app.schemas import TalkingHeadFakeGenerationRequest
 from app.video_use_adapter import VideoUseError, VideoUseNotFoundError
 from app.models import (
     DBAdoption,
@@ -5510,4 +5512,90 @@ def test_g72_fake_typed_or_worker_alias_drift_is_rejected(
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one() == 0
         assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == storage_before
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "G72 OPEN: TASK_CREATED binds image source but not the original typed "
+        "script hash. A correlated rewrite of mutable task.request_json and "
+        "task.request_hash may pass the FAKE-only Worker claim gate. "
+        "A trusted immutable request receipt needs Owner-approved evidence contract."
+    ),
+)
+def test_g72_correlated_typed_request_and_hash_rewrite_is_rejected(generation_context):
+    """Nonproduction negative diagnostic; never changes a production/audit store.
+
+    Prior request-drift tests change request_json alone. Here a compromised
+    durable task row rewrites both the typed script and its stored request hash,
+    while preserving the original append-only TASK_CREATED event. The Worker
+    must not mistake the new row-local digest for authenticated user consent.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 correlated typed request/hash diagnostic")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    typed = _g72_fake_payload(
+        client, project, asset_id, key="g72-correlated-typed-hash-diagnostic",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=typed,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    attacker_text = "unapproved synthetic script injected after task creation"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row is not None and row.request_json["text"] != attacker_text
+        created_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        original_event_metadata = json.loads(json.dumps(created_event.metadata_json))
+        typed_original = {
+            field: row.request_json[field]
+            for field in TalkingHeadFakeGenerationRequest.model_fields
+        }
+        assert generation_request_hash(typed_original) == row.request_hash
+        typed_forged = {**typed_original, "text": attacker_text}
+        forged_digest = generation_request_hash(typed_forged)
+        assert forged_digest != row.request_hash
+        row.request_json = {
+            **row.request_json,
+            "text": attacker_text,
+            "videoSubject": attacker_text,
+        }
+        row.request_hash = forged_digest
+        db.commit()
+
+    with sessions() as db:
+        event_after = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        assert event_after.metadata_json == original_event_metadata
+        assert db.get(DBGenerationTask, task_id).request_hash == forged_digest
+
+    result = claim(client, worker_id="worker-a")
+    if result.status_code == 200 and result.json().get("request", {}).get("text") == attacker_text:
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            assert row is not None and row.lease_owner == "worker-a"
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )).scalar_one() == 1
+        assert media.uploads == 0
+        app.state.moneyprinter.assert_not_called()
+        pytest.xfail(
+            "REPRODUCED G72: unapproved script+recomputed row hash reached "
+            "FAKE Worker; original TASK_CREATED event was unchanged. "
+            "This is a proven OPEN gate, not a repaired capability."
+        )
+    assert result.status_code == 204, result.text
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row is not None and row.lease_owner is None
+    assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
