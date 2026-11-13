@@ -5748,3 +5748,84 @@ def test_g73_corrupt_failure_policy_after_claim_returns_409_without_commit(
             DBGenerationUsageEntry.kind.in_(("SETTLED", "RELEASED")),
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
+
+
+# G73: read-only corruption fences for persisted tenant circuit history.
+# No Owner policy, schema, protected-store reconciliation or Provider changes.
+@pytest.mark.parametrize("bad_history", [
+    42,
+    {"broken": "history"},
+    [17],
+    ["2026-11-13T10:20:00"],  # Timestamp lacks a timezone; aware cutoff compare would raise.
+])
+def test_g73_bad_circuit_history_denies_claim_without_lease(
+    generation_context, bad_history,
+):
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 corrupted durable circuit claim")
+    task = create_task(client, project, key="g73-history-claim")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=row.tenant_id, provider="moneyprinter",
+            state="CLOSED", failure_timestamps_json=bad_history, updated_at=now,
+        ))
+        db.commit()
+
+    response = claim(client, "g73-circuit-history-worker")
+    assert response.status_code == 204, response.text
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert row.status == "QUEUED" and row.lease_owner is None
+        assert row.lease_epoch == 0
+        assert circuit.state == "CLOSED"
+        assert circuit.failure_timestamps_json == bad_history
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_history", [
+    42,
+    {"broken": "history"},
+    [17],
+    ["2026-11-13T10:20:00"],
+])
+def test_g73_bad_circuit_history_after_claim_fails_closed_without_settlement(
+    generation_context, bad_history,
+):
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 corrupted durable circuit transition")
+    task = create_task(client, project, key="g73-history-after-claim")
+    assert claim(client, "g73-circuit-history-worker").json()["taskId"] == task["taskId"]
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        circuit.failure_timestamps_json = bad_history
+        db.commit()
+
+    response = transition(
+        client, task["taskId"], "FAILED",
+        worker_id="g73-circuit-history-worker",
+        errorCode="PROVIDER_5XX", retryable=False,
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "GENERATION_CIRCUIT_HISTORY_INVALID"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert row.status == "SUBMITTING" and row.lease_owner == "g73-circuit-history-worker"
+        assert row.error_code is None
+        assert circuit.state == "CLOSED"
+        assert circuit.failure_timestamps_json == bad_history
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == row.id,
+            DBGenerationUsageEntry.kind.in_(("SETTLED", "RELEASED")),
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationProviderEvent.id)).where(
+            DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_OPENED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
