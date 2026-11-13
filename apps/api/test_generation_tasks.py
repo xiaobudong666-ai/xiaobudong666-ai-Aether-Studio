@@ -3126,7 +3126,7 @@ def test_g70_g71_completed_intake_replay_requires_exact_committed_asset(
     )
     if mutation == "exact":
         assert response.status_code == 201, response.text
-        assert response.json()["assetVersionId"] == original_asset_id
+        assert response.json()["results"][0]["assetVersionId"] == original_asset_id
     else:
         assert response.status_code == 409, response.text
         assert response.json()["detail"]["code"] == "ARTIFACT_REPLAY_MISMATCH"
