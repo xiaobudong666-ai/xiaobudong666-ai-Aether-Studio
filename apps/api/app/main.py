@@ -3388,6 +3388,10 @@ def create_app(
                     detail={"code": "FAKE_TALKING_HEAD_SOURCE_REVOKED", "message": "输入图片授权或版本已失效，模拟产物隔离"},
                 )
         if task.asset_version_id:
+            # G70/G71: a terminal idempotent ACK must bind the replay's bytes,
+            # MIME and scope to the already committed asset. Previously a
+            # different payload with the same artifact ID/worker got HTTP 201
+            # without its body being checked. This path is read-only.
             completion = db.execute(
                 select(DBGenerationEvent).where(
                     DBGenerationEvent.generation_task_id == task.id,
@@ -3395,9 +3399,43 @@ def create_app(
                     DBGenerationEvent.actor_id == x_worker_id,
                 )
             ).scalar_one_or_none()
-            if task.provider_artifact_id == providerArtifactId and completion is not None:
-                return generation_task_response(db, task, rights=generation_rights(db, task), include_history=True)
-            raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ALREADY_INGESTED", "message": "任务已绑定其他受治理产物"})
+            existing_asset = db.get(DBAssetVersion, task.asset_version_id)
+            if (
+                task.provider_artifact_id != providerArtifactId
+                or completion is None
+                or existing_asset is None
+                or existing_asset.tenant_id != task.tenant_id
+                or existing_asset.project_id != task.project_id
+                or existing_asset.media_id != task.media_id
+                or file.content_type != "video/mp4"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_REPLAY_MISMATCH",
+                            "message": "已入库产物的重试身份或类型不匹配"},
+                )
+            file.file.seek(0, os.SEEK_END)
+            replay_size = file.file.tell()
+            file.file.seek(0)
+            if replay_size <= 0 or replay_size > max_upload_bytes or replay_size != existing_asset.size_bytes:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_REPLAY_MISMATCH",
+                            "message": "已入库产物的重试字节数不匹配"},
+                )
+            replay_digest = hashlib.sha256()
+            while chunk := file.file.read(1024 * 1024):
+                replay_digest.update(chunk)
+            file.file.seek(0)
+            if not hmac.compare_digest(replay_digest.hexdigest(), existing_asset.sha256):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_REPLAY_MISMATCH",
+                            "message": "已入库产物的重试摘要不匹配"},
+                )
+            return generation_task_response(
+                db, task, rights=generation_rights(db, task), include_history=True
+            )
         task_circuit = generation_circuit(db, task.tenant_id)
         if task_circuit is not None and task_circuit.state == "DISABLED":
             raise HTTPException(

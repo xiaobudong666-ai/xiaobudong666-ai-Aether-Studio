@@ -3080,6 +3080,68 @@ def test_g72_changed_payload_same_idempotency_key_is_rejected(generation_context
         assert len(list(db.execute(select(DBGenerationUsageEntry)).scalars())) == 1
 
 
+@pytest.mark.parametrize("mutation", [
+    "exact", "changed_bytes_same_length", "changed_bytes_different_length",
+    "wrong_mime", "wrong_artifact_id",
+])
+def test_g70_g71_completed_intake_replay_requires_exact_committed_asset(
+    generation_context, mutation,
+):
+    """Completed HTTP 201 is only an ACK for the same stored bytes, not any replay.
+
+    Disposable FAKE-only API fixture; no new Sidecar call, asset, usage, or
+    storage mutation is allowed even when the replay is rejected.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G70/G71 terminal replay digest guard")
+    result = ingest_success(client, project, key="g70-g71-terminal-digest-" + mutation)
+    task_id = result["taskId"]
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.asset_version_id is not None
+        tenant_id = task.tenant_id
+        original_asset_id = task.asset_version_id
+        before_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+        before_assets = db.execute(select(func.count(DBAssetVersion.id))).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        before_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+    before_uploads = media.uploads
+
+    original = b"deterministic-video"
+    payload = {
+        "exact": original,
+        "changed_bytes_same_length": b"X" + original[1:],
+        "changed_bytes_different_length": original + b"!",
+        "wrong_mime": original,
+        "wrong_artifact_id": original,
+    }[mutation]
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "artifact-2" if mutation == "wrong_artifact_id" else "artifact-1"},
+        files={"file": (
+            "artifact.mp4", payload,
+            "image/png" if mutation == "wrong_mime" else "video/mp4",
+        )},
+    )
+    if mutation == "exact":
+        assert response.status_code == 201, response.text
+        assert response.json()["assetVersionId"] == original_asset_id
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "ARTIFACT_REPLAY_MISMATCH"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.asset_version_id == original_asset_id
+        assert task.status == "RIGHTS_BLOCKED"
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == before_bytes
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == before_assets
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == before_usage
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == before_events
+    assert media.uploads == before_uploads
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("corruption", [
     "response_not_object",
     "metadata_not_object",
