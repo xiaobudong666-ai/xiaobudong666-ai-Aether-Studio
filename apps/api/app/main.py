@@ -3551,12 +3551,40 @@ def create_app(
                         DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
                     )
                 ).scalars().all()
-                released_ids = {
-                    receipt.metadata_json.get("storageReservationEventId")
-                    for receipt in releases
-                    if isinstance(receipt.metadata_json, dict)
-                    and receipt.metadata_json.get("reservedStorageBytes") is not None
-                }
+                # A release event is evidence only when it binds exactly to
+                # the opened reservation. Untrusted/migrated JSON must never
+                # turn an outstanding quota hold into a presumed release.
+                opened_by_id = {hold.id: hold for hold in opened_holds}
+                released_ids = set()
+                for receipt in releases:
+                    released_metadata = receipt.metadata_json
+                    if not isinstance(released_metadata, dict):
+                        continue
+                    opened = opened_by_id.get(released_metadata.get("storageReservationEventId"))
+                    if opened is None or not isinstance(opened.metadata_json, dict):
+                        continue
+                    opened_metadata = opened.metadata_json
+                    binding_fields = (
+                        "workerId", "leaseEpoch", "providerArtifactId",
+                        "mediaId", "sha256", "reservedStorageBytes",
+                    )
+                    if (
+                        receipt.actor_type == "SYSTEM"
+                        and receipt.actor_id == "api"
+                        and released_metadata.get("reasonCode") in {
+                            "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED"
+                        }
+                        and type(opened_metadata.get("leaseEpoch")) is int
+                        and type(opened_metadata.get("reservedStorageBytes")) is int
+                        and opened_metadata["reservedStorageBytes"] > 0
+                        and type(released_metadata.get("leaseEpoch")) is int
+                        and type(released_metadata.get("reservedStorageBytes")) is int
+                        and all(
+                            released_metadata.get(field) == opened_metadata.get(field)
+                            for field in binding_fields
+                        )
+                    ):
+                        released_ids.add(opened.id)
                 # An unresolved hold in the SAME lease epoch is not proof that
                 # another request is still live. It may be a SIGKILL orphan.
                 # Permit legacy identical concurrent ACK flow only when every
