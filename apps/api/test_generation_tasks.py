@@ -5572,22 +5572,12 @@ def test_g72_fake_typed_or_worker_alias_drift_is_rejected(
     app.state.moneyprinter.assert_not_called()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "G72 OPEN: TASK_CREATED binds image source but not the original typed "
-        "script hash. A correlated rewrite of mutable task.request_json and "
-        "task.request_hash may pass the FAKE-only Worker claim gate. "
-        "A trusted immutable request receipt needs Owner-approved evidence contract."
-    ),
-)
 def test_g72_correlated_typed_request_and_hash_rewrite_is_rejected(generation_context):
     """Nonproduction negative diagnostic; never changes a production/audit store.
 
-    Prior request-drift tests change request_json alone. Here a compromised
-    durable task row rewrites both the typed script and its stored request hash,
-    while preserving the original append-only TASK_CREATED event. The Worker
-    must not mistake the new row-local digest for authenticated user consent.
+    This narrow regression changes BOTH mutable task fields but leaves the
+    original TASK_CREATED event intact. The event digest comparison must reject
+    the fake Worker claim; it does not prove independent trusted receipt security.
     """
     client, sessions, app, media = generation_context
     project = create_project(client, "G72 correlated typed request/hash diagnostic")
@@ -5610,6 +5600,7 @@ def test_g72_correlated_typed_request_and_hash_rewrite_is_rejected(generation_co
             DBGenerationEvent.event_type == "TASK_CREATED",
         )).scalar_one()
         original_event_metadata = json.loads(json.dumps(created_event.metadata_json))
+        assert original_event_metadata.get("typedRequestHash") == row.request_hash
         typed_original = {
             field: row.request_json[field]
             for field in TalkingHeadFakeGenerationRequest.model_fields
@@ -5635,27 +5626,64 @@ def test_g72_correlated_typed_request_and_hash_rewrite_is_rejected(generation_co
         assert db.get(DBGenerationTask, task_id).request_hash == forged_digest
 
     result = claim(client, worker_id="worker-a")
-    if result.status_code == 200 and result.json().get("request", {}).get("text") == attacker_text:
-        with sessions() as db:
-            row = db.get(DBGenerationTask, task_id)
-            assert row is not None and row.lease_owner == "worker-a"
-            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
-                DBGenerationEvent.generation_task_id == task_id,
-                DBGenerationEvent.event_type == "TASK_CLAIMED",
-            )).scalar_one() == 1
-        assert media.uploads == 0
-        app.state.moneyprinter.assert_not_called()
-        pytest.xfail(
-            "REPRODUCED G72: unapproved script+recomputed row hash reached "
-            "FAKE Worker; original TASK_CREATED event was unchanged. "
-            "This is a proven OPEN gate, not a repaired capability."
-        )
     assert result.status_code == 204, result.text
     with sessions() as db:
         row = db.get(DBGenerationTask, task_id)
         assert row is not None and row.lease_owner is None
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "G72 OPEN / OWNER POLICY: an attacker who can rewrite both the task "
+        "row and TASK_CREATED event can forge their two matching digests. "
+        "A separate immutable issuer/receipt is not approved or implemented."
+    ),
+)
+def test_g72_correlated_task_and_audit_event_rewrite_needs_trusted_receipt(
+    generation_context,
+):
+    """Diagnostic on disposable FAKE-only SQLite, not a trusted receipt acceptance."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 independent receipt gap")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    typed = _g72_fake_payload(
+        client, project, image_id, key="g72-task-and-event-rewrite-diagnostic",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=typed,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        original = {
+            name: task.request_json[name]
+            for name in TalkingHeadFakeGenerationRequest.model_fields
+        }
+        attacker_text = "correlated unauthorized request and audit edit"
+        forged = generation_request_hash({**original, "text": attacker_text})
+        task.request_json = {
+            **task.request_json,
+            "text": attacker_text,
+            "videoSubject": attacker_text,
+        }
+        task.request_hash = forged
+        event.metadata_json = {**event.metadata_json, "typedRequestHash": forged}
+        db.commit()
+    claimed = claim(client, worker_id="g72-audit-coedit-worker")
+    # This remains XFAIL until an independent, Owner-authorized receipt
+    # rejects co-edits to TWO ordinary mutable rows.
+    assert claimed.status_code == 204, claimed.text
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
 
 # G73: circuit governance readback, after real request creation, FAKE-only.
 @pytest.mark.parametrize(("field", "bad_value"), [
