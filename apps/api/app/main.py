@@ -750,6 +750,10 @@ def create_app(
         return (
             evidence.get("fakeOnly") is True
             and evidence.get("simulatedOutput") is True
+            # Defense in depth only: unlike row-local request_hash, this is
+            # a second event record. It is NOT an independently immutable
+            # Owner-approved trusted issuer/receipt and cannot close that gate.
+            and evidence.get("typedRequestHash") == task.request_hash
             and evidence.get("inputAssetVersionId") == source_id
             and evidence.get("sourceAssetSha256") == source_sha
         )
@@ -1721,6 +1725,7 @@ def create_app(
             actor_type="USER", actor_id=context.user_id, to_status="QUEUED",
             metadata={
                 "fakeOnly": True, "simulatedOutput": True, "actorRole": context.role,
+                "typedRequestHash": payload_hash,
                 "inputAssetVersionId": asset.id, "sourceAssetSha256": asset.sha256,
                 "usageReserved": True,
             }, now=now,
