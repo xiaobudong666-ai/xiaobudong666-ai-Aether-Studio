@@ -858,6 +858,93 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
         )
 
 
+@pytest.mark.parametrize(
+    "corruption", ["noninteger_release_bytes", "wrong_release_digest", "wrong_actor", "invalid_reason"]
+)
+def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
+    postgres_context, monkeypatch, corruption,
+):
+    """A release audit row is not quota proof unless it matches its opened hold.
+
+    Disposable PostgreSQL and FAKE-only Sidecar. A malformed release receipt
+    must not suppress orphan protection, reserve again, or invoke the Sidecar.
+    """
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        owner_client
+    )
+    payload = b"g70-g71-corrupt-release-receipt-must-not-duplicate-quota"
+    opened_id = str(uuid.uuid4())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "INGESTING"
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert tenant is not None
+        initial_used = tenant.used_storage_bytes
+        tenant.used_storage_bytes += len(payload)
+        opened_metadata = {
+            "workerId": worker_headers["X-Worker-Id"],
+            "leaseEpoch": int(worker_headers["X-Worker-Lease-Epoch"]),
+            "providerArtifactId": artifact_id,
+            "mediaId": _expected_media_id(task.project_id, f"generation:{task_id}"),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "reservedStorageBytes": len(payload),
+            # Deliberately no livenessLockKey: a legacy/abrupt orphan must
+            # remain unverified even if a corrupt release row references it.
+        }
+        release_metadata = {
+            **opened_metadata,
+            "storageReservationEventId": opened_id,
+            "reasonCode": "DUPLICATE_ARTIFACT_INTAKE",
+        }
+        actor = "SYSTEM"
+        if corruption == "noninteger_release_bytes":
+            release_metadata["reservedStorageBytes"] = str(len(payload))
+        elif corruption == "wrong_release_digest":
+            release_metadata["sha256"] = "0" * 64
+        elif corruption == "wrong_actor":
+            actor = "OWNER"
+        else:
+            release_metadata["reasonCode"] = "UNTRUSTED_RELEASE"
+        db.add(DBGenerationEvent(
+            id=opened_id, generation_task_id=task_id, attempt_id=None,
+            event_type="STORAGE_RESERVATION_OPENED", from_status="INGESTING",
+            to_status="INGESTING", actor_type="SYSTEM", actor_id="api",
+            metadata_json=opened_metadata, created_at=now,
+        ))
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id, attempt_id=None,
+            event_type="STORAGE_RESERVATION_RELEASED", from_status="INGESTING",
+            to_status="INGESTING", actor_type=actor, actor_id="api",
+            metadata_json=release_metadata, created_at=now,
+        ))
+        db.commit()
+
+    sidecar_upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(app.state.video_use, "upload_media", sidecar_upload)
+    replay = _post_g70_g71_duplicate_intake(
+        app, task_id, worker_headers, artifact_id, payload
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    sidecar_upload.assert_not_called()
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, stored.tenant_id)
+        assert stored.status == "INGESTING"
+        assert stored.asset_version_id is None
+        assert tenant.used_storage_bytes == initial_used + len(payload)
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == stored.project_id
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_g71_postgres_concurrent_duplicate_artifact_intake_is_idempotent(
     postgres_context, monkeypatch
 ):
