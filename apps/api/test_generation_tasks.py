@@ -5661,12 +5661,14 @@ def test_g72_correlated_typed_request_and_hash_rewrite_is_rejected(generation_co
 @pytest.mark.parametrize(("field", "bad_value"), [
     ("failureWindow", "300"),
     ("failureWindow", None),
+    ("failureWindow", 10**12),   # Timedelta fits, datetime subtraction does not.
     ("failureWindow", 10**100),  # No timedelta representable: reject before lease.
     ("failureThreshold", True),
     ("failureThreshold", 0),
     ("cooldownSeconds", []),
     ("cooldownSeconds", {"unexpected": 60}),
-    ("cooldownSeconds", 10**100),  # No datetime representable: reject before lease.
+    ("cooldownSeconds", 10**12),  # Timedelta fits, datetime addition does not.
+    ("cooldownSeconds", 10**100),  # No timedelta representable: reject before lease.
 ])
 def test_g73_corrupt_failure_policy_skips_poisoned_queue_without_starvation(
     generation_context, field, bad_value,
@@ -5703,9 +5705,11 @@ def test_g73_corrupt_failure_policy_skips_poisoned_queue_without_starvation(
 
 @pytest.mark.parametrize(("field", "bad_value"), [
     ("failureWindow", "300"),
+    ("failureWindow", 10**12),
     ("failureWindow", 10**100),
     ("failureThreshold", False),
     ("cooldownSeconds", []),
+    ("cooldownSeconds", 10**12),
     ("cooldownSeconds", 10**100),
 ])
 def test_g73_corrupt_failure_policy_after_claim_returns_409_without_commit(
