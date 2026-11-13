@@ -2855,15 +2855,15 @@ def test_g72_postgres_claimed_legacy_malformed_source_intake_fails_closed(
     app.state.moneyprinter.assert_not_called()
 
 
-def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(postgres_context, monkeypatch):
+def test_g72_postgres_revoke_after_final_rights_read_is_serialized(postgres_context, monkeypatch):
     """Probe REMIX rights/worker-commit linearization without test-side deadlock.
 
     Owner revocation starts after Worker's last ALLOWED read. When a future
     shared transaction lock serializes the endpoints, the Owner POST may wait
     for Worker's commit: do not synchronously wait for Owner before resuming.
-    The forbidden sequence remains Owner 201 *before worker resume* followed
-    by Worker 201 + new asset + SETTLED; only that proven sequence is XFAIL.
-    The legitimate worker-first and revocation-first orders are both checked.
+    Owner revocation must not ACK while the Worker holds the source asset
+    row lock after its last REMIX check. The Worker commits first, then Owner
+    revocation may commit; the already-ingested asset stays export-blocked.
     FAKE-only, disposable PostgreSQL; no rights/storage policy modification.
     """
     from app import main as api_main
@@ -2979,26 +2979,14 @@ def test_g72_postgres_revoke_after_final_rights_read_before_commit_diagnostic(po
         task_after = db.get(DBGenerationTask, task_id)
         task_state = task_after.status
     assert latest.status == "REVOKED", "Owner revocation did not persist"
-    if revoke_committed_before_worker_resume and response.status_code == 201 and asset_count == 2 and settled_count == 1:
-        pytest.xfail(
-            "CONFIRMED OPEN G72 post-read/pre-commit race: Owner REVOKED 201 "
-            "completed before Worker resume, but Worker committed 201 + "
-            "asset + SETTLED from stale ALLOWED rights"
-        )
-    if revoke_committed_before_worker_resume:
-        # Revocation-first: Worker must refuse artifact and settlement.
-        assert response.status_code == 409, response.text
-        assert asset_count == 1 and settled_count == 0
-        assert usage_after == base_usage
-    else:
-        # Worker-first is permitted if Owner's revoke could not commit before
-        # Worker was released. Also accept a late revoke-before-intake 409.
-        assert response.status_code in (201, 409), response.text
-        if response.status_code == 201:
-            assert asset_count == 2 and settled_count == 1
-            assert usage_after >= base_usage
-        else:
-            assert asset_count == 1 and settled_count == 0
-            assert usage_after == base_usage
-    assert task_state != "RIGHTS_BLOCKED"
+    assert not revoke_committed_before_worker_resume, (
+        "G72 revoke was acknowledged while Worker held the post-REMIX source "
+        "lock; the rights check and final asset+SETTLED commit are not serialized"
+    )
+    # The Worker acquired the source lock before the Owner POST. It may ingest
+    # and settle first; the subsequent revoked source remains non-exportable.
+    assert response.status_code == 201, response.text
+    assert asset_count == 2 and settled_count == 1
+    assert usage_after >= base_usage
+    assert task_state == "RIGHTS_BLOCKED"
     app.state.moneyprinter.assert_not_called()
