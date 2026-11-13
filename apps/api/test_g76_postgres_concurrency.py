@@ -3353,17 +3353,25 @@ def test_g70_g71_postgres_two_connection_pool_concurrent_retry_recovers_after_re
                 assert upload_entered.wait(timeout=12), (
                     "first Worker did not enter FAKE Sidecar upload"
                 )
+                # During one long Sidecar write, repeated bounded-pool
+                # retries must remain fail-closed and release their own DB
+                # connections; a single successful 503 is insufficient proof.
                 started = time.monotonic()
-                with pytest.raises(HTTPException) as blocked:
-                    intake_direct()
-                elapsed = time.monotonic() - started
-                assert blocked.value.status_code == 503
-                assert (
-                    blocked.value.detail["code"]
-                    == "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE"
+                for _retry in range(8):
+                    with pytest.raises(HTTPException) as blocked:
+                        intake_direct()
+                    assert blocked.value.status_code == 503
+                    assert (
+                        blocked.value.detail["code"]
+                        == "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE"
+                    )
+                    # Liveness from the first request is still checked out,
+                    # but retry sessions must not accumulate pool checkouts.
+                    assert limited_engine.pool.checkedout() == 1
+                    sidecar.upload_media.assert_called_once()
+                assert time.monotonic() - started < 12, (
+                    "eight capacity failures must remain bounded"
                 )
-                assert elapsed < 8, "capacity failure must be bounded"
-                sidecar.upload_media.assert_called_once()
             finally:
                 upload_resume.set()
             completed = first_future.result(timeout=20)
