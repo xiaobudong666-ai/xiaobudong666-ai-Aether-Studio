@@ -176,6 +176,18 @@ def generation_failure_policy_valid(snapshot: dict) -> bool:
         value = policy.get(field, fallback)
         if type(value) is not int or value < 1:
             return False
+        # G73: even an exact positive integer can exceed timedelta/datetime
+        # representability when poisoned in a persisted task. Reject it before
+        # a Worker lease or failure callback; never clamp Owner policy silently.
+        try:
+            interval = datetime.timedelta(seconds=value)
+            reference = datetime.datetime.now(datetime.timezone.utc)
+            if field == "failureWindow":
+                reference - interval
+            elif field == "cooldownSeconds":
+                reference + interval
+        except OverflowError:
+            return False
     return True
 
 
