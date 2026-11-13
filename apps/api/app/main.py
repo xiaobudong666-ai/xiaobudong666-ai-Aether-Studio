@@ -31,7 +31,7 @@ from sqlalchemy import and_, case, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, TimeoutError as SQLAlchemyPoolTimeout
 from sqlalchemy.orm import Session, sessionmaker
 
 from .auth import (
@@ -3327,7 +3327,18 @@ def create_app(
         if app_engine.dialect.name != "postgresql":
             yield
             return
-        with app_engine.connect() as conn:
+        # The request DB session already holds the task row lock. A second
+        # checkout may exhaust a bounded PostgreSQL pool. Return a retryable,
+        # fail-closed response rather than an unhandled 500 or quota mutation.
+        try:
+            liveness_conn = app_engine.connect()
+        except SQLAlchemyPoolTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE",
+                        "message": "存储预留保护连接暂不可用，请稍后重试"},
+            ) from exc
+        with liveness_conn as conn:
             acquired = False
             try:
                 conn.execute(text("SELECT pg_advisory_lock(:lock_key)"), {"lock_key": lock_key})
@@ -3351,7 +3362,15 @@ def create_app(
         """A freed advisory lock proves no active holder; not permission to refund."""
         if type(lock_key) is not int or lock_key < 0 or lock_key > 0x7FFFFFFFFFFFFFFF:
             return False
-        with app_engine.connect() as probe:
+        try:
+            probe_conn = app_engine.connect()
+        except SQLAlchemyPoolTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE",
+                        "message": "无法确认历史预留的存活状态，请稍后重试"},
+            ) from exc
+        with probe_conn as probe:
             obtained = probe.execute(
                 text("SELECT pg_try_advisory_lock(:lock_key)"), {"lock_key": lock_key}
             ).scalar_one()
