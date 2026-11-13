@@ -1625,7 +1625,14 @@ def test_g70_g71_owner_recovery_rejects_orphan_hash_mismatch(generation_context)
 
 @pytest.mark.parametrize(
     ("dimension", "malformed_value"),
-    [("width", "not-a-width"), ("height", [])],
+    [
+        ("width", "not-a-width"),
+        ("height", []),
+        ("width", True),
+        ("height", "240"),
+        ("durationSeconds", "1.0"),
+        ("durationSeconds", True),
+    ],
 )
 def test_g70_g71_owner_recovery_invalid_sidecar_probe_is_422_and_keeps_held(
     generation_context, dimension, malformed_value
@@ -1638,9 +1645,11 @@ def test_g70_g71_owner_recovery_invalid_sidecar_probe_is_422_and_keeps_held(
     media_id, _ = seed_g71_orphan_artifact(
         sessions, media_store, project["id"], task_id
     )
-    media_store.media_objects[(project["id"], media_id)]["metadata"]["video"][
-        dimension
-    ] = malformed_value
+    probe = media_store.media_objects[(project["id"], media_id)]["metadata"]
+    if dimension == "durationSeconds":
+        probe[dimension] = malformed_value
+    else:
+        probe["video"][dimension] = malformed_value
 
     response = client.post(
         f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
@@ -1673,6 +1682,57 @@ def test_g70_g71_owner_recovery_invalid_sidecar_probe_is_422_and_keeps_held(
     assert media_store.inspections == 1
     app.state.moneyprinter.assert_not_called()
 
+
+
+
+@pytest.mark.parametrize("invalid_size", [True, "31", 31.0, {"value": 31}])
+def test_g70_g71_owner_recovery_rejects_coerced_sidecar_storage_bytes(
+    generation_context, monkeypatch, invalid_size
+):
+    """No malformed Sidecar size can authorize storage or an asset in Owner recovery."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-orphan-recovery-sidecar-size-type")
+    task = create_task(client, project, key="g70-orphan-recovery-sidecar-size-type")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    original_inspect = media_store.inspect_media
+
+    def invalid_inspection(project_id, media_id):
+        inspected = original_inspect(project_id, media_id)
+        inspected["sizeBytes"] = invalid_size
+        return inspected
+
+    monkeypatch.setattr(media_store, "inspect_media", invalid_inspection)
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner refuses malformed Sidecar byte evidence"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_INTEGRITY_MISMATCH"
+    with sessions() as db:
+        task_row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task_row.tenant_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        entries = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert task_row.status == "FAILED"
+        assert task_row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one() == 0
+        assert sum(entry.kind == "RESERVED" for entry in entries) == 1
+        assert all(entry.kind not in {"SETTLED", "RELEASED"} for entry in entries)
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
 
 
 @pytest.mark.parametrize("invalid_size", ["invalid-size", {"malformed": True}])
