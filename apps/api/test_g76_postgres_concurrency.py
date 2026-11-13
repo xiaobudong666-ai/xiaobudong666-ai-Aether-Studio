@@ -3262,3 +3262,141 @@ def test_g70_g71_postgres_bounded_liveness_pool_exhaustion_is_retryable(postgres
         )).scalar_one() == 0
     sidecar.upload_media.assert_not_called()
     app.state.moneyprinter.assert_not_called()
+
+
+
+def test_g70_g71_postgres_two_connection_pool_concurrent_retry_recovers_after_release(
+    postgres_context,
+):
+    """Native bounded-pool FAKE-only fault: reject pressure, then release safely.
+
+    The first request holds the durable liveness connection while its fake
+    Sidecar upload is paused. A second request holds the remaining pool slot,
+    so its separate liveness checkout must return bounded HTTP 503 instead of
+    a 500, duplicated quota, or Sidecar call. After the first completes, all
+    pooled connections must be returned and identical terminal replay must
+    remain idempotent.
+    """
+    from fastapi import HTTPException
+    from sqlalchemy import create_engine
+
+    owner_client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        owner_client
+    )
+    payload = b"g70-g71-two-connection-pool-fake-only"
+    with sessions() as db:
+        task_before = db.get(DBGenerationTask, task_id)
+        assert task_before is not None
+        tenant_id, project_id = task_before.tenant_id, task_before.project_id
+        usage_before = db.get(DBTenant, tenant_id).used_storage_bytes
+
+    limited_engine = create_engine(
+        os.environ["AETHER_TEST_POSTGRES_URL"],
+        pool_size=2, max_overflow=0, pool_timeout=0.3,
+    )
+    limited_sessions = sessionmaker(
+        autocommit=False, autoflush=False, bind=limited_engine,
+    )
+
+    def limited_dependency():
+        with limited_sessions() as db:
+            yield db
+
+    fake_store = FakeMediaStore()
+    sidecar = MagicMock(wraps=fake_store)
+    upload_entered, upload_resume = Event(), Event()
+
+    def paused_fake_upload(*args, **kwargs):
+        upload_entered.set()
+        assert upload_resume.wait(timeout=15), "fake Sidecar was not resumed"
+        return fake_store.upload_media(*args, **kwargs)
+
+    sidecar.upload_media.side_effect = paused_fake_upload
+    limited_app = create_app(
+        app_engine=limited_engine,
+        db_dependency=limited_dependency,
+        video_use_adapter=sidecar,
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="g76-postgres-owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False,
+        enforce_csrf=True,
+        generation_provider_mode="deterministic-fake",
+    )
+    route = next(
+        route for route in limited_app.routes
+        if getattr(route, "path", None)
+        == "/internal/generation-tasks/{task_id}/artifact-intake"
+    )
+
+    def intake_direct():
+        with limited_sessions() as db:
+            return route.endpoint(
+                task_id,
+                providerArtifactId=artifact_id,
+                file=UploadFile(
+                    file=BytesIO(payload),
+                    filename="synthetic-g70-pool-concurrency.mp4",
+                    headers=Headers({"content-type": "video/mp4"}),
+                ),
+                x_worker_token=WORKER_TOKEN,
+                x_worker_id=headers["X-Worker-Id"],
+                x_worker_lease_epoch=int(headers["X-Worker-Lease-Epoch"]),
+                db=db,
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(intake_direct)
+            try:
+                assert upload_entered.wait(timeout=12), (
+                    "first Worker did not enter FAKE Sidecar upload"
+                )
+                started = time.monotonic()
+                with pytest.raises(HTTPException) as blocked:
+                    intake_direct()
+                elapsed = time.monotonic() - started
+                assert blocked.value.status_code == 503
+                assert (
+                    blocked.value.detail["code"]
+                    == "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE"
+                )
+                assert elapsed < 8, "capacity failure must be bounded"
+                sidecar.upload_media.assert_called_once()
+            finally:
+                upload_resume.set()
+            completed = first_future.result(timeout=20)
+
+        assert completed["results"][0]["assetVersionId"]
+        assert limited_engine.pool.checkedout() == 0, (
+            "request, liveness and probe sessions must release all connections"
+        )
+        replay = intake_direct()
+        assert replay["results"][0]["assetVersionId"] == (
+            completed["results"][0]["assetVersionId"]
+        )
+        assert limited_engine.pool.checkedout() == 0
+        sidecar.upload_media.assert_called_once()
+    finally:
+        upload_resume.set()
+        limited_engine.dispose()
+
+    with sessions() as db:
+        task_after = db.get(DBGenerationTask, task_id)
+        assert task_after is not None and task_after.asset_version_id is not None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == (
+            usage_before + len(payload)
+        )
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
