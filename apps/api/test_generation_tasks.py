@@ -5656,3 +5656,87 @@ def test_g72_correlated_typed_request_and_hash_rewrite_is_rejected(generation_co
         assert row is not None and row.lease_owner is None
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+# G73: circuit governance readback, after real request creation, FAKE-only.
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("failureWindow", "300"),
+    ("failureWindow", None),
+    ("failureThreshold", True),
+    ("failureThreshold", 0),
+    ("cooldownSeconds", []),
+    ("cooldownSeconds", {"unexpected": 60}),
+])
+def test_g73_corrupt_failure_policy_skips_poisoned_queue_without_starvation(
+    generation_context, field, bad_value,
+):
+    """Invalid persisted circuit metadata must not receive a Worker lease."""
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 failure policy claim fence")
+    poisoned = create_task(client, project, key="g73-poison-" + field)
+    healthy = create_task(client, project, key="g73-healthy-" + field)
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, poisoned["taskId"])
+        snapshot = dict(row.capability_snapshot_json)
+        policy = dict(snapshot.get("providerPolicy") or {})
+        policy[field] = bad_value
+        snapshot["providerPolicy"] = policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    claimed = claim(client, "g73-failure-policy-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, poisoned["taskId"])
+        assert row.status == "QUEUED"
+        assert row.lease_owner is None and row.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("failureWindow", "300"),
+    ("failureThreshold", False),
+    ("cooldownSeconds", []),
+])
+def test_g73_corrupt_failure_policy_after_claim_returns_409_without_commit(
+    generation_context, field, bad_value,
+):
+    """A post-claim poisoned snapshot cannot produce a 500 or circuit mutation."""
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 failure policy post-claim fence")
+    task = create_task(client, project, key="g73-postclaim-" + field)
+    assert claim(client, "g73-postclaim-worker").json()["taskId"] == task["taskId"]
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        snapshot = dict(row.capability_snapshot_json)
+        policy = dict(snapshot.get("providerPolicy") or {})
+        policy[field] = bad_value
+        snapshot["providerPolicy"] = policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    result = transition(
+        client, task["taskId"], "FAILED", worker_id="g73-postclaim-worker",
+        errorCode="PROVIDER_5XX", retryable=False,
+    )
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "GENERATION_FAILURE_POLICY_INVALID"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        assert row.status == "SUBMITTING"
+        assert row.lease_owner == "g73-postclaim-worker"
+        assert row.error_code is None
+        assert db.execute(select(func.count(DBGenerationProviderEvent.id)).where(
+            DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_OPENED"
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == row.id,
+            DBGenerationUsageEntry.kind.in_(("SETTLED", "RELEASED")),
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
