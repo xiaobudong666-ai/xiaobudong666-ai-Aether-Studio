@@ -3474,6 +3474,40 @@ def create_app(
             uuid.NAMESPACE_URL,
             f"aether-video-use:{task_project_id}:{artifact_idempotency_key}",
         ))
+        # G70/G71: a committed quota hold must carry a durable task-scoped
+        # receipt BEFORE the Sidecar call. If an API process was SIGKILLed,
+        # never reserve a second hold for an orphaned, potentially persisted
+        # object. Do not guess that the old hold is safe to release here:
+        # the object and its ACK require independent Owner reconciliation.
+        opened_holds = db.execute(
+            select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+            )
+        ).scalars().all()
+        if opened_holds:
+            releases = db.execute(
+                select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                    DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+                )
+            ).scalars().all()
+            released_ids = {
+                receipt.metadata_json.get("storageReservationEventId")
+                for receipt in releases
+                if isinstance(receipt.metadata_json, dict)
+                and receipt.metadata_json.get("reservedStorageBytes") is not None
+            }
+            if any(hold.id not in released_ids for hold in opened_holds):
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "已有未对账的持久存储预留，禁止重复计费，请人工核验原产物",
+                    },
+                )
+        storage_reservation_event_id = str(uuid.uuid4())
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
@@ -3482,6 +3516,28 @@ def create_app(
         if reservation.rowcount != 1:
             db.rollback()
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
+        opened_attempt = current_generation_attempt(db, task)
+        db.add(DBGenerationEvent(
+            id=storage_reservation_event_id,
+            generation_task_id=task_id,
+            attempt_id=opened_attempt.id if opened_attempt is not None else None,
+            event_type="STORAGE_RESERVATION_OPENED",
+            from_status=task.status,
+            to_status=task.status,
+            actor_type="SYSTEM",
+            actor_id="api",
+            metadata_json={
+                "workerId": x_worker_id,
+                "leaseEpoch": x_worker_lease_epoch,
+                "providerArtifactId": providerArtifactId,
+                "mediaId": expected_media_id,
+                "sha256": digest.hexdigest(),
+                "reservedStorageBytes": upload_size,
+            },
+            created_at=now,
+        ))
+        # Marker and aggregate quota increment are one PostgreSQL transaction.
+        # A crash can leave both committed, or neither, never only one.
         db.commit()
 
         duplicate_storage_release_event_id = str(uuid.uuid4())
@@ -3516,6 +3572,7 @@ def create_app(
                 actor_id="api",
                 metadata_json={
                     "reasonCode": storage_release_reason,
+                    "storageReservationEventId": storage_reservation_event_id,
                     "workerId": x_worker_id,
                     "leaseEpoch": x_worker_lease_epoch,
                     "providerArtifactId": providerArtifactId,
