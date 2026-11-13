@@ -3517,8 +3517,7 @@ def create_app(
                     or hold.metadata_json.get("mediaId") != expected_media_id
                     or type(hold.metadata_json.get("reservedStorageBytes")) is not int
                     or hold.metadata_json["reservedStorageBytes"] != upload_size
-                    or not isinstance(hold.metadata_json.get("sha256"), str)
-                    or not hmac.compare_digest(hold.metadata_json["sha256"], incoming_sha256)
+                    or hold.metadata_json.get("sha256") != incoming_sha256
                 )
                 for hold in opened_holds
             ):
