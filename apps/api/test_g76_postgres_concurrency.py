@@ -864,6 +864,8 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
         "paired_missing_worker_id", "paired_missing_provider_artifact",
         "paired_missing_media_id", "paired_missing_sha256",
         "paired_container_sha256", "forged_opened_actor",
+        "container_release_reservation_id_list", "container_release_reservation_id_object",
+        "container_release_reason_list", "container_release_reason_object",
     ]
 )
 def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
@@ -931,6 +933,14 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
             release_metadata["sha256"] = ["forged", "not-a-hash"]
         elif corruption == "forged_opened_actor":
             opened_actor = "OWNER"
+        elif corruption == "container_release_reservation_id_list":
+            release_metadata["storageReservationEventId"] = ["unhashable", opened_id]
+        elif corruption == "container_release_reservation_id_object":
+            release_metadata["storageReservationEventId"] = {"id": opened_id}
+        elif corruption == "container_release_reason_list":
+            release_metadata["reasonCode"] = ["DUPLICATE_ARTIFACT_INTAKE"]
+        elif corruption == "container_release_reason_object":
+            release_metadata["reasonCode"] = {"reason": "UPLOAD_INTERRUPTED"}
         db.add(DBGenerationEvent(
             id=opened_id, generation_task_id=task_id, attempt_id=None,
             event_type="STORAGE_RESERVATION_OPENED", from_status="INGESTING",
