@@ -3436,6 +3436,47 @@ def create_app(
             uuid.NAMESPACE_URL,
             f"aether-video-use:{task_project_id}:{artifact_idempotency_key}",
         ))
+        # G70/G71: the first storage charge and its receipt must commit in one
+        # transaction *before* the external Sidecar call. A process SIGKILL
+        # cannot execute Python exception compensation; a future replay must
+        # not silently create a second hold for this task. This gate is a
+        # nonproduction, fail-closed quarantine, not automatic reconciliation.
+        previous_holds = db.execute(
+            select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_HELD",
+            )
+        ).scalars().all()
+        for previous_hold in previous_holds:
+            evidence = previous_hold.metadata_json
+            if not isinstance(evidence, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_STORAGE_HOLD_UNRESOLVED",
+                            "message": "原始存储预留回执损坏，必须隔离并人工核对"},
+                )
+            previously_released = db.execute(
+                select(DBGenerationEvent.id).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                    DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+                )
+            ).scalars().all()
+            # All release receipts are scoped by the exact committed hold ID.
+            # Never infer a release from a matching byte count or total quota.
+            if not previously_released or not db.execute(
+                select(DBGenerationEvent.id).where(
+                    DBGenerationEvent.id.in_(previously_released),
+                    DBGenerationEvent.metadata_json["storageReservationId"].as_string()
+                    == previous_hold.id,
+                )
+            ).first():
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_STORAGE_HOLD_UNRESOLVED",
+                            "message": "存在未对账的存储预留，拒绝再次扣额或重复上传"},
+                )
+
+        storage_reservation_id = str(uuid.uuid4())
         reservation = db.execute(
             update(DBTenant)
             .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
@@ -3444,6 +3485,25 @@ def create_app(
         if reservation.rowcount != 1:
             db.rollback()
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
+        receipt_attempt = current_generation_attempt(db, task)
+        db.add(DBGenerationEvent(
+            id=storage_reservation_id,
+            generation_task_id=task_id,
+            attempt_id=receipt_attempt.id if receipt_attempt is not None else None,
+            event_type="STORAGE_RESERVATION_HELD",
+            from_status=task.status,
+            to_status=task.status,
+            actor_type="SYSTEM",
+            actor_id="api",
+            metadata_json={
+                "tenantId": task_tenant_id, "projectId": task_project_id,
+                "mediaId": expected_media_id,
+                "providerArtifactId": providerArtifactId,
+                "sha256": digest.hexdigest(),
+                "reservedStorageBytes": upload_size,
+            },
+            created_at=now,
+        ))
         db.commit()
 
         duplicate_storage_release_event_id = str(uuid.uuid4())
@@ -3484,6 +3544,7 @@ def create_app(
                     "mediaId": expected_media_id,
                     "sha256": digest.hexdigest(),
                     "reservedStorageBytes": upload_size,
+                    "storageReservationId": storage_reservation_id,
                 },
                 created_at=utc_now(),
             ))
