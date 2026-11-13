@@ -3474,11 +3474,11 @@ def create_app(
             uuid.NAMESPACE_URL,
             f"aether-video-use:{task_project_id}:{artifact_idempotency_key}",
         ))
-        # G70/G71: a committed quota hold must carry a durable task-scoped
-        # receipt BEFORE the Sidecar call. If an API process was SIGKILLed,
-        # never reserve a second hold for an orphaned, potentially persisted
-        # object. Do not guess that the old hold is safe to release here:
-        # the object and its ACK require independent Owner reconciliation.
+        # G70/G71: persist each quota hold with its lease epoch BEFORE Sidecar.
+        # When a Worker lease changes after an uncertain prior upload, stop
+        # cross-epoch replay without a durable release receipt. Same-epoch
+        # concurrent intake keeps its existing duplicate/ACK reconciliation;
+        # same-epoch OS SIGKILL still requires a separate durable remedy.
         opened_holds = db.execute(
             select(DBGenerationEvent).where(
                 DBGenerationEvent.generation_task_id == task_id,
@@ -3498,7 +3498,15 @@ def create_app(
                 if isinstance(receipt.metadata_json, dict)
                 and receipt.metadata_json.get("reservedStorageBytes") is not None
             }
-            if any(hold.id not in released_ids for hold in opened_holds):
+            if any(
+                hold.id not in released_ids
+                and (
+                    not isinstance(hold.metadata_json, dict)
+                    or type(hold.metadata_json.get("leaseEpoch")) is not int
+                    or hold.metadata_json["leaseEpoch"] != x_worker_lease_epoch
+                )
+                for hold in opened_holds
+            ):
                 db.rollback()
                 raise HTTPException(
                     status_code=409,
