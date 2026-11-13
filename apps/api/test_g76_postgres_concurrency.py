@@ -859,7 +859,12 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
 
 
 @pytest.mark.parametrize(
-    "corruption", ["noninteger_release_bytes", "wrong_release_digest", "wrong_actor", "invalid_reason"]
+    "corruption", [
+        "noninteger_release_bytes", "wrong_release_digest", "wrong_actor", "invalid_reason",
+        "paired_missing_worker_id", "paired_missing_provider_artifact",
+        "paired_missing_media_id", "paired_missing_sha256",
+        "paired_container_sha256", "forged_opened_actor",
+    ]
 )
 def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
     postgres_context, monkeypatch, corruption,
@@ -899,18 +904,37 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
             "reasonCode": "DUPLICATE_ARTIFACT_INTAKE",
         }
         actor = "SYSTEM"
+        opened_actor = "SYSTEM"
         if corruption == "noninteger_release_bytes":
             release_metadata["reservedStorageBytes"] = str(len(payload))
         elif corruption == "wrong_release_digest":
             release_metadata["sha256"] = "0" * 64
         elif corruption == "wrong_actor":
             actor = "OWNER"
-        else:
+        elif corruption == "invalid_reason":
             release_metadata["reasonCode"] = "UNTRUSTED_RELEASE"
+        elif corruption in {
+            "paired_missing_worker_id", "paired_missing_provider_artifact",
+            "paired_missing_media_id", "paired_missing_sha256",
+        }:
+            key = {
+                "paired_missing_worker_id": "workerId",
+                "paired_missing_provider_artifact": "providerArtifactId",
+                "paired_missing_media_id": "mediaId",
+                "paired_missing_sha256": "sha256",
+            }[corruption]
+            # Same absent field in both events used to satisfy None == None.
+            opened_metadata.pop(key)
+            release_metadata.pop(key)
+        elif corruption == "paired_container_sha256":
+            opened_metadata["sha256"] = ["forged", "not-a-hash"]
+            release_metadata["sha256"] = ["forged", "not-a-hash"]
+        elif corruption == "forged_opened_actor":
+            opened_actor = "OWNER"
         db.add(DBGenerationEvent(
             id=opened_id, generation_task_id=task_id, attempt_id=None,
             event_type="STORAGE_RESERVATION_OPENED", from_status="INGESTING",
-            to_status="INGESTING", actor_type="SYSTEM", actor_id="api",
+            to_status="INGESTING", actor_type=opened_actor, actor_id="api",
             metadata_json=opened_metadata, created_at=now,
         ))
         db.add(DBGenerationEvent(
