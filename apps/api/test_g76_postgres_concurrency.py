@@ -3181,3 +3181,84 @@ def test_g72_postgres_revoke_after_final_rights_read_is_serialized(postgres_cont
     assert usage_after >= base_usage
     assert task_state == "RIGHTS_BLOCKED"
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_bounded_liveness_pool_exhaustion_is_retryable(postgres_context):
+    """A full native PostgreSQL pool must fail closed before quota or FAKE Sidecar.
+
+    The intake DB session holds the sole connection. Its dedicated advisory
+    liveness checkout must not leak an HTTP 500, quota reservation, or asset.
+    The small pool is isolated from the main disposable PostgreSQL fixture.
+    """
+    from fastapi import HTTPException
+    from sqlalchemy import create_engine
+
+    owner_client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
+    payload = b"g70-g71-bounded-pg-pool-fake-only"
+    with sessions() as db:
+        task_before = db.get(DBGenerationTask, task_id)
+        assert task_before is not None
+        tenant_id = task_before.tenant_id
+        usage_before = db.get(DBTenant, tenant_id).used_storage_bytes
+
+    limited_engine = create_engine(
+        os.environ["AETHER_TEST_POSTGRES_URL"],
+        pool_size=1, max_overflow=0, pool_timeout=0.2,
+    )
+    limited_sessions = sessionmaker(autocommit=False, autoflush=False, bind=limited_engine)
+
+    def limited_dependency():
+        with limited_sessions() as db:
+            yield db
+
+    sidecar = MagicMock(wraps=FakeMediaStore())
+    limited_app = create_app(
+        app_engine=limited_engine,
+        db_dependency=limited_dependency,
+        video_use_adapter=sidecar,
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="g76-postgres-owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False,
+        enforce_csrf=True,
+        generation_provider_mode="deterministic-fake",
+    )
+    route = next(
+        route for route in limited_app.routes
+        if getattr(route, "path", None) == "/internal/generation-tasks/{task_id}/artifact-intake"
+    )
+    try:
+        with limited_sessions() as db:
+            with pytest.raises(HTTPException) as failed:
+                route.endpoint(
+                    task_id,
+                    providerArtifactId=artifact_id,
+                    file=UploadFile(
+                        file=BytesIO(payload),
+                        filename="synthetic-g70-pool.mp4",
+                        headers=Headers({"content-type": "video/mp4"}),
+                    ),
+                    x_worker_token=WORKER_TOKEN,
+                    x_worker_id=headers["X-Worker-Id"],
+                    x_worker_lease_epoch=int(headers["X-Worker-Lease-Epoch"]),
+                    db=db,
+                )
+            assert failed.value.status_code == 503
+            assert failed.value.detail["code"] == "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE"
+            db.rollback()
+    finally:
+        limited_engine.dispose()
+
+    with sessions() as db:
+        task_after = db.get(DBGenerationTask, task_id)
+        assert task_after is not None
+        assert task_after.status == "INGESTING"
+        assert task_after.asset_version_id is None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == usage_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+        )).scalar_one() == 0
+    sidecar.upload_media.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
