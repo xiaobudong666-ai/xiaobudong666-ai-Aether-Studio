@@ -3560,7 +3560,12 @@ def create_app(
                     released_metadata = receipt.metadata_json
                     if not isinstance(released_metadata, dict):
                         continue
-                    opened = opened_by_id.get(released_metadata.get("storageReservationEventId"))
+                    # Corrupt JSON containers are unhashable; an audit row must
+                    # never turn an orphan safety fence into an HTTP 500.
+                    opened_reference = released_metadata.get("storageReservationEventId")
+                    if type(opened_reference) is not str:
+                        continue
+                    opened = opened_by_id.get(opened_reference)
                     if opened is None or not isinstance(opened.metadata_json, dict):
                         continue
                     opened_metadata = opened.metadata_json
@@ -3588,7 +3593,8 @@ def create_app(
                         opened_identity_valid
                         and receipt.actor_type == "SYSTEM"
                         and receipt.actor_id == "api"
-                        and released_metadata.get("reasonCode") in {
+                        and type(released_metadata.get("reasonCode")) is str
+                        and released_metadata["reasonCode"] in {
                             "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED"
                         }
                         and type(opened_metadata.get("leaseEpoch")) is int
