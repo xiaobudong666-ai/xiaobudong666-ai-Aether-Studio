@@ -4124,8 +4124,26 @@ def create_app(
         db.commit()
         try:
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
-            metadata = uploaded.get("metadata") or {}
-            duration_seconds = float(metadata.get("durationSeconds") or 0)
+            # Video-use is an external process. Reject non-scalar or non-finite
+            # probe evidence before persisting a project material or asset.
+            # Storage quota was reserved above and is compensated by the
+            # existing exception handler for this FAKE-only intake path.
+            if not isinstance(uploaded, dict):
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的产物结构无效"})
+            metadata = uploaded.get("metadata")
+            if not isinstance(metadata, dict):
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的探测数据无效"})
+            probed_size_bytes = metadata.get("sizeBytes")
+            if type(probed_size_bytes) is not int or probed_size_bytes <= 0:
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的字节数无效"})
+            raw_duration = metadata.get("durationSeconds")
+            if raw_duration is not None and (
+                type(raw_duration) not in (int, float)
+                or not math.isfinite(raw_duration)
+                or raw_duration < 0
+            ):
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的时长无效"})
+            duration_seconds = float(raw_duration or 0)
             suffix = os.path.splitext(file.filename or "")[1].lower()
             image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
             if suffix in image_extensions:
@@ -4157,7 +4175,7 @@ def create_app(
                 "duration": None if media_type == "image" else {
                     "value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000,
                 },
-                "sizeBytes": int(metadata.get("sizeBytes") or upload_size),
+                "sizeBytes": probed_size_bytes,
             }
             updated = apply_project_update(
                 db, project_id,
