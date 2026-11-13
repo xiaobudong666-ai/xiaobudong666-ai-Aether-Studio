@@ -3585,5 +3585,27 @@ def test_g70_g71_postgres_contended_liveness_advisory_lock_is_bounded_and_nonmut
         files={"file": ("synthetic.mp4", payload, "video/mp4")},
     )
     assert accepted.status_code == 201, accepted.text
-    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    replay = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers=headers,
+        data={"providerArtifactId": artifact_id},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert replay.status_code == 201, replay.text
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "RIGHTS_BLOCKED"
+        assert task.asset_version_id is not None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == before_bytes + len(payload)
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == 1
+        events = list(db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalars())
+        assert sum(event.event_type == "STORAGE_RESERVATION_OPENED" for event in events) == 1
+        # Successful first-time intake has no compensating RELEASED event.
+        # The older duplicate-ACK helper expects one and does not apply here.
+        assert sum(event.event_type == "STORAGE_RESERVATION_RELEASED" for event in events) == 0
+        assert sum(event.event_type == "ARTIFACT_INGESTED" for event in events) == 1
     app.state.moneyprinter.assert_not_called()
