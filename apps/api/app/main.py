@@ -26,7 +26,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import and_, case, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -588,6 +588,22 @@ def create_app(
     created_app.state.generation_provider_mode = resolved_generation_provider_mode
     created_app.state.governance_gates = resolved_governance_gates
     created_app.state.setup_required = False
+
+    @created_app.exception_handler(SQLAlchemyPoolTimeout)
+    async def database_pool_capacity_unavailable(_request: Request, _exc: SQLAlchemyPoolTimeout):
+        """Fail closed when an initial request DB checkout exhausts the pool.
+
+        Liveness/probe checkouts already return bounded 503; an earlier
+        SQLAlchemy Session checkout must not leak an unhandled HTTP 500.
+        No quota, asset, release receipt or Provider action is implied.
+        """
+        return JSONResponse(
+            status_code=503,
+            content={"detail": {
+                "code": "DATABASE_CAPACITY_UNAVAILABLE",
+                "message": "数据库连接暂不可用，请稍后重试",
+            }},
+        )
 
     origins = [
         origin.strip()
