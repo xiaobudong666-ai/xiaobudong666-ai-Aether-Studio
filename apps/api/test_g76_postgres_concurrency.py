@@ -3496,3 +3496,94 @@ def test_g70_g71_postgres_initial_pool_checkout_exhaustion_is_bounded_and_nonmut
             DBGenerationEvent.generation_task_id == task_id,
         )).scalar_one() == events_before
     app.state.moneyprinter.assert_not_called()
+
+def test_g70_g71_postgres_contended_liveness_advisory_lock_is_bounded_and_nonmutating(
+    postgres_context, monkeypatch,
+):
+    """FAKE-only HTTP regression: a held PG advisory key cannot hang intake.
+
+    Force only the API reservation UUID to collide with a lock held by an
+    independent PostgreSQL connection. The request must return bounded 503
+    without quota, asset, audit or Sidecar writes; once the lock is released,
+    the same task must be ingested normally with exactly one committed asset.
+    """
+    import app.main as main_module
+
+    client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        client,
+    )
+    payload = b"g70-g71-advisory-contention-fake-only"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id, project_id = task.tenant_id, task.project_id
+        before_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+
+    forced_reservation_id = uuid.UUID("00000000-0000-4000-8000-00000000a71f")
+    forced_lock_key = int(forced_reservation_id) & 0x7FFFFFFFFFFFFFFF
+    real_uuid_module = main_module.uuid
+
+    class ScopedReservationUUID:
+        def __getattr__(self, name):
+            return getattr(real_uuid_module, name)
+
+        def uuid4(self):
+            return forced_reservation_id
+
+    real_upload = FakeMediaStore.upload_media
+    attempted_upload = MagicMock(
+        side_effect=AssertionError("held advisory lock must not reach Sidecar"),
+    )
+    engine = sessions.kw["bind"]
+    with engine.connect() as blocker:
+        blocker.execute(
+            text("SELECT pg_advisory_lock(:lock_key)"),
+            {"lock_key": forced_lock_key},
+        )
+        blocker.commit()
+        try:
+            monkeypatch.setattr(main_module, "uuid", ScopedReservationUUID())
+            monkeypatch.setattr(FakeMediaStore, "upload_media", attempted_upload)
+            started = time.monotonic()
+            for _retry in range(3):
+                rejected = client.post(
+                    f"/internal/generation-tasks/{task_id}/artifact-intake",
+                    headers=headers,
+                    data={"providerArtifactId": artifact_id},
+                    files={"file": ("synthetic.mp4", payload, "video/mp4")},
+                )
+                assert rejected.status_code == 503, rejected.text
+                assert rejected.json()["detail"]["code"] == "STORAGE_HOLD_LOCK_CONTENDED"
+            assert time.monotonic() - started < 5, "advisory contention must be bounded"
+            attempted_upload.assert_not_called()
+            with sessions() as db:
+                assert db.get(DBTenant, tenant_id).used_storage_bytes == before_bytes
+                assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one() == before_events
+                assert db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one() == 0
+        finally:
+            monkeypatch.setattr(main_module, "uuid", real_uuid_module)
+            monkeypatch.setattr(FakeMediaStore, "upload_media", real_upload)
+            unlocked = blocker.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": forced_lock_key},
+            ).scalar_one()
+            blocker.commit()
+            assert unlocked is True
+
+    accepted = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers=headers,
+        data={"providerArtifactId": artifact_id},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert accepted.status_code == 201, accepted.text
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    app.state.moneyprinter.assert_not_called()
