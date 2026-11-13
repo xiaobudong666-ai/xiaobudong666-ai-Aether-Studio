@@ -3408,3 +3408,91 @@ def test_g70_g71_postgres_two_connection_pool_concurrent_retry_recovers_after_re
             DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_initial_pool_checkout_exhaustion_is_bounded_and_nonmutating(
+    postgres_context,
+):
+    """FAKE-only native HTTP proof: initial DB checkout exhaustion must be 503.
+
+    Existing G70/G71 regression covers the *second* liveness connection.
+    Multiple busy Workers can also consume every slot before the request
+    Session's first SELECT. An exception here must not become HTTP 500, nor
+    create a storage hold, asset or Sidecar upload. This deliberately uses
+    a disposable PostgreSQL pool and no real Provider.
+    """
+    from sqlalchemy import create_engine
+
+    client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        client,
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id, project_id = task.tenant_id, task.project_id
+        bytes_before = db.get(DBTenant, tenant_id).used_storage_bytes
+        assets_before = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+
+    limited_engine = create_engine(
+        os.environ["AETHER_TEST_POSTGRES_URL"],
+        pool_size=2, max_overflow=0, pool_timeout=0.2,
+    )
+    limited_sessions = sessionmaker(
+        autocommit=False, autoflush=False, bind=limited_engine,
+    )
+
+    def limited_dependency():
+        with limited_sessions() as db:
+            yield db
+
+    sidecar = MagicMock(wraps=FakeMediaStore())
+    limited_app = create_app(
+        app_engine=limited_engine,
+        db_dependency=limited_dependency,
+        video_use_adapter=sidecar,
+        bootstrap_admin_password=OWNER_PASSWORD,
+        bootstrap_admin_email="g76-postgres-owner@example.com",
+        worker_token=WORKER_TOKEN,
+        cookie_secure=False,
+        enforce_csrf=True,
+        generation_provider_mode="deterministic-fake",
+    )
+    # Do not run app startup while deliberately pinning all DB slots; the
+    # existing fixture has already created the database and authenticated task.
+    request_client = TestClient(limited_app, raise_server_exceptions=False)
+    try:
+        with limited_engine.connect() as first_slot, limited_engine.connect() as second_slot:
+            assert limited_engine.pool.checkedout() == 2
+            started = time.monotonic()
+            for _retry in range(3):
+                rejected = request_client.post(
+                    f"/internal/generation-tasks/{task_id}/artifact-intake",
+                    headers=headers,
+                    data={"providerArtifactId": artifact_id},
+                    files={"file": ("synthetic.mp4", b"pool-exhaustion-fake", "video/mp4")},
+                )
+                assert rejected.status_code == 503, rejected.text
+                assert rejected.json()["detail"]["code"] == "DATABASE_CAPACITY_UNAVAILABLE"
+                assert limited_engine.pool.checkedout() == 2
+            assert time.monotonic() - started < 5, "pool exhaustion must be bounded"
+        assert limited_engine.pool.checkedout() == 0
+        sidecar.upload_media.assert_not_called()
+    finally:
+        request_client.close()
+        limited_engine.dispose()
+
+    with sessions() as db:
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == bytes_before
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == assets_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+    app.state.moneyprinter.assert_not_called()
