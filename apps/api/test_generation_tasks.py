@@ -5712,10 +5712,32 @@ def test_g72_fake_typed_or_worker_alias_drift_is_rejected(
     payload = _g72_fake_payload(
         client, project, image_id, key="g72-script-binding-" + phase,
     )
-    created = client.post(
-        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
-        json=payload,
-    )
+    # Capability snapshots can change between fixture acquisition and create
+    # under the shared CI clock. Retry only explicit stale-snapshot responses;
+    # preserve all security denials and the original tamper assertions.
+    create_path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for _ in range(3):
+        created = client.post(create_path, json=payload)
+        if created.status_code == 202:
+            break
+        detail = created.json().get("detail", {})
+        if (
+            created.status_code != 409
+            or detail.get("code") not in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }
+        ):
+            break
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        preflight = client.post(create_path + "/validate", json=payload)
+        if preflight.status_code == 200:
+            payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        elif preflight.status_code != 409 or preflight.json().get("detail", {}).get("code") not in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }:
+            assert preflight.status_code == 200, preflight.text
     assert created.status_code == 202, created.text
     task_id = created.json()["taskId"]
     with sessions() as db:
