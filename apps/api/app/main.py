@@ -3371,8 +3371,10 @@ def create_app(
                         detail={"code": "STORAGE_HOLD_LOCK_CONTENDED",
                                 "message": "存储预留保护锁暂被占用，请稍后重试"},
                     )
-                conn.commit()
+                # Mark acquired before COMMIT: even a failed commit must try
+                # to unlock or invalidate the session before pool reuse.
                 acquired = True
+                conn.commit()
                 yield
             finally:
                 if acquired:
