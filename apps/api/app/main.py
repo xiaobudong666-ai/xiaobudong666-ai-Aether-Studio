@@ -156,6 +156,29 @@ def private_canary_policy_valid(policy: dict) -> bool:
     )
 
 
+def generation_failure_policy_valid(snapshot: dict) -> bool:
+    """Reject corrupt persisted circuit bounds without normalizing Owner policy.
+
+    Legacy snapshots lacking one of these fields retain the established
+    defaults. Explicit bool/string/container/zero values do not become a
+    Worker lease or an unhandled provider-failure transition.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    policy = snapshot.get("providerPolicy", {})
+    if not isinstance(policy, dict):
+        return False
+    for field, fallback in (
+        ("failureWindow", 300),
+        ("failureThreshold", 5),
+        ("cooldownSeconds", 60),
+    ):
+        value = policy.get(field, fallback)
+        if type(value) is not int or value < 1:
+            return False
+    return True
+
+
 def attestation_canary_proof(
     attestation: DBGenerationProviderAttestation | None,
 ) -> tuple[str, str, str]:
@@ -1121,6 +1144,11 @@ def create_app(
         *,
         now: datetime.datetime,
     ) -> None:
+        if not generation_failure_policy_valid(task.capability_snapshot_json):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_FAILURE_POLICY_INVALID", "message": "任务故障熔断参数异常，需隔离核验"},
+            )
         policy = task.capability_snapshot_json.get("providerPolicy") or {}
         window_seconds = max(10, int(policy.get("failureWindow", 300)))
         threshold = max(1, int(policy.get("failureThreshold", 5)))
@@ -2866,6 +2894,10 @@ def create_app(
                 continue
             generated_seconds_limit = candidate_quota.get("monthlyGeneratedSecondsLimit")
             if type(generated_seconds_limit) is not int or generated_seconds_limit <= 0:
+                continue
+            # G73: malformed persisted failure-window/threshold/cooldown data
+            # cannot get a lease and later crash failure recording for all tasks.
+            if not generation_failure_policy_valid(candidate_snapshot):
                 continue
             # G73: any provider mode can inherit legacy/corrupt JSON.  Do
             # not lease a task whose request cannot be consumed by a Worker.
