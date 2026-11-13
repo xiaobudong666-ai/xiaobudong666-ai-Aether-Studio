@@ -3568,8 +3568,25 @@ def create_app(
                         "workerId", "leaseEpoch", "providerArtifactId",
                         "mediaId", "sha256", "reservedStorageBytes",
                     )
+                    # Paired absent/malformed identities previously passed via
+                    # None == None. A release is admissible only if its OPENED
+                    # event is a typed, system-originated reservation.
+                    required_opened_strings = ("workerId", "providerArtifactId", "mediaId", "sha256")
+                    opened_sha256 = opened_metadata.get("sha256")
+                    opened_identity_valid = (
+                        opened.actor_type == "SYSTEM"
+                        and opened.actor_id == "api"
+                        and all(
+                            type(opened_metadata.get(field)) is str and bool(opened_metadata[field])
+                            for field in required_opened_strings
+                        )
+                        and type(opened_sha256) is str
+                        and len(opened_sha256) == 64
+                        and all(c in "0123456789abcdef" for c in opened_sha256)
+                    )
                     if (
-                        receipt.actor_type == "SYSTEM"
+                        opened_identity_valid
+                        and receipt.actor_type == "SYSTEM"
                         and receipt.actor_id == "api"
                         and released_metadata.get("reasonCode") in {
                             "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED"
