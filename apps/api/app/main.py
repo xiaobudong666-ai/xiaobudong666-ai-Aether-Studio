@@ -3498,12 +3498,27 @@ def create_app(
                 if isinstance(receipt.metadata_json, dict)
                 and receipt.metadata_json.get("reservedStorageBytes") is not None
             }
+            # An unresolved hold in the SAME lease epoch is not proof that
+            # another request is still live. It may be a SIGKILL orphan.
+            # Permit legacy identical concurrent ACK flow only when every
+            # outstanding reservation binds to the exact same bytes, worker,
+            # artifact and project media. Reject changed bytes before a
+            # second quota increment or any Sidecar write. This does NOT
+            # reconcile a same-epoch orphan with identical bytes.
+            incoming_sha256 = digest.hexdigest()
             if any(
                 hold.id not in released_ids
                 and (
                     not isinstance(hold.metadata_json, dict)
                     or type(hold.metadata_json.get("leaseEpoch")) is not int
                     or hold.metadata_json["leaseEpoch"] != x_worker_lease_epoch
+                    or hold.metadata_json.get("workerId") != x_worker_id
+                    or hold.metadata_json.get("providerArtifactId") != providerArtifactId
+                    or hold.metadata_json.get("mediaId") != expected_media_id
+                    or type(hold.metadata_json.get("reservedStorageBytes")) is not int
+                    or hold.metadata_json["reservedStorageBytes"] != upload_size
+                    or not isinstance(hold.metadata_json.get("sha256"), str)
+                    or not hmac.compare_digest(hold.metadata_json["sha256"], incoming_sha256)
                 )
                 for hold in opened_holds
             ):
