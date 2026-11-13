@@ -2427,10 +2427,10 @@ def create_app(
             )
 
         expected_sha256 = str(evidence.get("orphanedMediaSha256") or "").lower()
-        try:
-            expected_size = int(evidence.get("orphanedMediaSizeBytes") or 0)
-        except (TypeError, ValueError):
-            expected_size = 0
+        # Failed-attempt audit evidence must be an exact byte count. Booleans,
+        # floats and numeric strings are not an independent storage receipt.
+        raw_expected_size = evidence.get("orphanedMediaSizeBytes")
+        expected_size = raw_expected_size if type(raw_expected_size) is int else 0
         if (
             len(expected_sha256) != 64
             or any(char not in "0123456789abcdef" for char in expected_sha256)
@@ -2478,21 +2478,25 @@ def create_app(
                 },
             )
         actual_sha256 = str(inspected.get("sha256") or "").lower()
-        try:
-            actual_size = int(inspected.get("sizeBytes") or 0)
-        except (TypeError, ValueError):
-            actual_size = 0
+        # The Sidecar JSON is untrusted. Never coerce a bool, string or float
+        # to an integer byte count before verifying an Owner-only recovery.
+        raw_actual_size = inspected.get("sizeBytes")
+        actual_size = raw_actual_size if type(raw_actual_size) is int else 0
         probe_metadata = inspected.get("metadata")
         video_metadata = (
             probe_metadata.get("video")
             if isinstance(probe_metadata, dict)
             else None
         )
+        raw_duration = (
+            probe_metadata.get("durationSeconds")
+            if isinstance(probe_metadata, dict) else None
+        )
         try:
-            duration_seconds = float(
-                probe_metadata.get("durationSeconds") or 0
-            ) if isinstance(probe_metadata, dict) else 0
-        except (TypeError, ValueError):
+            duration_seconds = (
+                float(raw_duration) if type(raw_duration) in (int, float) else 0
+            )
+        except (TypeError, ValueError, OverflowError):
             duration_seconds = 0
         # Historical snapshots can contain non-object providerPolicy JSON.
         # Owner recovery must refuse malformed policy evidence before changing
@@ -2566,11 +2570,12 @@ def create_app(
         # Sidecar probe data is untrusted. A malformed numeric dimension must
         # fail closed with a stable 422, not raise ValueError/TypeError as 500
         # during Owner-only orphan recovery (while usage remains HELD).
-        try:
-            probed_width = int(video_metadata.get("width") or 0) if isinstance(video_metadata, dict) else 0
-            probed_height = int(video_metadata.get("height") or 0) if isinstance(video_metadata, dict) else 0
-        except (TypeError, ValueError, OverflowError):
-            probed_width = probed_height = 0
+        # Media dimensions are measured integers. Coercing a boolean or
+        # numeric string would convert invalid probe evidence into an approval.
+        raw_width = video_metadata.get("width") if isinstance(video_metadata, dict) else None
+        raw_height = video_metadata.get("height") if isinstance(video_metadata, dict) else None
+        probed_width = raw_width if type(raw_width) is int else 0
+        probed_height = raw_height if type(raw_height) is int else 0
         if (
             not isinstance(video_metadata, dict)
             or probed_width <= 0
@@ -2763,10 +2768,8 @@ def create_app(
         if existing_material is not None:
             # Materials are untrusted project JSON. Malformed legacy sizes must
             # fail closed as a conflict instead of raising an unhandled 500.
-            try:
-                existing_material_size = int(existing_material.get("sizeBytes") or 0)
-            except (TypeError, ValueError, OverflowError):
-                existing_material_size = -1
+            raw_material_size = existing_material.get("sizeBytes")
+            existing_material_size = raw_material_size if type(raw_material_size) is int else -1
             if (
                 existing_material.get("url") != material["url"]
                 or existing_material.get("type") != "video"
