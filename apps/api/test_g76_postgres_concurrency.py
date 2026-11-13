@@ -2210,6 +2210,35 @@ with sessions() as db:
         finally:
             independent_engine.dispose()
 
+        # Before attempting normal replay, a changed artifact from the SAME
+        # lease epoch must be rejected against the durable opened receipt.
+        # Prior to this fence it could reserve a second quota hold and call
+        # the Sidecar even though the original SIGKILL orphan is unresolved.
+        # This is an actual OS-kill setup with a file-backed FAKE Sidecar;
+        # it does not prove automatic orphan reconciliation.
+        contradictory = _post_g70_g71_duplicate_intake(
+            app, task_id, headers, artifact_id, payload + b"-changed-after-crash"
+        )
+        assert contradictory.status_code == 409, contradictory.text
+        assert contradictory.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, tenant_id)
+            assert task is not None and tenant is not None
+            assert task.asset_version_id is None
+            assert task.status == "INGESTING"
+            assert tenant.used_storage_bytes == before_bytes + len(payload)
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+            )).scalar_one() == 1
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+            )).scalar_one() == 0
+        assert media_file.read_bytes() == payload
+        app.state.moneyprinter.assert_not_called()
+
         if rotate_lease:
             # A new worker generation can be granted after a dead API's
             # uncertain upload. The original hold cannot be silently reused
