@@ -3080,6 +3080,119 @@ def test_g72_changed_payload_same_idempotency_key_is_rejected(generation_context
         assert len(list(db.execute(select(DBGenerationUsageEntry)).scalars())) == 1
 
 
+@pytest.mark.parametrize("corruption", [
+    "response_not_object",
+    "metadata_not_object",
+    "size_bool",
+    "size_string",
+    "size_float",
+    "size_mismatch",
+    "duration_bool",
+    "duration_nan",
+    "duration_infinity",
+    "duration_zero",
+    "video_not_object",
+    "video_width_bool",
+    "video_height_string",
+    "project_scope_mismatch",
+    "top_level_size_mismatch",
+    "top_level_hash_mismatch",
+])
+def test_g70_g71_artifact_intake_strict_sidecar_probe_compensates_quota(
+    generation_context, monkeypatch, corruption,
+):
+    """FAKE-only corrupted Sidecar ACK cannot become asset/settlement evidence.
+
+    Isolated FastAPI/SQLite fixture; this is NOT a real Provider, protected
+    storage, crash reconciliation or PostgreSQL acceptance proof.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G70/G71 typed artifact probe " + corruption)
+    task = create_task(client, project, key="g70-g71-probe-" + corruption)
+    task_id = task["taskId"]
+    leased = claim(client, worker_id="worker-a")
+    assert leased.status_code == 200, leased.text
+    assert leased.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="fake-probe-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-probe-upstream",
+        providerArtifactId="fake-probe-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        before_bytes = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    original_upload = media.upload_media
+
+    def corrupted_upload(*args, **kwargs):
+        ack = original_upload(*args, **kwargs)
+        ack = {**ack, "metadata": dict(ack["metadata"])}
+        ack["metadata"]["video"] = dict(ack["metadata"]["video"])
+        if corruption == "response_not_object":
+            return ["invalid", "response"]
+        if corruption == "metadata_not_object":
+            ack["metadata"] = ["invalid"]
+        elif corruption == "size_bool":
+            ack["metadata"]["sizeBytes"] = True
+        elif corruption == "size_string":
+            ack["metadata"]["sizeBytes"] = "123"
+        elif corruption == "size_float":
+            ack["metadata"]["sizeBytes"] = 123.0
+        elif corruption == "size_mismatch":
+            ack["metadata"]["sizeBytes"] += 1
+        elif corruption == "duration_bool":
+            ack["metadata"]["durationSeconds"] = True
+        elif corruption == "duration_nan":
+            ack["metadata"]["durationSeconds"] = float("nan")
+        elif corruption == "duration_infinity":
+            ack["metadata"]["durationSeconds"] = float("inf")
+        elif corruption == "duration_zero":
+            ack["metadata"]["durationSeconds"] = 0
+        elif corruption == "video_not_object":
+            ack["metadata"]["video"] = ["h264"]
+        elif corruption == "video_width_bool":
+            ack["metadata"]["video"]["width"] = True
+        elif corruption == "video_height_string":
+            ack["metadata"]["video"]["height"] = "240"
+        elif corruption == "project_scope_mismatch":
+            ack["projectId"] = "different-tenant-project"
+        elif corruption == "top_level_size_mismatch":
+            ack["sizeBytes"] = 999999
+        elif corruption == "top_level_hash_mismatch":
+            ack["sha256"] = "0" * 64
+        return ack
+
+    monkeypatch.setattr(media, "upload_media", corrupted_upload)
+    denied = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "fake-probe-artifact"},
+        files={"file": ("synthetic.mp4", b"g70-g71-fake-only-upload", "video/mp4")},
+    )
+    assert denied.status_code == 422, denied.text
+    assert denied.json()["detail"]["code"] == "ARTIFACT_VALIDATION_FAILED"
+    assert media.uploads == 1
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        assert stored is not None and stored.status == "FAILED"
+        assert stored.asset_version_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == before_bytes
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
     g72_true_native_flow_context, monkeypatch, tmp_path,
 ):
