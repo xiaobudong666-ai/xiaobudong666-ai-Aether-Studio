@@ -2070,11 +2070,11 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
     app.state.moneyprinter.assert_not_called()
 
 def test_g70_g71_postgres_sigkill_after_sidecar_write_replay_storage_accounting(postgres_context):
-    """Expose durable duplicate quota after real SIGKILL (FAKE sidecar, isolated PostgreSQL).
+    """SIGKILL orphan replay must fail closed without reserving a second hold.
 
-    This is NOT a native video-use Sidecar or host-crash proof. A separate API
-    interpreter writes the simulated Sidecar object, is killed before ACK, and
-    the same idempotent artifact is replayed. Known defect is XFAIL, not PASS.
+    A disposable API child dies after FAKE Sidecar persistence and PostgreSQL
+    hold commit. This verifies crash-safe *quarantine* only, not automatic
+    recovery, native video-use reconciliation or host-power-loss durability.
     """
     import signal
     import subprocess
@@ -2205,26 +2205,31 @@ with sessions() as db:
             independent_engine.dispose()
 
         replay = _post_g70_g71_duplicate_intake(app, task_id, headers, artifact_id, payload)
-        assert replay.status_code == 201, replay.text
+        assert replay.status_code == 409, replay.text
+        assert replay.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_UNRESOLVED"
         with sessions() as db:
             task = db.get(DBGenerationTask, task_id)
             tenant = db.get(DBTenant, tenant_id)
             assert task is not None and tenant is not None
-            assert task.status == "RIGHTS_BLOCKED"
-            assert task.asset_version_id is not None
-            assert db.execute(select(func.count(DBAssetVersion.id)).where(
-                DBAssetVersion.id == task.asset_version_id,
-            )).scalar_one() == 1
-            actual_bytes = tenant.used_storage_bytes
-
-        if actual_bytes == before_bytes + 2 * len(payload):
-            pytest.xfail(
-                "CONFIRMED OPEN: API SIGKILL after FAKE Sidecar persisted left "
-                "unreceipted hold; retry double-counted one durable artifact"
+            assert task.status == "INGESTING"
+            assert task.asset_version_id is None
+            assert tenant.used_storage_bytes == before_bytes + len(payload), (
+                "Orphan replay must never double-charge or silently release the original hold"
             )
-        assert actual_bytes == before_bytes + len(payload), (
-            "Crash and idempotent replay must account for one durable artifact"
-        )
+            holds = list(db.execute(select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_HELD",
+            )).scalars())
+            assert len(holds) == 1
+            assert holds[0].metadata_json["reservedStorageBytes"] == len(payload)
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+            )).scalar_one() == 0
+            assert db.execute(select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == task.project_id,
+                DBAssetVersion.media_id == task.media_id,
+            )).scalar_one() == 0
 
 def test_g73_postgres_poisoned_queue_does_not_starve_healthy_fake_claim(postgres_context):
     """A corrupt persisted JSON payload must not starve independent FAKE Worker claims.
