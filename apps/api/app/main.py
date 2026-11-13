@@ -191,6 +191,30 @@ def generation_failure_policy_valid(snapshot: dict) -> bool:
     return True
 
 
+def generation_failure_history_valid(history: object) -> bool:
+    """Treat damaged durable circuit history as untrusted, without rewriting it.
+
+    A scalar/container record can raise during failure reporting, while a
+    timezone-naive timestamp cannot be compared to an aware UTC cutoff.
+    Ignoring damaged entries would also discard known failure evidence and
+    could keep an unsafe circuit closed. Refuse Worker claims and callbacks.
+    """
+    if history is None:
+        return True  # Legacy circuit rows may have no failure timestamps.
+    if not isinstance(history, list):
+        return False
+    for raw in history:
+        if not isinstance(raw, str):
+            return False
+        try:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.utcoffset() is None:
+                return False
+        except (ValueError, OverflowError):
+            return False
+    return True
+
+
 def attestation_canary_proof(
     attestation: DBGenerationProviderAttestation | None,
 ) -> tuple[str, str, str]:
@@ -1169,12 +1193,16 @@ def create_app(
         if circuit.state == "DISABLED":
             return
         cutoff = now - datetime.timedelta(seconds=window_seconds)
+        history = circuit.failure_timestamps_json
+        if not generation_failure_history_valid(history):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_CIRCUIT_HISTORY_INVALID",
+                        "message": "持久化熔断历史无效，任务必须隔离核验"},
+            )
         timestamps: list[datetime.datetime] = []
-        for raw in circuit.failure_timestamps_json or []:
-            try:
-                parsed = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            except ValueError:
-                continue
+        for raw in history or []:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
             if parsed >= cutoff:
                 timestamps.append(parsed)
         timestamps.append(now)
@@ -3034,6 +3062,10 @@ def create_app(
             # another tenant's Worker claim commits this transaction.
             candidate_circuit = generation_circuit(db, candidate.tenant_id, create=True, for_update=True)
             if candidate_circuit is not None:
+                # Never hand a Provider lease to a tenant whose stored
+                # failure evidence is malformed. This check is read-only.
+                if not generation_failure_history_valid(candidate_circuit.failure_timestamps_json):
+                    continue
                 if candidate_circuit.state == "DISABLED":
                     continue
                 if candidate_circuit.state == "OPEN":
