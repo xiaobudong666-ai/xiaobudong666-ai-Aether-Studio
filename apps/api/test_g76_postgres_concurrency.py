@@ -2073,10 +2073,10 @@ def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_no
 def test_g70_g71_postgres_sigkill_after_sidecar_write_replay_storage_accounting(
     postgres_context, rotate_lease,
 ):
-    """OS SIGKILL: cross-epoch replay is held; same-epoch double hold stays XFAIL.
+    """OS SIGKILL: both lease generations must fail closed on a durable orphan.
 
-    FAKE file-backed Sidecar + disposable PostgreSQL only. This checks a
-    limited lease-fence safety improvement, NOT automatic crash reconciliation.
+    FAKE file-backed Sidecar + disposable PostgreSQL only. A disconnected
+    liveness lock is a crash signal, not authority to refund or auto-adopt.
     """
     import signal
     import subprocess
@@ -2271,27 +2271,30 @@ with sessions() as db:
             assert media_file.read_bytes() == payload
             return
 
-        # The same Worker lease can still double count after SIGKILL. Leave a
-        # strict open XFAIL rather than representing this partial fence as a
-        # complete crash-durable quota repair.
-        assert replay.status_code == 201, replay.text
+        # A SIGKILL releases the PostgreSQL session-level liveness lock
+        # even though the hold and FAKE Sidecar bytes remain durable.
+        # Same-epoch replay must now refuse a second quota reservation.
+        assert replay.status_code == 409, replay.text
+        assert replay.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         with sessions() as db:
             task = db.get(DBGenerationTask, task_id)
             tenant = db.get(DBTenant, tenant_id)
             assert task is not None and tenant is not None
-            assert task.status == "RIGHTS_BLOCKED"
-            assert task.asset_version_id is not None
-            assert db.execute(select(func.count(DBAssetVersion.id)).where(
-                DBAssetVersion.id == task.asset_version_id,
-            )).scalar_one() == 1
-            actual_bytes = tenant.used_storage_bytes
-
-        if actual_bytes == before_bytes + 2 * len(payload):
-            pytest.xfail(
-                "CONFIRMED OPEN: same-lease API SIGKILL after FAKE Sidecar persisted "
-                "left a second durable quota hold despite successful replay"
-            )
-        assert actual_bytes == before_bytes + len(payload)
+            assert task.status == "INGESTING"
+            assert task.asset_version_id is None
+            assert tenant.used_storage_bytes == before_bytes + len(payload)
+            holds = db.execute(select(DBGenerationEvent).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+            )).scalars().all()
+            assert len(holds) == 1
+            assert type(holds[0].metadata_json.get("livenessLockKey")) is int
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+            )).scalar_one() == 0
+        assert media_file.read_bytes() == payload
+        app.state.moneyprinter.assert_not_called()
 
 def test_g73_postgres_poisoned_queue_does_not_starve_healthy_fake_claim(postgres_context):
     """A corrupt persisted JSON payload must not starve independent FAKE Worker claims.
