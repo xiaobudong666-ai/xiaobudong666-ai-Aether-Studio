@@ -3357,7 +3357,20 @@ def create_app(
         with liveness_conn as conn:
             acquired = False
             try:
-                conn.execute(text("SELECT pg_advisory_lock(:lock_key)"), {"lock_key": lock_key})
+                # Never block a worker indefinitely on a session-level lock.
+                # A colliding or externally held key is a retryable, non-mutating
+                # capacity condition; the quota hold is not opened yet.
+                obtained = conn.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"),
+                    {"lock_key": lock_key},
+                ).scalar_one()
+                if obtained is not True:
+                    conn.rollback()
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "STORAGE_HOLD_LOCK_CONTENDED",
+                                "message": "存储预留保护锁暂被占用，请稍后重试"},
+                    )
                 conn.commit()
                 acquired = True
                 yield
