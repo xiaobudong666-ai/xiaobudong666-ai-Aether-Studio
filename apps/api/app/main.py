@@ -642,14 +642,17 @@ def create_app(
         project_id: str,
         asset_version_id: str,
         context: AuthContext,
+        *,
+        for_update: bool = False,
     ) -> DBAssetVersion:
-        asset = db.execute(
-            select(DBAssetVersion).where(
-                DBAssetVersion.id == asset_version_id,
-                DBAssetVersion.project_id == project_id,
-                DBAssetVersion.tenant_id == context.tenant_id,
-            )
-        ).scalar_one_or_none()
+        statement = select(DBAssetVersion).where(
+            DBAssetVersion.id == asset_version_id,
+            DBAssetVersion.project_id == project_id,
+            DBAssetVersion.tenant_id == context.tenant_id,
+        )
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        asset = db.execute(statement).scalar_one_or_none()
         if asset is None:
             raise HTTPException(
                 status_code=404,
@@ -3668,11 +3671,18 @@ def create_app(
                         invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
                         invalid_message = "上传期间口播FAKE持久合约已变化，模拟产物隔离"
                     else:
-                        current_source = db.execute(select(DBAssetVersion).where(
+                        # G72: hold the same PostgreSQL asset-version lock
+                        # used by rights-snapshot writers through asset+SETTLED
+                        # commit. A revocation committed first is re-read here;
+                        # a later revoke cannot ACK before this commit.
+                        source_statement = select(DBAssetVersion).where(
                             DBAssetVersion.id == current_source_id,
                             DBAssetVersion.tenant_id == task.tenant_id,
                             DBAssetVersion.project_id == task.project_id,
-                        )).scalar_one_or_none()
+                        )
+                        if app_engine.dialect.name != "sqlite":
+                            source_statement = source_statement.with_for_update()
+                        current_source = db.execute(source_statement).scalar_one_or_none()
                         if (
                             current_source is None
                             or current_source.media_type != "image"
@@ -4223,7 +4233,11 @@ def create_app(
     ):
         require_roles(context, "owner", "editor")
         project_for_tenant(db, project_id, context)
-        asset_for_tenant(db, project_id, asset_version_id, context)
+        # G72: serialize every source-rights snapshot writer with FAKE-only
+        # Worker final intake by holding the same asset-version row lock until
+        # commit. This prevents an Owner revoke ACK from racing past the
+        # Worker's last REMIX check while it still settles stale ALLOWED usage.
+        asset_for_tenant(db, project_id, asset_version_id, context, for_update=True)
         snapshot = DBRightsSnapshot(
             id=str(uuid.uuid4()),
             tenant_id=context.tenant_id,
