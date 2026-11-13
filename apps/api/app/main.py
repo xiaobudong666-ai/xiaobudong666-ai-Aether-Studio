@@ -11,7 +11,7 @@ import math
 import os
 import uuid
 from collections.abc import Callable, Generator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import (
     Depends,
