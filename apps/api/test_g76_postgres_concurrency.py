@@ -867,6 +867,8 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
         "container_release_reservation_id_list", "container_release_reservation_id_object",
         "container_release_reason_list", "container_release_reason_object",
         "duplicate_valid_release", "valid_and_malformed_duplicate",
+        "valid_and_unknown_reference", "valid_and_untyped_reference",
+        "valid_and_unstructured_receipt",
     ]
 )
 def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
@@ -954,12 +956,22 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
             to_status="INGESTING", actor_type=actor, actor_id="api",
             metadata_json=release_metadata, created_at=now,
         ))
-        if corruption in {"duplicate_valid_release", "valid_and_malformed_duplicate"}:
+        if corruption in {
+            "duplicate_valid_release", "valid_and_malformed_duplicate",
+            "valid_and_unknown_reference", "valid_and_untyped_reference",
+            "valid_and_unstructured_receipt",
+        }:
             # A single legitimate receipt must not mask a second competing
-            # audit row. Neither case may re-reserve quota or contact Sidecar.
+            # or unmatchable audit row. No new quota hold or Sidecar call.
             extra_metadata = dict(release_metadata)
             if corruption == "valid_and_malformed_duplicate":
                 extra_metadata["sha256"] = "0" * 64
+            elif corruption == "valid_and_unknown_reference":
+                extra_metadata["storageReservationEventId"] = str(uuid.uuid4())
+            elif corruption == "valid_and_untyped_reference":
+                extra_metadata["storageReservationEventId"] = ["untrusted", opened_id]
+            elif corruption == "valid_and_unstructured_receipt":
+                extra_metadata = ["untrusted", opened_id]
             db.add(DBGenerationEvent(
                 id=str(uuid.uuid4()), generation_task_id=task_id, attempt_id=None,
                 event_type="STORAGE_RESERVATION_RELEASED", from_status="INGESTING",
