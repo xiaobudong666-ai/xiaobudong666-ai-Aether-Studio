@@ -3676,6 +3676,10 @@ def create_app(
                 # turn an outstanding quota hold into a presumed release.
                 opened_by_id = {hold.id: hold for hold in opened_holds}
                 released_ids = set()
+                # A release row without a typed reference to an OPENED hold is
+                # ambiguous audit evidence even if a different row is valid.
+                # Do not let a valid receipt hide an unrelated or corrupt one.
+                unmatched_release_reference = False
                 # A second receipt for one hold is ambiguous financial evidence,
                 # even when either individual receipt looks valid. Never infer
                 # quota reconciliation from duplicate audit rows.
@@ -3683,14 +3687,17 @@ def create_app(
                 for receipt in releases:
                     released_metadata = receipt.metadata_json
                     if not isinstance(released_metadata, dict):
+                        unmatched_release_reference = True
                         continue
                     # Corrupt JSON containers are unhashable; an audit row must
                     # never turn an orphan safety fence into an HTTP 500.
                     opened_reference = released_metadata.get("storageReservationEventId")
                     if type(opened_reference) is not str:
+                        unmatched_release_reference = True
                         continue
                     opened = opened_by_id.get(opened_reference)
                     if opened is None:
+                        unmatched_release_reference = True
                         continue
                     release_reference_counts[opened_reference] = (
                         release_reference_counts.get(opened_reference, 0) + 1
@@ -3738,13 +3745,15 @@ def create_app(
                         )
                     ):
                         released_ids.add(opened.id)
-                if any(count > 1 for count in release_reference_counts.values()):
+                if unmatched_release_reference or any(
+                    count > 1 for count in release_reference_counts.values()
+                ):
                     db.rollback()
                     raise HTTPException(
                         status_code=409,
                         detail={
                             "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
-                            "message": "同一存储预留存在重复释放回执，请人工核验原产物与额度",
+                            "message": "存储预留存在重复或无法匹配的释放回执，请人工核验原产物与额度",
                         },
                     )
                 # An unresolved hold in the SAME lease epoch is not proof that
