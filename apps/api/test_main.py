@@ -840,3 +840,74 @@ def test_additive_migration_preserves_legacy_project_and_creates_typed_tables(tm
             text("SELECT name FROM projects WHERE id = 'legacy-project'")
         ).scalar_one() == "Legacy"
     legacy_engine.dispose()
+
+
+@pytest.mark.parametrize("bad_field,bad_value", [
+    ("sizeBytes", True),
+    ("sizeBytes", "17"),
+    ("sizeBytes", 17.5),
+    ("sizeBytes", {"bytes": 17}),
+    ("sizeBytes", None),
+    ("durationSeconds", True),
+    ("durationSeconds", "1.0"),
+    ("durationSeconds", float("nan")),
+    ("durationSeconds", float("inf")),
+    ("durationSeconds", {"seconds": 1}),
+])
+def test_g70_g71_media_upload_rejects_untrusted_sidecar_probe_and_releases_hold(
+    api_context, monkeypatch, bad_field, bad_value,
+):
+    """Malformed FAKE Sidecar evidence must not persist an asset or charge quota."""
+    client, sessions = api_context
+    project = create_project(client, "Strict Sidecar probe")
+    adapter = client.app.state.video_use
+    original_upload = adapter.upload_media
+
+    def poisoned_sidecar(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        return {**result, "metadata": {**result["metadata"], bad_field: bad_value}}
+
+    monkeypatch.setattr(adapter, "upload_media", poisoned_sidecar)
+    with sessions() as db:
+        baseline_bytes = db.query(DBTenant).one().used_storage_bytes
+
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("source.mp4", b"real-media-bytes", "video/mp4")},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "MEDIA_PROBE_INVALID"
+    updated = client.get(f"/projects/{project['id']}").json()
+    assert updated["revision"] == project["revision"]
+    assert updated["materials"] == []
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes
+        assert db.query(DBAssetVersion).count() == 0
+
+
+@pytest.mark.parametrize("bad_response", [None, [], "not-a-mapping", {"metadata": []}])
+def test_g70_g71_media_upload_rejects_malformed_sidecar_response_without_asset(
+    api_context, monkeypatch, bad_response,
+):
+    """Reject an invalid Sidecar response root and compensate the upload hold."""
+    client, sessions = api_context
+    project = create_project(client, "Strict Sidecar response")
+    adapter = client.app.state.video_use
+    monkeypatch.setattr(adapter, "upload_media", lambda *a, **kw: bad_response)
+    with sessions() as db:
+        baseline_bytes = db.query(DBTenant).one().used_storage_bytes
+
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("source.mp4", b"real-media-bytes", "video/mp4")},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "MEDIA_PROBE_INVALID"
+    updated = client.get(f"/projects/{project['id']}").json()
+    assert updated["revision"] == project["revision"]
+    assert updated["materials"] == []
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes
+        assert db.query(DBAssetVersion).count() == 0

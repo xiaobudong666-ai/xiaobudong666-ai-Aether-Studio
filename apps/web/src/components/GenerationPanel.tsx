@@ -268,8 +268,9 @@ export function GenerationPanel({ role, tenantId, actorId, project, assetVersion
       <p>{task.message}</p>
       {!readOnly && <div className="generation-actions">
         {ACTIVE_STATUSES.has(task.status) && <button type="button" disabled={busy} onClick={() => void mutateTask(task.taskId, "cancel")}>取消</button>}
-        {["FAILED", "PARTIAL"].includes(task.status) && !task.errorCode?.startsWith("NON_RETRYABLE_") && <button type="button" disabled={busy} onClick={() => void mutateTask(task.taskId, "retry")}>重试</button>}
+        {["FAILED", "PARTIAL"].includes(task.status) && task.errorCode !== "ARTIFACT_INGEST_FAILED" && !task.errorCode?.startsWith("NON_RETRYABLE_") && <button type="button" disabled={busy} onClick={() => void mutateTask(task.taskId, "retry")}>重试</button>}
       </div>}
+      {task.errorCode === "ARTIFACT_INGEST_FAILED" && <p role="note">原始产物转存失败，禁止直接重试或重新生成。仅原任务发起 Owner 核对原始产物后可走人工恢复；存储额度保持待核对状态。</p>}
       {task.errorCode && <p>错误：{task.errorCode} · {task.errorMessage}</p>}
       {task.results.map((result) => <div className="generation-result" key={result.assetVersionId}>
         <span>{result.contentType} · {result.checksum.slice(0, 12)} · {result.rights.code}</span>

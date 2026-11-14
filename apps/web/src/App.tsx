@@ -111,6 +111,12 @@ export default function App() {
   const savingProjectRef = useRef(false);
   const selectedProjectIdRef = useRef<string | null>(null);
   const projectDetailRequestIdRef = useRef(0);
+  // A request from a previous login must not publish project data or evict a new session.
+  const sessionEpochRef = useRef(0);
+  // A delayed callback must not cross an actor/tenant login boundary.
+  const actorScopeKey = JSON.stringify([authUser?.tenant.id, authUser?.id]);
+  const activeActorScopeRef = useRef(actorScopeKey);
+  activeActorScopeRef.current = actorScopeKey;
   // Never render an old tenant/actor/project's unsent oral-broadcast prompt.
   const fakeEntryIdentityKey = JSON.stringify([
     authUser?.tenant.id, authUser?.id, authUser?.role, currentProject?.id,
@@ -144,6 +150,7 @@ export default function App() {
   const stateHeaders = { "X-Aether-CSRF": "1" };
 
   const expireSession = useCallback(() => {
+    sessionEpochRef.current += 1;
     setAuthUser(null);
     setProjects([]);
     setCurrentProject(null);
@@ -179,23 +186,33 @@ export default function App() {
 
   // 1. Fetch projects on load
   const fetchProjects = async () => {
+    const requestEpoch = sessionEpochRef.current;
+    const requestActor = activeActorScopeRef.current;
+    const stillCurrent = () => (
+      sessionEpochRef.current === requestEpoch
+      && activeActorScopeRef.current === requestActor
+    );
     try {
       const res = await fetch(`${API_BASE}/projects`);
+      // Discard old 401s too: a former session must never expire the new actor.
+      if (!stillCurrent()) return;
       if (handleExpiredSession(res)) return;
       if (res.ok) {
         const data = await res.json();
+        if (!stillCurrent()) return;
         setProjects(data);
         if (data.length > 0 && !currentProject) {
           // Default to first project
-          fetchProjectDetail(data[0].id);
+          void fetchProjectDetail(data[0].id);
         }
         setApiError(null);
       } else {
         const payload = await res.json().catch(() => null);
+        if (!stillCurrent()) return;
         throw new Error(apiErrorMessage(payload, "项目列表加载失败。"));
       }
     } catch (err) {
-      setApiError(safeErrorMessage(err, "服务暂时不可用，请稍后重试。"));
+      if (stillCurrent()) setApiError(safeErrorMessage(err, "服务暂时不可用，请稍后重试。"));
     }
   };
 
@@ -208,7 +225,7 @@ export default function App() {
   useEffect(() => {
     if (authUser) fetchProjects();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authUser?.id]);
+  }, [actorScopeKey]);
 
   const handleLogin = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -226,7 +243,9 @@ export default function App() {
         setLoginError(apiErrorMessage(payload, "登录失败，请检查邮箱和密码。"));
         return;
       }
-      setAuthUser(await response.json());
+      const nextActor = await response.json();
+      sessionEpochRef.current += 1;
+      setAuthUser(nextActor);
       setLoginPassword("");
       setActionMessage("登录成功，正在载入工作区。");
     } catch {
@@ -237,6 +256,10 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    // Invalidate outstanding requests before waiting for the logout HTTP response.
+    sessionEpochRef.current += 1;
+    selectedProjectIdRef.current = null;
+    projectDetailRequestIdRef.current += 1;
     try {
       await fetch(`${API_BASE}/auth/logout`, { method: "POST", headers: stateHeaders });
     } finally {
@@ -254,10 +277,14 @@ export default function App() {
 
   const fetchProjectDetail = async (id: string) => {
     const requestId = ++projectDetailRequestIdRef.current;
+    const requestEpoch = sessionEpochRef.current;
+    const requestActor = activeActorScopeRef.current;
     selectedProjectIdRef.current = id;
     const isCurrentRequest = () => (
       projectDetailRequestIdRef.current === requestId
       && selectedProjectIdRef.current === id
+      && sessionEpochRef.current === requestEpoch
+      && activeActorScopeRef.current === requestActor
     );
     // During a cross-project detail GET, remove the old timeline/asset
     // workspace and disable old-project exports/actions. Same-project conflict
@@ -273,8 +300,8 @@ export default function App() {
     setSelectedClip(null);
     try {
       const res = await fetch(`${API_BASE}/projects/${id}`);
-      if (handleExpiredSession(res)) return;
       if (!isCurrentRequest()) return;
+      if (handleExpiredSession(res)) return;
       if (res.ok) {
         const data = await res.json();
         if (!isCurrentRequest()) return;
@@ -283,8 +310,8 @@ export default function App() {
         setCurrentTime(new RationalTime(0, 24000));
         setApiError(null);
         const versionsResponse = await fetch(`${API_BASE}/projects/${id}/asset-versions`);
-        if (handleExpiredSession(versionsResponse)) return;
         if (!isCurrentRequest()) return;
+        if (handleExpiredSession(versionsResponse)) return;
         if (versionsResponse.ok) {
           const versionsPayload = await versionsResponse.json();
           if (!isCurrentRequest()) return;
@@ -1114,6 +1141,13 @@ export default function App() {
                 project={currentProject}
                 assetVersions={assetVersions}
                 onProjectUpdated={(project) => {
+                  // G72: ignore a GenerationPanel result returned after project
+                  // selection, logout, or actor/tenant changes. Server-side
+                  // project grants and revocation remain separately gated.
+                  if (
+                    selectedProjectIdRef.current !== project.id
+                    || activeActorScopeRef.current !== actorScopeKey
+                  ) return;
                   setCurrentProject(project);
                   setProjects((previous) => previous.map((candidate) => candidate.id === project.id ? project : candidate));
                 }}

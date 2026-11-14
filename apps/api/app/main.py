@@ -11,7 +11,7 @@ import math
 import os
 import uuid
 from collections.abc import Callable, Generator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import (
     Depends,
@@ -26,12 +26,12 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import and_, case, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, TimeoutError as SQLAlchemyPoolTimeout
 from sqlalchemy.orm import Session, sessionmaker
 
 from .auth import (
@@ -132,18 +132,87 @@ PRIVATE_CANARY_PROFILE = "private-one-task-v1"
 
 def private_canary_policy_valid(policy: dict) -> bool:
     """Return true only for the bounded, pinned one-task canary policy."""
-    try:
-        return (
-            bool(policy.get("enabledIntent"))
-            and int(policy.get("concurrentTaskLimit") or 0) == 1
-            and int(policy.get("monthlyRequestLimit") or 0) == 1
-            and 1 <= int(policy.get("monthlyGeneratedSecondsLimit") or 0) <= 10
-            and 1 <= int(policy.get("maxClipDurationSeconds") or 0) <= 10
-            and int(policy.get("maxOutputs") or 0) == 1
-            and policy.get("artifactPathPrefixes") == ["/tasks/"]
-        )
-    except (TypeError, ValueError):
+    # G73: persisted policy values are untrusted until checked for exact types.
+    # int(True), int("1") and int(1.9) would silently turn a malformed policy
+    # into a valid one-task canary and could permit an unintended Worker lease.
+    # This is read-only validation: do not normalize or persist Owner policy.
+    if not isinstance(policy, dict):
         return False
+    return (
+        policy.get("enabledIntent") is True
+        and type(policy.get("concurrentTaskLimit")) is int
+        and policy["concurrentTaskLimit"] == 1
+        and type(policy.get("monthlyRequestLimit")) is int
+        and policy["monthlyRequestLimit"] == 1
+        and type(policy.get("monthlyGeneratedSecondsLimit")) is int
+        and 1 <= policy["monthlyGeneratedSecondsLimit"] <= 10
+        and type(policy.get("maxClipDurationSeconds")) is int
+        and 1 <= policy["maxClipDurationSeconds"] <= 10
+        and type(policy.get("maxOutputs")) is int
+        and policy["maxOutputs"] == 1
+        and policy.get("artifactPathPrefixes") == ["/tasks/"]
+        and type(policy.get("maxArtifactBytes")) is int
+        and policy["maxArtifactBytes"] > 0
+    )
+
+
+def generation_failure_policy_valid(snapshot: dict) -> bool:
+    """Reject corrupt persisted circuit bounds without normalizing Owner policy.
+
+    Legacy snapshots lacking one of these fields retain the established
+    defaults. Explicit bool/string/container/zero values do not become a
+    Worker lease or an unhandled provider-failure transition.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    policy = snapshot.get("providerPolicy", {})
+    if not isinstance(policy, dict):
+        return False
+    for field, fallback in (
+        ("failureWindow", 300),
+        ("failureThreshold", 5),
+        ("cooldownSeconds", 60),
+    ):
+        value = policy.get(field, fallback)
+        if type(value) is not int or value < 1:
+            return False
+        # G73: even an exact positive integer can exceed timedelta/datetime
+        # representability when poisoned in a persisted task. Reject it before
+        # a Worker lease or failure callback; never clamp Owner policy silently.
+        try:
+            interval = datetime.timedelta(seconds=value)
+            reference = datetime.datetime.now(datetime.timezone.utc)
+            if field == "failureWindow":
+                reference - interval
+            elif field == "cooldownSeconds":
+                reference + interval
+        except OverflowError:
+            return False
+    return True
+
+
+def generation_failure_history_valid(history: object) -> bool:
+    """Treat damaged durable circuit history as untrusted, without rewriting it.
+
+    A scalar/container record can raise during failure reporting, while a
+    timezone-naive timestamp cannot be compared to an aware UTC cutoff.
+    Ignoring damaged entries would also discard known failure evidence and
+    could keep an unsafe circuit closed. Refuse Worker claims and callbacks.
+    """
+    if history is None:
+        return True  # Legacy circuit rows may have no failure timestamps.
+    if not isinstance(history, list):
+        return False
+    for raw in history:
+        if not isinstance(raw, str):
+            return False
+        try:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.utcoffset() is None:
+                return False
+        except (ValueError, OverflowError):
+            return False
+    return True
 
 
 def attestation_canary_proof(
@@ -520,6 +589,22 @@ def create_app(
     created_app.state.governance_gates = resolved_governance_gates
     created_app.state.setup_required = False
 
+    @created_app.exception_handler(SQLAlchemyPoolTimeout)
+    async def database_pool_capacity_unavailable(_request: Request, _exc: SQLAlchemyPoolTimeout):
+        """Fail closed when an initial request DB checkout exhausts the pool.
+
+        Liveness/probe checkouts already return bounded 503; an earlier
+        SQLAlchemy Session checkout must not leak an unhandled HTTP 500.
+        No quota, asset, release receipt or Provider action is implied.
+        """
+        return JSONResponse(
+            status_code=503,
+            content={"detail": {
+                "code": "DATABASE_CAPACITY_UNAVAILABLE",
+                "message": "数据库连接暂不可用，请稍后重试",
+            }},
+        )
+
     origins = [
         origin.strip()
         for origin in os.environ.get(
@@ -573,14 +658,17 @@ def create_app(
         project_id: str,
         asset_version_id: str,
         context: AuthContext,
+        *,
+        for_update: bool = False,
     ) -> DBAssetVersion:
-        asset = db.execute(
-            select(DBAssetVersion).where(
-                DBAssetVersion.id == asset_version_id,
-                DBAssetVersion.project_id == project_id,
-                DBAssetVersion.tenant_id == context.tenant_id,
-            )
-        ).scalar_one_or_none()
+        statement = select(DBAssetVersion).where(
+            DBAssetVersion.id == asset_version_id,
+            DBAssetVersion.project_id == project_id,
+            DBAssetVersion.tenant_id == context.tenant_id,
+        )
+        if for_update and app_engine.dialect.name != "sqlite":
+            statement = statement.with_for_update()
+        asset = db.execute(statement).scalar_one_or_none()
         if asset is None:
             raise HTTPException(
                 status_code=404,
@@ -619,6 +707,75 @@ def create_app(
                 "code": "RIGHTS_TRUSTED_ISSUER_REQUIRED",
             }
         return decision
+
+    def fake_talking_head_creation_evidence_matches(
+        db: Session, task: DBGenerationTask, request: dict
+    ) -> bool:
+        """Bind a FAKE-only Worker task to its original append-only create receipt.
+
+        The request row may be edited after creation/claim. A self-consistent
+        replacement image ID + SHA + version list is not sufficient proof of
+        the image the authenticated user actually submitted.
+        """
+        source_id = request.get("imageAssetId")
+        source_sha = request.get("sourceAssetSha256")
+        if (
+            not isinstance(source_id, str) or not source_id
+            or not isinstance(source_sha, str) or not source_sha
+            or request.get("imageAssetVersionId") != source_id
+        ):
+            return False
+        # G72: the authenticated typed request was hashed before internal
+        # FAKE routing fields were appended. The immutable image receipt
+        # alone does not bind the script/duration or other user choices.
+        # Reject changed persisted user fields at Worker claim, pre-upload
+        # and final intake without writing usage, assets or audit storage.
+        original_request_fields = {
+            field: request.get(field)
+            for field in TalkingHeadFakeGenerationRequest.model_fields
+        }
+        if generation_request_hash(original_request_fields) != task.request_hash:
+            return False
+        # G72: typed user choices are copied into Worker-facing fields at
+        # creation. Those derived values are NOT part of the typed request
+        # hash. A corrupted row could leave text/duration intact while
+        # changing the actual video sent to the FAKE Worker. Bind the copies
+        # to the same original choices before claim, upload and final intake.
+        if (
+            request.get("videoSubject") != original_request_fields["text"]
+            or request.get("videoAspect") != "9:16"
+            or type(request.get("videoClipDuration")) is not int
+            or request.get("videoClipDuration") != original_request_fields["durationSeconds"]
+            or request.get("voiceId") != "synthetic-seed"
+        ):
+            return False
+        created = db.execute(
+            select(DBGenerationEvent)
+            .where(
+                DBGenerationEvent.generation_task_id == task.id,
+                DBGenerationEvent.event_type == "TASK_CREATED",
+            )
+            .order_by(DBGenerationEvent.created_at.asc(), DBGenerationEvent.id.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if (
+            created is None
+            or created.actor_type != "USER"
+            or created.actor_id != task.requested_by
+            or not isinstance(created.metadata_json, dict)
+        ):
+            return False
+        evidence = created.metadata_json
+        return (
+            evidence.get("fakeOnly") is True
+            and evidence.get("simulatedOutput") is True
+            # Defense in depth only: unlike row-local request_hash, this is
+            # a second event record. It is NOT an independently immutable
+            # Owner-approved trusted issuer/receipt and cannot close that gate.
+            and evidence.get("typedRequestHash") == task.request_hash
+            and evidence.get("inputAssetVersionId") == source_id
+            and evidence.get("sourceAssetSha256") == source_sha
+        )
 
     def generated_asset_export_rights(
         db: Session, asset: DBAssetVersion
@@ -752,7 +909,10 @@ def create_app(
         config = published_generation_config(db, tenant_id)
         circuit = generation_circuit(db, tenant_id, for_update=True)
         circuit_state = circuit.state if circuit is not None else "CLOSED"
-        policy = config.policy_json if config is not None else DEFAULT_FAKE_POLICY
+        # A persisted published policy can be malformed in legacy/partially recovered data.
+        # Never let corrupt JSON crash readiness or authorize a Provider claim.
+        config_policy = config.policy_json if config is not None and isinstance(config.policy_json, dict) else None
+        policy = config_policy if config_policy is not None else DEFAULT_FAKE_POLICY
         reason_code: str | None = None
         attestation: DBGenerationProviderAttestation | None = None
         healthy = True
@@ -764,7 +924,10 @@ def create_app(
             if config is None:
                 reason_code = "OWNER_CONFIG_MISSING"
                 healthy = False
-            elif not bool(config.policy_json.get("enabledIntent")):
+            elif config_policy is None:
+                reason_code = "OWNER_POLICY_INVALID"
+                healthy = False
+            elif not bool(config_policy.get("enabledIntent")):
                 reason_code = "OWNER_POLICY_DISABLED"
                 healthy = False
             else:
@@ -802,7 +965,7 @@ def create_app(
                 elif attestation_canary_proof(attestation)[2] != PRIVATE_CANARY_PROFILE:
                     reason_code = "WORKER_CANARY_PROFILE_MISMATCH"
                     healthy = False
-                elif not private_canary_policy_valid(config.policy_json):
+                elif not private_canary_policy_valid(config_policy):
                     reason_code = "CANARY_POLICY_MISMATCH"
                     healthy = False
                 elif not attestation.healthy:
@@ -830,6 +993,13 @@ def create_app(
                 reason_code = "GENERATION_CIRCUIT_OPEN"
                 healthy = False
 
+        # G73: a structurally corrupted *published* policy may have failed
+        # the canary gate, but quota/snapshot serializers still cast its raw
+        # fields. A disabled readiness response must be safe to construct.
+        # Use synthetic fallback values for reporting only; never change the
+        # persisted Owner policy, create a lease, or enable the Provider.
+        if mode == "moneyprinter" and not private_canary_policy_valid(policy):
+            policy = DEFAULT_FAKE_POLICY
         quota = quota_summary(db, tenant_id, policy, now)
         snapshot = build_capability_snapshot(
             mode if healthy else "disabled",
@@ -853,7 +1023,7 @@ def create_app(
             "canaryProfile": canary_profile,
             "ownerPolicy": {
                 "published": config is not None,
-                "enabledIntent": bool(config and config.policy_json.get("enabledIntent")),
+                "enabledIntent": bool(config_policy and config_policy.get("enabledIntent")),
             },
             "workerProof": {
                 "present": attestation is not None,
@@ -1033,6 +1203,11 @@ def create_app(
         *,
         now: datetime.datetime,
     ) -> None:
+        if not generation_failure_policy_valid(task.capability_snapshot_json):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_FAILURE_POLICY_INVALID", "message": "任务故障熔断参数异常，需隔离核验"},
+            )
         policy = task.capability_snapshot_json.get("providerPolicy") or {}
         window_seconds = max(10, int(policy.get("failureWindow", 300)))
         threshold = max(1, int(policy.get("failureThreshold", 5)))
@@ -1041,12 +1216,16 @@ def create_app(
         if circuit.state == "DISABLED":
             return
         cutoff = now - datetime.timedelta(seconds=window_seconds)
+        history = circuit.failure_timestamps_json
+        if not generation_failure_history_valid(history):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "GENERATION_CIRCUIT_HISTORY_INVALID",
+                        "message": "持久化熔断历史无效，任务必须隔离核验"},
+            )
         timestamps: list[datetime.datetime] = []
-        for raw in circuit.failure_timestamps_json or []:
-            try:
-                parsed = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            except ValueError:
-                continue
+        for raw in history or []:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
             if parsed >= cutoff:
                 timestamps.append(parsed)
         timestamps.append(now)
@@ -1104,11 +1283,19 @@ def create_app(
 
     @created_app.get("/health")
     def health_check(db: Session = Depends(db_dependency)):
-        journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
+        # SQLite has PRAGMA journal_mode; PostgreSQL does not. A health probe
+        # must verify the configured native database rather than failing with
+        # a SQLite-only statement or misreporting the active backend.
+        dialect = app_engine.dialect.name
+        if dialect == "sqlite":
+            journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
+        else:
+            db.execute(text("SELECT 1")).scalar_one()
+            journal_mode = None
         return {
             "status": "healthy",
             "service": "api",
-            "database": "sqlite",
+            "database": dialect,
             "journal_mode": journal_mode,
             "setupRequired": created_app.state.setup_required,
             "timestamp": iso_utc(utc_now()),
@@ -1565,6 +1752,7 @@ def create_app(
             actor_type="USER", actor_id=context.user_id, to_status="QUEUED",
             metadata={
                 "fakeOnly": True, "simulatedOutput": True, "actorRole": context.role,
+                "typedRequestHash": payload_hash,
                 "inputAssetVersionId": asset.id, "sourceAssetSha256": asset.sha256,
                 "usageReserved": True,
             }, now=now,
@@ -2263,10 +2451,10 @@ def create_app(
             )
 
         expected_sha256 = str(evidence.get("orphanedMediaSha256") or "").lower()
-        try:
-            expected_size = int(evidence.get("orphanedMediaSizeBytes") or 0)
-        except (TypeError, ValueError):
-            expected_size = 0
+        # Failed-attempt audit evidence must be an exact byte count. Booleans,
+        # floats and numeric strings are not an independent storage receipt.
+        raw_expected_size = evidence.get("orphanedMediaSizeBytes")
+        expected_size = raw_expected_size if type(raw_expected_size) is int else 0
         if (
             len(expected_sha256) != 64
             or any(char not in "0123456789abcdef" for char in expected_sha256)
@@ -2302,32 +2490,81 @@ def create_app(
                 },
             ) from exc
 
+        # G70/G71: a malformed Sidecar inspection JSON root is not proof
+        # that an orphan is recoverable. Preserve HELD/usage unchanged and
+        # return a stable upstream-inspection failure instead of HTTP 500.
+        if not isinstance(inspected, dict):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_INSPECTION_UNAVAILABLE",
+                    "message": "孤儿媒资校验响应格式异常，任务继续保持 HELD",
+                },
+            )
         actual_sha256 = str(inspected.get("sha256") or "").lower()
-        try:
-            actual_size = int(inspected.get("sizeBytes") or 0)
-        except (TypeError, ValueError):
-            actual_size = 0
+        # The Sidecar JSON is untrusted. Never coerce a bool, string or float
+        # to an integer byte count before verifying an Owner-only recovery.
+        raw_actual_size = inspected.get("sizeBytes")
+        actual_size = raw_actual_size if type(raw_actual_size) is int else 0
         probe_metadata = inspected.get("metadata")
         video_metadata = (
             probe_metadata.get("video")
             if isinstance(probe_metadata, dict)
             else None
         )
-        try:
-            duration_seconds = float(
-                probe_metadata.get("durationSeconds") or 0
-            ) if isinstance(probe_metadata, dict) else 0
-        except (TypeError, ValueError):
-            duration_seconds = 0
-        provider_policy = (
-            task.capability_snapshot_json.get("providerPolicy") or {}
-            if isinstance(task.capability_snapshot_json, dict)
-            else {}
+        raw_duration = (
+            probe_metadata.get("durationSeconds")
+            if isinstance(probe_metadata, dict) else None
         )
         try:
-            policy_max_bytes = int(provider_policy.get("maxArtifactBytes") or max_upload_bytes)
-        except (TypeError, ValueError):
+            duration_seconds = (
+                float(raw_duration) if type(raw_duration) in (int, float) else 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            duration_seconds = 0
+        # Historical snapshots can contain non-object providerPolicy JSON.
+        # Owner recovery must refuse malformed policy evidence before changing
+        # any media, quota or settlement state (no Provider call).
+        raw_snapshot = task.capability_snapshot_json
+        if not isinstance(raw_snapshot, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_POLICY_INVALID",
+                    "message": "原任务生成快照证据格式异常，保持 HELD，需人工核对",
+                },
+            )
+        raw_provider_policy = raw_snapshot.get("providerPolicy")
+        if raw_provider_policy is not None and not isinstance(raw_provider_policy, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_POLICY_INVALID",
+                    "message": "原任务生成策略证据格式异常，保持 HELD，需人工核对",
+                },
+            )
+        provider_policy = raw_provider_policy or {}
+        # Missing historical limit retains the existing global upload cap.
+        # A present but malformed stored limit is NOT evidence of a larger
+        # allowance. Never silently fall back to the global cap in that case.
+        if "maxArtifactBytes" not in provider_policy:
             policy_max_bytes = max_upload_bytes
+        else:
+            raw_limit = provider_policy["maxArtifactBytes"]
+            try:
+                if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)):
+                    raise ValueError("maxArtifactBytes is not an integer")
+                policy_max_bytes = int(raw_limit)
+                if not (1 <= policy_max_bytes <= 2 * 1024**3):
+                    raise ValueError("maxArtifactBytes exceeds schema bounds")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_RECOVERY_POLICY_INVALID",
+                        "message": "原任务产物大小策略证据异常，保持 HELD，需人工核对",
+                    },
+                ) from exc
 
         if (
             inspected.get("projectId") != project_id
@@ -2354,10 +2591,19 @@ def create_app(
                     "message": "孤儿媒资大小超出原任务允许范围",
                 },
             )
+        # Sidecar probe data is untrusted. A malformed numeric dimension must
+        # fail closed with a stable 422, not raise ValueError/TypeError as 500
+        # during Owner-only orphan recovery (while usage remains HELD).
+        # Media dimensions are measured integers. Coercing a boolean or
+        # numeric string would convert invalid probe evidence into an approval.
+        raw_width = video_metadata.get("width") if isinstance(video_metadata, dict) else None
+        raw_height = video_metadata.get("height") if isinstance(video_metadata, dict) else None
+        probed_width = raw_width if type(raw_width) is int else 0
+        probed_height = raw_height if type(raw_height) is int else 0
         if (
             not isinstance(video_metadata, dict)
-            or int(video_metadata.get("width") or 0) <= 0
-            or int(video_metadata.get("height") or 0) <= 0
+            or probed_width <= 0
+            or probed_height <= 0
             or not math.isfinite(duration_seconds)
             or not (0 < duration_seconds <= 86_400)
         ):
@@ -2486,6 +2732,22 @@ def create_app(
                 },
             )
 
+        # G70/G71: legacy project materials must be an array of object rows.
+        # Treat an invalid JSON shape as conflicting evidence before *any*
+        # quota/asset mutation. Converting a dict or string with list(...) can
+        # silently append corrupt rows and publish an unrecoverable media list.
+        if project.materials is not None and (
+            not isinstance(project.materials, list)
+            or any(not isinstance(item, dict) for item in project.materials)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_INVALID",
+                    "message": "项目现存素材列表格式异常，保持 HELD，需人工核对",
+                },
+            )
+
         storage_reservation = db.execute(
             update(DBTenant)
             .where(
@@ -2528,11 +2790,17 @@ def create_app(
             "sizeBytes": actual_size,
         }
         if existing_material is not None:
+            # Materials are untrusted project JSON. Malformed legacy sizes must
+            # fail closed as a conflict instead of raising an unhandled 500.
+            raw_material_size = existing_material.get("sizeBytes")
+            existing_material_size = raw_material_size if type(raw_material_size) is int else -1
             if (
                 existing_material.get("url") != material["url"]
                 or existing_material.get("type") != "video"
-                or int(existing_material.get("sizeBytes") or 0) != actual_size
+                or existing_material_size != actual_size
             ):
+                # Undo the provisional quota increment before refusing recovery.
+                db.rollback()
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -2680,53 +2948,136 @@ def create_app(
         task: DBGenerationTask | None = None
         claim_attestation: DBGenerationProviderAttestation | None = None
         for candidate in iter_claim_candidates():
-            candidate_mode = candidate.capability_snapshot_json.get("mode")
+            # G73: legacy/corrupt JSON may still appear in the durable queue.
+            # A single malformed row must not crash every Worker claim or starve
+            # later healthy tasks. Never claim it or mutate its lease/usage.
+            candidate_snapshot = candidate.capability_snapshot_json
+            if not isinstance(candidate_snapshot, dict):
+                continue
+            # G73: reject corrupt nested policy before leasing any mode. A
+            # malformed legacy policy cannot be safely consumed by a Worker.
+            # Missing policy retains the existing historical compatibility path.
+            candidate_policy = candidate_snapshot.get("providerPolicy")
+            if candidate_policy is not None and not isinstance(candidate_policy, dict):
+                continue
+            # G73: a persisted snapshot may have an invalid quota object even
+            # when its outer JSON is valid. Never lease such an artifact:
+            # final intake must not interpret malformed limits after Sidecar
+            # persistence. This validates shape only; no quota is altered.
+            candidate_quota = candidate_snapshot.get("quota")
+            if not isinstance(candidate_quota, dict):
+                continue
+            generated_seconds_limit = candidate_quota.get("monthlyGeneratedSecondsLimit")
+            if type(generated_seconds_limit) is not int or generated_seconds_limit <= 0:
+                continue
+            # G73: malformed persisted failure-window/threshold/cooldown data
+            # cannot get a lease and later crash failure recording for all tasks.
+            if not generation_failure_policy_valid(candidate_snapshot):
+                continue
+            # G73: any provider mode can inherit legacy/corrupt JSON.  Do
+            # not lease a task whose request cannot be consumed by a Worker.
+            candidate_request = candidate.request_json
+            if not isinstance(candidate_request, dict):
+                continue
+            # G73: a legacy task can reference an attempt number with no
+            # persisted attempt record. Never lease that task: downstream
+            # current_generation_attempt() would raise and starve the queue.
+            # Read-only validation; do not repair protected usage/attempt data.
+            candidate_attempt_id = db.execute(
+                select(DBGenerationAttempt.id).where(
+                    DBGenerationAttempt.generation_task_id == candidate.id,
+                    DBGenerationAttempt.attempt_no == candidate.attempts,
+                )
+            ).scalar_one_or_none()
+            if candidate_attempt_id is None:
+                continue
+            candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
+            # G72/G73: the normal Provider path must not launder a persisted
+            # FAKE talking-head request around its source/REMIX rights fence.
+            # Legitimate nonproduction moneyprinter tasks retain FAKE mode;
+            # only unknown providers or the fake-only marker on moneyprinter
+            # are rejected. Never advance a lease or call an external Provider.
+            if candidate.provider not in {"moneyprinter", "deterministic-fake-talking-head"}:
+                continue
+            if candidate.provider == "moneyprinter" and candidate_request.get("fakeTaskType") is not None:
+                continue
             if candidate.provider == "deterministic-fake-talking-head":
+                # G72: a queued FAKE task is not a standing authority to act
+                # after the originating Owner is deactivated/downgraded or the
+                # project no longer belongs to that Owner. This is a read-only
+                # revocation fence; no grant/delegation policy is selected.
+                active_originator = db.execute(
+                    select(DBUser.id).where(
+                        DBUser.id == candidate.requested_by,
+                        DBUser.tenant_id == candidate.tenant_id,
+                        DBUser.role == "owner",
+                        DBUser.is_active.is_(True),
+                    )
+                ).scalar_one_or_none()
+                original_project_owner = db.execute(
+                    select(DBProject.id).where(
+                        DBProject.id == candidate.project_id,
+                        DBProject.tenant_id == candidate.tenant_id,
+                        DBProject.owner_id == candidate.requested_by,
+                    )
+                ).scalar_one_or_none()
+                if active_originator is None or original_project_owner is None:
+                    continue
                 # Recheck the immutable image version and latest REMIX rights
                 # when a Worker claims a FAKE-only task; NEVER allow a real mode.
-                stored = candidate.request_json or {}
+                stored = candidate_request
                 if candidate_mode != "deterministic-fake" or stored.get("fakeTaskType") != "talking-head":
                     continue
+                # G72 FAKE-only promises are persisted by the typed Owner
+                # creation route. Refuse poisoned/legacy rows that attempt to
+                # relabel simulated work as publishable, omit explicit consent,
+                # or mutate the single-output contract before any Worker lease.
+                # This is a nonproduction safety fence, not an Owner policy change.
+                if (
+                    stored.get("simulatedOutput") is not True
+                    or stored.get("publishable") is not False
+                    or stored.get("confirmSyntheticTestOnly") is not True
+                    or type(stored.get("outputCount")) is not int
+                    or stored["outputCount"] != 1
+                ):
+                    continue
+                # Corrupt nested JSON may be a list/dict even when the outer
+                # request is a dict. Never bind it as an asset identifier: a
+                # DBAPI type error would starve later healthy Worker claims.
+                image_asset_id = stored.get("imageAssetId")
+                source_sha256 = stored.get("sourceAssetSha256")
+                if (
+                    not isinstance(image_asset_id, str) or not image_asset_id
+                    or not isinstance(source_sha256, str) or not source_sha256
+                ):
+                    continue
+                # Preserve the original single immutable image version in the
+                # typed FAKE-only request. A forged list must not reach the
+                # Worker or its eventual artifact evidence.
+                if stored.get("inputAssetVersionIds") != [image_asset_id]:
+                    continue
+                if not fake_talking_head_creation_evidence_matches(db, candidate, stored):
+                    continue
                 source = db.execute(select(DBAssetVersion).where(
-                    DBAssetVersion.id == stored.get("imageAssetId"),
+                    DBAssetVersion.id == image_asset_id,
                     DBAssetVersion.project_id == candidate.project_id,
                     DBAssetVersion.tenant_id == candidate.tenant_id,
                 )).scalar_one_or_none()
                 if (
                     source is None or source.media_type != "image"
-                    or source.sha256 != stored.get("sourceAssetSha256")
+                    or source.sha256 != source_sha256
                     or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
                 ):
                     continue
-            candidate_circuit = generation_circuit(db, candidate.tenant_id, create=True, for_update=True)
-            if candidate_circuit is not None:
-                if candidate_circuit.state == "DISABLED":
-                    continue
-                if candidate_circuit.state == "OPEN":
-                    cooldown_until = _as_utc(candidate_circuit.cooldown_until)
-                    if cooldown_until is None or now < cooldown_until:
-                        continue
-                    candidate_circuit.state = "HALF_OPEN"
-                    candidate_circuit.half_open_task_id = None
-                    candidate_circuit.half_open_lease_epoch = None
-                    candidate_circuit.half_open_issuer = None
-                    candidate_circuit.updated_at = now
-                    add_provider_event(
-                        db, tenant_id=candidate.tenant_id,
-                        event_type="CIRCUIT_HALF_OPENED", actor_type="SYSTEM",
-                        actor_id="api", now=now,
-                    )
-                if candidate_circuit.state == "HALF_OPEN":
-                    if candidate_circuit.half_open_task_id not in {None, candidate.id}:
-                        continue
             if candidate_mode == "moneyprinter":
                 config = published_generation_config(db, candidate.tenant_id)
                 if (
                     config is None
                     or config.id != candidate.capability_snapshot_json.get("configVersionId")
                     or config.policy_hash != candidate.capability_snapshot_json.get("policyHash")
+                    or not isinstance(config.policy_json, dict)
                     or not config.policy_json.get("enabledIntent")
                 ):
                     continue
@@ -2761,6 +3112,35 @@ def create_app(
                     continue
             elif candidate_mode != "deterministic-fake":
                 continue
+            # G75: only an eligible, attested candidate may advance a
+            # tenant's OPEN circuit to HALF_OPEN. An ineligible foreign
+            # tenant candidate must never change circuit state merely because
+            # another tenant's Worker claim commits this transaction.
+            candidate_circuit = generation_circuit(db, candidate.tenant_id, create=True, for_update=True)
+            if candidate_circuit is not None:
+                # Never hand a Provider lease to a tenant whose stored
+                # failure evidence is malformed. This check is read-only.
+                if not generation_failure_history_valid(candidate_circuit.failure_timestamps_json):
+                    continue
+                if candidate_circuit.state == "DISABLED":
+                    continue
+                if candidate_circuit.state == "OPEN":
+                    cooldown_until = _as_utc(candidate_circuit.cooldown_until)
+                    if cooldown_until is None or now < cooldown_until:
+                        continue
+                    candidate_circuit.state = "HALF_OPEN"
+                    candidate_circuit.half_open_task_id = None
+                    candidate_circuit.half_open_lease_epoch = None
+                    candidate_circuit.half_open_issuer = None
+                    candidate_circuit.updated_at = now
+                    add_provider_event(
+                        db, tenant_id=candidate.tenant_id,
+                        event_type="CIRCUIT_HALF_OPENED", actor_type="SYSTEM",
+                        actor_id="api", now=now,
+                    )
+                if candidate_circuit.state == "HALF_OPEN":
+                    if candidate_circuit.half_open_task_id not in {None, candidate.id}:
+                        continue
             task = candidate
             break
         if task is None:
@@ -2982,6 +3362,93 @@ def create_app(
         db.commit()
         return {"taskId": task.id, "status": task.status, "progress": task.progress}
 
+    @contextmanager
+    def postgres_storage_hold_liveness(lock_key: int):
+        """Hold a dedicated PostgreSQL advisory lock throughout the intake.
+
+        The quota marker commits before Sidecar I/O; this session-level lock
+        survives that commit but disappears on an actual process SIGKILL.
+        """
+        if app_engine.dialect.name != "postgresql":
+            yield
+            return
+        # The request DB session already holds the task row lock. A second
+        # checkout may exhaust a bounded PostgreSQL pool. Return a retryable,
+        # fail-closed response rather than an unhandled 500 or quota mutation.
+        try:
+            liveness_conn = app_engine.connect()
+        except SQLAlchemyPoolTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE",
+                        "message": "存储预留保护连接暂不可用，请稍后重试"},
+            ) from exc
+        with liveness_conn as conn:
+            acquired = False
+            try:
+                # Never block a worker indefinitely on a session-level lock.
+                # A colliding or externally held key is a retryable, non-mutating
+                # capacity condition; the quota hold is not opened yet.
+                obtained = conn.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"),
+                    {"lock_key": lock_key},
+                ).scalar_one()
+                if obtained is not True:
+                    conn.rollback()
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "STORAGE_HOLD_LOCK_CONTENDED",
+                                "message": "存储预留保护锁暂被占用，请稍后重试"},
+                    )
+                # Mark acquired before COMMIT: even a failed commit must try
+                # to unlock or invalidate the session before pool reuse.
+                acquired = True
+                conn.commit()
+                yield
+            finally:
+                if acquired:
+                    try:
+                        unlocked = conn.execute(
+                            text("SELECT pg_advisory_unlock(:lock_key)"), {"lock_key": lock_key}
+                        ).scalar_one()
+                        conn.commit()
+                        if unlocked is not True:
+                            raise RuntimeError("storage hold liveness lock could not be released")
+                    except BaseException:
+                        conn.invalidate()
+                        raise
+
+    def postgres_storage_hold_is_live(lock_key: int) -> bool:
+        """A freed advisory lock proves no active holder; not permission to refund."""
+        if type(lock_key) is not int or lock_key < 0 or lock_key > 0x7FFFFFFFFFFFFFFF:
+            return False
+        try:
+            probe_conn = app_engine.connect()
+        except SQLAlchemyPoolTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "STORAGE_HOLD_DB_CAPACITY_UNAVAILABLE",
+                        "message": "无法确认历史预留的存活状态，请稍后重试"},
+            ) from exc
+        with probe_conn as probe:
+            obtained = probe.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"), {"lock_key": lock_key}
+            ).scalar_one()
+            if obtained is True:
+                try:
+                    released = probe.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key)"), {"lock_key": lock_key}
+                    ).scalar_one()
+                    probe.commit()
+                    if released is not True:
+                        raise RuntimeError("orphan probe liveness lock could not be released")
+                except BaseException:
+                    probe.invalidate()
+                    raise
+                return False
+            probe.rollback()
+            return True
+
     @created_app.post("/internal/generation-tasks/{task_id}/artifact-intake", status_code=201)
     def intake_generation_artifact(
         task_id: str,
@@ -2999,7 +3466,72 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         if task.provider == "deterministic-fake-talking-head":
-            source_id = (task.request_json or {}).get("imageAssetId")
+            # G72: revoking the original Owner or changing project ownership
+            # after Worker claim must fence artifact intake before quota, Sidecar
+            # upload or audit mutation. An internal Worker token does not grant
+            # authority to impersonate a deactivated task initiator.
+            active_originator = db.execute(
+                select(DBUser.id).where(
+                    DBUser.id == task.requested_by,
+                    DBUser.tenant_id == task.tenant_id,
+                    DBUser.role == "owner",
+                    DBUser.is_active.is_(True),
+                )
+            ).scalar_one_or_none()
+            original_project_owner = db.execute(
+                select(DBProject.id).where(
+                    DBProject.id == task.project_id,
+                    DBProject.tenant_id == task.tenant_id,
+                    DBProject.owner_id == task.requested_by,
+                )
+            ).scalar_one_or_none()
+            if active_originator is None or original_project_owner is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                        "message": "原口播任务发起人或项目归属已失效，模拟产物隔离",
+                    },
+                )
+            # A task leased on a previous build can contain malformed durable
+            # request JSON. Refuse intake before querying with a non-scalar
+            # source ID; do not mutate the lease, storage, or usage ledger.
+            stored_request = task.request_json
+            if not isinstance(stored_request, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                            "message": "口播任务请求结构异常，模拟产物已隔离"},
+                )
+            source_id = stored_request.get("imageAssetId")
+            source_sha256 = stored_request.get("sourceAssetSha256")
+            if (
+                not isinstance(source_id, str) or not source_id
+                or not isinstance(source_sha256, str) or not source_sha256
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                            "message": "口播素材字段异常，模拟产物已隔离"},
+                )
+            # G72: claim-time FAKE-only consent/nonpublication/input binding
+            # must remain true at intake, even for a row changed after lease.
+            # Reject before any storage reservation or Sidecar upload.
+            if (
+                stored_request.get("fakeTaskType") != "talking-head"
+                or stored_request.get("simulatedOutput") is not True
+                or stored_request.get("publishable") is not False
+                or stored_request.get("confirmSyntheticTestOnly") is not True
+                or type(stored_request.get("outputCount")) is not int
+                or stored_request["outputCount"] != 1
+                or stored_request.get("inputAssetVersionIds") != [source_id]
+                or not fake_talking_head_creation_evidence_matches(db, task, stored_request)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                            "message": "口播FAKE任务持久合约已变化，模拟产物已隔离"},
+                )
             source = db.execute(select(DBAssetVersion).where(
                 DBAssetVersion.id == source_id,
                 DBAssetVersion.tenant_id == task.tenant_id,
@@ -3007,14 +3539,40 @@ def create_app(
             )).scalar_one_or_none()
             if (
                 source is None or source.media_type != "image"
-                or source.sha256 != (task.request_json or {}).get("sourceAssetSha256")
+                or source.sha256 != source_sha256
                 or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), utc_now())["allowed"]
             ):
                 raise HTTPException(
                     status_code=409,
                     detail={"code": "FAKE_TALKING_HEAD_SOURCE_REVOKED", "message": "输入图片授权或版本已失效，模拟产物隔离"},
                 )
+            # A previously revoked upload may have returned its storage debit
+            # with a valid receipt, but Owner reactivation is NOT a recovery ACK.
+            # Fail closed on the durable orphan audit; a Worker must never
+            # silently re-upload or settle the old FAKE artifact after restoration.
+            previous_revocation_failures = db.execute(
+                select(DBGenerationEvent.metadata_json).where(
+                    DBGenerationEvent.generation_task_id == task.id,
+                    DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+                )
+            ).scalars().all()
+            if any(
+                isinstance(evidence, dict)
+                and evidence.get("reasonCode") == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+                for evidence in previous_revocation_failures
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_RECOVERY_REQUIRED",
+                        "message": "此前授权撤销已形成持久孤儿产物，须先人工核验原始产物",
+                    },
+                )
         if task.asset_version_id:
+            # G70/G71: a terminal idempotent ACK must bind the replay's bytes,
+            # MIME and scope to the already committed asset. Previously a
+            # different payload with the same artifact ID/worker got HTTP 201
+            # without its body being checked. This path is read-only.
             completion = db.execute(
                 select(DBGenerationEvent).where(
                     DBGenerationEvent.generation_task_id == task.id,
@@ -3022,9 +3580,43 @@ def create_app(
                     DBGenerationEvent.actor_id == x_worker_id,
                 )
             ).scalar_one_or_none()
-            if task.provider_artifact_id == providerArtifactId and completion is not None:
-                return generation_task_response(db, task, rights=generation_rights(db, task), include_history=True)
-            raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ALREADY_INGESTED", "message": "任务已绑定其他受治理产物"})
+            existing_asset = db.get(DBAssetVersion, task.asset_version_id)
+            if (
+                task.provider_artifact_id != providerArtifactId
+                or completion is None
+                or existing_asset is None
+                or existing_asset.tenant_id != task.tenant_id
+                or existing_asset.project_id != task.project_id
+                or existing_asset.media_id != task.media_id
+                or file.content_type != "video/mp4"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_REPLAY_MISMATCH",
+                            "message": "已入库产物的重试身份或类型不匹配"},
+                )
+            file.file.seek(0, os.SEEK_END)
+            replay_size = file.file.tell()
+            file.file.seek(0)
+            if replay_size <= 0 or replay_size > max_upload_bytes or replay_size != existing_asset.size_bytes:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_REPLAY_MISMATCH",
+                            "message": "已入库产物的重试字节数不匹配"},
+                )
+            replay_digest = hashlib.sha256()
+            while chunk := file.file.read(1024 * 1024):
+                replay_digest.update(chunk)
+            file.file.seek(0)
+            if not hmac.compare_digest(replay_digest.hexdigest(), existing_asset.sha256):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ARTIFACT_REPLAY_MISMATCH",
+                            "message": "已入库产物的重试摘要不匹配"},
+                )
+            return generation_task_response(
+                db, task, rights=generation_rights(db, task), include_history=True
+            )
         task_circuit = generation_circuit(db, task.tenant_id)
         if task_circuit is not None and task_circuit.state == "DISABLED":
             raise HTTPException(
@@ -3063,80 +3655,716 @@ def create_app(
             uuid.NAMESPACE_URL,
             f"aether-video-use:{task_project_id}:{artifact_idempotency_key}",
         ))
-        reservation = db.execute(
-            update(DBTenant)
-            .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
-            .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
-        )
-        if reservation.rowcount != 1:
-            db.rollback()
-            raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
-        db.commit()
-
-        duplicate_storage_release_event_id = str(uuid.uuid4())
-        duplicate_storage_release_requested = False
-
-        def release_duplicate_storage_reservation() -> None:
-            nonlocal duplicate_storage_release_requested
-            duplicate_storage_release_requested = True
-            existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
-            if existing_release is not None:
-                existing_bytes = int(
-                    (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
+        # PostgreSQL session-level liveness remains bound across quota commit
+        # and the FAKE Sidecar call, to distinguish active duplicates from
+        # crash-orphaned holds even within the same lease generation.
+        storage_reservation_event_id = str(uuid.uuid4())
+        storage_liveness_lock_key = int(uuid.UUID(storage_reservation_event_id)) & 0x7FFFFFFFFFFFFFFF
+        with postgres_storage_hold_liveness(storage_liveness_lock_key):
+            # G70/G71: persist each quota hold with its lease epoch BEFORE Sidecar.
+            # When a Worker lease changes after an uncertain prior upload, stop
+            # cross-epoch replay without a durable release receipt. Same-epoch
+            # concurrent intake keeps its existing duplicate/ACK reconciliation;
+            # same-epoch OS SIGKILL still requires a separate durable remedy.
+            opened_holds = db.execute(
+                select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                    DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
                 )
-                if (
-                    existing_release.generation_task_id != task_id
-                    or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
-                    or existing_bytes != upload_size
+            ).scalars().all()
+            # G70/G71: a RELEASED receipt without any OPENED reservation is
+            # orphaned audit evidence, not proof that a storage debit was
+            # returned. Never reserve new quota or call Sidecar on that task.
+            # Do not reconstruct, refund or erase historical evidence here.
+            releases = db.execute(
+                select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                    DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+                )
+            ).scalars().all()
+            if releases and not opened_holds:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "发现无原始预留的持久释放回执，须人工核验原产物及额度",
+                    },
+                )
+            # G70/G71: an unresolved OPENED hold must originate from the same
+            # trusted API issuer as an OPENED hold that was later released.
+            # Without this check, a forged/migrated actor with matching bytes
+            # and a live advisory lock could authorize another storage debit.
+            # Fail closed; do not rewrite historical quota or audit evidence.
+            if any(
+                hold.actor_type != "SYSTEM" or hold.actor_id != "api"
+                for hold in opened_holds
+            ):
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "存储预留来源不可信，须人工核验原产物与额度",
+                    },
+                )
+            if opened_holds:
+                # A release event is evidence only when it binds exactly to
+                # the opened reservation. Untrusted/migrated JSON must never
+                # turn an outstanding quota hold into a presumed release.
+                opened_by_id = {hold.id: hold for hold in opened_holds}
+                released_ids = set()
+                # A release row without a typed reference to an OPENED hold is
+                # ambiguous audit evidence even if a different row is valid.
+                # Do not let a valid receipt hide an unrelated or corrupt one.
+                unmatched_release_reference = False
+                # A second receipt for one hold is ambiguous financial evidence,
+                # even when either individual receipt looks valid. Never infer
+                # quota reconciliation from duplicate audit rows.
+                release_reference_counts = {}
+                # A referenced RELEASED row with invalid accounting bindings is
+                # not an admissible release, even while the OPENED liveness
+                # advisory lock is held by a concurrent API process. Otherwise
+                # it could be ignored and a second quota hold opened.
+                invalid_release_binding = False
+                for receipt in releases:
+                    released_metadata = receipt.metadata_json
+                    if not isinstance(released_metadata, dict):
+                        unmatched_release_reference = True
+                        continue
+                    # Corrupt JSON containers are unhashable; an audit row must
+                    # never turn an orphan safety fence into an HTTP 500.
+                    opened_reference = released_metadata.get("storageReservationEventId")
+                    if type(opened_reference) is not str:
+                        unmatched_release_reference = True
+                        continue
+                    opened = opened_by_id.get(opened_reference)
+                    if opened is None:
+                        unmatched_release_reference = True
+                        continue
+                    release_reference_counts[opened_reference] = (
+                        release_reference_counts.get(opened_reference, 0) + 1
+                    )
+                    if not isinstance(opened.metadata_json, dict):
+                        invalid_release_binding = True
+                        continue
+                    opened_metadata = opened.metadata_json
+                    binding_fields = (
+                        "workerId", "leaseEpoch", "providerArtifactId",
+                        "mediaId", "sha256", "reservedStorageBytes",
+                    )
+                    # Paired absent/malformed identities previously passed via
+                    # None == None. A release is admissible only if its OPENED
+                    # event is a typed, system-originated reservation.
+                    required_opened_strings = ("workerId", "providerArtifactId", "mediaId", "sha256")
+                    opened_sha256 = opened_metadata.get("sha256")
+                    opened_identity_valid = (
+                        opened.actor_type == "SYSTEM"
+                        and opened.actor_id == "api"
+                        and all(
+                            type(opened_metadata.get(field)) is str and bool(opened_metadata[field])
+                            for field in required_opened_strings
+                        )
+                        and type(opened_sha256) is str
+                        and len(opened_sha256) == 64
+                        and all(c in "0123456789abcdef" for c in opened_sha256)
+                    )
+                    if (
+                        opened_identity_valid
+                        and receipt.actor_type == "SYSTEM"
+                        and receipt.actor_id == "api"
+                        and type(released_metadata.get("reasonCode")) is str
+                        and released_metadata["reasonCode"] in {
+                            "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED",
+                            "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+                        }
+                        and type(opened_metadata.get("leaseEpoch")) is int
+                        and type(opened_metadata.get("reservedStorageBytes")) is int
+                        and opened_metadata["reservedStorageBytes"] > 0
+                        and type(released_metadata.get("leaseEpoch")) is int
+                        and type(released_metadata.get("reservedStorageBytes")) is int
+                        and all(
+                            released_metadata.get(field) == opened_metadata.get(field)
+                            for field in binding_fields
+                        )
+                    ):
+                        released_ids.add(opened.id)
+                    else:
+                        invalid_release_binding = True
+                if unmatched_release_reference or invalid_release_binding or any(
+                    count > 1 for count in release_reference_counts.values()
                 ):
-                    raise RuntimeError("duplicate storage release receipt does not match this request")
-                return
-
-            attempt = current_generation_attempt(db, task)
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "message": "存储预留存在重复或无法匹配的释放回执，请人工核验原产物与额度",
+                        },
+                    )
+                # An unresolved hold in the SAME lease epoch is not proof that
+                # another request is still live. It may be a SIGKILL orphan.
+                # Permit legacy identical concurrent ACK flow only when every
+                # outstanding reservation binds to the exact same bytes, worker,
+                # artifact and project media. Reject changed bytes before a
+                # second quota increment or any Sidecar write. This does NOT
+                # reconcile a same-epoch orphan with identical bytes.
+                incoming_sha256 = digest.hexdigest()
+                if any(
+                    hold.id not in released_ids
+                    and (
+                        not isinstance(hold.metadata_json, dict)
+                        or type(hold.metadata_json.get("leaseEpoch")) is not int
+                        or hold.metadata_json["leaseEpoch"] != x_worker_lease_epoch
+                        or hold.metadata_json.get("workerId") != x_worker_id
+                        or hold.metadata_json.get("providerArtifactId") != providerArtifactId
+                        or hold.metadata_json.get("mediaId") != expected_media_id
+                        or type(hold.metadata_json.get("reservedStorageBytes")) is not int
+                        or hold.metadata_json["reservedStorageBytes"] != upload_size
+                        or hold.metadata_json.get("sha256") != incoming_sha256
+                    )
+                    for hold in opened_holds
+                ):
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "message": "已有未对账的持久存储预留，禁止重复计费，请人工核验原产物",
+                        },
+                    )
+            if app_engine.dialect.name == "postgresql" and any(
+                hold.id not in released_ids
+                and not postgres_storage_hold_is_live(
+                    hold.metadata_json.get("livenessLockKey")
+                    if isinstance(hold.metadata_json, dict) else None
+                )
+                for hold in opened_holds
+            ):
+                # A durable receipt with no live connection is either an orphan
+                # or legacy/unverifiable. Never silently reserve or refund again.
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "持久预留缺少在途证明，禁止重复占额，请人工核验原产物",
+                    },
+                )
+            reservation = db.execute(
+                update(DBTenant)
+                .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
+                .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
+            )
+            if reservation.rowcount != 1:
+                db.rollback()
+                raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
+            opened_attempt = current_generation_attempt(db, task)
             db.add(DBGenerationEvent(
-                id=duplicate_storage_release_event_id,
+                id=storage_reservation_event_id,
                 generation_task_id=task_id,
-                attempt_id=attempt.id if attempt is not None else None,
-                event_type="STORAGE_RESERVATION_RELEASED",
+                attempt_id=opened_attempt.id if opened_attempt is not None else None,
+                event_type="STORAGE_RESERVATION_OPENED",
                 from_status=task.status,
                 to_status=task.status,
                 actor_type="SYSTEM",
                 actor_id="api",
                 metadata_json={
-                    "reasonCode": "DUPLICATE_ARTIFACT_INTAKE",
                     "workerId": x_worker_id,
                     "leaseEpoch": x_worker_lease_epoch,
+                    "livenessLockKey": storage_liveness_lock_key,
                     "providerArtifactId": providerArtifactId,
                     "mediaId": expected_media_id,
                     "sha256": digest.hexdigest(),
                     "reservedStorageBytes": upload_size,
                 },
-                created_at=utc_now(),
+                created_at=now,
             ))
-            released = db.execute(
-                update(DBTenant)
-                .where(
-                    DBTenant.id == task_tenant_id,
-                    DBTenant.used_storage_bytes >= upload_size,
-                )
-                .values(
-                    used_storage_bytes=DBTenant.used_storage_bytes - upload_size,
-                    updated_at=utc_now(),
-                )
-            )
-            if released.rowcount != 1:
-                raise RuntimeError("duplicate storage reservation cannot be reconciled safely")
-
-        def persist_duplicate_storage_reservation_release() -> None:
-            # The release receipt and aggregate decrement share one transaction.
-            # After an ambiguous commit result, read the receipt before retrying.
-            for retry_index in range(2):
-                try:
-                    release_duplicate_storage_reservation()
-                    db.commit()
+            # Marker and aggregate quota increment are one PostgreSQL transaction.
+            # A crash can leave both committed, or neither, never only one.
+            db.commit()
+    
+            duplicate_storage_release_event_id = str(uuid.uuid4())
+            duplicate_storage_release_requested = False
+            storage_release_reason = "DUPLICATE_ARTIFACT_INTAKE"
+    
+            def release_duplicate_storage_reservation() -> None:
+                nonlocal duplicate_storage_release_requested
+                duplicate_storage_release_requested = True
+                existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
+                if existing_release is not None:
+                    existing_bytes = int(
+                        (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
+                    )
+                    if (
+                        existing_release.generation_task_id != task_id
+                        or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
+                        or existing_bytes != upload_size
+                    ):
+                        raise RuntimeError("duplicate storage release receipt does not match this request")
                     return
-                except Exception:
+    
+                attempt = current_generation_attempt(db, task)
+                db.add(DBGenerationEvent(
+                    id=duplicate_storage_release_event_id,
+                    generation_task_id=task_id,
+                    attempt_id=attempt.id if attempt is not None else None,
+                    event_type="STORAGE_RESERVATION_RELEASED",
+                    from_status=task.status,
+                    to_status=task.status,
+                    actor_type="SYSTEM",
+                    actor_id="api",
+                    metadata_json={
+                        "reasonCode": storage_release_reason,
+                        "storageReservationEventId": storage_reservation_event_id,
+                        "workerId": x_worker_id,
+                        "leaseEpoch": x_worker_lease_epoch,
+                        "providerArtifactId": providerArtifactId,
+                        "mediaId": expected_media_id,
+                        "sha256": digest.hexdigest(),
+                        "reservedStorageBytes": upload_size,
+                    },
+                    created_at=utc_now(),
+                ))
+                released = db.execute(
+                    update(DBTenant)
+                    .where(
+                        DBTenant.id == task_tenant_id,
+                        DBTenant.used_storage_bytes >= upload_size,
+                    )
+                    .values(
+                        used_storage_bytes=DBTenant.used_storage_bytes - upload_size,
+                        updated_at=utc_now(),
+                    )
+                )
+                if released.rowcount != 1:
+                    raise RuntimeError("duplicate storage reservation cannot be reconciled safely")
+    
+            def persist_duplicate_storage_reservation_release() -> None:
+                # The release receipt and aggregate decrement share one transaction.
+                # After an ambiguous commit result, read the receipt before retrying.
+                for retry_index in range(2):
+                    try:
+                        release_duplicate_storage_reservation()
+                        db.commit()
+                        return
+                    except Exception:
+                        db.rollback()
+                        existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
+                        if existing_release is not None:
+                            existing_bytes = int(
+                                (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
+                            )
+                            if (
+                                existing_release.generation_task_id != task_id
+                                or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
+                                or existing_bytes != upload_size
+                            ):
+                                raise RuntimeError("duplicate storage release receipt does not match this request")
+                            db.rollback()
+                            return
+                        db.rollback()
+                        if retry_index == 1:
+                            raise
+                        begin_serialized_write(db)
+    
+            uploaded = None
+            media_id = None
+            metadata = {}
+            try:
+                try:
+                    uploaded = created_app.state.video_use.upload_media(
+                        task_project_id,
+                        f"generation-{task_id}.mp4",
+                        "video/mp4",
+                        file.file,
+                        idempotency_key=artifact_idempotency_key,
+                        content_sha256=digest.hexdigest(),
+                    )
+                except BaseException as abrupt_exit:
+                    if isinstance(abrupt_exit, Exception):
+                        # Ordinary transport errors use the established FAILED/HELD
+                        # recovery path; do not change paid-usage semantics.
+                        raise
+                    # G70/G71: the reservation was committed before the sidecar
+                    # call. An in-process abrupt request exit bypasses the normal
+                    # Exception compensation path, so release this request's hold
+                    # with an atomic DB receipt before propagating the interruption.
+                    # This cannot protect against process kill or host crash.
                     db.rollback()
+                    begin_serialized_write(db)
+                    storage_release_reason = "UPLOAD_INTERRUPTED"
+                    persist_duplicate_storage_reservation_release()
+                    raise
+                # G70/G71/G72: a Sidecar ACK is untrusted media evidence, not
+                # permission to coerce its values into an asset/usage ledger.
+                # Validate before the final DB transaction; existing failure/HELD
+                # compensation handles rejected data without publishing an asset.
+                if not isinstance(uploaded, dict):
+                    uploaded = None
+                    raise ValueError("generated artifact Sidecar response must be an object")
+                if (
+                    uploaded.get("projectId") != task_project_id
+                    or not isinstance(uploaded.get("mediaId"), str)
+                    or uploaded["mediaId"] != expected_media_id
+                    or (uploaded.get("contentType") is not None
+                        and uploaded["contentType"] != "video/mp4")
+                    or (uploaded.get("sha256") is not None
+                        and uploaded["sha256"] != digest.hexdigest())
+                    or (uploaded.get("sizeBytes") is not None
+                        and (type(uploaded["sizeBytes"]) is not int
+                             or uploaded["sizeBytes"] != upload_size))
+                ):
+                    raise ValueError("generated artifact Sidecar identity, hash or content type mismatched")
+                metadata = uploaded.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise ValueError("generated artifact Sidecar probe must be an object")
+                raw_size = metadata.get("sizeBytes")
+                duration = metadata.get("durationSeconds")
+                video = metadata.get("video")
+                if (
+                    type(raw_size) is not int or raw_size != upload_size
+                    or type(duration) not in (int, float)
+                    or not math.isfinite(duration) or duration <= 0
+                    or not isinstance(video, dict)
+                    or not isinstance(video.get("codec"), str) or not video["codec"]
+                    or type(video.get("width")) is not int or video["width"] <= 0
+                    or type(video.get("height")) is not int or video["height"] <= 0
+                ):
+                    raise ValueError("generated artifact Sidecar probe values are invalid")
+                media_id = uploaded["mediaId"]
+                if media_id != expected_media_id:
+                    raise ValueError("generated artifact returned an unexpected idempotent media identity")
+    
+                # The storage reservation commit above intentionally ends the first task
+                # lock before the network call. Re-open a serialized transaction after
+                # upload and re-read the current task before any asset/SETTLED write.
+                db.rollback()
+                begin_serialized_write(db)
+                current_statement = (
+                    select(DBGenerationTask)
+                    .where(DBGenerationTask.id == task_id)
+                    .execution_options(populate_existing=True)
+                )
+                if app_engine.dialect.name != "sqlite":
+                    current_statement = current_statement.with_for_update()
+                task = db.execute(current_statement).scalar_one_or_none()
+                if task is None:
+                    db.execute(
+                        update(DBTenant)
+                        .where(DBTenant.id == task_tenant_id)
+                        .values(used_storage_bytes=case(
+                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                            else_=0,
+                        ))
+                    )
+                    db.commit()
+                    raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
+    
+                # A concurrent duplicate intake may have completed while this request
+                # was uploading. Reconcile against the durable asset + receipt before
+                # treating the now-terminal task as a failed late artifact.
+                if task.asset_version_id is not None:
+                    completion = db.execute(
+                        select(DBGenerationEvent).where(
+                            DBGenerationEvent.generation_task_id == task.id,
+                            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+                            DBGenerationEvent.actor_id == x_worker_id,
+                        )
+                    ).scalar_one_or_none()
+                    existing_asset = db.get(DBAssetVersion, task.asset_version_id)
+                    same_ingest = (
+                        task.provider_artifact_id == providerArtifactId
+                        and completion is not None
+                        and existing_asset is not None
+                        and existing_asset.tenant_id == task.tenant_id
+                        and existing_asset.project_id == task.project_id
+                        and existing_asset.media_id == expected_media_id
+                        and existing_asset.sha256 == digest.hexdigest()
+                    )
+                    if same_ingest:
+                        persist_duplicate_storage_reservation_release()
+                        return generation_task_response(
+                            db, task, rights=generation_rights(db, task), include_history=True
+                        )
+    
+                now = utc_now()
+                invalid_code = None
+                invalid_message = None
+                # Serialize the final artifact commit with the Owner emergency stop.
+                # The kill-switch can be activated while the sidecar upload is in flight.
+                final_circuit = generation_circuit(db, task.tenant_id, create=True, for_update=True)
+                if final_circuit is not None and final_circuit.state == "DISABLED":
+                    invalid_code = "PROVIDER_EMERGENCY_STOPPED"
+                    invalid_message = "紧急停机期间迟到产物已隔离"
+                elif task.cancel_requested_at is not None or task.status == "CANCELED":
+                    invalid_code = "TASK_CANCELED"
+                    invalid_message = "任务已取消，迟到产物已隔离"
+                elif task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
+                    invalid_code = "LEASE_LOST"
+                    invalid_message = "上传期间工作节点已失去任务租约"
+                elif x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
+                    invalid_code = "LEASE_EPOCH_MISMATCH"
+                    invalid_message = "上传期间任务租约版本已更新"
+                elif task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
+                    invalid_code = "ARTIFACT_ID_MISMATCH"
+                    invalid_message = "上传期间任务关联的上游产物编号已改变"
+                elif task.status not in {"RUNNING", "INGESTING"}:
+                    invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
+                    invalid_message = "上传期间任务状态已改变"
+    
+                # G72: a pre-upload Owner check is not authorization for the
+                # final asset/SETTLED commit. The storage-reservation commit
+                # releases that earlier transaction while FAKE Sidecar runs.
+                # Lock the original actor and project rows in this final
+                # transaction, using the same row locks as account deactivation,
+                # role updates and project reassignment. An earlier revocation
+                # wins and rejects the artifact; a later revocation must wait
+                # until this transaction commits. This does not grant admins
+                # delegation or change tenant/project policy.
+                if invalid_code is None and task.provider == "deterministic-fake-talking-head":
+                    final_owner_query = select(DBUser.id).where(
+                        DBUser.id == task.requested_by,
+                        DBUser.tenant_id == task.tenant_id,
+                        DBUser.role == "owner",
+                        DBUser.is_active.is_(True),
+                    )
+                    final_project_query = select(DBProject.id).where(
+                        DBProject.id == task.project_id,
+                        DBProject.tenant_id == task.tenant_id,
+                        DBProject.owner_id == task.requested_by,
+                    )
+                    if app_engine.dialect.name == "postgresql":
+                        final_owner_query = final_owner_query.with_for_update()
+                        final_project_query = final_project_query.with_for_update()
+                    final_owner = db.execute(final_owner_query).scalar_one_or_none()
+                    final_project = db.execute(final_project_query).scalar_one_or_none()
+                    if final_owner is None or final_project is None:
+                        invalid_code = "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+                        invalid_message = "上传期间原发起人授权或项目归属已失效，模拟产物隔离"
+
+                # The initial FAKE talking-head rights check precedes a network
+                # upload and its committed storage reservation. A REMIX revocation
+                # may commit while that upload is in flight. Re-read the persisted
+                # source and rights in the final serialized artifact transaction:
+                # never ingest/settle bytes against rights already revoked.
+                if invalid_code is None and task.provider == "deterministic-fake-talking-head":
+                    current_request = task.request_json
+                    if not isinstance(current_request, dict):
+                        invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
+                        invalid_message = "上传期间口播任务请求结构异常，模拟产物隔离"
+                    else:
+                        current_source_id = current_request.get("imageAssetId")
+                        current_source_hash = current_request.get("sourceAssetSha256")
+                        if (
+                            not isinstance(current_source_id, str) or not current_source_id
+                            or not isinstance(current_source_hash, str) or not current_source_hash
+                        ):
+                            invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
+                            invalid_message = "上传期间口播素材字段异常，模拟产物隔离"
+                        elif (
+                            current_request.get("fakeTaskType") != "talking-head"
+                            or current_request.get("simulatedOutput") is not True
+                            or current_request.get("publishable") is not False
+                            or current_request.get("confirmSyntheticTestOnly") is not True
+                            or type(current_request.get("outputCount")) is not int
+                            or current_request["outputCount"] != 1
+                            or current_request.get("inputAssetVersionIds") != [current_source_id]
+                            or not fake_talking_head_creation_evidence_matches(db, task, current_request)
+                        ):
+                            # Sidecar upload ends the first DB transaction. Recheck
+                            # the complete FAKE-only promise after reacquiring the
+                            # final write lock, before committing asset or usage.
+                            invalid_code = "FAKE_TALKING_HEAD_REQUEST_INVALID"
+                            invalid_message = "上传期间口播FAKE持久合约已变化，模拟产物隔离"
+                        else:
+                            # G72: hold the same PostgreSQL asset-version lock
+                            # used by rights-snapshot writers through asset+SETTLED
+                            # commit. A revocation committed first is re-read here;
+                            # a later revoke cannot ACK before this commit.
+                            source_statement = select(DBAssetVersion).where(
+                                DBAssetVersion.id == current_source_id,
+                                DBAssetVersion.tenant_id == task.tenant_id,
+                                DBAssetVersion.project_id == task.project_id,
+                            )
+                            if app_engine.dialect.name != "sqlite":
+                                source_statement = source_statement.with_for_update()
+                            current_source = db.execute(source_statement).scalar_one_or_none()
+                            if (
+                                current_source is None
+                                or current_source.media_type != "image"
+                                or current_source.sha256 != current_source_hash
+                                or not rights_decision(
+                                    latest_rights_snapshot(db, current_source.id, "REMIX"), now
+                                )["allowed"]
+                            ):
+                                invalid_code = "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+                                invalid_message = "上传期间口播素材授权或版本失效，模拟产物隔离"
+    
+                if invalid_code:
+                    attempt = current_generation_attempt(db, task)
+                    orphan_size = int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size
+                    orphan_evidence = {
+                        "reasonCode": invalid_code,
+                        "workerId": x_worker_id,
+                        "leaseEpoch": x_worker_lease_epoch,
+                        "reservedStorageBytes": upload_size,
+                    }
+                    if media_id and uploaded.get("projectId") == task_project_id:
+                        orphan_evidence.update({
+                            "orphanedMediaId": media_id,
+                            "orphanedMediaSha256": digest.hexdigest(),
+                            "orphanedMediaSizeBytes": orphan_size,
+                            "originalProviderArtifactId": providerArtifactId,
+                            "currentTaskProviderArtifactId": task.provider_artifact_id,
+                            "originalUpstreamJobId": task.upstream_job_id or "",
+                            "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                        })
+                        if invalid_code == "TASK_CANCELED" and task.media_id is None:
+                            task.media_id = media_id
+                            task.provider_artifact_id = task.provider_artifact_id or providerArtifactId
+                            task.updated_at = now
+                    # FAKE-only G72: the existing rejected-intake quota decrement
+                    # must have a durable, same-transaction receipt referencing
+                    # its precise OPENED event. This records an existing release;
+                    # it does not authorize new refunds or protected-store actions.
+                    if invalid_code == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED":
+                        db.add(DBGenerationEvent(
+                            id=str(uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"aether-storage-release:{storage_reservation_event_id}:g72-owner-revoked",
+                            )),
+                            generation_task_id=task_id,
+                            attempt_id=attempt.id if attempt is not None else None,
+                            event_type="STORAGE_RESERVATION_RELEASED",
+                            from_status=task.status,
+                            to_status=task.status,
+                            actor_type="SYSTEM",
+                            actor_id="api",
+                            metadata_json={
+                                "reasonCode": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                                "storageReservationEventId": storage_reservation_event_id,
+                                "workerId": x_worker_id,
+                                "leaseEpoch": x_worker_lease_epoch,
+                                "providerArtifactId": providerArtifactId,
+                                "mediaId": expected_media_id,
+                                "sha256": digest.hexdigest(),
+                                "reservedStorageBytes": upload_size,
+                            },
+                            created_at=now,
+                        ))
+                    db.execute(
+                        update(DBTenant)
+                        .where(DBTenant.id == task.tenant_id)
+                        .values(used_storage_bytes=case(
+                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                            else_=0,
+                        ))
+                    )
+                    add_generation_event(
+                        db, task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
+                        actor_type="SYSTEM", actor_id="api",
+                        from_status=task.status, to_status=task.status,
+                        metadata=orphan_evidence, now=now,
+                    )
+                    db.commit()
+                    raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message})
+    
+                if not media_id or uploaded.get("projectId") != task.project_id:
+                    raise ValueError("generated artifact returned invalid media scope")
+                if not isinstance(metadata, dict) or not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
+                    raise ValueError("generated artifact did not pass media probe")
+    
+                project = db.execute(select(DBProject).where(DBProject.id == task.project_id, DBProject.tenant_id == task.tenant_id)).scalar_one()
+                provenance = {
+                    "provider": task.provider,
+                    "providerArtifactId": providerArtifactId,
+                    "generationTaskId": task.id,
+                    "attempt": task.attempts,
+                    "capabilitySnapshotHash": task.capability_snapshot_hash,
+                }
+                probe = {**metadata, "provenance": provenance}
+                duration_seconds = float(metadata["durationSeconds"])
+                generated_seconds = max(1, int(duration_seconds + 0.999999))
+                settled_seconds = db.execute(
+                    select(func.coalesce(func.sum(DBGenerationUsageEntry.generated_seconds), 0)).where(
+                        DBGenerationUsageEntry.tenant_id == task.tenant_id,
+                        DBGenerationUsageEntry.kind.in_(["SETTLED", "ADJUSTED"]),
+                        DBGenerationUsageEntry.created_at >= now.replace(
+                            day=1, hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    )
+                ).scalar_one()
+                seconds_limit = int(
+                    (task.capability_snapshot_json.get("quota") or {}).get(
+                        "monthlyGeneratedSecondsLimit", 0
+                    )
+                )
+                if seconds_limit < 1 or int(settled_seconds) + generated_seconds > seconds_limit:
+                    raise ValueError("generated seconds quota exceeded")
+                size_bytes = int(metadata.get("sizeBytes") or upload_size)
+                material = {
+                    "id": media_id,
+                    "name": uploaded.get("fileName") or f"generation-{task.id}.mp4",
+                    "url": f"/api/video-use/media/{task.project_id}/{media_id}",
+                    "type": "video",
+                    "contentType": "video/mp4",
+                    "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
+                    "sizeBytes": size_bytes,
+                }
+                if not any(item.get("id") == media_id for item in project.materials):
+                    project.materials = [*project.materials, material]
+                    project.revision += 1
+                    project.updated_at = now
+                next_version = (db.execute(
+                    select(func.max(DBAssetVersion.version_no)).where(
+                        DBAssetVersion.project_id == task.project_id,
+                        DBAssetVersion.media_id == media_id,
+                    )
+                ).scalar_one_or_none() or 0) + 1
+                asset = DBAssetVersion(
+                    id=str(uuid.uuid4()), tenant_id=task.tenant_id, project_id=task.project_id,
+                    media_id=media_id, version_no=next_version, sha256=digest.hexdigest(),
+                    media_type="video", content_type="video/mp4", size_bytes=size_bytes,
+                    probe_json=probe, created_by=task.requested_by, created_at=now,
+                )
+                previous = task.status
+                task.status = "RIGHTS_BLOCKED"
+                task.progress = 100
+                task.message = "生成产物已入库，等待权利审核"
+                task.provider_artifact_id = providerArtifactId
+                task.media_id = media_id
+                task.asset_version_id = asset.id
+                task.completed_at = now
+                task.updated_at = now
+                task.lease_owner = None
+                task.lease_expires_at = None
+                attempt = current_generation_attempt(db, task)
+                attempt.status = "RIGHTS_BLOCKED"
+                attempt.reconciliation_state = "ARTIFACT_INGESTED"
+                attempt.completed_at = now
+                db.add(asset)
+                add_usage_entry(
+                    db, task=task, attempt=attempt, kind="SETTLED",
+                    request_units=0, generated_seconds=generated_seconds,
+                    reservation_key=f"generation:{task.id}",
+                    config_version_id=task.capability_snapshot_json.get("configVersionId"),
+                    now=now,
+                )
+                record_generation_success(db, task, issuer_id=x_worker_id, now=now)
+                add_generation_event(
+                    db, task, attempt=attempt, event_type="ARTIFACT_INGESTED",
+                    actor_type="WORKER", actor_id=x_worker_id,
+                    from_status=previous, to_status="RIGHTS_BLOCKED",
+                    metadata={"assetVersionId": asset.id, "sha256": asset.sha256,
+                              "sizeBytes": size_bytes, "generatedSeconds": generated_seconds}, now=now,
+                )
+                db.commit()
+            except HTTPException:
+                raise
+            except Exception as exc:
+                db.rollback()
+                if duplicate_storage_release_requested:
                     existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
                     if existing_release is not None:
                         existing_bytes = int(
@@ -3149,350 +4377,169 @@ def create_app(
                         ):
                             raise RuntimeError("duplicate storage release receipt does not match this request")
                         db.rollback()
-                        return
+                        duplicate_statement = (
+                            select(DBGenerationTask)
+                            .where(DBGenerationTask.id == task_id)
+                            .execution_options(populate_existing=True)
+                        )
+                        if app_engine.dialect.name != "sqlite":
+                            duplicate_statement = duplicate_statement.with_for_update()
+                        duplicate_task = db.execute(duplicate_statement).scalar_one_or_none()
+                        if duplicate_task is None:
+                            raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
+                        return generation_task_response(
+                            db, duplicate_task, rights=generation_rights(db, duplicate_task), include_history=True
+                        )
                     db.rollback()
-                    if retry_index == 1:
-                        raise
-                    begin_serialized_write(db)
-
-        uploaded = None
-        media_id = None
-        metadata = {}
-        try:
-            uploaded = created_app.state.video_use.upload_media(
-                task_project_id,
-                f"generation-{task_id}.mp4",
-                "video/mp4",
-                file.file,
-                idempotency_key=artifact_idempotency_key,
-                content_sha256=digest.hexdigest(),
-            )
-            metadata = uploaded.get("metadata") or {}
-            media_id = str(uploaded.get("mediaId") or "")
-            if media_id != expected_media_id:
-                raise ValueError("generated artifact returned an unexpected idempotent media identity")
-
-            # The storage reservation commit above intentionally ends the first task
-            # lock before the network call. Re-open a serialized transaction after
-            # upload and re-read the current task before any asset/SETTLED write.
-            db.rollback()
-            begin_serialized_write(db)
-            current_statement = (
-                select(DBGenerationTask)
-                .where(DBGenerationTask.id == task_id)
-                .execution_options(populate_existing=True)
-            )
-            if app_engine.dialect.name != "sqlite":
-                current_statement = current_statement.with_for_update()
-            task = db.execute(current_statement).scalar_one_or_none()
-            if task is None:
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == task_tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
+                    raise
+                begin_serialized_write(db)
+                failed_statement = (
+                    select(DBGenerationTask)
+                    .where(DBGenerationTask.id == task_id)
+                    .execution_options(populate_existing=True)
                 )
-                db.commit()
-                raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
-
-            # A concurrent duplicate intake may have completed while this request
-            # was uploading. Reconcile against the durable asset + receipt before
-            # treating the now-terminal task as a failed late artifact.
-            if task.asset_version_id is not None:
-                completion = db.execute(
-                    select(DBGenerationEvent).where(
-                        DBGenerationEvent.generation_task_id == task.id,
-                        DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
-                        DBGenerationEvent.actor_id == x_worker_id,
+                if app_engine.dialect.name != "sqlite":
+                    failed_statement = failed_statement.with_for_update()
+                failed_task = db.execute(failed_statement).scalar_one_or_none()
+                if failed_task is None:
+                    db.execute(
+                        update(DBTenant)
+                        .where(DBTenant.id == task_tenant_id)
+                        .values(used_storage_bytes=case(
+                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                            else_=0,
+                        ))
                     )
-                ).scalar_one_or_none()
-                existing_asset = db.get(DBAssetVersion, task.asset_version_id)
-                same_ingest = (
-                    task.provider_artifact_id == providerArtifactId
-                    and completion is not None
-                    and existing_asset is not None
-                    and existing_asset.tenant_id == task.tenant_id
-                    and existing_asset.project_id == task.project_id
-                    and existing_asset.media_id == expected_media_id
-                    and existing_asset.sha256 == digest.hexdigest()
-                )
-                if same_ingest:
-                    persist_duplicate_storage_reservation_release()
-                    return generation_task_response(
-                        db, task, rights=generation_rights(db, task), include_history=True
+                    db.commit()
+                    raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
+    
+                # A commit can succeed while its ACK is lost. Reconcile only against the
+                # durable asset, artifact ID, worker receipt and content hash. If the
+                # sidecar call itself did not return, this request's storage reservation
+                # is duplicate and can be released. If it returned, preserve storage:
+                # this may be the original request whose final DB commit ACK was lost.
+                if failed_task.asset_version_id is not None:
+                    completion = db.execute(
+                        select(DBGenerationEvent).where(
+                            DBGenerationEvent.generation_task_id == failed_task.id,
+                            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+                            DBGenerationEvent.actor_id == x_worker_id,
+                        )
+                    ).scalar_one_or_none()
+                    existing_asset = db.get(DBAssetVersion, failed_task.asset_version_id)
+                    same_ingest = (
+                        failed_task.provider_artifact_id == providerArtifactId
+                        and completion is not None
+                        and existing_asset is not None
+                        and existing_asset.tenant_id == failed_task.tenant_id
+                        and existing_asset.project_id == failed_task.project_id
+                        and existing_asset.media_id == expected_media_id
+                        and existing_asset.sha256 == digest.hexdigest()
                     )
-
-            now = utc_now()
-            invalid_code = None
-            invalid_message = None
-            # Serialize the final artifact commit with the Owner emergency stop.
-            # The kill-switch can be activated while the sidecar upload is in flight.
-            final_circuit = generation_circuit(db, task.tenant_id, create=True, for_update=True)
-            if final_circuit is not None and final_circuit.state == "DISABLED":
-                invalid_code = "PROVIDER_EMERGENCY_STOPPED"
-                invalid_message = "紧急停机期间迟到产物已隔离"
-            elif task.cancel_requested_at is not None or task.status == "CANCELED":
-                invalid_code = "TASK_CANCELED"
-                invalid_message = "任务已取消，迟到产物已隔离"
-            elif task.lease_owner != x_worker_id or task.lease_expires_at is None or _as_utc(task.lease_expires_at) < now:
-                invalid_code = "LEASE_LOST"
-                invalid_message = "上传期间工作节点已失去任务租约"
-            elif x_worker_lease_epoch is None or x_worker_lease_epoch != task.lease_epoch:
-                invalid_code = "LEASE_EPOCH_MISMATCH"
-                invalid_message = "上传期间任务租约版本已更新"
-            elif task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
-                invalid_code = "ARTIFACT_ID_MISMATCH"
-                invalid_message = "上传期间任务关联的上游产物编号已改变"
-            elif task.status not in {"RUNNING", "INGESTING"}:
-                invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
-                invalid_message = "上传期间任务状态已改变"
-
-            if invalid_code:
-                attempt = current_generation_attempt(db, task)
-                orphan_size = int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size
-                orphan_evidence = {
-                    "reasonCode": invalid_code,
-                    "workerId": x_worker_id,
-                    "leaseEpoch": x_worker_lease_epoch,
-                    "reservedStorageBytes": upload_size,
-                }
-                if media_id and uploaded.get("projectId") == task_project_id:
-                    orphan_evidence.update({
-                        "orphanedMediaId": media_id,
-                        "orphanedMediaSha256": digest.hexdigest(),
-                        "orphanedMediaSizeBytes": orphan_size,
+                    if same_ingest:
+                        if uploaded is None:
+                            task = failed_task
+                            persist_duplicate_storage_reservation_release()
+                        else:
+                            db.rollback()
+                        return generation_task_response(
+                            db, failed_task, rights=generation_rights(db, failed_task), include_history=True
+                        )
+    
+                now = utc_now()
+                invalid_code = None
+                invalid_message = None
+                if failed_task.cancel_requested_at is not None or failed_task.status == "CANCELED":
+                    invalid_code = "TASK_CANCELED"
+                    invalid_message = "任务已取消，迟到产物已隔离"
+                elif failed_task.lease_owner != x_worker_id or failed_task.lease_expires_at is None or _as_utc(failed_task.lease_expires_at) < now:
+                    invalid_code = "LEASE_LOST"
+                    invalid_message = "上传期间工作节点已失去任务租约"
+                elif x_worker_lease_epoch is None or x_worker_lease_epoch != failed_task.lease_epoch:
+                    invalid_code = "LEASE_EPOCH_MISMATCH"
+                    invalid_message = "上传期间任务租约版本已更新"
+                elif failed_task.provider_artifact_id and failed_task.provider_artifact_id != providerArtifactId:
+                    invalid_code = "ARTIFACT_ID_MISMATCH"
+                    invalid_message = "上传期间任务关联的上游产物编号已改变"
+                elif failed_task.status not in {"RUNNING", "INGESTING"}:
+                    invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
+                    invalid_message = "上传期间任务状态已改变"
+    
+                if invalid_code:
+                    attempt = current_generation_attempt(db, failed_task)
+                    failure_metadata = {
+                        "reasonCode": invalid_code,
+                        "workerId": x_worker_id,
+                        "leaseEpoch": x_worker_lease_epoch,
+                        "reservedStorageBytes": upload_size,
+                    }
+                    if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
+                        failure_metadata.update({
+                            "orphanedMediaId": media_id,
+                            "orphanedMediaSha256": digest.hexdigest(),
+                            "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
+                            "originalProviderArtifactId": providerArtifactId,
+                            "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
+                            "originalUpstreamJobId": failed_task.upstream_job_id or "",
+                            "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                        })
+                        if invalid_code == "TASK_CANCELED" and failed_task.media_id is None:
+                            failed_task.media_id = media_id
+                            failed_task.provider_artifact_id = failed_task.provider_artifact_id or providerArtifactId
+                            failed_task.updated_at = now
+                    db.execute(
+                        update(DBTenant)
+                        .where(DBTenant.id == failed_task.tenant_id)
+                        .values(used_storage_bytes=case(
+                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
+                            else_=0,
+                        ))
+                    )
+                    add_generation_event(
+                        db, failed_task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
+                        actor_type="SYSTEM", actor_id="api",
+                        from_status=failed_task.status, to_status=failed_task.status,
+                        metadata=failure_metadata, now=now,
+                    )
+                    db.commit()
+                    raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message}) from exc
+    
+                previous_status = failed_task.status
+                failed_attempt = current_generation_attempt(db, failed_task)
+                failed_task.status = "FAILED"
+                failed_task.error_code = "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED" if isinstance(exc, ValueError) else "ARTIFACT_INGEST_FAILED"
+                failed_task.error_message = "生成产物未通过受治理媒体校验" if isinstance(exc, ValueError) else "生成产物入库失败"
+                failed_task.completed_at = now
+                failed_task.updated_at = now
+                failed_task.lease_owner = None
+                failed_task.lease_expires_at = None
+                failed_attempt.status = "FAILED"
+                failed_attempt.error_code = failed_task.error_code
+                failed_attempt.error_message = failed_task.error_message
+                failed_attempt.completed_at = failed_task.completed_at
+                failure_metadata = {"compensatedQuotaBytes": upload_size}
+                artifact_recovery_hold = bool(failed_task.upstream_job_id and providerArtifactId)
+                if artifact_recovery_hold:
+                    # The remote job is already known and may be billable. Storage
+                    # compensation is separate from generation usage: preserve the
+                    # original RESERVED entry. The deterministic Sidecar ID lets the
+                    # Owner inspect/recover a committed object even when its upload
+                    # acknowledgement was lost and no response body reached the API.
+                    failed_attempt.reconciliation_state = "HELD"
+                    failed_task.media_id = expected_media_id
+                    failure_metadata.update({
                         "originalProviderArtifactId": providerArtifactId,
-                        "currentTaskProviderArtifactId": task.provider_artifact_id,
-                        "originalUpstreamJobId": task.upstream_job_id or "",
-                        "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
+                        "originalUpstreamJobId": failed_task.upstream_job_id,
+                        "reconciliationState": "HELD",
+                        "usageReservation": "HELD",
+                        "orphanedMediaId": expected_media_id,
+                        "orphanedMediaSha256": digest.hexdigest(),
+                        "orphanedMediaSizeBytes": upload_size,
+                        "orphanedMediaMetadata": {},
+                        "artifactIdempotencyKey": artifact_idempotency_key,
                     })
-                    if invalid_code == "TASK_CANCELED" and task.media_id is None:
-                        task.media_id = media_id
-                        task.provider_artifact_id = task.provider_artifact_id or providerArtifactId
-                        task.updated_at = now
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == task.tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
-                )
-                add_generation_event(
-                    db, task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
-                    actor_type="SYSTEM", actor_id="api",
-                    from_status=task.status, to_status=task.status,
-                    metadata=orphan_evidence, now=now,
-                )
-                db.commit()
-                raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message})
-
-            if not media_id or uploaded.get("projectId") != task.project_id:
-                raise ValueError("generated artifact returned invalid media scope")
-            if not isinstance(metadata, dict) or not metadata.get("video") or float(metadata.get("durationSeconds") or 0) <= 0:
-                raise ValueError("generated artifact did not pass media probe")
-
-            project = db.execute(select(DBProject).where(DBProject.id == task.project_id, DBProject.tenant_id == task.tenant_id)).scalar_one()
-            provenance = {
-                "provider": task.provider,
-                "providerArtifactId": providerArtifactId,
-                "generationTaskId": task.id,
-                "attempt": task.attempts,
-                "capabilitySnapshotHash": task.capability_snapshot_hash,
-            }
-            probe = {**metadata, "provenance": provenance}
-            duration_seconds = float(metadata["durationSeconds"])
-            generated_seconds = max(1, int(duration_seconds + 0.999999))
-            settled_seconds = db.execute(
-                select(func.coalesce(func.sum(DBGenerationUsageEntry.generated_seconds), 0)).where(
-                    DBGenerationUsageEntry.tenant_id == task.tenant_id,
-                    DBGenerationUsageEntry.kind.in_(["SETTLED", "ADJUSTED"]),
-                    DBGenerationUsageEntry.created_at >= now.replace(
-                        day=1, hour=0, minute=0, second=0, microsecond=0
-                    ),
-                )
-            ).scalar_one()
-            seconds_limit = int(
-                (task.capability_snapshot_json.get("quota") or {}).get(
-                    "monthlyGeneratedSecondsLimit", 0
-                )
-            )
-            if seconds_limit < 1 or int(settled_seconds) + generated_seconds > seconds_limit:
-                raise ValueError("generated seconds quota exceeded")
-            size_bytes = int(metadata.get("sizeBytes") or upload_size)
-            material = {
-                "id": media_id,
-                "name": uploaded.get("fileName") or f"generation-{task.id}.mp4",
-                "url": f"/api/video-use/media/{task.project_id}/{media_id}",
-                "type": "video",
-                "contentType": "video/mp4",
-                "duration": {"value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000},
-                "sizeBytes": size_bytes,
-            }
-            if not any(item.get("id") == media_id for item in project.materials):
-                project.materials = [*project.materials, material]
-                project.revision += 1
-                project.updated_at = now
-            next_version = (db.execute(
-                select(func.max(DBAssetVersion.version_no)).where(
-                    DBAssetVersion.project_id == task.project_id,
-                    DBAssetVersion.media_id == media_id,
-                )
-            ).scalar_one_or_none() or 0) + 1
-            asset = DBAssetVersion(
-                id=str(uuid.uuid4()), tenant_id=task.tenant_id, project_id=task.project_id,
-                media_id=media_id, version_no=next_version, sha256=digest.hexdigest(),
-                media_type="video", content_type="video/mp4", size_bytes=size_bytes,
-                probe_json=probe, created_by=task.requested_by, created_at=now,
-            )
-            previous = task.status
-            task.status = "RIGHTS_BLOCKED"
-            task.progress = 100
-            task.message = "生成产物已入库，等待权利审核"
-            task.provider_artifact_id = providerArtifactId
-            task.media_id = media_id
-            task.asset_version_id = asset.id
-            task.completed_at = now
-            task.updated_at = now
-            task.lease_owner = None
-            task.lease_expires_at = None
-            attempt = current_generation_attempt(db, task)
-            attempt.status = "RIGHTS_BLOCKED"
-            attempt.reconciliation_state = "ARTIFACT_INGESTED"
-            attempt.completed_at = now
-            db.add(asset)
-            add_usage_entry(
-                db, task=task, attempt=attempt, kind="SETTLED",
-                request_units=0, generated_seconds=generated_seconds,
-                reservation_key=f"generation:{task.id}",
-                config_version_id=task.capability_snapshot_json.get("configVersionId"),
-                now=now,
-            )
-            record_generation_success(db, task, issuer_id=x_worker_id, now=now)
-            add_generation_event(
-                db, task, attempt=attempt, event_type="ARTIFACT_INGESTED",
-                actor_type="WORKER", actor_id=x_worker_id,
-                from_status=previous, to_status="RIGHTS_BLOCKED",
-                metadata={"assetVersionId": asset.id, "sha256": asset.sha256,
-                          "sizeBytes": size_bytes, "generatedSeconds": generated_seconds}, now=now,
-            )
-            db.commit()
-        except HTTPException:
-            raise
-        except Exception as exc:
-            db.rollback()
-            if duplicate_storage_release_requested:
-                existing_release = db.get(DBGenerationEvent, duplicate_storage_release_event_id)
-                if existing_release is not None:
-                    existing_bytes = int(
-                        (existing_release.metadata_json or {}).get("reservedStorageBytes") or -1
-                    )
-                    if (
-                        existing_release.generation_task_id != task_id
-                        or existing_release.event_type != "STORAGE_RESERVATION_RELEASED"
-                        or existing_bytes != upload_size
-                    ):
-                        raise RuntimeError("duplicate storage release receipt does not match this request")
-                    db.rollback()
-                    duplicate_statement = (
-                        select(DBGenerationTask)
-                        .where(DBGenerationTask.id == task_id)
-                        .execution_options(populate_existing=True)
-                    )
-                    if app_engine.dialect.name != "sqlite":
-                        duplicate_statement = duplicate_statement.with_for_update()
-                    duplicate_task = db.execute(duplicate_statement).scalar_one_or_none()
-                    if duplicate_task is None:
-                        raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
-                    return generation_task_response(
-                        db, duplicate_task, rights=generation_rights(db, duplicate_task), include_history=True
-                    )
-                db.rollback()
-                raise
-            begin_serialized_write(db)
-            failed_statement = (
-                select(DBGenerationTask)
-                .where(DBGenerationTask.id == task_id)
-                .execution_options(populate_existing=True)
-            )
-            if app_engine.dialect.name != "sqlite":
-                failed_statement = failed_statement.with_for_update()
-            failed_task = db.execute(failed_statement).scalar_one_or_none()
-            if failed_task is None:
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == task_tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
-                )
-                db.commit()
-                raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
-
-            # A commit can succeed while its ACK is lost. Reconcile only against the
-            # durable asset, artifact ID, worker receipt and content hash. If the
-            # sidecar call itself did not return, this request's storage reservation
-            # is duplicate and can be released. If it returned, preserve storage:
-            # this may be the original request whose final DB commit ACK was lost.
-            if failed_task.asset_version_id is not None:
-                completion = db.execute(
-                    select(DBGenerationEvent).where(
-                        DBGenerationEvent.generation_task_id == failed_task.id,
-                        DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
-                        DBGenerationEvent.actor_id == x_worker_id,
-                    )
-                ).scalar_one_or_none()
-                existing_asset = db.get(DBAssetVersion, failed_task.asset_version_id)
-                same_ingest = (
-                    failed_task.provider_artifact_id == providerArtifactId
-                    and completion is not None
-                    and existing_asset is not None
-                    and existing_asset.tenant_id == failed_task.tenant_id
-                    and existing_asset.project_id == failed_task.project_id
-                    and existing_asset.media_id == expected_media_id
-                    and existing_asset.sha256 == digest.hexdigest()
-                )
-                if same_ingest:
-                    if uploaded is None:
-                        task = failed_task
-                        persist_duplicate_storage_reservation_release()
-                    else:
-                        db.rollback()
-                    return generation_task_response(
-                        db, failed_task, rights=generation_rights(db, failed_task), include_history=True
-                    )
-
-            now = utc_now()
-            invalid_code = None
-            invalid_message = None
-            if failed_task.cancel_requested_at is not None or failed_task.status == "CANCELED":
-                invalid_code = "TASK_CANCELED"
-                invalid_message = "任务已取消，迟到产物已隔离"
-            elif failed_task.lease_owner != x_worker_id or failed_task.lease_expires_at is None or _as_utc(failed_task.lease_expires_at) < now:
-                invalid_code = "LEASE_LOST"
-                invalid_message = "上传期间工作节点已失去任务租约"
-            elif x_worker_lease_epoch is None or x_worker_lease_epoch != failed_task.lease_epoch:
-                invalid_code = "LEASE_EPOCH_MISMATCH"
-                invalid_message = "上传期间任务租约版本已更新"
-            elif failed_task.provider_artifact_id and failed_task.provider_artifact_id != providerArtifactId:
-                invalid_code = "ARTIFACT_ID_MISMATCH"
-                invalid_message = "上传期间任务关联的上游产物编号已改变"
-            elif failed_task.status not in {"RUNNING", "INGESTING"}:
-                invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
-                invalid_message = "上传期间任务状态已改变"
-
-            if invalid_code:
-                attempt = current_generation_attempt(db, failed_task)
-                failure_metadata = {
-                    "reasonCode": invalid_code,
-                    "workerId": x_worker_id,
-                    "leaseEpoch": x_worker_lease_epoch,
-                    "reservedStorageBytes": upload_size,
-                }
                 if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
+                    failed_task.media_id = media_id
                     failure_metadata.update({
                         "orphanedMediaId": media_id,
                         "orphanedMediaSha256": digest.hexdigest(),
@@ -3502,10 +4549,6 @@ def create_app(
                         "originalUpstreamJobId": failed_task.upstream_job_id or "",
                         "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                     })
-                    if invalid_code == "TASK_CANCELED" and failed_task.media_id is None:
-                        failed_task.media_id = media_id
-                        failed_task.provider_artifact_id = failed_task.provider_artifact_id or providerArtifactId
-                        failed_task.updated_at = now
                 db.execute(
                     update(DBTenant)
                     .where(DBTenant.id == failed_task.tenant_id)
@@ -3515,86 +4558,24 @@ def create_app(
                     ))
                 )
                 add_generation_event(
-                    db, failed_task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
-                    actor_type="SYSTEM", actor_id="api",
-                    from_status=failed_task.status, to_status=failed_task.status,
-                    metadata=failure_metadata, now=now,
+                    db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
+                    actor_type="SYSTEM", actor_id="api", from_status=previous_status,
+                    to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
                 )
+                if not artifact_recovery_hold:
+                    release_generation_reservation(
+                        db, failed_task, failed_attempt,
+                        reason_code=failed_task.error_code, now=failed_task.completed_at,
+                    )
                 db.commit()
-                raise HTTPException(status_code=409, detail={"code": invalid_code, "message": invalid_message}) from exc
-
-            previous_status = failed_task.status
-            failed_attempt = current_generation_attempt(db, failed_task)
-            failed_task.status = "FAILED"
-            failed_task.error_code = "NON_RETRYABLE_ARTIFACT_VALIDATION_FAILED" if isinstance(exc, ValueError) else "ARTIFACT_INGEST_FAILED"
-            failed_task.error_message = "生成产物未通过受治理媒体校验" if isinstance(exc, ValueError) else "生成产物入库失败"
-            failed_task.completed_at = now
-            failed_task.updated_at = now
-            failed_task.lease_owner = None
-            failed_task.lease_expires_at = None
-            failed_attempt.status = "FAILED"
-            failed_attempt.error_code = failed_task.error_code
-            failed_attempt.error_message = failed_task.error_message
-            failed_attempt.completed_at = failed_task.completed_at
-            failure_metadata = {"compensatedQuotaBytes": upload_size}
-            artifact_recovery_hold = bool(failed_task.upstream_job_id and providerArtifactId)
-            if artifact_recovery_hold:
-                # The remote job is already known and may be billable. Storage
-                # compensation is separate from generation usage: preserve the
-                # original RESERVED entry. The deterministic Sidecar ID lets the
-                # Owner inspect/recover a committed object even when its upload
-                # acknowledgement was lost and no response body reached the API.
-                failed_attempt.reconciliation_state = "HELD"
-                failed_task.media_id = expected_media_id
-                failure_metadata.update({
-                    "originalProviderArtifactId": providerArtifactId,
-                    "originalUpstreamJobId": failed_task.upstream_job_id,
-                    "reconciliationState": "HELD",
-                    "usageReservation": "HELD",
-                    "orphanedMediaId": expected_media_id,
-                    "orphanedMediaSha256": digest.hexdigest(),
-                    "orphanedMediaSizeBytes": upload_size,
-                    "orphanedMediaMetadata": {},
-                    "artifactIdempotencyKey": artifact_idempotency_key,
-                })
-            if uploaded is not None and media_id and uploaded.get("projectId") == task_project_id:
-                failed_task.media_id = media_id
-                failure_metadata.update({
-                    "orphanedMediaId": media_id,
-                    "orphanedMediaSha256": digest.hexdigest(),
-                    "orphanedMediaSizeBytes": int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size,
-                    "originalProviderArtifactId": providerArtifactId,
-                    "currentTaskProviderArtifactId": failed_task.provider_artifact_id,
-                    "originalUpstreamJobId": failed_task.upstream_job_id or "",
-                    "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
-                })
-            db.execute(
-                update(DBTenant)
-                .where(DBTenant.id == failed_task.tenant_id)
-                .values(used_storage_bytes=case(
-                    (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                    else_=0,
-                ))
-            )
-            add_generation_event(
-                db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
-                actor_type="SYSTEM", actor_id="api", from_status=previous_status,
-                to_status="FAILED", metadata=failure_metadata, now=failed_task.completed_at,
-            )
-            if not artifact_recovery_hold:
-                release_generation_reservation(
-                    db, failed_task, failed_attempt,
-                    reason_code=failed_task.error_code, now=failed_task.completed_at,
-                )
-            db.commit()
-            if isinstance(exc, ValueError):
-                raise HTTPException(status_code=422, detail={"code": "ARTIFACT_VALIDATION_FAILED", "message": "生成产物未通过媒体校验"}) from exc
-            if isinstance(exc, VideoUseError):
-                raise HTTPException(status_code=502, detail={"code": "ARTIFACT_STORE_FAILED", "message": "生成产物存储失败"}) from exc
-            raise
-        finally:
-            file.file.close()
-        return generation_task_response(db, task, rights=generation_rights(db, task), include_history=True)
+                if isinstance(exc, ValueError):
+                    raise HTTPException(status_code=422, detail={"code": "ARTIFACT_VALIDATION_FAILED", "message": "生成产物未通过媒体校验"}) from exc
+                if isinstance(exc, VideoUseError):
+                    raise HTTPException(status_code=502, detail={"code": "ARTIFACT_STORE_FAILED", "message": "生成产物存储失败"}) from exc
+                raise
+            finally:
+                file.file.close()
+            return generation_task_response(db, task, rights=generation_rights(db, task), include_history=True)
 
     @created_app.get("/video-use/health")
     def video_use_health():
@@ -3676,8 +4657,26 @@ def create_app(
         db.commit()
         try:
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
-            metadata = uploaded.get("metadata") or {}
-            duration_seconds = float(metadata.get("durationSeconds") or 0)
+            # Video-use is an external process. Reject non-scalar or non-finite
+            # probe evidence before persisting a project material or asset.
+            # Storage quota was reserved above and is compensated by the
+            # existing exception handler for this FAKE-only intake path.
+            if not isinstance(uploaded, dict):
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的产物结构无效"})
+            metadata = uploaded.get("metadata")
+            if not isinstance(metadata, dict):
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的探测数据无效"})
+            probed_size_bytes = metadata.get("sizeBytes")
+            if type(probed_size_bytes) is not int or probed_size_bytes <= 0:
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的字节数无效"})
+            raw_duration = metadata.get("durationSeconds")
+            if raw_duration is not None and (
+                type(raw_duration) not in (int, float)
+                or not math.isfinite(raw_duration)
+                or raw_duration < 0
+            ):
+                raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的时长无效"})
+            duration_seconds = float(raw_duration or 0)
             suffix = os.path.splitext(file.filename or "")[1].lower()
             image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
             if suffix in image_extensions:
@@ -3709,7 +4708,7 @@ def create_app(
                 "duration": None if media_type == "image" else {
                     "value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000,
                 },
-                "sizeBytes": int(metadata.get("sizeBytes") or upload_size),
+                "sizeBytes": probed_size_bytes,
             }
             updated = apply_project_update(
                 db, project_id,
@@ -3788,7 +4787,11 @@ def create_app(
     ):
         require_roles(context, "owner", "editor")
         project_for_tenant(db, project_id, context)
-        asset_for_tenant(db, project_id, asset_version_id, context)
+        # G72: serialize every source-rights snapshot writer with FAKE-only
+        # Worker final intake by holding the same asset-version row lock until
+        # commit. This prevents an Owner revoke ACK from racing past the
+        # Worker's last REMIX check while it still settles stale ALLOWED usage.
+        asset_for_tenant(db, project_id, asset_version_id, context, for_update=True)
         snapshot = DBRightsSnapshot(
             id=str(uuid.uuid4()),
             tenant_id=context.tenant_id,
