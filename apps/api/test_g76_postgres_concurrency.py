@@ -139,6 +139,26 @@ def postgres_context(monkeypatch):
         engine.dispose()
 
 
+
+def test_postgres_health_endpoint_uses_actual_database_dialect(postgres_context):
+    """Disposable native PostgreSQL readiness must not execute SQLite PRAGMA.
+
+    FAKE-only API and no real Provider call; SQLite WAL behavior is covered
+    independently in test_main.py.
+    """
+    client, _, app = postgres_context
+    response = client.get("/health")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "healthy"
+    assert body["service"] == "api"
+    assert body["database"] == "postgresql"
+    assert body["journal_mode"] is None
+    assert type(body["setupRequired"]) is bool
+    assert type(body["timestamp"]) is str and body["timestamp"]
+    app.state.moneyprinter.assert_not_called()
+
+
 def _create_task(client: TestClient) -> str:
     project_response = client.post("/projects", json={"name": "G76 PostgreSQL lock proof"})
     assert project_response.status_code == 201, project_response.text
