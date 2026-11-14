@@ -890,6 +890,7 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
         "valid_and_unknown_reference", "valid_and_untyped_reference",
         "valid_and_unstructured_receipt",
         "paired_missing_liveness_key", "paired_boolean_liveness_key",
+        "paired_wrong_liveness_key", "paired_unparseable_opened_id",
     ]
 )
 def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
@@ -905,7 +906,11 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
         owner_client
     )
     payload = b"g70-g71-corrupt-release-receipt-must-not-duplicate-quota"
-    opened_id = str(uuid.uuid4())
+    opened_id = (
+        "legacy-not-a-uuid-" + str(uuid.uuid4())
+        if corruption == "paired_unparseable_opened_id"
+        else str(uuid.uuid4())
+    )
     now = datetime.datetime.now(datetime.timezone.utc)
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
@@ -921,8 +926,13 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
             "mediaId": _expected_media_id(task.project_id, f"generation:{task_id}"),
             "sha256": hashlib.sha256(payload).hexdigest(),
             "reservedStorageBytes": len(payload),
-            # Deliberately no livenessLockKey: a legacy/abrupt orphan must
-            # remain unverified even if a corrupt release row references it.
+            # Use a valid, event-ID-derived lock identity by default: otherwise
+            # all corrupt-release cases pass for an unrelated missing-key
+            # reason and never test their intended rejection condition.
+            "livenessLockKey": (
+                int(uuid.UUID(opened_id)) & 0x7FFFFFFFFFFFFFFF
+                if corruption != "paired_unparseable_opened_id" else 0
+            ),
         }
         release_metadata = {
             **opened_metadata,
@@ -931,9 +941,16 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
         }
         actor = "SYSTEM"
         opened_actor = "SYSTEM"
-        if corruption == "paired_boolean_liveness_key":
+        if corruption == "paired_missing_liveness_key":
+            opened_metadata.pop("livenessLockKey")
+        elif corruption == "paired_boolean_liveness_key":
             # bool is an int subclass in Python; accept only a real PG key.
             opened_metadata["livenessLockKey"] = True
+        elif corruption == "paired_wrong_liveness_key":
+            # Wrong but well-typed lock keys must not authenticate a release.
+            opened_metadata["livenessLockKey"] = (
+                (opened_metadata["livenessLockKey"] + 1) & 0x7FFFFFFFFFFFFFFF
+            )
         elif corruption == "noninteger_release_bytes":
             release_metadata["reservedStorageBytes"] = str(len(payload))
         elif corruption == "wrong_release_digest":
