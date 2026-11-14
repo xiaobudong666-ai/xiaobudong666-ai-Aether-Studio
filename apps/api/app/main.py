@@ -3693,7 +3693,8 @@ def create_app(
                         and receipt.actor_id == "api"
                         and type(released_metadata.get("reasonCode")) is str
                         and released_metadata["reasonCode"] in {
-                            "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED"
+                            "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED",
+                            "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
                         }
                         and type(opened_metadata.get("leaseEpoch")) is int
                         and type(opened_metadata.get("reservedStorageBytes")) is int
@@ -4128,6 +4129,35 @@ def create_app(
                             task.media_id = media_id
                             task.provider_artifact_id = task.provider_artifact_id or providerArtifactId
                             task.updated_at = now
+                    # FAKE-only G72: the existing rejected-intake quota decrement
+                    # must have a durable, same-transaction receipt referencing
+                    # its precise OPENED event. This records an existing release;
+                    # it does not authorize new refunds or protected-store actions.
+                    if invalid_code == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED":
+                        db.add(DBGenerationEvent(
+                            id=str(uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"aether-storage-release:{storage_reservation_event_id}:g72-owner-revoked",
+                            )),
+                            generation_task_id=task_id,
+                            attempt_id=attempt.id if attempt is not None else None,
+                            event_type="STORAGE_RESERVATION_RELEASED",
+                            from_status=task.status,
+                            to_status=task.status,
+                            actor_type="SYSTEM",
+                            actor_id="api",
+                            metadata_json={
+                                "reasonCode": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                                "storageReservationEventId": storage_reservation_event_id,
+                                "workerId": x_worker_id,
+                                "leaseEpoch": x_worker_lease_epoch,
+                                "providerArtifactId": providerArtifactId,
+                                "mediaId": expected_media_id,
+                                "sha256": digest.hexdigest(),
+                                "reservedStorageBytes": upload_size,
+                            },
+                            created_at=now,
+                        ))
                     db.execute(
                         update(DBTenant)
                         .where(DBTenant.id == task.tenant_id)
