@@ -892,7 +892,7 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
         "paired_missing_liveness_key", "paired_boolean_liveness_key",
         "paired_wrong_liveness_key", "paired_unparseable_opened_id",
         "paired_opened_attempt_only", "paired_release_attempt_only",
-        "paired_foreign_task_attempt",
+        "paired_foreign_task_attempt", "paired_release_predates_opened",
     ]
 )
 def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
@@ -1021,7 +1021,10 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
             id=str(uuid.uuid4()), generation_task_id=task_id, attempt_id=release_attempt_id,
             event_type="STORAGE_RESERVATION_RELEASED", from_status="INGESTING",
             to_status="INGESTING", actor_type=actor, actor_id="api",
-            metadata_json=release_metadata, created_at=now,
+            metadata_json=release_metadata, created_at=(
+                now - datetime.timedelta(seconds=60)
+                if corruption == "paired_release_predates_opened" else now
+            ),
         ))
         if corruption in {
             "duplicate_valid_release", "valid_and_malformed_duplicate",

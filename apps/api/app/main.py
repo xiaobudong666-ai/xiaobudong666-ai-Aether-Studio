@@ -3810,6 +3810,9 @@ def create_app(
                         and receipt.actor_type == "SYSTEM"
                         and receipt.actor_id == "api"
                         and receipt.attempt_id == opened.attempt_id
+                        # A release cannot precede the original reservation.
+                        # An inverted durable audit timeline is not refund proof.
+                        and receipt.created_at >= opened.created_at
                         and type(released_metadata.get("reasonCode")) is str
                         and released_metadata["reasonCode"] in {
                             "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED",
