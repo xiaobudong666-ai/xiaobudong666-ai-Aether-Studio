@@ -889,6 +889,7 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
         "duplicate_valid_release", "valid_and_malformed_duplicate",
         "valid_and_unknown_reference", "valid_and_untyped_reference",
         "valid_and_unstructured_receipt",
+        "paired_missing_liveness_key", "paired_boolean_liveness_key",
     ]
 )
 def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
@@ -930,7 +931,10 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
         }
         actor = "SYSTEM"
         opened_actor = "SYSTEM"
-        if corruption == "noninteger_release_bytes":
+        if corruption == "paired_boolean_liveness_key":
+            # bool is an int subclass in Python; accept only a real PG key.
+            opened_metadata["livenessLockKey"] = True
+        elif corruption == "noninteger_release_bytes":
             release_metadata["reservedStorageBytes"] = str(len(payload))
         elif corruption == "wrong_release_digest":
             release_metadata["sha256"] = "0" * 64
