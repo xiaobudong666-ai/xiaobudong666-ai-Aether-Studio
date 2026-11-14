@@ -2626,10 +2626,41 @@ with sessions() as db:
                     DBGenerationEvent.generation_task_id == task_id,
                     DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
                 )).scalar_one() == 0
-                assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                # Native read-only crash evidence: the original committed
+                # debit must be attributable to one trusted, typed OPENED row.
+                # A row count alone cannot prove the issuer, artifact identity,
+                # lease epoch, bytes or durable held-quota binding.
+                opened_rows = db.execute(select(DBGenerationEvent).where(
                     DBGenerationEvent.generation_task_id == task_id,
                     DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
-                )).scalar_one() == 1
+                )).scalars().all()
+                assert len(opened_rows) == 1
+                opened = opened_rows[0]
+                assert (opened.actor_type, opened.actor_id) == ("SYSTEM", "api")
+                stored_task = db.get(DBGenerationTask, task_id)
+                assert stored_task is not None
+                assert stored_task.tenant_id == tenant_id
+                assert stored_task.asset_version_id is None
+                assert stored_task.status == "INGESTING"
+                meta = opened.metadata_json
+                assert isinstance(meta, dict)
+                assert meta.get("workerId") == headers["X-Worker-Id"]
+                assert type(meta.get("leaseEpoch")) is int
+                assert meta["leaseEpoch"] == int(headers["X-Worker-Lease-Epoch"])
+                assert meta.get("providerArtifactId") == artifact_id
+                assert meta.get("mediaId") == _expected_media_id(
+                    stored_task.project_id, f"generation:{task_id}"
+                )
+                assert meta.get("sha256") == hashlib.sha256(payload).hexdigest()
+                assert type(meta.get("reservedStorageBytes")) is int
+                assert meta["reservedStorageBytes"] == len(payload)
+                assert type(meta.get("livenessLockKey")) is int
+                assert meta["livenessLockKey"] >= 0
+                assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                    DBGenerationUsageEntry.kind == "SETTLED",
+                )).scalar_one() == 0
+                assert media_file.read_bytes() == payload
         finally:
             independent_engine.dispose()
 
