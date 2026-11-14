@@ -937,15 +937,13 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
             own_attempt_id if corruption == "paired_release_attempt_only" else None
         )
         if foreign_task_id is not None:
-            foreign_attempt_id = str(uuid.uuid4())
-            db.add(DBGenerationAttempt(
-                id=foreign_attempt_id,
-                generation_task_id=foreign_task_id,
-                attempt_no=1,
-                status="QUEUED",
-                reconciliation_state="NOT_SUBMITTED",
-                created_at=now,
-            ))
+            # _create_task already inserts attempt 1; reuse the real,
+            # foreign-task FK instead of creating a duplicate attempt.
+            foreign_attempt_id = db.execute(
+                select(DBGenerationAttempt.id).where(
+                    DBGenerationAttempt.generation_task_id == foreign_task_id
+                )
+            ).scalar_one()
             opened_attempt_id = release_attempt_id = foreign_attempt_id
         opened_metadata = {
             "workerId": worker_headers["X-Worker-Id"],
