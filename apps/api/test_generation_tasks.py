@@ -2662,6 +2662,96 @@ def test_g72_native_fake_http_db_create_claim_and_idempotency(generation_context
         )).scalars())) == 1
 
 
+
+@pytest.mark.parametrize("phase", ["queued", "claimed"])
+@pytest.mark.parametrize("revocation", ["inactive", "downgraded", "project_reassigned"])
+def test_g72_originator_revocation_fences_fake_worker_before_sidecar(
+    generation_context, phase, revocation,
+):
+    """FAKE-only HTTP/SQLite: no stale Owner authority after account/project changes.
+
+    This does not create delegated grants or choose the pending Owner project
+    membership policy. Existing RESERVED usage stays untouched for reconciliation.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 original Owner revocation fence")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, image_id, key=f"g72-owner-revoke-{phase}-{revocation}"
+    )
+    create = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=payload,
+    )
+    assert create.status_code == 202, create.text
+    task_id = create.json()["taskId"]
+    if phase == "claimed":
+        claimed = claim(client)
+        assert claimed.status_code == 200, claimed.text
+        assert claimed.json()["taskId"] == task_id
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        owner = db.get(DBUser, task.requested_by)
+        project_row = db.get(DBProject, task.project_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert owner is not None and project_row is not None and tenant is not None
+        assert owner.role == "owner" and owner.is_active
+        assert project_row.owner_id == owner.id
+        before_state = (task.status, task.lease_owner, task.lease_epoch, task.asset_version_id)
+        before_bytes = tenant.used_storage_bytes
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        if revocation == "inactive":
+            owner.is_active = False
+        elif revocation == "downgraded":
+            owner.role = "editor"
+        else:
+            substitute = DBUser(
+                id=str(uuid.uuid4()), tenant_id=owner.tenant_id,
+                email=f"g72-reassigned-{phase}@example.com",
+                display_name="Synthetic Replacement Owner",
+                password_hash=hash_password(secrets.token_urlsafe(24)),
+                role="owner", is_active=True,
+                created_at=datetime.datetime.now(datetime.timezone.utc),
+                updated_at=datetime.datetime.now(datetime.timezone.utc),
+            )
+            db.add(substitute)
+            db.flush()
+            project_row.owner_id = substitute.id
+        db.commit()
+
+    if phase == "queued":
+        assert claim(client).status_code == 204
+    else:
+        rejected = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "synthetic-revoked-owner"},
+            files={"file": ("synthetic.mp4", b"synthetic-test-video", "video/mp4")},
+        )
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert (task.status, task.lease_owner, task.lease_epoch, task.asset_version_id) == before_state
+        assert tenant.used_storage_bytes == before_bytes
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == before_events
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == before_usage
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g72_native_fake_missing_asset_or_missing_rights_fail_closed(generation_context):
     client, sessions, _app, _ = generation_context
     project = create_project(client)
