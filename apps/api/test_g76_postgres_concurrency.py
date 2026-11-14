@@ -3211,8 +3211,10 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
 
     original_upload = app.state.video_use.upload_media
     uploaded = Event()
+    sidecar_upload_attempts = []
 
     def revoke_while_uploading(*args, **kwargs):
+        sidecar_upload_attempts.append(1)
         result = original_upload(*args, **kwargs)
         with sessions() as db:
             original = db.get(DBUser, requested_by)
@@ -3248,6 +3250,7 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
         files={"file": ("synthetic.mp4", b"fake-only-final-owner-revoke", "video/mp4")},
     )
     assert uploaded.is_set(), "Test must reach Sidecar after committed reservation"
+    assert len(sidecar_upload_attempts) == 1
     assert result.status_code == 409, result.text
     assert result.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
     with sessions() as db:
@@ -3261,6 +3264,50 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one() == 0
         assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_bytes
+        # The Sidecar already accepted bytes before final authorization failed.
+        # A successful HTTP 409 is insufficient: the orphan must be durably
+        # discoverable for Owner-only reconciliation, not silently forgotten.
+        failures = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalars().all()
+        assert len(failures) == 1
+        orphan = failures[0].metadata_json
+        assert isinstance(orphan, dict)
+        assert orphan["reasonCode"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+        assert orphan["orphanedMediaId"] == _expected_media_id(
+            project_id, f"generation:{task_id}"
+        )
+        assert orphan["orphanedMediaSha256"] == hashlib.sha256(
+            b"fake-only-final-owner-revoke"
+        ).hexdigest()
+        assert orphan["orphanedMediaSizeBytes"] == len(
+            b"fake-only-final-owner-revoke"
+        )
+        assert orphan["originalProviderArtifactId"] == (
+            "g72-final-owner-revoke-" + revocation
+        )
+
+    # A Worker retry after revocation must not re-upload this orphan or
+    # recreate quota; existing Owner/tenant/project fences remain in force.
+    repeated = owner.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(epoch),
+        },
+        data={"providerArtifactId": "g72-final-owner-revoke-" + revocation},
+        files={"file": ("synthetic.mp4", b"fake-only-final-owner-revoke", "video/mp4")},
+    )
+    assert repeated.status_code == 409, repeated.text
+    assert repeated.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+    assert len(sidecar_upload_attempts) == 1
+    with sessions() as db:
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_bytes
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
     app.state.moneyprinter.assert_not_called()
 
 
