@@ -3758,6 +3758,19 @@ def create_app(
                     # event is a typed, system-originated reservation.
                     required_opened_strings = ("workerId", "providerArtifactId", "mediaId", "sha256")
                     opened_sha256 = opened_metadata.get("sha256")
+                    # Each OPENED marker's advisory-lock identity is derived
+                    # from its immutable event ID at reservation time. A
+                    # different but well-typed lock key is NOT proof that this
+                    # released hold was ever protected by the original API
+                    # connection. Malformed legacy IDs fail closed, not 500.
+                    expected_opened_lock_key = None
+                    if type(opened.id) is str:
+                        try:
+                            expected_opened_lock_key = (
+                                int(uuid.UUID(opened.id)) & 0x7FFFFFFFFFFFFFFF
+                            )
+                        except ValueError:
+                            pass
                     opened_identity_valid = (
                         opened.actor_type == "SYSTEM"
                         and opened.actor_id == "api"
@@ -3783,7 +3796,7 @@ def create_app(
                         # A well-formed RELEASED row alone is not a trustworthy
                         # quota refund or a reason to reserve a second time.
                         and type(opened_metadata.get("livenessLockKey")) is int
-                        and opened_metadata["livenessLockKey"] >= 0
+                        and opened_metadata["livenessLockKey"] == expected_opened_lock_key
                         and type(opened_metadata.get("leaseEpoch")) is int
                         and type(opened_metadata.get("reservedStorageBytes")) is int
                         and opened_metadata["reservedStorageBytes"] > 0
