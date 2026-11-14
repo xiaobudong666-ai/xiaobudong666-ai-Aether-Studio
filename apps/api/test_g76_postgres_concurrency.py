@@ -1073,6 +1073,107 @@ def test_g70_g71_postgres_release_receipt_without_any_opened_hold_blocks_intake(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("corruption", ["wrong_release_digest", "invalid_release_reason"])
+def test_g70_g71_postgres_invalid_release_with_live_hold_blocks_second_reservation(
+    postgres_context, monkeypatch, corruption,
+):
+    """A live PostgreSQL hold cannot legitimize a corrupt matching RELEASED.
+
+    A corrupt release with the correct reservation ID must fail closed even
+    when a separate backend holds its liveness advisory lock. FAKE-only and
+    disposable PostgreSQL; no real Provider or protected quota changes.
+    """
+    owner_client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        owner_client
+    )
+    payload = b"g70-g71-live-hold-invalid-release-must-not-duplicate"
+    reservation_id = str(uuid.uuid4())
+    lock_key = int(uuid.uuid4()) & 0x7FFFFFFFFFFFFFFF
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "INGESTING"
+        tenant_id, project_id = task.tenant_id, task.project_id
+        tenant = db.get(DBTenant, tenant_id)
+        initial_used = tenant.used_storage_bytes
+        tenant.used_storage_bytes += len(payload)
+        opened_metadata = {
+            "workerId": headers["X-Worker-Id"],
+            "leaseEpoch": int(headers["X-Worker-Lease-Epoch"]),
+            "livenessLockKey": lock_key,
+            "providerArtifactId": artifact_id,
+            "mediaId": _expected_media_id(project_id, f"generation:{task_id}"),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "reservedStorageBytes": len(payload),
+        }
+        released_metadata = {
+            **opened_metadata,
+            "storageReservationEventId": reservation_id,
+            "reasonCode": "DUPLICATE_ARTIFACT_INTAKE",
+        }
+        if corruption == "wrong_release_digest":
+            released_metadata["sha256"] = "0" * 64
+        else:
+            released_metadata["reasonCode"] = "UNTRUSTED_RELEASE"
+        for event_type, metadata, event_id in [
+            ("STORAGE_RESERVATION_OPENED", opened_metadata, reservation_id),
+            ("STORAGE_RESERVATION_RELEASED", released_metadata, str(uuid.uuid4())),
+        ]:
+            db.add(DBGenerationEvent(
+                id=event_id, generation_task_id=task_id, attempt_id=None,
+                event_type=event_type, from_status="INGESTING",
+                to_status="INGESTING", actor_type="SYSTEM", actor_id="api",
+                metadata_json=metadata, created_at=now,
+            ))
+        db.commit()
+
+    sidecar_upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(app.state.video_use, "upload_media", sidecar_upload)
+    engine = sessions.kw["bind"]
+    with engine.connect() as blocker:
+        acquired = blocker.execute(
+            text("SELECT pg_try_advisory_lock(:lock_key)"),
+            {"lock_key": lock_key},
+        ).scalar_one()
+        assert acquired is True
+        blocker.commit()
+        try:
+            replay = _post_g70_g71_duplicate_intake(
+                app, task_id, headers, artifact_id, payload
+            )
+            assert replay.status_code == 409, replay.text
+            assert replay.json()["detail"]["code"] == (
+                "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+            )
+            sidecar_upload.assert_not_called()
+            with sessions() as db:
+                task = db.get(DBGenerationTask, task_id)
+                assert task is not None and task.asset_version_id is None
+                assert task.status == "INGESTING"
+                assert db.get(DBTenant, tenant_id).used_storage_bytes == (
+                    initial_used + len(payload)
+                )
+                assert db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one() == 0
+                for event_type in (
+                    "STORAGE_RESERVATION_OPENED", "STORAGE_RESERVATION_RELEASED"
+                ):
+                    assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                        DBGenerationEvent.generation_task_id == task_id,
+                        DBGenerationEvent.event_type == event_type,
+                    )).scalar_one() == 1
+            app.state.moneyprinter.assert_not_called()
+        finally:
+            unlocked = blocker.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": lock_key},
+            ).scalar_one()
+            blocker.commit()
+            assert unlocked is True
+
+
 def test_g70_g71_postgres_concurrent_duplicate_artifact_intake_is_idempotent(
     postgres_context, monkeypatch
 ):
