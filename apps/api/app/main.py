@@ -3538,6 +3538,28 @@ def create_app(
                     status_code=409,
                     detail={"code": "FAKE_TALKING_HEAD_SOURCE_REVOKED", "message": "输入图片授权或版本已失效，模拟产物隔离"},
                 )
+            # A previously revoked upload may have returned its storage debit
+            # with a valid receipt, but Owner reactivation is NOT a recovery ACK.
+            # Fail closed on the durable orphan audit; a Worker must never
+            # silently re-upload or settle the old FAKE artifact after restoration.
+            previous_revocation_failures = db.execute(
+                select(DBGenerationEvent.metadata_json).where(
+                    DBGenerationEvent.generation_task_id == task.id,
+                    DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+                )
+            ).scalars().all()
+            if any(
+                isinstance(evidence, dict)
+                and evidence.get("reasonCode") == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+                for evidence in previous_revocation_failures
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_RECOVERY_REQUIRED",
+                        "message": "此前授权撤销已形成持久孤儿产物，须先人工核验原始产物",
+                    },
+                )
         if task.asset_version_id:
             # G70/G71: a terminal idempotent ACK must bind the replay's bytes,
             # MIME and scope to the already committed asset. Previously a
