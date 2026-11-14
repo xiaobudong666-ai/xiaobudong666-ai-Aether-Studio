@@ -3778,6 +3778,12 @@ def create_app(
                             "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED",
                             "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
                         }
+                        # Legacy/migrated OPENED receipts lacking the typed
+                        # PG liveness identity cannot clear a durable hold.
+                        # A well-formed RELEASED row alone is not a trustworthy
+                        # quota refund or a reason to reserve a second time.
+                        and type(opened_metadata.get("livenessLockKey")) is int
+                        and opened_metadata["livenessLockKey"] >= 0
                         and type(opened_metadata.get("leaseEpoch")) is int
                         and type(opened_metadata.get("reservedStorageBytes")) is int
                         and opened_metadata["reservedStorageBytes"] > 0
