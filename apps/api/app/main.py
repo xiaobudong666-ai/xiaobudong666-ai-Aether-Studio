@@ -3676,6 +3676,10 @@ def create_app(
                 # turn an outstanding quota hold into a presumed release.
                 opened_by_id = {hold.id: hold for hold in opened_holds}
                 released_ids = set()
+                # A second receipt for one hold is ambiguous financial evidence,
+                # even when either individual receipt looks valid. Never infer
+                # quota reconciliation from duplicate audit rows.
+                release_reference_counts = {}
                 for receipt in releases:
                     released_metadata = receipt.metadata_json
                     if not isinstance(released_metadata, dict):
@@ -3686,7 +3690,12 @@ def create_app(
                     if type(opened_reference) is not str:
                         continue
                     opened = opened_by_id.get(opened_reference)
-                    if opened is None or not isinstance(opened.metadata_json, dict):
+                    if opened is None:
+                        continue
+                    release_reference_counts[opened_reference] = (
+                        release_reference_counts.get(opened_reference, 0) + 1
+                    )
+                    if not isinstance(opened.metadata_json, dict):
                         continue
                     opened_metadata = opened.metadata_json
                     binding_fields = (
@@ -3729,6 +3738,15 @@ def create_app(
                         )
                     ):
                         released_ids.add(opened.id)
+                if any(count > 1 for count in release_reference_counts.values()):
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "message": "同一存储预留存在重复释放回执，请人工核验原产物与额度",
+                        },
+                    )
                 # An unresolved hold in the SAME lease epoch is not proof that
                 # another request is still live. It may be a SIGKILL orphan.
                 # Permit legacy identical concurrent ACK flow only when every
