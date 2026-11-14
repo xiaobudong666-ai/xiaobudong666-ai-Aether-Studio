@@ -3183,6 +3183,190 @@ def test_g72_postgres_revoke_after_final_rights_read_is_serialized(postgres_cont
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("revocation", ["inactive", "downgraded", "project_reassigned"])
+def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
+    postgres_context, monkeypatch, revocation,
+):
+    """A pre-upload Owner check cannot authorize post-upload asset settlement.
+
+    Actual disposable PostgreSQL, typed HTTP FAKE task and Sidecar stub.
+    Revocation commits after the first quota reservation, while upload is
+    in flight. No new asset/SETTLED or permanent quota usage may survive.
+    """
+    owner, sessions, app = postgres_context
+    worker_id = "g72-final-originator-revoke-" + revocation
+    task_id, _source_id, project_id, tenant_id, requested_by, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            owner, sessions, worker_id, source_sha="d" * 64,
+        )
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        task.status = "RUNNING"
+        db.commit()
+        initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+        initial_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+
+    original_upload = app.state.video_use.upload_media
+    uploaded = Event()
+
+    def revoke_while_uploading(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        with sessions() as db:
+            original = db.get(DBUser, requested_by)
+            if revocation == "inactive":
+                original.is_active = False
+            elif revocation == "downgraded":
+                original.role = "editor"
+            else:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                replacement = DBUser(
+                    id=str(uuid.uuid4()), tenant_id=tenant_id,
+                    email=f"g72-pg-new-owner-{uuid.uuid4()}@example.com",
+                    display_name="FAKE replacement Owner",
+                    password_hash="unused-fake-test-hash",
+                    role="owner", is_active=True,
+                    created_at=now, updated_at=now,
+                )
+                db.add(replacement)
+                db.flush()
+                db.get(DBProject, project_id).owner_id = replacement.id
+            db.commit()
+        uploaded.set()
+        return result
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", revoke_while_uploading)
+    result = owner.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(epoch),
+        },
+        data={"providerArtifactId": "g72-final-owner-revoke-" + revocation},
+        files={"file": ("synthetic.mp4", b"fake-only-final-owner-revoke", "video/mp4")},
+    )
+    assert uploaded.is_set(), "Test must reach Sidecar after committed reservation"
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.asset_version_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == initial_assets
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_bytes
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_postgres_originator_disable_after_final_lock_waits_for_commit(
+    postgres_context, monkeypatch,
+):
+    """Owner deactivation must not ACK inside Worker's final commit window.
+
+    Hook the completed PostgreSQL SELECT FOR UPDATE on the original Owner.
+    Once the Worker owns the row lock, a separate disable transaction must
+    wait rather than racing past the final asset/SETTLED write.
+    """
+    owner, sessions, app = postgres_context
+    worker_id = "g72-owner-final-auth-rowlock-worker"
+    task_id, _source, project_id, tenant_id, requested_by, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            owner, sessions, worker_id, source_sha="e" * 64,
+        )
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        task.status = "RUNNING"
+        db.commit()
+        initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+
+    final_owner_locked, resume_worker = Event(), Event()
+    disable_started, disable_finished = Event(), Event()
+    engine = sessions.kw["bind"]
+
+    def after_final_owner_lock(conn, cursor, statement, parameters, context, executemany):
+        normalized = " ".join(statement.lower().split())
+        if (
+            "select" in normalized and "users.id" in normalized
+            and "for update" in normalized and not final_owner_locked.is_set()
+        ):
+            final_owner_locked.set()
+            assert resume_worker.wait(timeout=20), "Final Owner rowlock test timed out"
+
+    def worker_intake():
+        with TestClient(app) as client:
+            return client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers={
+                    "X-Worker-Token": WORKER_TOKEN,
+                    "X-Worker-Id": worker_id,
+                    "X-Worker-Lease-Epoch": str(epoch),
+                },
+                data={"providerArtifactId": "g72-final-owner-rowlock"},
+                files={"file": ("synthetic.mp4", b"fake-only-owner-commit-race", "video/mp4")},
+            )
+
+    def disable_owner():
+        disable_started.set()
+        try:
+            with sessions() as db:
+                original = db.get(DBUser, requested_by)
+                original.is_active = False
+                db.commit()
+            return True
+        finally:
+            disable_finished.set()
+
+    event.listen(engine, "after_cursor_execute", after_final_owner_lock)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            worker_future = pool.submit(worker_intake)
+            disable_future = None
+            observed_lock_wait = False
+            try:
+                assert final_owner_locked.wait(timeout=15), (
+                    "Worker never acquired original Owner final row lock"
+                )
+                disable_future = pool.submit(disable_owner)
+                assert disable_started.wait(timeout=5)
+                observed_lock_wait = _wait_until_postgres_reports_lock_wait(
+                    sessions, "users", timeout_seconds=6,
+                )
+                assert not disable_finished.is_set(), (
+                    "Owner deactivation committed while Worker held final row lock"
+                )
+            finally:
+                resume_worker.set()
+            worker_result = worker_future.result(timeout=25)
+            assert disable_future is not None
+            assert disable_future.result(timeout=25)
+        assert observed_lock_wait, "PostgreSQL did not show a blocked Owner UPDATE"
+        assert worker_result.status_code == 201, worker_result.text
+        with sessions() as db:
+            assert db.get(DBUser, requested_by).is_active is False
+            task = db.get(DBGenerationTask, task_id)
+            assert task.asset_version_id is not None
+            assert db.execute(select(func.count(DBAssetVersion.id)).where(
+                DBAssetVersion.project_id == project_id,
+            )).scalar_one() == initial_assets + 1
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one() == 1
+        app.state.moneyprinter.assert_not_called()
+    finally:
+        resume_worker.set()
+        event.remove(engine, "after_cursor_execute", after_final_owner_lock)
+
+
 def test_g70_g71_postgres_bounded_liveness_pool_exhaustion_is_retryable(postgres_context):
     """A full native PostgreSQL pool must fail closed before quota or FAKE Sidecar.
 
