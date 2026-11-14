@@ -1283,11 +1283,19 @@ def create_app(
 
     @created_app.get("/health")
     def health_check(db: Session = Depends(db_dependency)):
-        journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
+        # SQLite has PRAGMA journal_mode; PostgreSQL does not. A health probe
+        # must verify the configured native database rather than failing with
+        # a SQLite-only statement or misreporting the active backend.
+        dialect = app_engine.dialect.name
+        if dialect == "sqlite":
+            journal_mode = db.execute(text("PRAGMA journal_mode;")).scalar_one().upper()
+        else:
+            db.execute(text("SELECT 1")).scalar_one()
+            journal_mode = None
         return {
             "status": "healthy",
             "service": "api",
-            "database": "sqlite",
+            "database": dialect,
             "journal_mode": journal_mode,
             "setupRequired": created_app.state.setup_required,
             "timestamp": iso_utc(utc_now()),
