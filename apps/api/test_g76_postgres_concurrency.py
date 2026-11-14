@@ -3334,6 +3334,38 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
         )).scalar_one() == 1
+    # A later reactivation/reassignment is not a durable orphan-recovery ACK.
+    # The now-paired storage release must not accidentally allow a second
+    # Sidecar upload or settlement of the previously revoked artifact.
+    with sessions() as db:
+        original = db.get(DBUser, requested_by)
+        original.is_active = True
+        original.role = "owner"
+        db.get(DBProject, project_id).owner_id = requested_by
+        db.commit()
+    restored_retry = owner.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(epoch),
+        },
+        data={"providerArtifactId": "g72-final-owner-revoke-" + revocation},
+        files={"file": ("synthetic.mp4", b"fake-only-final-owner-revoke", "video/mp4")},
+    )
+    assert restored_retry.status_code == 409, restored_retry.text
+    assert restored_retry.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert len(sidecar_upload_attempts) == 1
+    with sessions() as db:
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_bytes
+        assert db.get(DBGenerationTask, task_id).asset_version_id is None
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
 
