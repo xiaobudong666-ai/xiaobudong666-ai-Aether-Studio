@@ -3697,6 +3697,11 @@ def create_app(
                 # even when either individual receipt looks valid. Never infer
                 # quota reconciliation from duplicate audit rows.
                 release_reference_counts = {}
+                # A referenced RELEASED row with invalid accounting bindings is
+                # not an admissible release, even while the OPENED liveness
+                # advisory lock is held by a concurrent API process. Otherwise
+                # it could be ignored and a second quota hold opened.
+                invalid_release_binding = False
                 for receipt in releases:
                     released_metadata = receipt.metadata_json
                     if not isinstance(released_metadata, dict):
@@ -3716,6 +3721,7 @@ def create_app(
                         release_reference_counts.get(opened_reference, 0) + 1
                     )
                     if not isinstance(opened.metadata_json, dict):
+                        invalid_release_binding = True
                         continue
                     opened_metadata = opened.metadata_json
                     binding_fields = (
@@ -3758,7 +3764,9 @@ def create_app(
                         )
                     ):
                         released_ids.add(opened.id)
-                if unmatched_release_reference or any(
+                    else:
+                        invalid_release_binding = True
+                if unmatched_release_reference or invalid_release_binding or any(
                     count > 1 for count in release_reference_counts.values()
                 ):
                     db.rollback()
