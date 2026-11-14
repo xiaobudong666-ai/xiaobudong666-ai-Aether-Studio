@@ -3609,3 +3609,183 @@ def test_g70_g71_postgres_contended_liveness_advisory_lock_is_bounded_and_nonmut
         assert sum(event.event_type == "STORAGE_RESERVATION_RELEASED" for event in events) == 0
         assert sum(event.event_type == "ARTIFACT_INGESTED" for event in events) == 1
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_live_independent_process_duplicate_intake_is_idempotent(
+    postgres_context,
+):
+    """Live two-process API intake against shared PG must not double-account.
+
+    The earlier concurrent HTTP test uses threads within one API process;
+    the SIGKILL test runs the second API only after the first one is dead.
+    Here an independent API process holds an actual committed storage
+    reservation and PostgreSQL liveness lock during its FAKE Sidecar upload.
+    A different API instance completes the same artifact while it is alive.
+    This checks cross-process quota/asset/release receipts, not production
+    sizing, a real Sidecar, Provider billing or crash-durable reconciliation.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    if sys.platform != "linux":
+        pytest.skip("independent API process proof uses disposable Linux CI")
+
+    owner_client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        owner_client
+    )
+    payload = b"g70-g71-live-two-process-fake-only-shared-postgres"
+    child_script = r'''
+import json
+import os
+import time
+from io import BytesIO
+from pathlib import Path
+from fastapi import UploadFile
+from starlette.datastructures import Headers
+from sqlalchemy.orm import sessionmaker
+from app.database import build_engine
+from app.main import create_app
+from test_g76_postgres_concurrency import FakeMediaStore
+
+class PausedFakeSidecar(FakeMediaStore):
+    def upload_media(self, project_id, filename, content_type, stream, *,
+                     idempotency_key=None, content_sha256=None):
+        result = super().upload_media(
+            project_id, filename, content_type, stream,
+            idempotency_key=idempotency_key, content_sha256=content_sha256,
+        )
+        Path(os.environ["AETHER_TEST_LIVE_CHILD_READY"]).write_text("FAKE_UPLOAD_HELD")
+        deadline = time.monotonic() + 20
+        while not Path(os.environ["AETHER_TEST_LIVE_CHILD_RELEASE"]).exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError("independent FAKE Sidecar release timed out")
+            time.sleep(0.05)
+        return result
+
+engine = build_engine(os.environ["AETHER_TEST_POSTGRES_URL"])
+sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+def get_db():
+    with sessions() as db:
+        yield db
+app = create_app(
+    app_engine=engine,
+    db_dependency=get_db,
+    video_use_adapter=PausedFakeSidecar(),
+    bootstrap_admin_password=os.environ["AETHER_TEST_LIVE_CHILD_OWNER_PASSWORD"],
+    bootstrap_admin_email="g76-postgres-owner@example.com",
+    worker_token=os.environ["AETHER_TEST_LIVE_CHILD_WORKER_TOKEN"],
+    cookie_secure=False,
+    enforce_csrf=True,
+    generation_provider_mode="deterministic-fake",
+)
+route = next(
+    r for r in app.routes
+    if getattr(r, "path", None) == "/internal/generation-tasks/{task_id}/artifact-intake"
+)
+with sessions() as db:
+    result = route.endpoint(
+        os.environ["AETHER_TEST_LIVE_CHILD_TASK"],
+        providerArtifactId=os.environ["AETHER_TEST_LIVE_CHILD_ARTIFACT"],
+        file=UploadFile(
+            file=BytesIO(b"g70-g71-live-two-process-fake-only-shared-postgres"),
+            filename="synthetic-g70-g71-live.mp4",
+            headers=Headers({"content-type": "video/mp4"}),
+        ),
+        x_worker_token=os.environ["AETHER_TEST_LIVE_CHILD_WORKER_TOKEN"],
+        x_worker_id=os.environ["AETHER_TEST_LIVE_CHILD_WORKER"],
+        x_worker_lease_epoch=int(os.environ["AETHER_TEST_LIVE_CHILD_EPOCH"]),
+        db=db,
+    )
+Path(os.environ["AETHER_TEST_LIVE_CHILD_RESULT"]).write_text(
+    json.dumps(result["results"][0], sort_keys=True)
+)
+engine.dispose()
+'''
+    with tempfile.TemporaryDirectory(prefix="aether-g70-live-multiprocess-") as tmp:
+        ready = Path(tmp, "ready")
+        release = Path(tmp, "release")
+        result_path = Path(tmp, "result.json")
+        child_env = os.environ.copy()
+        child_env.update({
+            "AETHER_TEST_LIVE_CHILD_READY": str(ready),
+            "AETHER_TEST_LIVE_CHILD_RELEASE": str(release),
+            "AETHER_TEST_LIVE_CHILD_RESULT": str(result_path),
+            "AETHER_TEST_LIVE_CHILD_TASK": task_id,
+            "AETHER_TEST_LIVE_CHILD_ARTIFACT": artifact_id,
+            "AETHER_TEST_LIVE_CHILD_WORKER": headers["X-Worker-Id"],
+            "AETHER_TEST_LIVE_CHILD_EPOCH": headers["X-Worker-Lease-Epoch"],
+            "AETHER_TEST_LIVE_CHILD_WORKER_TOKEN": WORKER_TOKEN,
+            "AETHER_TEST_LIVE_CHILD_OWNER_PASSWORD": OWNER_PASSWORD,
+        })
+        child = subprocess.Popen(
+            [sys.executable, "-u", "-c", child_script],
+            env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        parent_response = None
+        try:
+            deadline = time.monotonic() + 15
+            while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not ready.exists():
+                _, err = child.communicate(timeout=5) if child.poll() is not None else ("", "")
+                pytest.fail(f"independent API did not reach FAKE Sidecar: {err[-1200:]}")
+            assert child.poll() is None, "independent API exited before live overlap"
+
+            # This independent main-process HTTP client races the live child
+            # while its first hold and session-level PG lock are still active.
+            parent_response = _post_g70_g71_duplicate_intake(
+                app, task_id, headers, artifact_id, payload
+            )
+            assert parent_response.status_code == 201, parent_response.text
+            assert child.poll() is None, "child must still be in FAKE upload"
+        finally:
+            release.write_text("release")
+            try:
+                child.wait(timeout=25)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=10)
+            _, child_err = child.communicate(timeout=5)
+
+        assert child.returncode == 0, child_err[-2000:]
+        assert result_path.exists(), child_err[-1200:]
+        child_result = json.loads(result_path.read_text())
+        assert child_result["assetVersionId"] == (
+            parent_response.json()["results"][0]["assetVersionId"]
+        )
+        assert child_result["mediaId"] == parent_response.json()["results"][0]["mediaId"]
+
+    _assert_g70_g71_postgres_single_ingest(sessions, task_id, payload)
+    with sessions() as db:
+        holds = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+        )).scalars().all()
+        assert len(holds) == 2, "both live API processes reserved before Sidecar"
+        releases = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalars().all()
+        assert len(releases) == 1, "only the duplicate reservation was released"
+        liveness_keys = [hold.metadata_json["livenessLockKey"] for hold in holds]
+
+    # Independent backend must reacquire every prior session-level lock:
+    # process exit or normal request completion cannot strand a pooled lock.
+    from sqlalchemy import create_engine
+    check_engine = create_engine(os.environ["AETHER_TEST_POSTGRES_URL"])
+    try:
+        with check_engine.connect() as conn:
+            for key in liveness_keys:
+                assert conn.execute(
+                    text("SELECT pg_try_advisory_lock(:key)"), {"key": key}
+                ).scalar_one() is True
+                assert conn.execute(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": key}
+                ).scalar_one() is True
+            conn.rollback()
+    finally:
+        check_engine.dispose()
+    app.state.moneyprinter.assert_not_called()
