@@ -3264,6 +3264,28 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one() == 0
         assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_bytes
+        # Existing quota debit reversal must be paired with one immutable
+        # release receipt bound to the exact OPENED event (FAKE-only).
+        opened = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+        )).scalars().all()
+        released = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalars().all()
+        assert len(opened) == len(released) == 1
+        opened_meta = opened[0].metadata_json
+        released_meta = released[0].metadata_json
+        assert released_meta["storageReservationEventId"] == opened[0].id
+        assert released_meta["reasonCode"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+        assert released[0].actor_type == "SYSTEM"
+        assert released[0].actor_id == "api"
+        for field in (
+            "workerId", "leaseEpoch", "providerArtifactId",
+            "mediaId", "sha256", "reservedStorageBytes",
+        ):
+            assert released_meta[field] == opened_meta[field]
         # The Sidecar already accepted bytes before final authorization failed.
         # A successful HTTP 409 is insufficient: the orphan must be durably
         # discoverable for Owner-only reconciliation, not silently forgotten.
@@ -3303,6 +3325,10 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
     assert repeated.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
     assert len(sidecar_upload_attempts) == 1
     with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalar_one() == 1
         assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_bytes
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
