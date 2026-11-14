@@ -3828,6 +3828,35 @@ def create_app(
                 # artifact and project media. Reject changed bytes before a
                 # second quota increment or any Sidecar write. This does NOT
                 # reconcile a same-epoch orphan with identical bytes.
+                # G70/G71: a live advisory lock proves only that SOME backend
+                # holds that number. For an unresolved OPENED event, bind the
+                # lock to the immutable reservation ID before trusting a live
+                # connection; otherwise an unrelated live lock can permit a
+                # second debit against a corrupted historical hold.
+                # No automatic refund or release is authorized here.
+                for hold in opened_holds:
+                    if hold.id in released_ids:
+                        continue
+                    try:
+                        expected_hold_lock_key = (
+                            int(uuid.UUID(hold.id)) & 0x7FFFFFFFFFFFFFFF
+                        )
+                    except (TypeError, ValueError, AttributeError):
+                        expected_hold_lock_key = None
+                    hold_metadata = hold.metadata_json
+                    if (
+                        not isinstance(hold_metadata, dict)
+                        or type(hold_metadata.get("livenessLockKey")) is not int
+                        or hold_metadata["livenessLockKey"] != expected_hold_lock_key
+                    ):
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                                "message": "未释放预留的存活锁与原始事件不匹配，须人工核验额度",
+                            },
+                        )
                 incoming_sha256 = digest.hexdigest()
                 if any(
                     hold.id not in released_ids
