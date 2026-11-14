@@ -2996,6 +2996,27 @@ def create_app(
             if candidate.provider == "moneyprinter" and candidate_request.get("fakeTaskType") is not None:
                 continue
             if candidate.provider == "deterministic-fake-talking-head":
+                # G72: a queued FAKE task is not a standing authority to act
+                # after the originating Owner is deactivated/downgraded or the
+                # project no longer belongs to that Owner. This is a read-only
+                # revocation fence; no grant/delegation policy is selected.
+                active_originator = db.execute(
+                    select(DBUser.id).where(
+                        DBUser.id == candidate.requested_by,
+                        DBUser.tenant_id == candidate.tenant_id,
+                        DBUser.role == "owner",
+                        DBUser.is_active.is_(True),
+                    )
+                ).scalar_one_or_none()
+                original_project_owner = db.execute(
+                    select(DBProject.id).where(
+                        DBProject.id == candidate.project_id,
+                        DBProject.tenant_id == candidate.tenant_id,
+                        DBProject.owner_id == candidate.requested_by,
+                    )
+                ).scalar_one_or_none()
+                if active_originator is None or original_project_owner is None:
+                    continue
                 # Recheck the immutable image version and latest REMIX rights
                 # when a Worker claims a FAKE-only task; NEVER allow a real mode.
                 stored = candidate_request
@@ -3437,6 +3458,33 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
         if task.provider == "deterministic-fake-talking-head":
+            # G72: revoking the original Owner or changing project ownership
+            # after Worker claim must fence artifact intake before quota, Sidecar
+            # upload or audit mutation. An internal Worker token does not grant
+            # authority to impersonate a deactivated task initiator.
+            active_originator = db.execute(
+                select(DBUser.id).where(
+                    DBUser.id == task.requested_by,
+                    DBUser.tenant_id == task.tenant_id,
+                    DBUser.role == "owner",
+                    DBUser.is_active.is_(True),
+                )
+            ).scalar_one_or_none()
+            original_project_owner = db.execute(
+                select(DBProject.id).where(
+                    DBProject.id == task.project_id,
+                    DBProject.tenant_id == task.tenant_id,
+                    DBProject.owner_id == task.requested_by,
+                )
+            ).scalar_one_or_none()
+            if active_originator is None or original_project_owner is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                        "message": "原口播任务发起人或项目归属已失效，模拟产物隔离",
+                    },
+                )
             # A task leased on a previous build can contain malformed durable
             # request JSON. Refuse intake before querying with a non-scalar
             # source ID; do not mutate the lease, storage, or usage ledger.
