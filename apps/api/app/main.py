@@ -3664,13 +3664,26 @@ def create_app(
                     DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
                 )
             ).scalars().all()
+            # G70/G71: a RELEASED receipt without any OPENED reservation is
+            # orphaned audit evidence, not proof that a storage debit was
+            # returned. Never reserve new quota or call Sidecar on that task.
+            # Do not reconstruct, refund or erase historical evidence here.
+            releases = db.execute(
+                select(DBGenerationEvent).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                    DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+                )
+            ).scalars().all()
+            if releases and not opened_holds:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "发现无原始预留的持久释放回执，须人工核验原产物及额度",
+                    },
+                )
             if opened_holds:
-                releases = db.execute(
-                    select(DBGenerationEvent).where(
-                        DBGenerationEvent.generation_task_id == task_id,
-                        DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
-                    )
-                ).scalars().all()
                 # A release event is evidence only when it binds exactly to
                 # the opened reservation. Untrusted/migrated JSON must never
                 # turn an outstanding quota hold into a presumed release.
