@@ -1004,6 +1004,75 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("receipt_shape", ["structured_orphan", "unstructured_orphan"])
+def test_g70_g71_postgres_release_receipt_without_any_opened_hold_blocks_intake(
+    postgres_context, monkeypatch, receipt_shape,
+):
+    """No OPENED event + a dangling RELEASED is ambiguous durable audit.
+
+    Disposable native PostgreSQL and FAKE Sidecar, without any actual
+    quota mutation, Provider call or historical reconciliation.
+    """
+    owner_client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        owner_client
+    )
+    payload = b"g70-g71-release-without-opened-fake-only"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "INGESTING"
+        tenant_id, project_id = task.tenant_id, task.project_id
+        initial_used = db.get(DBTenant, tenant_id).used_storage_bytes
+        release_metadata = {
+            "storageReservationEventId": str(uuid.uuid4()),
+            "reasonCode": "UPLOAD_INTERRUPTED",
+            "workerId": worker_headers["X-Worker-Id"],
+            "leaseEpoch": int(worker_headers["X-Worker-Lease-Epoch"]),
+            "providerArtifactId": artifact_id,
+            "mediaId": _expected_media_id(project_id, f"generation:{task_id}"),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "reservedStorageBytes": len(payload),
+        }
+        if receipt_shape == "unstructured_orphan":
+            release_metadata = ["legacy", "dangling-release"]
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id, attempt_id=None,
+            event_type="STORAGE_RESERVATION_RELEASED",
+            from_status="INGESTING", to_status="INGESTING",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json=release_metadata,
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+        ))
+        db.commit()
+
+    sidecar_upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(app.state.video_use, "upload_media", sidecar_upload)
+    replay = _post_g70_g71_duplicate_intake(
+        app, task_id, worker_headers, artifact_id, payload
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    sidecar_upload.assert_not_called()
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "INGESTING"
+        assert task.asset_version_id is None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_used
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == 0
+        for event_type, expected_count in [
+            ("STORAGE_RESERVATION_OPENED", 0),
+            ("STORAGE_RESERVATION_RELEASED", 1),
+            ("ARTIFACT_INGESTED", 0),
+        ]:
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == event_type,
+            )).scalar_one() == expected_count
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_g71_postgres_concurrent_duplicate_artifact_intake_is_idempotent(
     postgres_context, monkeypatch
 ):
