@@ -3683,6 +3683,23 @@ def create_app(
                         "message": "发现无原始预留的持久释放回执，须人工核验原产物及额度",
                     },
                 )
+            # G70/G71: an unresolved OPENED hold must originate from the same
+            # trusted API issuer as an OPENED hold that was later released.
+            # Without this check, a forged/migrated actor with matching bytes
+            # and a live advisory lock could authorize another storage debit.
+            # Fail closed; do not rewrite historical quota or audit evidence.
+            if any(
+                hold.actor_type != "SYSTEM" or hold.actor_id != "api"
+                for hold in opened_holds
+            ):
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "存储预留来源不可信，须人工核验原产物与额度",
+                    },
+                )
             if opened_holds:
                 # A release event is evidence only when it binds exactly to
                 # the opened reservation. Untrusted/migrated JSON must never
