@@ -3709,6 +3709,29 @@ def create_app(
                     },
                 )
             if opened_holds:
+                # A durable reservation must refer to an attempt belonging to
+                # THIS task. A foreign-task attempt can satisfy every JSON
+                # field while incorrectly clearing a hold or allowing a second
+                # storage debit. Historical NULL/NULL pairs remain readable;
+                # do not synthesize a reconciliation or refund.
+                valid_attempt_ids = set(db.execute(
+                    select(DBGenerationAttempt.id).where(
+                        DBGenerationAttempt.generation_task_id == task_id
+                    )
+                ).scalars())
+                if any(
+                    hold.attempt_id is not None
+                    and hold.attempt_id not in valid_attempt_ids
+                    for hold in opened_holds
+                ):
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "message": "存储预留归属的任务尝试不可信，须人工核验原产物与额度",
+                        },
+                    )
                 # A release event is evidence only when it binds exactly to
                 # the opened reservation. Untrusted/migrated JSON must never
                 # turn an outstanding quota hold into a presumed release.
@@ -3786,6 +3809,7 @@ def create_app(
                         opened_identity_valid
                         and receipt.actor_type == "SYSTEM"
                         and receipt.actor_id == "api"
+                        and receipt.attempt_id == opened.attempt_id
                         and type(released_metadata.get("reasonCode")) is str
                         and released_metadata["reasonCode"] in {
                             "DUPLICATE_ARTIFACT_INTAKE", "UPLOAD_INTERRUPTED",

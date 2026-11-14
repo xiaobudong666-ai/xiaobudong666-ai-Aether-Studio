@@ -891,6 +891,8 @@ def _post_g70_g71_duplicate_intake(app, task_id, worker_headers, artifact_id, pa
         "valid_and_unstructured_receipt",
         "paired_missing_liveness_key", "paired_boolean_liveness_key",
         "paired_wrong_liveness_key", "paired_unparseable_opened_id",
+        "paired_opened_attempt_only", "paired_release_attempt_only",
+        "paired_foreign_task_attempt",
     ]
 )
 def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
@@ -912,6 +914,10 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
         else str(uuid.uuid4())
     )
     now = datetime.datetime.now(datetime.timezone.utc)
+    foreign_task_id = (
+        _create_task(owner_client)
+        if corruption == "paired_foreign_task_attempt" else None
+    )
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         assert task is not None and task.status == "INGESTING"
@@ -919,6 +925,28 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
         assert tenant is not None
         initial_used = tenant.used_storage_bytes
         tenant.used_storage_bytes += len(payload)
+        own_attempt_id = db.execute(
+            select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        opened_attempt_id = (
+            own_attempt_id if corruption == "paired_opened_attempt_only" else None
+        )
+        release_attempt_id = (
+            own_attempt_id if corruption == "paired_release_attempt_only" else None
+        )
+        if foreign_task_id is not None:
+            foreign_attempt_id = str(uuid.uuid4())
+            db.add(DBGenerationAttempt(
+                id=foreign_attempt_id,
+                generation_task_id=foreign_task_id,
+                attempt_no=1,
+                status="QUEUED",
+                reconciliation_state="NOT_SUBMITTED",
+                created_at=now,
+            ))
+            opened_attempt_id = release_attempt_id = foreign_attempt_id
         opened_metadata = {
             "workerId": worker_headers["X-Worker-Id"],
             "leaseEpoch": int(worker_headers["X-Worker-Lease-Epoch"]),
@@ -986,13 +1014,13 @@ def test_g70_g71_postgres_corrupt_release_receipt_does_not_clear_open_hold(
         elif corruption == "container_release_reason_object":
             release_metadata["reasonCode"] = {"reason": "UPLOAD_INTERRUPTED"}
         db.add(DBGenerationEvent(
-            id=opened_id, generation_task_id=task_id, attempt_id=None,
+            id=opened_id, generation_task_id=task_id, attempt_id=opened_attempt_id,
             event_type="STORAGE_RESERVATION_OPENED", from_status="INGESTING",
             to_status="INGESTING", actor_type=opened_actor, actor_id="api",
             metadata_json=opened_metadata, created_at=now,
         ))
         db.add(DBGenerationEvent(
-            id=str(uuid.uuid4()), generation_task_id=task_id, attempt_id=None,
+            id=str(uuid.uuid4()), generation_task_id=task_id, attempt_id=release_attempt_id,
             event_type="STORAGE_RESERVATION_RELEASED", from_status="INGESTING",
             to_status="INGESTING", actor_type=actor, actor_id="api",
             metadata_json=release_metadata, created_at=now,
