@@ -1115,6 +1115,102 @@ def test_g70_g71_postgres_release_receipt_without_any_opened_hold_blocks_intake(
 
 
 @pytest.mark.parametrize(
+    "corruption", ["wrong_live_lock_key", "unparseable_opened_event_id"],
+)
+def test_g70_g71_postgres_unreleased_opened_lock_must_bind_event_id(
+    postgres_context, monkeypatch, corruption,
+):
+    """An unrelated live PostgreSQL lock cannot validate an OPENED quota hold.
+
+    All other task/lease/digest/issuer identities are valid. The old code
+    checked only that the unrelated lock was live, allowing a second debit.
+    Disposable FAKE-only PostgreSQL; no trusted recovery ACK or refund.
+    """
+    client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(
+        client
+    )
+    payload = b"g70-g71-unreleased-hold-needs-event-bound-live-lock"
+    opened_id = (
+        "legacy-not-uuid-" + str(uuid.uuid4())
+        if corruption == "unparseable_opened_event_id"
+        else str(uuid.uuid4())
+    )
+    # The lock exists, but cannot be the derived lock for this OPENED event.
+    lock_key = (
+        int(uuid.uuid4()) & 0x7FFFFFFFFFFFFFFF
+        if corruption == "unparseable_opened_event_id"
+        else (int(uuid.UUID(opened_id)) + 1) & 0x7FFFFFFFFFFFFFFF
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "INGESTING"
+        tenant_id, project_id = task.tenant_id, task.project_id
+        tenant = db.get(DBTenant, tenant_id)
+        initial_bytes = tenant.used_storage_bytes
+        tenant.used_storage_bytes += len(payload)
+        db.add(DBGenerationEvent(
+            id=opened_id, generation_task_id=task_id, attempt_id=None,
+            event_type="STORAGE_RESERVATION_OPENED",
+            from_status="INGESTING", to_status="INGESTING",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "workerId": headers["X-Worker-Id"],
+                "leaseEpoch": int(headers["X-Worker-Lease-Epoch"]),
+                "livenessLockKey": lock_key,
+                "providerArtifactId": artifact_id,
+                "mediaId": _expected_media_id(project_id, f"generation:{task_id}"),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "reservedStorageBytes": len(payload),
+            },
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+        ))
+        db.commit()
+
+    sidecar_upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(app.state.video_use, "upload_media", sidecar_upload)
+    engine = sessions.kw["bind"]
+    with engine.connect() as blocker:
+        assert blocker.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key}
+        ).scalar_one() is True
+        blocker.commit()
+        try:
+            response = _post_g70_g71_duplicate_intake(
+                app, task_id, headers, artifact_id, payload
+            )
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["code"] == (
+                "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+            )
+            sidecar_upload.assert_not_called()
+            with sessions() as db:
+                task = db.get(DBGenerationTask, task_id)
+                assert task is not None and task.status == "INGESTING"
+                assert task.asset_version_id is None
+                assert db.get(DBTenant, tenant_id).used_storage_bytes == (
+                    initial_bytes + len(payload)
+                )
+                assert db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one() == 0
+                for event_type, count in (
+                    ("STORAGE_RESERVATION_OPENED", 1),
+                    ("STORAGE_RESERVATION_RELEASED", 0),
+                ):
+                    assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                        DBGenerationEvent.generation_task_id == task_id,
+                        DBGenerationEvent.event_type == event_type,
+                    )).scalar_one() == count
+            app.state.moneyprinter.assert_not_called()
+        finally:
+            assert blocker.execute(
+                text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key}
+            ).scalar_one() is True
+            blocker.commit()
+
+
+@pytest.mark.parametrize(
     "opened_actor_type,opened_actor_id",
     [("OWNER", "api"), ("SYSTEM", "owner")],
 )
