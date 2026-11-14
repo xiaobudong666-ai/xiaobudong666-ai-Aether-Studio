@@ -4017,6 +4017,36 @@ def create_app(
                     invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
                     invalid_message = "上传期间任务状态已改变"
     
+                # G72: a pre-upload Owner check is not authorization for the
+                # final asset/SETTLED commit. The storage-reservation commit
+                # releases that earlier transaction while FAKE Sidecar runs.
+                # Lock the original actor and project rows in this final
+                # transaction, using the same row locks as account deactivation,
+                # role updates and project reassignment. An earlier revocation
+                # wins and rejects the artifact; a later revocation must wait
+                # until this transaction commits. This does not grant admins
+                # delegation or change tenant/project policy.
+                if invalid_code is None and task.provider == "deterministic-fake-talking-head":
+                    final_owner_query = select(DBUser.id).where(
+                        DBUser.id == task.requested_by,
+                        DBUser.tenant_id == task.tenant_id,
+                        DBUser.role == "owner",
+                        DBUser.is_active.is_(True),
+                    )
+                    final_project_query = select(DBProject.id).where(
+                        DBProject.id == task.project_id,
+                        DBProject.tenant_id == task.tenant_id,
+                        DBProject.owner_id == task.requested_by,
+                    )
+                    if app_engine.dialect.name == "postgresql":
+                        final_owner_query = final_owner_query.with_for_update()
+                        final_project_query = final_project_query.with_for_update()
+                    final_owner = db.execute(final_owner_query).scalar_one_or_none()
+                    final_project = db.execute(final_project_query).scalar_one_or_none()
+                    if final_owner is None or final_project is None:
+                        invalid_code = "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+                        invalid_message = "上传期间原发起人授权或项目归属已失效，模拟产物隔离"
+
                 # The initial FAKE talking-head rights check precedes a network
                 # upload and its committed storage reservation. A REMIX revocation
                 # may commit while that upload is in flight. Re-read the persisted
