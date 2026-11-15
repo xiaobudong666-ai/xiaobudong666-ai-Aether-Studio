@@ -3660,6 +3660,29 @@ def create_app(
         # crash-orphaned holds even within the same lease generation.
         storage_reservation_event_id = str(uuid.uuid4())
         storage_liveness_lock_key = int(uuid.UUID(storage_reservation_event_id)) & 0x7FFFFFFFFFFFFFFF
+
+        def compensate_artifact_storage_or_hold(tenant_id: str) -> None:
+            # G70/G71: a damaged quota counter is not a valid refund. Never
+            # clamp it to zero while recording a successful compensation.
+            # Keep the durable OPENED hold for human reconciliation instead.
+            released = db.execute(
+                update(DBTenant)
+                .where(
+                    DBTenant.id == tenant_id,
+                    DBTenant.used_storage_bytes >= upload_size,
+                )
+                .values(used_storage_bytes=DBTenant.used_storage_bytes - upload_size)
+            )
+            if released.rowcount != 1:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "持久预留与租户存储额度不一致，须人工核验，禁止宣称已释放",
+                    },
+                )
+
         with postgres_storage_hold_liveness(storage_liveness_lock_key):
             # G70/G71: persist each quota hold with its lease epoch BEFORE Sidecar.
             # When a Worker lease changes after an uncertain prior upload, stop
@@ -4125,14 +4148,7 @@ def create_app(
                     current_statement = current_statement.with_for_update()
                 task = db.execute(current_statement).scalar_one_or_none()
                 if task is None:
-                    db.execute(
-                        update(DBTenant)
-                        .where(DBTenant.id == task_tenant_id)
-                        .values(used_storage_bytes=case(
-                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                            else_=0,
-                        ))
-                    )
+                    compensate_artifact_storage_or_hold(task_tenant_id)
                     db.commit()
                     raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"})
     
@@ -4328,14 +4344,7 @@ def create_app(
                             },
                             created_at=now,
                         ))
-                    db.execute(
-                        update(DBTenant)
-                        .where(DBTenant.id == task.tenant_id)
-                        .values(used_storage_bytes=case(
-                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                            else_=0,
-                        ))
-                    )
+                    compensate_artifact_storage_or_hold(task.tenant_id)
                     add_generation_event(
                         db, task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
                         actor_type="SYSTEM", actor_id="api",
@@ -4477,14 +4486,7 @@ def create_app(
                     failed_statement = failed_statement.with_for_update()
                 failed_task = db.execute(failed_statement).scalar_one_or_none()
                 if failed_task is None:
-                    db.execute(
-                        update(DBTenant)
-                        .where(DBTenant.id == task_tenant_id)
-                        .values(used_storage_bytes=case(
-                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                            else_=0,
-                        ))
-                    )
+                    compensate_artifact_storage_or_hold(task_tenant_id)
                     db.commit()
                     raise HTTPException(status_code=404, detail={"code": "GENERATION_TASK_NOT_FOUND", "message": "未找到该生成任务"}) from exc
     
@@ -4562,14 +4564,7 @@ def create_app(
                             failed_task.media_id = media_id
                             failed_task.provider_artifact_id = failed_task.provider_artifact_id or providerArtifactId
                             failed_task.updated_at = now
-                    db.execute(
-                        update(DBTenant)
-                        .where(DBTenant.id == failed_task.tenant_id)
-                        .values(used_storage_bytes=case(
-                            (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                            else_=0,
-                        ))
-                    )
+                    compensate_artifact_storage_or_hold(failed_task.tenant_id)
                     add_generation_event(
                         db, failed_task, attempt=attempt, event_type="ARTIFACT_INGEST_FAILED",
                         actor_type="SYSTEM", actor_id="api",
@@ -4624,14 +4619,7 @@ def create_app(
                         "originalUpstreamJobId": failed_task.upstream_job_id or "",
                         "orphanedMediaMetadata": metadata if isinstance(metadata, dict) else {},
                     })
-                db.execute(
-                    update(DBTenant)
-                    .where(DBTenant.id == failed_task.tenant_id)
-                    .values(used_storage_bytes=case(
-                        (DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size),
-                        else_=0,
-                    ))
-                )
+                compensate_artifact_storage_or_hold(failed_task.tenant_id)
                 add_generation_event(
                     db, failed_task, attempt=failed_attempt, event_type="ARTIFACT_INGEST_FAILED",
                     actor_type="SYSTEM", actor_id="api", from_status=previous_status,
