@@ -4836,7 +4836,10 @@ def test_g70_g71_postgres_direct_media_uncertain_quota_commit_stops_before_sidec
 
     def lost_reservation_ack(db, *args, **kwargs):
         commit_calls[0] += 1
-        if commit_calls[0] == 1:
+        # The HTTP auth dependency commits its credential/session bookkeeping
+        # before the upload route runs. Fault-inject only the *second* COMMIT,
+        # which is the storage reservation's first durable transaction.
+        if commit_calls[0] == 2:
             if commit_is_durable:
                 original_commit(db, *args, **kwargs)
             raise RuntimeError("FAKE quota reservation COMMIT acknowledgement lost")
@@ -4854,7 +4857,7 @@ def test_g70_g71_postgres_direct_media_uncertain_quota_commit_stops_before_sidec
     assert response.json()["detail"]["code"] == (
         "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     )
-    assert commit_calls[0] == 1
+    assert commit_calls[0] == 2
     sidecar_upload.assert_not_called()
     with sessions() as db:
         assert db.query(DBTenant).one().used_storage_bytes == (
