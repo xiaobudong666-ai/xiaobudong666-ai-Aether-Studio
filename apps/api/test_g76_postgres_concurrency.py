@@ -4586,3 +4586,54 @@ engine.dispose()
     finally:
         check_engine.dispose()
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("underfunded", [False, True])
+def test_g70_g71_postgres_project_media_refund_never_clamps_underfunded_counter(
+    postgres_context, monkeypatch, underfunded,
+):
+    """Disposable PostgreSQL: direct media failure cannot certify missing quota.
+
+    Sidecar fails after the initial reservation commit. A separate connection
+    injects an inconsistent tenant counter before compensation. This only
+    proves a FAKE-only fail-closed guard, not durable signed reconciliation.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE direct media quota guard"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    uploaded_bytes = b"fake-only-direct-media-evidence"
+    adapter = app.state.video_use
+    original_upload = adapter.upload_media
+    calls = []
+
+    def failed_probe(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        calls.append(result["mediaId"])
+        with sessions() as db:
+            tenant = db.query(DBTenant).one()
+            assert tenant.used_storage_bytes == len(uploaded_bytes)
+            if underfunded:
+                tenant.used_storage_bytes = 0
+                db.commit()
+        return {**result, "metadata": []}
+
+    monkeypatch.setattr(adapter, "upload_media", failed_probe)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", uploaded_bytes, "video/mp4")},
+    )
+    assert response.status_code == (409 if underfunded else 422), response.text
+    assert response.json()["detail"]["code"] == (
+        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+        if underfunded else "MEDIA_PROBE_INVALID"
+    )
+    assert len(calls) == 1
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == 0
+        assert db.query(DBAssetVersion).count() == 0
+        project_row = db.get(DBProject, project["id"])
+        assert project_row.revision == project["revision"]
+        assert project_row.materials == []
+    app.state.moneyprinter.assert_not_called()

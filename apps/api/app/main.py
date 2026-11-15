@@ -4806,7 +4806,25 @@ def create_app(
             db.refresh(asset_version)
         except Exception as exc:
             db.rollback()
-            db.execute(update(DBTenant).where(DBTenant.id == context.tenant_id).values(used_storage_bytes=case((DBTenant.used_storage_bytes >= upload_size, DBTenant.used_storage_bytes - upload_size), else_=0)))
+            compensation = db.execute(
+                update(DBTenant)
+                .where(
+                    DBTenant.id == context.tenant_id,
+                    DBTenant.used_storage_bytes >= upload_size,
+                )
+                .values(used_storage_bytes=DBTenant.used_storage_bytes - upload_size)
+            )
+            if compensation.rowcount != 1:
+                # Never certify a refund when the reserved bytes are missing.
+                # Preserve the inconsistent counter for trusted reconciliation.
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "存储预留与额度不一致，需要人工核对",
+                    },
+                ) from exc
             db.commit()
             if isinstance(exc, VideoUseError):
                 logger.exception("video-use media upload failed")
