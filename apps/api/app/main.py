@@ -4732,6 +4732,20 @@ def create_app(
             probed_size_bytes = metadata.get("sizeBytes")
             if type(probed_size_bytes) is not int or probed_size_bytes <= 0:
                 raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的字节数无效"})
+            # G70/G71: the storage debit is based on the exact uploaded bytes.
+            # A different Sidecar probe size cannot be committed as the asset's
+            # size; otherwise one tenant can retain unaccounted storage or be
+            # charged for bytes that were not uploaded. Keep the existing guarded
+            # rollback/refund path; remote orphan cleanup is still a separate
+            # trusted-reconciliation gate, not proven by this metadata fence.
+            if probed_size_bytes != upload_size:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "MEDIA_PROBE_SIZE_MISMATCH",
+                        "message": "媒体服务返回的字节数与原始上传不一致，禁止登记资产",
+                    },
+                )
             raw_duration = metadata.get("durationSeconds")
             if raw_duration is not None and (
                 type(raw_duration) not in (int, float)
