@@ -836,5 +836,5 @@ jobs:
 
       - name: Prove G76 PostgreSQL lease, circuit, and Owner-cancel lock invariants (FAKE-only)
         run: |
-          python -m pytest apps/api/test_g76_postgres_concurrency.py -v
+          python -m pytest apps/api/test_g76_postgres_concurrency.py apps/api/test_g70_g71_direct_media_sigkill.py -v
           AETHER_POSTGRES_TEST_DATABASE_URL="$AETHER_TEST_POSTGRES_URL" python -m pytest apps/api/test_generation_tasks.py -k "g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel" -v
