@@ -4815,6 +4815,58 @@ def test_g70_g71_postgres_negative_storage_counter_blocks_direct_media_reservati
         assert stored_project.materials == []
     app.state.moneyprinter.assert_not_called()
 
+@pytest.mark.parametrize("commit_is_durable", [False, True])
+def test_g70_g71_postgres_direct_media_uncertain_quota_commit_stops_before_sidecar(
+    postgres_context, monkeypatch, commit_is_durable,
+):
+    """FAKE-only PostgreSQL: a lost reservation-COMMIT acknowledgement must
+    not trigger Sidecar or a guessed quota refund.
+
+    A pre-COMMIT error leaves no durable debit; a post-COMMIT lost ACK
+    retains the durable debit, both with reconciliation-required 409.
+    This is not a trusted orphan receipt or durable human recovery ACK.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE ambiguous reservation commit"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"fake-only-direct-media-uncertain-reservation"
+    original_commit = Session.commit
+    commit_calls = [0]
+
+    def lost_reservation_ack(db, *args, **kwargs):
+        commit_calls[0] += 1
+        if commit_calls[0] == 1:
+            if commit_is_durable:
+                original_commit(db, *args, **kwargs)
+            raise RuntimeError("FAKE quota reservation COMMIT acknowledgement lost")
+        return original_commit(db, *args, **kwargs)
+
+    sidecar_upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(Session, "commit", lost_reservation_ack)
+    monkeypatch.setattr(app.state.video_use, "upload_media", sidecar_upload)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == (
+        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    )
+    assert commit_calls[0] == 1
+    sidecar_upload.assert_not_called()
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == (
+            len(payload) if commit_is_durable else 0
+        )
+        assert db.query(DBAssetVersion).count() == 0
+        stored_project = db.get(DBProject, project["id"])
+        assert stored_project.revision == project["revision"]
+        assert stored_project.materials == []
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("failure_stage", ["postcommit_ack_lost", "postcommit_refresh_lost"])
 def test_g70_g71_postgres_direct_media_uncertain_asset_commit_keeps_storage_hold(
     postgres_context, monkeypatch, failure_stage,
