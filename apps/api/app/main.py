@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import uuid
 from collections.abc import Callable, Generator
 from contextlib import asynccontextmanager, contextmanager
@@ -4771,7 +4772,24 @@ def create_app(
                 media_type = "image"
             else:
                 media_type = "video" if metadata.get("video") else "audio"
-            media_id = uploaded["mediaId"]
+            # Sidecar upload replies are not tenant-authority evidence. Before
+            # adding a durable asset/material, require the returned project
+            # identity to match the authenticated tenant-scoped project and
+            # constrain mediaId to the Sidecar's safe path-identifier contract.
+            # A syntactically valid reply is NOT an independently signed receipt.
+            media_id = uploaded.get("mediaId")
+            if (
+                uploaded.get("projectId") != project_id
+                or type(media_id) is not str
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", media_id) is None
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "MEDIA_PROBE_IDENTITY_MISMATCH",
+                        "message": "媒体服务返回的项目或媒体身份不可信，禁止登记资产",
+                    },
+                )
             fallback_content_type = {
                 ".png": "image/png",
                 ".jpg": "image/jpeg",

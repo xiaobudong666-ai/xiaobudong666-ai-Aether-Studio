@@ -4685,3 +4685,54 @@ def test_g70_g71_postgres_direct_media_rejects_probe_byte_drift(
         assert stored_project.revision == project["revision"]
         assert stored_project.materials == []
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", [
+    "foreign_project",
+    "missing_project",
+    "unsafe_media_id",
+    "nonscalar_media_id",
+])
+def test_g70_g71_postgres_direct_media_rejects_sidecar_identity_mismatch(
+    postgres_context, monkeypatch, mutation,
+):
+    """Native PostgreSQL: wrong-project or malformed FAKE Sidecar identity
+    cannot create an asset/material or consume a tenant storage reservation.
+
+    This does not assert a trusted Sidecar issuer, cleanup of remote orphan
+    media, or actual cross-tenant signed attribution.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE Sidecar identity binding"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"fake-only-sidecar-identity-binding"
+    adapter = app.state.video_use
+    original_upload = adapter.upload_media
+
+    def poisoned_identity(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        if mutation == "foreign_project":
+            return {**result, "projectId": str(uuid.uuid4())}
+        if mutation == "missing_project":
+            return {k: v for k, v in result.items() if k != "projectId"}
+        if mutation == "unsafe_media_id":
+            return {**result, "mediaId": "../foreign-media"}
+        return {**result, "mediaId": ["not-a-media-id"]}
+
+    monkeypatch.setattr(adapter, "upload_media", poisoned_identity)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "MEDIA_PROBE_IDENTITY_MISMATCH"
+
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == 0
+        assert db.query(DBAssetVersion).count() == 0
+        stored_project = db.get(DBProject, project["id"])
+        assert stored_project.revision == project["revision"]
+        assert stored_project.materials == []
+    app.state.moneyprinter.assert_not_called()
