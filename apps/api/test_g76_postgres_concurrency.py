@@ -31,6 +31,7 @@ from app.main import create_app
 from app.video_use_adapter import VideoUseError
 from app.models import (
     DBAssetVersion,
+    DBDirectMediaUploadHold,
     DBGenerationAttempt,
     DBGenerationCircuitState,
     DBGenerationEvent,
@@ -5165,4 +5166,90 @@ def test_g70_g71_postgres_direct_media_stored_sha_readback_fail_closed(
         saved = db.get(DBProject, project["id"])
         assert saved.revision == project["revision"]
         assert saved.materials == []
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("remote_write_completed", [False, True])
+def test_g70_g71_postgres_crash_durable_direct_media_hold_blocks_retransmission(
+    postgres_context, monkeypatch, remote_write_completed,
+):
+    """Native PG FAKE-only: a prior UNKNOWN survives beyond the request lock.
+
+    Replaying the *same normal upload* against the unchanged project revision
+    must not reserve additional quota or dispatch to Sidecar a second time.
+    This only proves a durable fail-closed fence, not a trusted orphan recovery
+    proof, manual ACK, auto refund, or real SIGKILL sidecar settlement.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE durable direct media hold"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"g70-g71-fake-durable-direct-media-unknown-retry"
+    adapter = app.state.video_use
+    original_upload = adapter.upload_media
+    calls = []
+
+    def uncertain_upload(*args, **kwargs):
+        calls.append(1)
+        if remote_write_completed:
+            original_upload(*args, **kwargs)
+        raise VideoUseError("FAKE transport ACK lost after dispatch")
+
+    monkeypatch.setattr(adapter, "upload_media", uncertain_upload)
+    request = lambda: client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    first = request()
+    assert first.status_code == 409, first.text
+    assert first.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    # The first session has returned and released its PG advisory lock.
+    second = request()
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert len(calls) == 1, "unreconciled second request must never reach Sidecar"
+    with sessions() as db:
+        tenant = db.query(DBTenant).one()
+        assert tenant.used_storage_bytes == len(payload)
+        holds = db.execute(select(DBDirectMediaUploadHold).where(
+            DBDirectMediaUploadHold.project_id == project["id"],
+        )).scalars().all()
+        assert len(holds) == 1
+        assert holds[0].state == "HELD"
+        assert holds[0].source_sha256 == hashlib.sha256(payload).hexdigest()
+        assert holds[0].size_bytes == len(payload)
+        assert holds[0].media_id is None
+        assert db.query(DBAssetVersion).count() == 0
+        saved = db.get(DBProject, project["id"])
+        assert saved.revision == project["revision"]
+        assert saved.materials == []
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_direct_media_success_settles_durable_hold_atomically(
+    postgres_context,
+):
+    """FAKE-only real PG: normal media commit must settle its original hold."""
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE direct hold settled"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"g70-g71-fake-atomic-successful-media-hold"
+    result = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert result.status_code == 201, result.text
+    with sessions() as db:
+        holds = db.execute(select(DBDirectMediaUploadHold).where(
+            DBDirectMediaUploadHold.project_id == project["id"],
+        )).scalars().all()
+        assert len(holds) == 1
+        assert holds[0].state == "SETTLED"
+        assert holds[0].media_id == result.json()["assetVersion"]["mediaId"]
+        assert holds[0].source_sha256 == hashlib.sha256(payload).hexdigest()
+        assert db.query(DBTenant).one().used_storage_bytes == len(payload)
+        assert db.query(DBAssetVersion).count() == 1
     app.state.moneyprinter.assert_not_called()
