@@ -4592,11 +4592,11 @@ engine.dispose()
 def test_g70_g71_postgres_project_media_refund_never_clamps_underfunded_counter(
     postgres_context, monkeypatch, underfunded,
 ):
-    """Disposable PostgreSQL: direct media failure cannot certify missing quota.
+    """FAKE PostgreSQL: malformed Sidecar replies cannot justify refunds.
 
-    Sidecar fails after the initial reservation commit. A separate connection
-    injects an inconsistent tenant counter before compensation. This only
-    proves a FAKE-only fail-closed guard, not durable signed reconciliation.
+    Remote bytes were written before the invalid probe was returned. Preserve
+    the reservation even when it conflicts with an out-of-band damaged counter.
+    This does not prove actual remote deletion or trusted reconciliation.
     """
     client, sessions, app = postgres_context
     created = client.post("/projects", json={"name": "FAKE direct media quota guard"})
@@ -4624,14 +4624,11 @@ def test_g70_g71_postgres_project_media_refund_never_clamps_underfunded_counter(
         data={"expectedRevision": str(project["revision"])},
         files={"file": ("synthetic.mp4", uploaded_bytes, "video/mp4")},
     )
-    assert response.status_code == (409 if underfunded else 422), response.text
-    assert response.json()["detail"]["code"] == (
-        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
-        if underfunded else "MEDIA_PROBE_INVALID"
-    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     assert len(calls) == 1
     with sessions() as db:
-        assert db.query(DBTenant).one().used_storage_bytes == 0
+        assert db.query(DBTenant).one().used_storage_bytes == (0 if underfunded else len(uploaded_bytes))
         assert db.query(DBAssetVersion).count() == 0
         project_row = db.get(DBProject, project["id"])
         assert project_row.revision == project["revision"]
@@ -4675,11 +4672,11 @@ def test_g70_g71_postgres_direct_media_rejects_probe_byte_drift(
         data={"expectedRevision": str(project["revision"])},
         files={"file": ("synthetic.mp4", payload, "video/mp4")},
     )
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"]["code"] == "MEDIA_PROBE_SIZE_MISMATCH"
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
 
     with sessions() as db:
-        assert db.query(DBTenant).one().used_storage_bytes == 0
+        assert db.query(DBTenant).one().used_storage_bytes == len(payload)
         assert db.query(DBAssetVersion).count() == 0
         stored_project = db.get(DBProject, project["id"])
         assert stored_project.revision == project["revision"]
@@ -4726,11 +4723,11 @@ def test_g70_g71_postgres_direct_media_rejects_sidecar_identity_mismatch(
         data={"expectedRevision": str(project["revision"])},
         files={"file": ("synthetic.mp4", payload, "video/mp4")},
     )
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"]["code"] == "MEDIA_PROBE_IDENTITY_MISMATCH"
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
 
     with sessions() as db:
-        assert db.query(DBTenant).one().used_storage_bytes == 0
+        assert db.query(DBTenant).one().used_storage_bytes == len(payload)
         assert db.query(DBAssetVersion).count() == 0
         stored_project = db.get(DBProject, project["id"])
         assert stored_project.revision == project["revision"]
@@ -4976,6 +4973,50 @@ def test_g70_g71_postgres_direct_media_ambiguous_sidecar_failure_retains_hold(
         "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     )
     assert len(remote_receipts) == int(sidecar_wrote_bytes)
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == len(payload)
+        assert db.query(DBAssetVersion).count() == 0
+        stored_project = db.get(DBProject, project["id"])
+        assert stored_project.revision == project["revision"]
+        assert stored_project.materials == []
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("remote_write_completed", [False, True])
+def test_g70_g71_postgres_direct_media_generic_sidecar_exception_retains_hold(
+    postgres_context, monkeypatch, remote_write_completed,
+):
+    """FAKE-only: non-VideoUseError after dispatch is not non-write proof.
+
+    The Sidecar can write a durable remote object before a generic exception.
+    No quota refund, asset commit, Provider call or automated retry may follow.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE generic lost Sidecar ACK"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"fake-sidecar-nonguaranteed-write-before-runtime-error"
+    adapter = app.state.video_use
+    original_upload = adapter.upload_media
+    remote_receipts = []
+    dispatches = []
+
+    def fail_with_generic_exception(*args, **kwargs):
+        dispatches.append(1)
+        if remote_write_completed:
+            remote_receipts.append(original_upload(*args, **kwargs))
+        raise RuntimeError("FAKE Sidecar outcome uncertain after dispatch")
+
+    monkeypatch.setattr(adapter, "upload_media", fail_with_generic_exception)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert len(dispatches) == 1
+    assert len(remote_receipts) == int(remote_write_completed)
     with sessions() as db:
         assert db.query(DBTenant).one().used_storage_bytes == len(payload)
         assert db.query(DBAssetVersion).count() == 0
