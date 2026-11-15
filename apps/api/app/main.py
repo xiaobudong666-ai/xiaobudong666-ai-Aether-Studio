@@ -55,6 +55,7 @@ from .migrations import ensure_schema
 from .models import (
     DBAdoption,
     DBAssetVersion,
+    DBDirectMediaUploadHold,
     DBCandidate,
     DBGenerationAttempt,
     DBGenerationCircuitState,
@@ -4729,6 +4730,28 @@ def create_app(
             project = project_for_tenant(db, project_id, context)
             if project.revision != expectedRevision:
                 raise HTTPException(status_code=409, detail={"code": "CONCURRENCY_CONFLICT", "message": "项目版本冲突，请重新载入后再操作"})
+            # G70/G71: an uncertain prior Sidecar dispatch can outlive this
+            # process and its session advisory lock. A durable HELD record
+            # fences retransmission before a second quota debit or dispatch.
+            # No automatic release or replay is authorized by this record.
+            unresolved_hold_id = db.execute(
+                select(DBDirectMediaUploadHold.id)
+                .where(
+                    DBDirectMediaUploadHold.tenant_id == context.tenant_id,
+                    DBDirectMediaUploadHold.project_id == project_id,
+                    DBDirectMediaUploadHold.state == "HELD",
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if unresolved_hold_id is not None:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "此前媒体占额结果待可信核对，禁止重复上传或重新占额",
+                    },
+                )
             file.file.seek(0, os.SEEK_END)
             upload_size = file.file.tell()
             file.file.seek(0)
@@ -4764,6 +4787,23 @@ def create_app(
                         },
                     )
                 raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
+            # Quota UPDATE and durable hold receipt must commit atomically:
+            # after SIGKILL a new process can see HELD before re-dispatch.
+            now_hold = utc_now()
+            direct_media_hold = DBDirectMediaUploadHold(
+                id=str(uuid.uuid4()),
+                tenant_id=context.tenant_id,
+                project_id=project_id,
+                requested_by=context.user_id,
+                project_revision=expectedRevision,
+                source_sha256=digest.hexdigest(),
+                size_bytes=upload_size,
+                state="HELD",
+                media_id=None,
+                created_at=now_hold,
+                updated_at=now_hold,
+            )
+            db.add(direct_media_hold)
             try:
                 db.commit()
             except Exception as exc:
@@ -4921,6 +4961,12 @@ def create_app(
                     created_at=utc_now(),
                 )
                 db.add(asset_version)
+                # The same asset COMMIT transitions the matching durable hold.
+                # A lost COMMIT ACK may mean either HELD or SETTLED; both
+                # outcomes must be read back, never guessed or refunded.
+                direct_media_hold.state = "SETTLED"
+                direct_media_hold.media_id = media_id
+                direct_media_hold.updated_at = utc_now()
                 asset_commit_attempted = True
                 db.commit()
                 db.refresh(asset_version)
