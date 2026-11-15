@@ -4636,6 +4636,75 @@ def test_g70_g71_postgres_project_media_refund_never_clamps_underfunded_counter(
     app.state.moneyprinter.assert_not_called()
 
 
+def test_g70_g71_postgres_same_project_direct_media_overlap_is_fenced(
+    postgres_context, monkeypatch,
+):
+    """FAKE-only real PostgreSQL: serialize concurrent direct media by project.
+
+    The first request commits its quota hold before entering a paused fake
+    Sidecar. The second request has the *same* expected revision; it must be
+    rejected before quota or any second remote upload, even though the row
+    lock from the first reservation transaction was already released. This
+    only closes the concurrent in-flight window, not post-crash reconciliation.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE direct media PG liveness"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"fake-only-concurrent-direct-media-content"
+    store = app.state.video_use
+    original_upload = store.upload_media
+    entered, resume = Event(), Event()
+    calls = []
+
+    def paused_upload(*args, **kwargs):
+        calls.append(args[0])
+        entered.set()
+        assert resume.wait(timeout=20), "FAKE Sidecar must be resumed by test"
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(store, "upload_media", paused_upload)
+
+    def post_media():
+        return client.post(
+            f"/projects/{project['id']}/media",
+            data={"expectedRevision": str(project["revision"])},
+            files={"file": ("synthetic.mp4", payload, "video/mp4")},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(post_media)
+        try:
+            assert entered.wait(timeout=15), "first request did not reach fake Sidecar"
+            started = time.monotonic()
+            blocked = post_media()
+            assert blocked.status_code == 503, blocked.text
+            assert blocked.json()["detail"]["code"] == "STORAGE_HOLD_LOCK_CONTENDED"
+            assert time.monotonic() - started < 10
+            assert calls == [project["id"]], "contended request reached remote Sidecar"
+            with sessions() as db:
+                assert db.query(DBTenant).one().used_storage_bytes == len(payload)
+                assert db.query(DBAssetVersion).count() == 0
+                assert db.get(DBProject, project["id"]).revision == project["revision"]
+        finally:
+            resume.set()
+        completed = first.result(timeout=20)
+
+    assert completed.status_code == 201, completed.text
+    assert calls == [project["id"]]
+    stale = post_media()
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "CONCURRENCY_CONFLICT"
+    assert calls == [project["id"]]
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == len(payload)
+        assert db.query(DBAssetVersion).count() == 1
+        saved = db.get(DBProject, project["id"])
+        assert saved.revision == project["revision"] + 1
+        assert len(saved.materials) == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("probe_delta", [-1, 1])
 def test_g70_g71_postgres_direct_media_rejects_probe_byte_drift(
     postgres_context, monkeypatch, probe_delta,
