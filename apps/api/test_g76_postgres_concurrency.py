@@ -4637,3 +4637,51 @@ def test_g70_g71_postgres_project_media_refund_never_clamps_underfunded_counter(
         assert project_row.revision == project["revision"]
         assert project_row.materials == []
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("probe_delta", [-1, 1])
+def test_g70_g71_postgres_direct_media_rejects_probe_byte_drift(
+    postgres_context, monkeypatch, probe_delta,
+):
+    """FAKE Sidecar byte-probe drift must not create an unaccounted asset.
+
+    The API reserves the original upload byte count. Sidecar's returned
+    media size is a distinct untrusted observation; a different size
+    must not become the durable AssetVersion/material size. This test
+    does not prove remote orphan cleanup or trusted quota reconciliation.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE probe-byte binding"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"fake-only-sidecar-probe-size-binding"
+    adapter = app.state.video_use
+    original_upload = adapter.upload_media
+
+    def drift_probe(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        assert result["metadata"]["sizeBytes"] == len(payload)
+        return {
+            **result,
+            "metadata": {
+                **result["metadata"],
+                "sizeBytes": len(payload) + probe_delta,
+            },
+        }
+
+    monkeypatch.setattr(adapter, "upload_media", drift_probe)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "MEDIA_PROBE_SIZE_MISMATCH"
+
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == 0
+        assert db.query(DBAssetVersion).count() == 0
+        stored_project = db.get(DBProject, project["id"])
+        assert stored_project.revision == project["revision"]
+        assert stored_project.materials == []
+    app.state.moneyprinter.assert_not_called()
