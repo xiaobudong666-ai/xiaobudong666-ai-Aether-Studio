@@ -4814,3 +4814,68 @@ def test_g70_g71_postgres_negative_storage_counter_blocks_direct_media_reservati
         assert stored_project.revision == project["revision"]
         assert stored_project.materials == []
     app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize("failure_stage", ["postcommit_ack_lost", "postcommit_refresh_lost"])
+def test_g70_g71_postgres_direct_media_uncertain_asset_commit_keeps_storage_hold(
+    postgres_context, monkeypatch, failure_stage,
+):
+    """FAKE-only PostgreSQL: never refund an asset whose COMMIT may be durable.
+
+    A successful DB COMMIT may lose its acknowledgement or the subsequent
+    refresh may fail. The old generic exception handler refunded the quota
+    even though the asset/material had already committed. The safe response
+    is reconciliation-required 409 while retaining the storage debit.
+    This is NOT remote Sidecar cleanup, signed proof, or human recovery ACK.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE ambiguous asset commit"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"fake-direct-media-commit-unknown-boundary"
+    original_commit = Session.commit
+    original_refresh = Session.refresh
+
+    if failure_stage == "postcommit_ack_lost":
+        def lost_commit_ack(db, *args, **kwargs):
+            committing_asset = any(
+                isinstance(obj, DBAssetVersion) for obj in db.new
+            )
+            result = original_commit(db, *args, **kwargs)
+            if committing_asset:
+                raise RuntimeError("FAKE lost asset COMMIT acknowledgement")
+            return result
+
+        monkeypatch.setattr(Session, "commit", lost_commit_ack)
+    else:
+        def lost_refresh(db, instance, *args, **kwargs):
+            if isinstance(instance, DBAssetVersion):
+                raise RuntimeError("FAKE post-COMMIT asset readback failure")
+            return original_refresh(db, instance, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "refresh", lost_refresh)
+
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == (
+        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    )
+    with sessions() as db:
+        tenant = db.query(DBTenant).one()
+        assert tenant.used_storage_bytes == len(payload), (
+            "Post-COMMIT failure must not refund the persisted asset"
+        )
+        assets = db.execute(select(DBAssetVersion).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalars().all()
+        assert len(assets) == 1
+        assert assets[0].size_bytes == len(payload)
+        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
+        stored_project = db.get(DBProject, project["id"])
+        assert stored_project.revision == project["revision"] + 1
+        assert len(stored_project.materials) == 1
+        assert stored_project.materials[0]["id"] == assets[0].media_id
+    app.state.moneyprinter.assert_not_called()
