@@ -23,11 +23,11 @@ from test_g76_postgres_concurrency import postgres_context, OWNER_PASSWORD
 
 
 # Test imports postgres_context as a fixture from the existing isolated PG suite.
-@pytest.mark.parametrize("crash_phase", ["during_upload", "after_upload_ack"])
+@pytest.mark.parametrize("crash_phase", ["before_object_write", "during_upload", "after_upload_ack"])
 def test_g70_g71_direct_media_actual_api_sigkill_then_new_process_replay_is_fenced(
     postgres_context, crash_phase,
 ):
-    """Crash after quota COMMIT, during upload OR after FAKE Sidecar upload ACK.
+    """Crash after quota COMMIT, before object write, during upload, or after FAKE Sidecar ACK.
 
     A different fresh interpreter replays the normal authenticated media POST.
     The after-upload-ACK case blocks during the subsequent stored SHA inspection,
@@ -52,8 +52,8 @@ def test_g70_g71_direct_media_actual_api_sigkill_then_new_process_replay_is_fenc
         )).scalars().all() == []
 
     # A child creates its *own* API, auth session and database engine.
-    # CRASH mode leaves the real HTTP request blocked after the Sidecar
-    # has written FAKE bytes, then the parent issues actual OS SIGKILL.
+    # CRASH mode leaves the real HTTP request blocked before or after
+    # FAKE Sidecar object creation; parent then issues actual OS SIGKILL.
     # REPLAY mode restarts a new API and checks the unchanged revision.
     child_script = r"""
 import io
@@ -72,6 +72,12 @@ class CrashOrRejectFakeSidecar(FakeMediaStore):
         if os.environ["AETHER_TEST_MEDIA_STAGE"] == "REPLAY":
             Path(os.environ["AETHER_TEST_DISPATCH_MARKER"]).write_text("unexpected dispatch")
             raise AssertionError("unreconciled upload reached Sidecar twice")
+        if os.environ["AETHER_TEST_CRASH_PHASE"] == "before_object_write":
+            # API durable quota+HELD commit is already complete, but the
+            # FAKE Sidecar has not written an object. Stay fail-closed.
+            Path(os.environ["AETHER_TEST_MEDIA_READY"]).write_text("sidecar-entered-prewrite")
+            while True:
+                time.sleep(0.1)
         blob = stream.read()
         Path(os.environ["AETHER_TEST_MEDIA_OBJECT"]).write_bytes(blob)
         if os.environ["AETHER_TEST_CRASH_PHASE"] == "during_upload":
@@ -164,11 +170,15 @@ engine.dispose()
                 _, err = crash.communicate(timeout=5)
                 pytest.fail("first API process exited before quota/remote write: " + err[-1500:])
             assert crash.poll() is None
-            assert media.read_bytes() == payload
-            assert ready.read_text() == (
-                "upload-acked-inspection" if crash_phase == "after_upload_ack"
-                else "sidecar-write-before-ack"
-            )
+            if crash_phase == "before_object_write":
+                assert not media.exists(), "pre-write crash must not fabricate a FAKE remote object"
+            else:
+                assert media.read_bytes() == payload
+            assert ready.read_text() == {
+                "before_object_write": "sidecar-entered-prewrite",
+                "during_upload": "sidecar-write-before-ack",
+                "after_upload_ack": "upload-acked-inspection",
+            }[crash_phase]
             os.kill(crash.pid, signal.SIGKILL)
             assert crash.wait(timeout=10) == -signal.SIGKILL
         finally:
@@ -243,7 +253,10 @@ engine.dispose()
         assert result["status"] == 409, result
         assert result["detail"]["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED", result
         assert not unexpected_dispatch.exists(), "replay made a second FAKE Sidecar upload"
-        assert media.read_bytes() == payload
+        if crash_phase == "before_object_write":
+            assert not media.exists(), "replay must not create the object while HELD is unresolved"
+        else:
+            assert media.read_bytes() == payload
 
         with sessions() as db:
             assert db.get(DBTenant, tenant_id).used_storage_bytes == (
