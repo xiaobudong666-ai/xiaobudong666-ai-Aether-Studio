@@ -691,7 +691,8 @@ def test_g76_postgres_additive_migration_is_idempotent_and_preserves_legacy_rows
 
         connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
 
-def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_context, monkeypatch):
+@pytest.mark.parametrize("corrupt_quota_counter", [False, True])
+def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_context, monkeypatch, corrupt_quota_counter):
     """A real disposable PostgreSQL transaction executes the upload-failure CASE compensation."""
     client, sessions, app = postgres_context
     task_id = _create_task(client)
@@ -732,7 +733,18 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
     )
     assert ingesting.status_code == 200, ingesting.text
 
+    failure_payload = b"g72-postgres-failure-bytes"
+
     def fail_upload(*_args, **_kwargs):
+        if corrupt_quota_counter:
+            # The API already durably reserved the payload. Simulate
+            # independent ledger corruption before its compensation path.
+            with sessions() as independent:
+                tenant = independent.get(DBTenant, tenant_id)
+                assert tenant is not None
+                assert tenant.used_storage_bytes == len(failure_payload)
+                tenant.used_storage_bytes = 0
+                independent.commit()
         raise VideoUseError("synthetic PostgreSQL sidecar upload failure")
 
     monkeypatch.setattr(app.state.video_use, "upload_media", fail_upload)
@@ -740,16 +752,20 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
         f"/internal/generation-tasks/{task_id}/artifact-intake",
         headers=worker_headers,
         data={"providerArtifactId": artifact_id},
-        files={"file": ("synthetic.mp4", b"g72-postgres-failure-bytes", "video/mp4")},
+        files={"file": ("synthetic.mp4", failure_payload, "video/mp4")}, 
     )
-    assert response.status_code == 502, response.text
-    assert response.json()["detail"]["code"] == "ARTIFACT_STORE_FAILED"
+    assert response.status_code == (409 if corrupt_quota_counter else 502), response.text
+    assert response.json()["detail"]["code"] == (
+        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+        if corrupt_quota_counter else "ARTIFACT_STORE_FAILED"
+    )
 
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
         tenant = db.get(DBTenant, tenant_id)
-        assert stored.status == "FAILED"
-        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.status == ("INGESTING" if corrupt_quota_counter else "FAILED")
+        if not corrupt_quota_counter:
+            assert stored.error_code == "ARTIFACT_INGEST_FAILED"
         assert tenant.used_storage_bytes == 0
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
@@ -758,11 +774,22 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one() == 1
+        )).scalar_one() == (0 if corrupt_quota_counter else 1)
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.reconciliation_state == "HELD"
+        if not corrupt_quota_counter:
+            assert attempt.reconciliation_state == "HELD"
+        else:
+            # No release receipt or failure event may certify an underfunded refund.
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+            )).scalar_one() == 1
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+            )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
