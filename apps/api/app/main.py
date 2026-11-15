@@ -4750,7 +4750,20 @@ def create_app(
                     },
                 )
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
-        db.commit()
+        try:
+            db.commit()
+        except Exception as exc:
+            # The quota UPDATE may already be durable when the COMMIT
+            # acknowledgement is lost. Never issue a speculative refund or
+            # call the Sidecar until the original hold is reconciled.
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                    "message": "媒体存储预留提交结果不明确，须人工核对额度后再重试",
+                },
+            ) from exc
         # Once the asset transaction COMMIT is attempted, its outcome can be
         # uncertain (e.g. lost acknowledgement or failed post-commit refresh).
         # The reservation is already durable; never refund it blindly.
