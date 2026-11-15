@@ -4900,6 +4900,21 @@ def create_app(
                         "message": "媒体资产提交结果不明确，须人工核对产物和额度，禁止自动退回预留",
                     },
                 ) from exc
+            if isinstance(exc, VideoUseError):
+                # A Sidecar transport error is NOT proof that remote bytes were
+                # never committed (for example, an ACK can be lost after write).
+                # Keep the already-durable quota hold for Owner reconciliation;
+                # a speculative refund here can undercount an orphaned object.
+                # This is not an independently signed orphan receipt or a
+                # durable human recovery ACK. Do not auto-retry this upload.
+                logger.exception("video-use media upload outcome uncertain")
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "媒体服务上传结果不明确，预留额度保持待核对，禁止自动重试",
+                    },
+                ) from exc
             compensation = db.execute(
                 update(DBTenant)
                 .where(
@@ -4920,9 +4935,6 @@ def create_app(
                     },
                 ) from exc
             db.commit()
-            if isinstance(exc, VideoUseError):
-                logger.exception("video-use media upload failed")
-                raise HTTPException(status_code=502, detail={"code": "VIDEO_USE_UPLOAD_FAILED", "message": "视频处理服务未能完成媒体上传"}) from exc
             raise
         finally:
             file.file.close()
