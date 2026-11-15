@@ -4736,3 +4736,81 @@ def test_g70_g71_postgres_direct_media_rejects_sidecar_identity_mismatch(
         assert stored_project.revision == project["revision"]
         assert stored_project.materials == []
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_negative_storage_counter_blocks_artifact_reservation(
+    postgres_context, monkeypatch,
+):
+    """Native PostgreSQL FAKE-only: an invalid negative balance is not quota.
+
+    Before the counter guard, the atomic reservation accepted negative used
+    bytes and could call Sidecar, creating an asset against corrupt accounting.
+    This is a fail-closed subgate, not trusted orphan reconciliation.
+    """
+    client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(client)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        tenant_id, project_id = task.tenant_id, task.project_id
+        tenant = db.get(DBTenant, tenant_id)
+        assert tenant is not None
+        tenant.used_storage_bytes = -7
+        db.commit()
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+
+    sidecar_upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(app.state.video_use, "upload_media", sidecar_upload)
+    denied = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers=headers,
+        data={"providerArtifactId": artifact_id},
+        files={"file": ("synthetic.mp4", b"fake-negative-quota-artifact", "video/mp4")},
+    )
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    sidecar_upload.assert_not_called()
+    with sessions() as db:
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == -7
+        assert db.get(DBGenerationTask, task_id).asset_version_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_negative_storage_counter_blocks_direct_media_reservation(
+    postgres_context, monkeypatch,
+):
+    """Native PostgreSQL FAKE-only: direct media cannot debit corrupt quota."""
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE negative direct-media quota"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    with sessions() as db:
+        tenant = db.query(DBTenant).one()
+        tenant.used_storage_bytes = -11
+        db.commit()
+
+    sidecar_upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(app.state.video_use, "upload_media", sidecar_upload)
+    denied = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", b"fake-negative-quota-direct", "video/mp4")},
+    )
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    sidecar_upload.assert_not_called()
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == -11
+        assert db.query(DBAssetVersion).count() == 0
+        stored_project = db.get(DBProject, project["id"])
+        assert stored_project.revision == project["revision"]
+        assert stored_project.materials == []
+    app.state.moneyprinter.assert_not_called()
