@@ -3952,11 +3952,27 @@ def create_app(
                 )
             reservation = db.execute(
                 update(DBTenant)
-                .where(DBTenant.id == task_tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
+                .where(
+                    DBTenant.id == task_tenant_id,
+                    DBTenant.used_storage_bytes >= 0,
+                    DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes,
+                )
                 .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=now)
             )
             if reservation.rowcount != 1:
+                # A negative counter is corrupt evidence, not spare capacity.
+                stored_bytes = db.execute(
+                    select(DBTenant.used_storage_bytes).where(DBTenant.id == task_tenant_id)
+                ).scalar_one_or_none()
                 db.rollback()
+                if stored_bytes is not None and stored_bytes < 0:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "message": "存储计数器异常，须人工对账后才能重新占额",
+                        },
+                    )
                 raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
             opened_attempt = current_generation_attempt(db, task)
             db.add(DBGenerationEvent(
@@ -4712,11 +4728,27 @@ def create_app(
         file.file.seek(0)
         reservation = db.execute(
             update(DBTenant)
-            .where(DBTenant.id == context.tenant_id, DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes)
+            .where(
+                DBTenant.id == context.tenant_id,
+                DBTenant.used_storage_bytes >= 0,
+                DBTenant.used_storage_bytes + upload_size <= DBTenant.storage_quota_bytes,
+            )
             .values(used_storage_bytes=DBTenant.used_storage_bytes + upload_size, updated_at=utc_now())
         )
         if reservation.rowcount != 1:
+            # A negative counter is corrupt evidence, not spare capacity.
+            stored_bytes = db.execute(
+                select(DBTenant.used_storage_bytes).where(DBTenant.id == context.tenant_id)
+            ).scalar_one_or_none()
             db.rollback()
+            if stored_bytes is not None and stored_bytes < 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "存储计数器异常，须人工对账后才能重新占额",
+                    },
+                )
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
         try:
