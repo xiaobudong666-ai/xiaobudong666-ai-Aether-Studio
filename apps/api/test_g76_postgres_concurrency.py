@@ -692,8 +692,10 @@ def test_g76_postgres_additive_migration_is_idempotent_and_preserves_legacy_rows
         connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
 
 @pytest.mark.parametrize("corrupt_quota_counter", [False, True])
-def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_context, monkeypatch, corrupt_quota_counter):
-    """A real disposable PostgreSQL transaction executes the upload-failure CASE compensation."""
+def test_g72_postgres_artifact_upload_failure_compensates_storage_case(
+    postgres_context, monkeypatch, corrupt_quota_counter,
+):
+    """Native PostgreSQL: damaged quota counters must not certify a refund."""
     client, sessions, app = postgres_context
     task_id = _create_task(client)
     with sessions() as db:
@@ -752,7 +754,7 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(postgres_
         f"/internal/generation-tasks/{task_id}/artifact-intake",
         headers=worker_headers,
         data={"providerArtifactId": artifact_id},
-        files={"file": ("synthetic.mp4", failure_payload, "video/mp4")}, 
+        files={"file": ("synthetic.mp4", failure_payload, "video/mp4")},
     )
     assert response.status_code == (409 if corrupt_quota_counter else 502), response.text
     assert response.json()["detail"]["code"] == (
