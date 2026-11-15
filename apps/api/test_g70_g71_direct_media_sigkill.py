@@ -171,6 +171,39 @@ engine.dispose()
                 DBAssetVersion.project_id == project["id"]
             )).scalars().all() == []
 
+        # Project-scoped HELD must not freeze unrelated work in the SAME tenant.
+        # This is not an Owner-authorized reconciliation: the orphan stays HELD.
+        other_created = client.post(
+            "/projects", json={"name": "FAKE unrelated project during HELD"}
+        )
+        assert other_created.status_code == 201, other_created.text
+        other_project = other_created.json()
+        other_payload = b"g70-g71-unrelated-project-upload-while-first-hold-is-orphaned"
+        other_result = client.post(
+            f"/projects/{other_project['id']}/media",
+            data={"expectedRevision": str(other_project["revision"])},
+            files={"file": ("other-synthetic.mp4", other_payload, "video/mp4")},
+        )
+        assert other_result.status_code == 201, other_result.text
+        with sessions() as db:
+            original_hold = db.execute(select(DBDirectMediaUploadHold).where(
+                DBDirectMediaUploadHold.project_id == project["id"],
+            )).scalar_one()
+            other_hold = db.execute(select(DBDirectMediaUploadHold).where(
+                DBDirectMediaUploadHold.project_id == other_project["id"],
+            )).scalar_one()
+            assert original_hold.state == "HELD"
+            assert other_hold.state == "SETTLED"
+            assert original_hold.tenant_id == other_hold.tenant_id == tenant_id
+            assert db.get(DBTenant, tenant_id).used_storage_bytes == (
+                original_used + len(payload) + len(other_payload)
+            )
+            other_assets = db.execute(select(DBAssetVersion).where(
+                DBAssetVersion.project_id == other_project["id"],
+            )).scalars().all()
+            assert len(other_assets) == 1
+            assert other_assets[0].sha256 == hashlib.sha256(other_payload).hexdigest()
+
         # A genuinely new interpreter and API engine repeat the authenticated
         # normal HTTP request. The HELD receipt must fence dispatch *before*
         # quota mutation, even though the crashed process's PG lock is gone.
@@ -188,7 +221,9 @@ engine.dispose()
         assert media.read_bytes() == payload
 
         with sessions() as db:
-            assert db.get(DBTenant, tenant_id).used_storage_bytes == original_used + len(payload)
+            assert db.get(DBTenant, tenant_id).used_storage_bytes == (
+                original_used + len(payload) + len(other_payload)
+            )
             holds = db.execute(select(DBDirectMediaUploadHold).where(
                 DBDirectMediaUploadHold.project_id == project["id"]
             )).scalars().all()
