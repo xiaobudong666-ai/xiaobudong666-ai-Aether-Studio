@@ -854,10 +854,10 @@ def test_additive_migration_preserves_legacy_project_and_creates_typed_tables(tm
     ("durationSeconds", float("inf")),
     ("durationSeconds", {"seconds": 1}),
 ])
-def test_g70_g71_media_upload_rejects_untrusted_sidecar_probe_and_releases_hold(
+def test_g70_g71_media_upload_rejects_untrusted_sidecar_probe_and_retains_hold(
     api_context, monkeypatch, bad_field, bad_value,
 ):
-    """Malformed FAKE Sidecar evidence must not persist an asset or charge quota."""
+    """Malformed FAKE Sidecar evidence must not persist an asset or refund unknown remote bytes."""
     client, sessions = api_context
     project = create_project(client, "Strict Sidecar probe")
     adapter = client.app.state.video_use
@@ -876,13 +876,13 @@ def test_g70_g71_media_upload_rejects_untrusted_sidecar_probe_and_releases_hold(
         data={"expectedRevision": str(project["revision"])},
         files={"file": ("source.mp4", b"real-media-bytes", "video/mp4")},
     )
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"]["code"] == "MEDIA_PROBE_INVALID"
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     updated = client.get(f"/projects/{project['id']}").json()
     assert updated["revision"] == project["revision"]
     assert updated["materials"] == []
     with sessions() as db:
-        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes
+        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes + len(b"real-media-bytes")
         assert db.query(DBAssetVersion).count() == 0
 
 
@@ -890,7 +890,7 @@ def test_g70_g71_media_upload_rejects_untrusted_sidecar_probe_and_releases_hold(
 def test_g70_g71_media_upload_rejects_malformed_sidecar_response_without_asset(
     api_context, monkeypatch, bad_response,
 ):
-    """Reject an invalid Sidecar response root and compensate the upload hold."""
+    """Reject an invalid Sidecar response root without speculative quota refund."""
     client, sessions = api_context
     project = create_project(client, "Strict Sidecar response")
     adapter = client.app.state.video_use
@@ -903,11 +903,11 @@ def test_g70_g71_media_upload_rejects_malformed_sidecar_response_without_asset(
         data={"expectedRevision": str(project["revision"])},
         files={"file": ("source.mp4", b"real-media-bytes", "video/mp4")},
     )
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"]["code"] == "MEDIA_PROBE_INVALID"
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     updated = client.get(f"/projects/{project['id']}").json()
     assert updated["revision"] == project["revision"]
     assert updated["materials"] == []
     with sessions() as db:
-        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes
+        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes + len(b"real-media-bytes")
         assert db.query(DBAssetVersion).count() == 0
