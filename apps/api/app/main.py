@@ -4768,12 +4768,18 @@ def create_app(
         # uncertain (e.g. lost acknowledgement or failed post-commit refresh).
         # The reservation is already durable; never refund it blindly.
         asset_commit_attempted = False
+        sidecar_call_started = False
         try:
+            # Once invoked, the remote Sidecar may have committed bytes even if
+            # it returns malformed metadata or raises a non-VideoUseError.
+            # Never refund this quota hold without independent non-write proof.
+            sidecar_call_started = True
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
             # Video-use is an external process. Reject non-scalar or non-finite
             # probe evidence before persisting a project material or asset.
-            # Storage quota was reserved above and is compensated by the
-            # existing exception handler for this FAKE-only intake path.
+            # Storage quota was reserved above. After Sidecar dispatch,
+            # malformed/untrusted replies retain the quota hold for
+            # independent reconciliation, not speculative compensation.
             if not isinstance(uploaded, dict):
                 raise HTTPException(status_code=422, detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的产物结构无效"})
             metadata = uploaded.get("metadata")
@@ -4785,9 +4791,8 @@ def create_app(
             # G70/G71: the storage debit is based on the exact uploaded bytes.
             # A different Sidecar probe size cannot be committed as the asset's
             # size; otherwise one tenant can retain unaccounted storage or be
-            # charged for bytes that were not uploaded. Keep the existing guarded
-            # rollback/refund path; remote orphan cleanup is still a separate
-            # trusted-reconciliation gate, not proven by this metadata fence.
+            # charged for bytes that were not uploaded. Hold quota pending
+            # trusted remote-orphan reconciliation, not a guessed refund.
             if probed_size_bytes != upload_size:
                 raise HTTPException(
                     status_code=422,
@@ -4900,19 +4905,16 @@ def create_app(
                         "message": "媒体资产提交结果不明确，须人工核对产物和额度，禁止自动退回预留",
                     },
                 ) from exc
-            if isinstance(exc, VideoUseError):
-                # A Sidecar transport error is NOT proof that remote bytes were
-                # never committed (for example, an ACK can be lost after write).
-                # Keep the already-durable quota hold for Owner reconciliation;
-                # a speculative refund here can undercount an orphaned object.
-                # This is not an independently signed orphan receipt or a
-                # durable human recovery ACK. Do not auto-retry this upload.
-                logger.exception("video-use media upload outcome uncertain")
+            if sidecar_call_started:
+                # Any error after dispatch (including malformed Sidecar probe or
+                # a generic transport exception) may leave durable remote bytes.
+                # This is a fail-closed hold, NOT a trusted reconciliation ACK.
+                logger.exception("video-use media dispatch/probe outcome uncertain")
                 raise HTTPException(
                     status_code=409,
                     detail={
                         "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
-                        "message": "媒体服务上传结果不明确，预留额度保持待核对，禁止自动重试",
+                        "message": "媒体上传或回执不可信，保留原始存储预留供人工核对，禁止自动退款或重试",
                     },
                 ) from exc
             compensation = db.execute(
