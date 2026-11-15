@@ -29,6 +29,7 @@ class FakeVideoUseAdapter:
     def __init__(self):
         self.jobs = {}
         self.status_calls = {}
+        self.media_objects = {}
 
     def check_health(self):
         return {"status": "healthy", "service": "video-use"}
@@ -39,6 +40,7 @@ class FakeVideoUseAdapter:
     def upload_media(self, project_id, filename, content_type, stream):
         payload = stream.read()
         assert payload
+        self.media_objects[(project_id, "media-1")] = payload
         if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
             return {
                 "mediaId": "media-1",
@@ -68,6 +70,13 @@ class FakeVideoUseAdapter:
                 "audio": {"codec": "aac", "sampleRate": 48000},
             },
         }
+
+    def inspect_media(self, project_id, media_id):
+        payload = self.media_objects.get((project_id, media_id))
+        if payload is None:
+            raise RuntimeError("FAKE media not found")
+        return {"projectId": project_id, "mediaId": media_id,
+                "sizeBytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
 
     def submit_render(self, payload):
         assert payload["ranges"] == [

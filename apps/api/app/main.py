@@ -4858,6 +4858,25 @@ def create_app(
                             "message": "媒体服务返回的项目或媒体身份不可信，禁止登记资产",
                         },
                     )
+                # G70/G71: the Sidecar ACK and matching byte length alone
+                # do not prove that the persisted object has the source bytes.
+                # Same-Sidecar inspection is NOT an independent signed issuer.
+                inspected = created_app.state.video_use.inspect_media(project_id, media_id)
+                if (
+                    not isinstance(inspected, dict)
+                    or inspected.get("projectId") != project_id
+                    or inspected.get("mediaId") != media_id
+                    or type(inspected.get("sizeBytes")) is not int
+                    or inspected["sizeBytes"] != upload_size
+                    or type(inspected.get("sha256")) is not str
+                    or inspected["sha256"].lower() != digest.hexdigest()
+                ):
+                    # Post-dispatch UNKNOWN remains HELD; no speculative refund.
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                                "message": "媒体存储摘要或身份与上传不符，须可信对账"},
+                    )
                 fallback_content_type = {
                     ".png": "image/png",
                     ".jpg": "image/jpeg",

@@ -56,6 +56,9 @@ def _expected_media_id(project_id: str, idempotency_key: str) -> str:
 
 
 class FakeMediaStore:
+    def __init__(self):
+        self.media_objects = {}
+
     def check_health(self):
         return {"status": "healthy"}
 
@@ -77,6 +80,7 @@ class FakeMediaStore:
             if idempotency_key is not None
             else f"unused-{uuid.uuid4()}"
         )
+        self.media_objects[(project_id, media_id)] = payload
         return {
             "mediaId": media_id,
             "projectId": project_id,
@@ -88,6 +92,13 @@ class FakeMediaStore:
                 "video": {"codec": "h264", "width": 320, "height": 240},
             },
         }
+    def inspect_media(self, project_id, media_id):
+        stored = self.media_objects.get((project_id, media_id))
+        if stored is None:
+            raise VideoUseError("FAKE media not found")
+        return {"projectId": project_id, "mediaId": media_id,
+                "sizeBytes": len(stored),
+                "sha256": hashlib.sha256(stored).hexdigest()}
 
 
 @pytest.fixture()
@@ -5092,4 +5103,66 @@ def test_g70_g71_postgres_direct_media_generic_sidecar_exception_retains_hold(
         stored_project = db.get(DBProject, project["id"])
         assert stored_project.revision == project["revision"]
         assert stored_project.materials == []
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "inspection_fault",
+    ["same_size_sha_drift", "foreign_project", "foreign_media",
+     "wrong_bytes", "boolean_bytes", "missing_sha", "inspect_unavailable"],
+)
+def test_g70_g71_postgres_direct_media_stored_sha_readback_fail_closed(
+    postgres_context, monkeypatch, inspection_fault,
+):
+    """FAKE-only PG: equal-size Sidecar ACK is not proof of actual stored bytes.
+
+    A failing same-Sidecar read-back leaves quota HELD, without new assets,
+    materials, version edits or speculative refund. This does not certify an
+    independently signed issuer or safe orphan recovery.
+    """
+    client, sessions, app = postgres_context
+    created = client.post(
+        "/projects", json={"name": "FAKE direct-media stored SHA readback"}
+    )
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"g70-g71-fake-direct-media-stored-bytes-proof"
+    adapter = app.state.video_use
+    original_inspect = adapter.inspect_media
+    calls = []
+
+    def untrusted_inspection(project_id, media_id):
+        calls.append((project_id, media_id))
+        if inspection_fault == "inspect_unavailable":
+            raise VideoUseError("FAKE Sidecar inspection ACK lost")
+        evidence = original_inspect(project_id, media_id)
+        if inspection_fault == "same_size_sha_drift":
+            evidence["sha256"] = hashlib.sha256(payload[::-1]).hexdigest()
+        elif inspection_fault == "foreign_project":
+            evidence["projectId"] = "untrusted-foreign-project"
+        elif inspection_fault == "foreign_media":
+            evidence["mediaId"] = "untrusted-foreign-media"
+        elif inspection_fault == "wrong_bytes":
+            evidence["sizeBytes"] = len(payload) + 1
+        elif inspection_fault == "boolean_bytes":
+            evidence["sizeBytes"] = True
+        elif inspection_fault == "missing_sha":
+            evidence.pop("sha256")
+        return evidence
+
+    monkeypatch.setattr(adapter, "inspect_media", untrusted_inspection)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert len(calls) == 1
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == len(payload)
+        assert db.query(DBAssetVersion).count() == 0
+        saved = db.get(DBProject, project["id"])
+        assert saved.revision == project["revision"]
+        assert saved.materials == []
     app.state.moneyprinter.assert_not_called()
