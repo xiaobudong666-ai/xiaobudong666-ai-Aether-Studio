@@ -23,14 +23,16 @@ from test_g76_postgres_concurrency import postgres_context, OWNER_PASSWORD
 
 
 # Test imports postgres_context as a fixture from the existing isolated PG suite.
+@pytest.mark.parametrize("crash_phase", ["during_upload", "after_upload_ack"])
 def test_g70_g71_direct_media_actual_api_sigkill_then_new_process_replay_is_fenced(
-    postgres_context,
+    postgres_context, crash_phase,
 ):
-    """Crash after quota COMMIT and FAKE Sidecar write; no second debit or dispatch.
+    """Crash after quota COMMIT, during upload OR after FAKE Sidecar upload ACK.
 
-    The first process is SIGKILLed inside the normal POST /projects/{id}/media
-    route; a *different* fresh interpreter creates the app and sends the same
-    authenticated HTTP request. No Provider or production storage is used.
+    A different fresh interpreter replays the normal authenticated media POST.
+    The after-upload-ACK case blocks during the subsequent stored SHA inspection,
+    proving HELD survives a real process death after remote upload returned.
+    This is NOT an independently signed Sidecar proof or trusted reconciliation.
     """
     if sys.platform != "linux":
         pytest.skip("real SIGKILL process proof needs disposable Linux CI")
@@ -54,6 +56,7 @@ def test_g70_g71_direct_media_actual_api_sigkill_then_new_process_replay_is_fenc
     # has written FAKE bytes, then the parent issues actual OS SIGKILL.
     # REPLAY mode restarts a new API and checks the unchanged revision.
     child_script = r"""
+import io
 import json
 import os
 from pathlib import Path
@@ -71,9 +74,26 @@ class CrashOrRejectFakeSidecar(FakeMediaStore):
             raise AssertionError("unreconciled upload reached Sidecar twice")
         blob = stream.read()
         Path(os.environ["AETHER_TEST_MEDIA_OBJECT"]).write_bytes(blob)
-        Path(os.environ["AETHER_TEST_MEDIA_READY"]).write_text("written")
-        while True:
-            time.sleep(0.1)
+        if os.environ["AETHER_TEST_CRASH_PHASE"] == "during_upload":
+            Path(os.environ["AETHER_TEST_MEDIA_READY"]).write_text("sidecar-write-before-ack")
+            while True:
+                time.sleep(0.1)
+        # Complete the FAKE upload and return the ACK; the API now moves
+        # to inspect_media. This models the later post-upload crash window.
+        return super().upload_media(
+            project_id, filename, content_type, io.BytesIO(blob), **kwargs
+        )
+
+    def inspect_media(self, project_id, media_id):
+        inspected = super().inspect_media(project_id, media_id)
+        if (
+            os.environ["AETHER_TEST_MEDIA_STAGE"] == "CRASH"
+            and os.environ["AETHER_TEST_CRASH_PHASE"] == "after_upload_ack"
+        ):
+            Path(os.environ["AETHER_TEST_MEDIA_READY"]).write_text("upload-acked-inspection")
+            while True:
+                time.sleep(0.1)
+        return inspected
 
 engine = build_engine(os.environ["AETHER_TEST_POSTGRES_URL"])
 sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -128,6 +148,7 @@ engine.dispose()
             "AETHER_TEST_REPLAY_RESULT": str(replay_result),
             "AETHER_TEST_DISPATCH_MARKER": str(unexpected_dispatch),
             "AETHER_TEST_MEDIA_STAGE": "CRASH",
+            "AETHER_TEST_CRASH_PHASE": crash_phase,
         })
         crash = subprocess.Popen(
             [sys.executable, "-u", "-c", child_script],
@@ -144,6 +165,10 @@ engine.dispose()
                 pytest.fail("first API process exited before quota/remote write: " + err[-1500:])
             assert crash.poll() is None
             assert media.read_bytes() == payload
+            assert ready.read_text() == (
+                "upload-acked-inspection" if crash_phase == "after_upload_ack"
+                else "sidecar-write-before-ack"
+            )
             os.kill(crash.pid, signal.SIGKILL)
             assert crash.wait(timeout=10) == -signal.SIGKILL
         finally:
