@@ -4751,6 +4751,10 @@ def create_app(
                 )
             raise HTTPException(status_code=429, detail={"code": "STORAGE_QUOTA_EXCEEDED", "message": "团队存储空间已达到配额上限"})
         db.commit()
+        # Once the asset transaction COMMIT is attempted, its outcome can be
+        # uncertain (e.g. lost acknowledgement or failed post-commit refresh).
+        # The reservation is already durable; never refund it blindly.
+        asset_commit_attempted = False
         try:
             uploaded = created_app.state.video_use.upload_media(project_id, file.filename or "media.mp4", file.content_type, file.file)
             # Video-use is an external process. Reject non-scalar or non-finite
@@ -4866,10 +4870,23 @@ def create_app(
                 created_at=utc_now(),
             )
             db.add(asset_version)
+            asset_commit_attempted = True
             db.commit()
             db.refresh(asset_version)
         except Exception as exc:
             db.rollback()
+            if asset_commit_attempted:
+                # The asset commit may already be durable. Compensating its
+                # storage reservation here could undercount a real asset.
+                # Return UNKNOWN for independent reconciliation; do not guess
+                # whether the asset, material and quota are fully committed.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "媒体资产提交结果不明确，须人工核对产物和额度，禁止自动退回预留",
+                    },
+                ) from exc
             compensation = db.execute(
                 update(DBTenant)
                 .where(
