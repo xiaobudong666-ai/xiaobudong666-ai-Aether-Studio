@@ -4934,3 +4934,52 @@ def test_g70_g71_postgres_direct_media_uncertain_asset_commit_keeps_storage_hold
         assert len(stored_project.materials) == 1
         assert stored_project.materials[0]["id"] == assets[0].media_id
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("sidecar_wrote_bytes", [False, True])
+def test_g70_g71_postgres_direct_media_ambiguous_sidecar_failure_retains_hold(
+    postgres_context, monkeypatch, sidecar_wrote_bytes,
+):
+    """FAKE-only PostgreSQL: a Sidecar transport failure is not a storage
+    non-write receipt. Even if the remote file has been durably written,
+    the API can lose its ACK before the media/asset transaction begins.
+
+    Preserve the original quota hold and return reconciliation-required;
+    never issue a speculative quota refund or accept an automatic retry.
+    This tests only the fail-closed boundary, not signed Sidecar evidence,
+    a durable human ACK, or orphan recovery.
+    """
+    client, sessions, app = postgres_context
+    created = client.post("/projects", json={"name": "FAKE uncertain Sidecar ACK"})
+    assert created.status_code == 201, created.text
+    project = created.json()
+    payload = b"fake-only-direct-media-sidecar-ack-may-be-lost"
+    adapter = app.state.video_use
+    original_upload = adapter.upload_media
+    remote_receipts = []
+
+    def lose_sidecar_ack(*args, **kwargs):
+        if sidecar_wrote_bytes:
+            result = original_upload(*args, **kwargs)
+            assert result["projectId"] == project["id"]
+            remote_receipts.append(result)
+        raise VideoUseError("FAKE Sidecar ACK lost; storage outcome unknown")
+
+    monkeypatch.setattr(adapter, "upload_media", lose_sidecar_ack)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == (
+        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    )
+    assert len(remote_receipts) == int(sidecar_wrote_bytes)
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == len(payload)
+        assert db.query(DBAssetVersion).count() == 0
+        stored_project = db.get(DBProject, project["id"])
+        assert stored_project.revision == project["revision"]
+        assert stored_project.materials == []
+    app.state.moneyprinter.assert_not_called()
