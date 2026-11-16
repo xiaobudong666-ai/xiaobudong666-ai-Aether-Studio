@@ -6484,3 +6484,165 @@ def test_g72_fake_task_read_owner_transfer_does_not_expose_previous_owner_reques
         )).scalar_one() == 1
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def _g72_create_owner_fake_for_mutation_fence(client, sessions, project, key):
+    """Create a FAKE job via the real typed route; no Provider or media upload."""
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, image_id, key=key)
+    route = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        created = client.post(route, json=payload)
+        if created.status_code == 202:
+            return created.json()["taskId"]
+        assert created.status_code == 409 and (
+            created.json().get("detail", {}).get("code") in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }
+        ), created.text
+    raise AssertionError(f"FAKE job create did not succeed: {created.text if created else 'not attempted'}")
+
+
+def test_g72_fake_draft_apply_unassigned_editor_is_denied_before_rights(
+    generation_context,
+):
+    """An unrelated tenant Editor must not apply another Owner's FAKE draft.
+
+    Even without a rights-cleared result, the authority fence must run before
+    result validation, and cannot change the project, audit or reserved quota.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake draft apply scope")
+    task_id = _g72_create_owner_fake_for_mutation_fence(
+        client, sessions, project, "g72-fake-editor-draft-apply",
+    )
+    actor_id = "g72-fake-editor-apply-" + str(uuid.uuid4())
+    actor_password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        proj = db.get(DBProject, project["id"])
+        assert task.requested_by == proj.owner_id
+        tenant_id = task.tenant_id
+        db.add(DBUser(
+            id=actor_id, tenant_id=tenant_id,
+            email=f"{actor_id}@example.com",
+            display_name="Unassigned Editor",
+            password_hash=hash_password(actor_password),
+            role="editor", is_active=True, created_at=now, updated_at=now,
+        ))
+        db.commit()
+        project_revision = proj.revision
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+
+    route = f"/projects/{project['id']}/generation-tasks/{task_id}/apply-talking-head-draft"
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{actor_id}@example.com", "password": actor_password,
+    }).status_code == 200
+    denied = client.post(route, json={
+        "expectedRevision": project_revision, "aspect": "9:16", "subtitles": [],
+    })
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    with sessions() as db:
+        assert db.get(DBProject, project["id"]).revision == project_revision
+        assert db.get(DBGenerationTask, task_id).status == "QUEUED"
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    owner_result = client.post(route, json={
+        "expectedRevision": project_revision, "aspect": "9:16", "subtitles": [],
+    })
+    assert owner_result.status_code == 422, owner_result.text
+    assert owner_result.json()["detail"]["code"] == "RIGHTS_MISSING"
+
+
+def test_g72_fake_transfer_blocks_old_owner_apply_and_orphan_recovery(
+    generation_context,
+):
+    """Neither old nor new project Owner can mutate a historical FAKE job.
+
+    Ownership transfer does not grant historical synthetic task rights;
+    originator alone does not preserve authority after the transfer.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake project transfer fence")
+    task_id = _g72_create_owner_fake_for_mutation_fence(
+        client, sessions, project, "g72-fake-owner-transfer-apply-recover",
+    )
+    successor_id = "g72-successor-owner-" + str(uuid.uuid4())
+    successor_password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        proj = db.get(DBProject, project["id"])
+        assert task.requested_by == proj.owner_id
+        db.add(DBUser(
+            id=successor_id, tenant_id=task.tenant_id,
+            email=f"{successor_id}@example.com",
+            display_name="Successor Owner",
+            password_hash=hash_password(successor_password),
+            role="owner", is_active=True, created_at=now, updated_at=now,
+        ))
+        proj.owner_id = successor_id
+        db.commit()
+        revision = proj.revision
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+    draft_route = f"/projects/{project['id']}/generation-tasks/{task_id}/apply-talking-head-draft"
+    recovery_route = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    draft_body = {"expectedRevision": revision, "aspect": "9:16", "subtitles": []}
+    recovery_body = {"reason": "Synthetic task owner-transfer isolation audit"}
+
+    for route, payload in [(draft_route, draft_body), (recovery_route, recovery_body)]:
+        result = client.post(route, json=payload)
+        assert result.status_code == 403, result.text
+        assert result.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{successor_id}@example.com", "password": successor_password,
+    }).status_code == 200
+    result = client.post(draft_route, json=draft_body)
+    assert result.status_code == 403, result.text
+    assert result.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    result = client.post(recovery_route, json=recovery_body)
+    assert result.status_code == 403, result.text
+    assert result.json()["detail"]["code"] == "OWNER_SELF_ONLY"
+
+    with sessions() as db:
+        assert db.get(DBProject, project["id"]).revision == revision
+        assert db.get(DBGenerationTask, task_id).status == "QUEUED"
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+    assert media.uploads == 0
+    assert media.inspections == 0
+    app.state.moneyprinter.assert_not_called()
