@@ -4293,6 +4293,94 @@ def test_g72_unassigned_same_tenant_editor_is_denied_by_project_grant(
 
 
 
+
+
+def test_g72_fake_owner_task_cannot_be_canceled_by_unassigned_same_tenant_editor(
+    generation_context,
+):
+    """FAKE-only: an Editor cannot mutate another Owner's queue or quota.
+
+    No delegated project grant has been approved. A 403 must preserve
+    the queued task, RESERVED usage, event history and original Owner path.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 cancel actor scope")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, image_id, key="g72-editor-cannot-cancel-owner-fake"
+    )
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created is not None and created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    editor_password = secrets.token_urlsafe(24)
+    editor_id = "g72-cancel-unassigned-" + str(uuid.uuid4())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        owner_id = db.get(DBProject, project["id"]).owner_id
+        assert task is not None and task.requested_by == owner_id
+        db.add(DBUser(
+            id=editor_id, tenant_id=task.tenant_id,
+            email=f"{editor_id}@example.com",
+            display_name="Synthetic Unassigned Editor",
+            password_hash=hash_password(editor_password),
+            role="editor", is_active=True,
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+        before = (task.status, task.lease_owner, task.cancel_requested_at)
+        events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{editor_id}@example.com", "password": editor_password,
+    }).status_code == 200
+    denied = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/cancel"
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert (task.status, task.lease_owner, task.cancel_requested_at) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    claimed = claim(client, worker_id="worker-g72-owner-post-denial")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    app.state.moneyprinter.assert_not_called()
+
 @pytest.fixture()
 def postgres_generation_context():
     database_url = (

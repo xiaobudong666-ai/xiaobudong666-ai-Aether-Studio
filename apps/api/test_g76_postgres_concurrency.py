@@ -413,6 +413,105 @@ def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context
 
 
 
+
+
+def test_g72_postgres_editor_cannot_cancel_claimed_owner_fake_and_release_quota(
+    postgres_context,
+):
+    """Native disposable PostgreSQL: Editor denial cannot cancel an Owner lease.
+
+    This protects the existing FAKE Worker ownership contract; it does NOT
+    approve cross-project grants, refunds or historical orphan reconciliation.
+    """
+    client, sessions, app = postgres_context
+    task_id, _source, project_id, tenant_id, owner_id, _epoch = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, "worker-g72-actor-cancel", source_sha="b" * 64
+        )
+    )
+    editor_id = "g72-pg-cancel-editor-" + str(uuid.uuid4())
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.tenant_id == tenant_id
+        assert task.requested_by == owner_id and task.lease_owner is not None
+        before_state = (
+            task.status, task.lease_owner, task.lease_epoch,
+            task.cancel_requested_at, task.completed_at,
+        )
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one()
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        db.add(DBUser(
+            id=editor_id, tenant_id=tenant_id,
+            email=f"{editor_id}@example.com",
+            display_name="Synthetic PG Unassigned Editor",
+            password_hash=hash_password(password), role="editor", is_active=True,
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{editor_id}@example.com", "password": password,
+    }).status_code == 200
+    denied = client.post(
+        f"/projects/{project_id}/generation-tasks/{task_id}/cancel"
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert (
+            task.status, task.lease_owner, task.lease_epoch,
+            task.cancel_requested_at, task.completed_at,
+        ) == before_state
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id
+        )).scalar_one() == before_events
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalar_one() == before_usage
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+    assert app.state.video_use.media_objects == {}
+    app.state.moneyprinter.assert_not_called()
+    # Positive control: original Owner retains the ordinary cancellation path
+    # before any upstream acceptance. This does not authorize paid refunds.
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    owner_cancel = client.post(
+        f"/projects/{project_id}/generation-tasks/{task_id}/cancel"
+    )
+    assert owner_cancel.status_code == 200, owner_cancel.text
+    assert owner_cancel.json()["status"] == "CANCELED"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "CANCELED"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
 def test_g72_postgres_unassigned_editor_is_denied_before_reservation(
     postgres_context,
 ):

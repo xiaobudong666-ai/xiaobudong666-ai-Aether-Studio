@@ -2268,6 +2268,23 @@ def create_app(
         task = generation_task_for_tenant(
             db, project_id, task_id, context, for_update=True
         )
+        # G72 FAKE-only safety: a tenant-wide Editor cannot cancel another
+        # Owner's queued/leased synthetic task and release its reservation.
+        # Reuse the existing Worker/creation Owner contract; do not infer
+        # project grants or delegated-admin privileges from tenant membership.
+        # Historical tasks with a mismatched originator remain isolated
+        # pending the Owner-approved recovery/settlement policy.
+        if task.provider == "deterministic-fake-talking-head":
+            project = project_for_tenant(db, project_id, context)
+            require_fake_talking_head_claim_authority(db, project, context)
+            if task.requested_by != context.user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
+                        "message": "当前身份无权取消此模拟口播任务",
+                    },
+                )
         if task.cancel_requested_at is None and task.status not in TERMINAL_GENERATION_STATES:
             now = utc_now()
             previous = task.status
