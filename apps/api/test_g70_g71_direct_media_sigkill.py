@@ -5,20 +5,24 @@ independently signed remote-storage evidence. It cannot authorize reconciliation
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 import pytest
 from sqlalchemy import select
 
-from app.models import DBAssetVersion, DBDirectMediaUploadHold, DBProject, DBTenant
+from app.auth import hash_password
+from app.models import DBAssetVersion, DBDirectMediaUploadHold, DBProject, DBTenant, DBUser
 from test_g76_postgres_concurrency import postgres_context, OWNER_PASSWORD
 
 
@@ -210,6 +214,57 @@ engine.dispose()
             assert db.execute(select(DBAssetVersion).where(
                 DBAssetVersion.project_id == project["id"]
             )).scalars().all() == []
+
+        # G70/G71 tenant isolation under a durable orphan: a foreign Owner
+        # must see 404, not the existence or HELD state of another tenant's
+        # project. The rejection must not release the original storage hold.
+        foreign_now = datetime.datetime.now(datetime.timezone.utc)
+        foreign_tenant_id = str(uuid.uuid4())
+        foreign_email = f"g70-foreign-{uuid.uuid4().hex}@example.com"
+        foreign_password = secrets.token_urlsafe(24)
+        with sessions() as db:
+            db.add(DBTenant(
+                id=foreign_tenant_id, name="G70 foreign tenant",
+                slug=f"g70-foreign-{uuid.uuid4().hex}",
+                project_quota=50, storage_quota_bytes=1024**3,
+                used_storage_bytes=0, concurrent_render_quota=2,
+                monthly_render_seconds_quota=3600, render_seconds_used=0,
+                quota_period=foreign_now.strftime("%Y-%m"),
+                created_at=foreign_now, updated_at=foreign_now,
+            ))
+            db.add(DBUser(
+                id=str(uuid.uuid4()), tenant_id=foreign_tenant_id,
+                email=foreign_email, display_name="G70 foreign Owner",
+                password_hash=hash_password(foreign_password), role="owner",
+                is_active=True, created_at=foreign_now, updated_at=foreign_now,
+            ))
+            db.commit()
+        assert client.post("/auth/logout").status_code == 204
+        foreign_login = client.post("/auth/login", json={
+            "email": foreign_email, "password": foreign_password,
+        })
+        assert foreign_login.status_code == 200, foreign_login.text
+        denied = client.post(
+            f"/projects/{project['id']}/media",
+            data={"expectedRevision": str(project["revision"])},
+            files={"file": ("foreign.mp4", payload, "video/mp4")},
+        )
+        assert denied.status_code == 404, denied.text
+        assert client.get(f"/projects/{project['id']}").status_code == 404
+        assert client.post("/auth/logout").status_code == 204
+        owner_login = client.post("/auth/login", json={
+            "email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD,
+        })
+        assert owner_login.status_code == 200, owner_login.text
+        with sessions() as db:
+            assert db.get(DBTenant, tenant_id).used_storage_bytes == original_used + len(payload)
+            assert db.get(DBTenant, foreign_tenant_id).used_storage_bytes == 0
+            original_hold = db.execute(select(DBDirectMediaUploadHold).where(
+                DBDirectMediaUploadHold.project_id == project["id"],
+            )).scalar_one()
+            assert original_hold.state == "HELD"
+            assert original_hold.requested_by == owner_id
+            assert original_hold.source_sha256 == hashlib.sha256(payload).hexdigest()
 
         # Project-scoped HELD must not freeze unrelated work in the SAME tenant.
         # This is not an Owner-authorized reconciliation: the orphan stays HELD.
