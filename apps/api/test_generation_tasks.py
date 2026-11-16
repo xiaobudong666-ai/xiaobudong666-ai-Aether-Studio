@@ -6646,3 +6646,88 @@ def test_g72_fake_transfer_blocks_old_owner_apply_and_orphan_recovery(
     assert media.uploads == 0
     assert media.inspections == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_fake_retry_denies_unassigned_editor_before_task_state_disclosure(
+    generation_context,
+):
+    """FAKE-only shared retry route must preserve Owner, task and quota fences.
+
+    This is a nonproduction negative case, not an approval of retries or grants.
+    Synthetic talking-head jobs currently have max_attempts=1; the test
+    confirms unauthorized users receive 403 before learning retryability.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake retry project scope")
+    visual_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, visual_id, key="g72-fake-retry-editor-denial"
+    )
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        created = client.post(base, json=payload)
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created is not None and created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    editor_id = "g72-retry-editor-" + str(uuid.uuid4())
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.max_attempts == 1
+        before = (task.status, task.attempts, task.lease_owner, task.error_code)
+        events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        attempts = db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        db.add(DBUser(
+            id=editor_id, tenant_id=task.tenant_id,
+            email=f"{editor_id}@example.com", display_name="Synthetic Editor",
+            password_hash=hash_password(password),
+            role="editor", is_active=True, created_at=now, updated_at=now,
+        ))
+        db.commit()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{editor_id}@example.com", "password": password,
+    }).status_code == 200
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
+    denied = client.post(path)
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert (task.status, task.attempts, task.lease_owner, task.error_code) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one() == attempts
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    owner_response = client.post(path)
+    assert owner_response.status_code == 409, owner_response.text
+    assert owner_response.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
