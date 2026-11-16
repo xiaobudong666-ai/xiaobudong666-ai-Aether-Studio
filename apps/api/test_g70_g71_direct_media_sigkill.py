@@ -146,6 +146,7 @@ engine.dispose()
         root = Path(tempdir)
         ready = root / "remote-object-ready"
         media = root / "fake-sidecar-object"
+        replay_result = root / "replay-initial-unused.json"
         unexpected_dispatch = root / "unexpected-dispatch"
         env = os.environ.copy()
         env.update({
