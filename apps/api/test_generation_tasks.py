@@ -4158,24 +4158,26 @@ def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_con
 
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "G72 project-grant/Owner delegation contract is not approved or implemented: "
-        "tenant-wide editor access is currently accepted without an explicit project grant"
+@pytest.mark.parametrize("action", [
+    pytest.param(
+        "read",
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason="G72 per-project read grant/delegated-admin contract remains unapproved",
+        ),
     ),
-)
-@pytest.mark.parametrize("action", ["read", "preflight", "create"])
+    "preflight",
+    "create",
+])
 def test_g72_unassigned_same_tenant_editor_is_denied_by_project_grant(
     generation_context, action,
 ):
-    """Approval-gated diagnostic only: prove the G72 per-project actor-scope gap.
+    """FAKE-only typed entry must reject unassigned editor before reservation.
 
-    A same-tenant editor, not the project's owner and without a recorded
-    project grant, must not infer access from the tenant-wide editor role.
-    This XFAIL does NOT implement a membership model or pick an Owner policy.
-    Once an authoritative issuer/delegation contract exists, replace the
-    XFAIL with a normal native denial/positive-grant/revocation regression.
+    A tenant-wide Editor has no currently approved project grant. The typed
+    preflight/create are fail-closed to match existing Worker claim authority;
+    only project-read remains strict XFAIL awaiting the Owner grant contract.
+    This does not decide grants or delegated-admin policy.
     """
     client, sessions, app, media = generation_context
     project = create_project(client, "G72 unassigned actor scope")

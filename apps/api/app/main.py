@@ -1109,12 +1109,39 @@ def create_app(
                 )
         return snapshot
 
+    def require_fake_talking_head_claim_authority(
+        db: Session, project: DBProject, context: AuthContext,
+    ) -> None:
+        # Fail closed before any FAKE-only queue/usage write: the existing
+        # Worker can claim only if the originating user is an active project
+        # Owner. Do not invent editor grants or admin delegation while the
+        # Owner's project authorization contract remains unapproved.
+        if project.owner_id != context.user_id or context.role != "owner":
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
+                        "message": "当前身份无权建立可领取的模拟口播任务"},
+            )
+        originator_id = db.execute(select(DBUser.id).where(
+            DBUser.id == context.user_id,
+            DBUser.tenant_id == context.tenant_id,
+            DBUser.role == "owner",
+            DBUser.is_active.is_(True),
+        )).scalar_one_or_none()
+        if originator_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
+                        "message": "当前身份无权建立可领取的模拟口播任务"},
+            )
+
     def validate_fake_talking_head_request(
         db: Session,
         project: DBProject,
         req: TalkingHeadFakeGenerationRequest,
         context: AuthContext,
     ) -> tuple[dict, DBAssetVersion]:
+        require_fake_talking_head_claim_authority(db, project, context)
         # The real production/default mode is always disabled here.
         if created_app.state.generation_provider_mode != "deterministic-fake":
             raise HTTPException(
@@ -1664,6 +1691,9 @@ def create_app(
         require_roles(context, "owner", "editor")
         begin_serialized_write(db)
         project = project_for_tenant(db, project_id, context)
+        # Protect even the existing-idempotency early return. A queued task
+        # must not be returned or reserved for an actor the Worker cannot claim.
+        require_fake_talking_head_claim_authority(db, project, context)
         key = str(req.idempotencyKey)
         if idempotency_key_header is not None and idempotency_key_header != key:
             raise HTTPException(

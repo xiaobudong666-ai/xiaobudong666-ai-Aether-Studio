@@ -413,16 +413,14 @@ def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context
 
 
 
-def test_g72_postgres_unassigned_editor_queued_reservation_unclaimable_diagnostic(
+def test_g72_postgres_unassigned_editor_is_denied_before_reservation(
     postgres_context,
 ):
-    """FAKE-only PostgreSQL *diagnostic* of the still-OPEN G72 grant mismatch.
+    """FAKE-only disposable PostgreSQL: denied Editor cannot create orphan usage.
 
-    Current API accepts an unassigned same-tenant editor for typed preflight
-    and task creation; the Worker still requires the original active project
-    Owner. Assert the resulting QUEUED + RESERVED but unclaimable task on the
-    actual disposable PG service. PASS means the defect was reproduced, NOT
-    that project grants, delegation, or manual quota recovery were fixed.
+    This is a fail-closed typed-entry regression aligned to existing Worker
+    Owner-only claim. It neither implements grants/delegation nor repairs
+    already stranded historical RESERVED entries.
     """
     client, sessions, app = postgres_context
     project_response = client.post(
@@ -480,67 +478,67 @@ def test_g72_postgres_unassigned_editor_queued_reservation_unclaimable_diagnosti
         "expectedProjectRevision": project["revision"],
         "confirmSyntheticTestOnly": True,
     }
-    created = None
-    for _ in range(4):
-        capabilities = client.get("/generation/providers/moneyprinter/capabilities")
-        assert capabilities.status_code == 200, capabilities.text
-        payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
-        preflight = client.post(base + "/validate", json=payload)
-        if preflight.status_code != 200:
-            if preflight.status_code == 409 and preflight.json().get(
-                "detail", {},
-            ).get("code") in {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}:
-                continue
-            pytest.fail("G72 PG unassigned editor preflight: " + preflight.text)
-        payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
-        created = client.post(base, json=payload)
-        if created.status_code == 202:
-            break
-        if created.status_code != 409 or created.json().get(
-            "detail", {},
-        ).get("code") not in {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}:
-            break
-    assert created is not None and created.status_code == 202, (
-        created.text if created is not None else "G72 PG create was not attempted"
-    )
-    task_id = created.json()["taskId"]
+    capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+    assert capabilities.status_code == 200, capabilities.text
+    payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+    for endpoint in (base + "/validate", base, base):
+        rejected = client.post(endpoint, json=payload)
+        assert rejected.status_code == 403, rejected.text
+        assert rejected.json()["detail"]["code"] == (
+            "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+        )
     with sessions() as db:
-        queued = db.get(DBGenerationTask, task_id)
-        assert queued is not None
-        assert queued.project_id == project["id"]
-        assert queued.tenant_id == tenant_id
-        assert queued.requested_by == editor_id
-        assert queued.status == "QUEUED"
-        assert queued.lease_owner is None
-        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "RESERVED",
-        )).scalar_one() == 1
-        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "SETTLED",
+        assert db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.tenant_id == tenant_id,
+            DBGenerationTask.idempotency_key == payload["idempotencyKey"],
         )).scalar_one() == 0
-
-    claim = client.post(
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == 0
+    assert app.state.video_use.media_objects == {}
+    app.state.moneyprinter.assert_not_called()
+    no_lease = client.post(
         "/internal/generation-tasks/claim",
         headers={"X-Worker-Token": WORKER_TOKEN,
                  "X-Worker-Id": "worker-g72-pg-unassigned"},
     )
-    assert claim.status_code == 204, claim.text
+    assert no_lease.status_code == 204, no_lease.text
+
+    # Positive control on the same tenant/project/source: original Owner
+    # remains eligible for the existing FAKE Worker claim path.
+    assert client.post("/auth/logout").status_code == 204
+    owner_login = client.post("/auth/login", json={
+        "email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD,
+    })
+    assert owner_login.status_code == 200, owner_login.text
+    owner_capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+    assert owner_capabilities.status_code == 200, owner_capabilities.text
+    payload["capabilitySnapshotHash"] = owner_capabilities.json()["snapshotHash"]
+    payload["idempotencyKey"] = str(uuid.uuid4())
+    owner_preflight = client.post(base + "/validate", json=payload)
+    assert owner_preflight.status_code == 200, owner_preflight.text
+    payload["capabilitySnapshotHash"] = owner_preflight.json()["capabilitySnapshotHash"]
+    created = client.post(base, json=payload)
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
     with sessions() as db:
-        still_queued = db.get(DBGenerationTask, task_id)
-        assert still_queued is not None and still_queued.status == "QUEUED"
-        assert still_queued.lease_owner is None
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "QUEUED"
+        assert task.tenant_id == tenant_id and task.project_id == project["id"]
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
         )).scalar_one() == 1
-        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
-            DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "SETTLED",
-        )).scalar_one() == 0
+    eligible_claim = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN,
+                 "X-Worker-Id": "worker-g72-pg-owner"},
+    )
+    assert eligible_claim.status_code == 200, eligible_claim.text
+    assert eligible_claim.json()["taskId"] == task_id
     assert app.state.video_use.media_objects == {}
     app.state.moneyprinter.assert_not_called()
+
 
 
 def test_g76_postgres_artifact_success_waits_for_circuit_lock_and_preserves_reopen(postgres_context):
