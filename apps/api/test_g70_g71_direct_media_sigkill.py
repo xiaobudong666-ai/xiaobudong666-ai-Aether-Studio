@@ -128,7 +128,12 @@ with TestClient(app) as client:
     response = client.post(
         "/projects/" + os.environ["AETHER_TEST_MEDIA_PROJECT"] + "/media",
         data={"expectedRevision": os.environ["AETHER_TEST_MEDIA_REVISION"]},
-        files={"file": ("synthetic.mp4", b"g70-g71-direct-media-real-process-kill-fake-sidecar", "video/mp4")},
+        files={"file": ("synthetic.mp4", (
+            b"g70-g71-different-file-after-crash" if (
+                os.environ["AETHER_TEST_MEDIA_STAGE"] == "REPLAY"
+                and os.environ.get("AETHER_TEST_MEDIA_REPLAY_VARIANT") == "different"
+            ) else b"g70-g71-direct-media-real-process-kill-fake-sidecar"
+        ), "video/mp4")},
     )
     if os.environ["AETHER_TEST_MEDIA_STAGE"] == "REPLAY":
         Path(os.environ["AETHER_TEST_REPLAY_RESULT"]).write_text(
@@ -141,7 +146,6 @@ engine.dispose()
         root = Path(tempdir)
         ready = root / "remote-object-ready"
         media = root / "fake-sidecar-object"
-        replay_result = root / "replay.json"
         unexpected_dispatch = root / "unexpected-dispatch"
         env = os.environ.copy()
         env.update({
@@ -243,16 +247,28 @@ engine.dispose()
         # normal HTTP request. The HELD receipt must fence dispatch *before*
         # quota mutation, even though the crashed process's PG lock is gone.
         env["AETHER_TEST_MEDIA_STAGE"] = "REPLAY"
-        replay = subprocess.run(
-            [sys.executable, "-u", "-c", child_script],
-            env=env, capture_output=True, text=True, timeout=25,
-        )
-        assert replay.returncode == 0, replay.stderr[-2000:]
-        assert replay_result.exists(), replay.stderr[-1200:]
-        result = json.loads(replay_result.read_text())
-        assert result["status"] == 409, result
-        assert result["detail"]["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED", result
-        assert not unexpected_dispatch.exists(), "replay made a second FAKE Sidecar upload"
+        # A manual retry may supply different media bytes rather than resend
+        # the original file. In both cases the durable HELD record must fence
+        # a *fresh* process before a second Sidecar upload or quota debit.
+        # Do not mistake this local FAKE result for a trusted recovery ACK.
+        for replay_variant in ("original", "different"):
+            env["AETHER_TEST_MEDIA_REPLAY_VARIANT"] = replay_variant
+            env["AETHER_TEST_REPLAY_RESULT"] = str(root / f"replay-{replay_variant}.json")
+            replay = subprocess.run(
+                [sys.executable, "-u", "-c", child_script],
+                env=env, capture_output=True, text=True, timeout=25,
+            )
+            assert replay.returncode == 0, replay.stderr[-2000:]
+            variant_result = Path(env["AETHER_TEST_REPLAY_RESULT"])
+            assert variant_result.exists(), replay.stderr[-1200:]
+            result = json.loads(variant_result.read_text())
+            assert result["status"] == 409, (replay_variant, result)
+            assert result["detail"]["detail"]["code"] == (
+                "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+            ), (replay_variant, result)
+            assert not unexpected_dispatch.exists(), (
+                f"{replay_variant} replay made a second FAKE Sidecar upload"
+            )
         if crash_phase == "before_object_write":
             assert not media.exists(), "replay must not create the object while HELD is unresolved"
         else:
