@@ -4239,6 +4239,45 @@ def test_g72_unassigned_same_tenant_editor_is_denied_by_project_grant(
         accepted_status = 200 if action == "preflight" else 202
         expected_status = 403
 
+    # G72 same-XFAIL diagnostic: verify the exact queued/RESERVED side effect
+    # of the accepted unassigned-editor create, then prove the existing
+    # read-only Worker claim fence cannot lease it. This adds no new XFAIL
+    # or policy; do not grant editor access or auto-refund the reservation.
+    # If Owner later adopts a project-grant contract and denies this route,
+    # the branch will be skipped and the existing strict XFAIL becomes XPASS
+    # until the approval-gated test is promoted to a normal regression.
+    if action == "create" and response.status_code == accepted_status:
+        task_id = response.json()["taskId"]
+        with sessions() as db:
+            queued = db.get(DBGenerationTask, task_id)
+            assert queued is not None
+            assert queued.tenant_id == tenant_id
+            assert queued.project_id == project["id"]
+            assert queued.requested_by == editor_id
+            assert queued.provider == "deterministic-fake-talking-head"
+            assert queued.status == "QUEUED"
+            assert queued.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "RESERVED",
+            )).scalar_one() == 1
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one() == 0
+        worker_claim = claim(client, worker_id="worker-g72-unassigned-editor")
+        assert worker_claim.status_code == 204, worker_claim.text
+        with sessions() as db:
+            unclaimed = db.get(DBGenerationTask, task_id)
+            assert unclaimed is not None
+            assert unclaimed.status == "QUEUED"
+            assert unclaimed.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "RESERVED",
+            )).scalar_one() == 1
+        assert media.uploads == 0
+
     # The current implementation answers 200/202 because role + tenant
     # matches; project.owner_id is not part of project_for_tenant().
     # The strict XFAIL keeps this explicit, unclosed, and CI-visible.
