@@ -99,6 +99,36 @@ describe("GenerationPanel server authority", () => {
     expect(screen.queryByText(/原始产物转存失败，禁止直接重试或重新生成/)).toBeNull();
   });
 
+  test.each([
+    ["G72 FAKE task at its only attempt", "deterministic-fake-talking-head", 1, 1],
+    ["legacy FAKE task that claims extra attempts", "deterministic-fake-talking-head", 1, 3],
+    ["generic task whose retry attempts are exhausted", "moneyprinter", 3, 3],
+  ] as const)(
+    "%s never offers a misleading retry action",
+    async (_label, provider, attempt, maxAttempts) => {
+      const blockedTask: ServerGenerationTask = {
+        ...queuedTask,
+        taskId: "g72-retry-fenced",
+        provider,
+        status: "FAILED",
+        storedStatus: "FAILED",
+        errorCode: "PROVIDER_TEMPORARY_FAILURE",
+        errorMessage: "Synthetic failure; no Provider was called",
+        attempt,
+        maxAttempts,
+      };
+      const fetchMock = installFetch([blockedTask]);
+      render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
+      fireEvent.click(screen.getByRole("button", { name: "打开生成任务" }));
+      expect(await screen.findByText("g72-retry-fenced")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+      if (provider === "deterministic-fake-talking-head") {
+        expect(screen.getByText(/FAKE-ONLY 模拟口播任务不提供重试/)).toBeTruthy();
+      }
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/retry"))).toHaveLength(0);
+    },
+  );
+
   test("preflight and submit use server APIs without a local run action", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<GenerationPanel role="owner" tenantId="tenant-1" actorId="owner-1" project={project} assetVersions={[]} />);
