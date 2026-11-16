@@ -2379,6 +2379,20 @@ def create_app(
         task = generation_task_for_tenant(
             db, project_id, task_id, context, for_update=True
         )
+        # G72 FAKE-only: the shared retry endpoint must not disclose a
+        # synthetic Owner's task state or permit a forged future attempt.
+        # Reuse existing Worker claim authority; do not infer any new grant.
+        if task.provider == "deterministic-fake-talking-head":
+            project = project_for_tenant(db, project_id, context)
+            require_fake_talking_head_claim_authority(db, project, context)
+            if task.requested_by != context.user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
+                        "message": "当前身份无权重试此模拟口播任务",
+                    },
+                )
         # G70/G71: a completed upstream job may already have produced billable output.
         # A failed media transfer requires reconciliation of the ORIGINAL artifact,
         # not another generation attempt with a new upstream job and possible charge.
