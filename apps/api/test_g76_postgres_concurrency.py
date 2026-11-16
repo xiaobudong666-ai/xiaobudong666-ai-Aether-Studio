@@ -438,6 +438,7 @@ def test_g72_postgres_unassigned_editor_queued_reservation_unclaimable_diagnosti
         row = db.get(DBProject, project["id"])
         assert row is not None
         assert row.owner_id != editor_id
+        tenant_id = row.tenant_id
         db.add(DBAssetVersion(
             id=source_id, tenant_id=row.tenant_id, project_id=row.id,
             media_id="g72-pg-unassigned-synthetic-" + source_id,
@@ -507,7 +508,7 @@ def test_g72_postgres_unassigned_editor_queued_reservation_unclaimable_diagnosti
         queued = db.get(DBGenerationTask, task_id)
         assert queued is not None
         assert queued.project_id == project["id"]
-        assert queued.tenant_id == row.tenant_id
+        assert queued.tenant_id == tenant_id
         assert queued.requested_by == editor_id
         assert queued.status == "QUEUED"
         assert queued.lease_owner is None
