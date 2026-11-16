@@ -2033,7 +2033,14 @@ def create_app(
             DBGenerationTask.project_id == project_id,
             DBGenerationTask.tenant_id == context.tenant_id,
         )
-        if not can_read_fake_tasks:
+        if can_read_fake_tasks:
+            # Project ownership alone must not disclose historical FAKE jobs
+            # requested by the previous Owner after an ownership transfer.
+            query = query.where(or_(
+                DBGenerationTask.provider != "deterministic-fake-talking-head",
+                DBGenerationTask.requested_by == context.user_id,
+            ))
+        else:
             query = query.where(
                 DBGenerationTask.provider != "deterministic-fake-talking-head"
             )

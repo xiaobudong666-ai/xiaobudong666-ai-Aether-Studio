@@ -6413,3 +6413,74 @@ def test_g72_fake_task_read_denies_unassigned_tenant_users_before_pagination(gen
         "email": "owner@example.com", "password": OWNER_PASSWORD,
     }).status_code == 200
     assert client.get(f"{path}/{task_id}").status_code == 200
+
+def test_g72_fake_task_read_owner_transfer_does_not_expose_previous_owner_request(generation_context):
+    """After a project owner change, neither Owner may read the old FAKE script."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 historical FAKE transfer read fence")
+    source = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, source, key="g72-transfer-owner-no-disclosure",
+    )
+    for _ in range(3):
+        cap = client.get("/generation/providers/moneyprinter/capabilities")
+        assert cap.status_code == 200, cap.text
+        payload["capabilitySnapshotHash"] = cap.json()["snapshotHash"]
+        created = client.post(
+            f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+            json=payload,
+        )
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    new_owner_id = "g72-new-owner-" + str(uuid.uuid4())
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        task = db.get(DBGenerationTask, task_id)
+        old_owner_id = project_row.owner_id
+        assert task.requested_by == old_owner_id
+        db.add(DBUser(
+            id=new_owner_id, tenant_id=task.tenant_id,
+            email=f"{new_owner_id}@example.com",
+            display_name="G72 Changed Project Owner",
+            password_hash=hash_password(password), role="owner",
+            is_active=True, created_at=now, updated_at=now,
+        ))
+        project_row.owner_id = new_owner_id
+        db.commit()
+    path = f"/projects/{project['id']}/generation-tasks"
+    # New project Owner cannot see the old originator's task.
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{new_owner_id}@example.com", "password": password,
+    }).status_code == 200
+    assert client.get(f"{path}/{task_id}").status_code == 403
+    for query in ({}, {"pagination": "keyset", "pageSize": 1},
+                  {"provider": "deterministic-fake-talking-head"}):
+        result = client.get(path, params=query)
+        assert result.status_code == 200, result.text
+        assert result.json()["items"] == []
+    # Original requester has lost the project authority; the row stays untouched.
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    assert client.get(f"{path}/{task_id}").status_code == 403
+    assert client.get(path).json()["items"] == []
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "QUEUED"
+        assert task.requested_by == old_owner_id
+        assert task.lease_owner is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
