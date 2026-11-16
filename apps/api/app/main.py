@@ -1958,7 +1958,18 @@ def create_app(
         context: AuthContext = Depends(context_dependency),
         db: Session = Depends(db_dependency),
     ):
-        project_for_tenant(db, project_id, context)
+        project = project_for_tenant(db, project_id, context)
+        # G72 FAKE-only read fence: tenant membership is not a project grant.
+        # Apply it before pagination; generic provider tasks are unaffected.
+        can_read_fake_tasks = (
+            context.role == "owner" and project.owner_id == context.user_id
+            and db.execute(select(DBUser.id).where(
+                DBUser.id == context.user_id,
+                DBUser.tenant_id == context.tenant_id,
+                DBUser.role == "owner",
+                DBUser.is_active.is_(True),
+            )).scalar_one_or_none() is not None
+        )
         if pagination not in {"offset", "keyset"}:
             raise HTTPException(
                 status_code=422,
@@ -2022,6 +2033,10 @@ def create_app(
             DBGenerationTask.project_id == project_id,
             DBGenerationTask.tenant_id == context.tenant_id,
         )
+        if not can_read_fake_tasks:
+            query = query.where(
+                DBGenerationTask.provider != "deterministic-fake-talking-head"
+            )
         if status is not None:
             # The status filter is explicitly against the persisted state, not the
             # rights-derived display status returned in the response.
@@ -2106,8 +2121,20 @@ def create_app(
         context: AuthContext = Depends(context_dependency),
         db: Session = Depends(db_dependency),
     ):
-        project_for_tenant(db, project_id, context)
+        project = project_for_tenant(db, project_id, context)
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        if task.provider == "deterministic-fake-talking-head":
+            # An unassigned Editor/Admin/Owner cannot see the synthetic script
+            # or history; no delegated project-read policy is inferred here.
+            require_fake_talking_head_claim_authority(db, project, context)
+            if task.requested_by != context.user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
+                        "message": "当前身份无权读取此模拟口播任务",
+                    },
+                )
         return generation_task_response(
             db, task, rights=generation_rights(db, task), include_history=True
         )

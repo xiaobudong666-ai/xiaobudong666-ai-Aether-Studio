@@ -6333,3 +6333,83 @@ def test_g73_bad_circuit_history_after_claim_fails_closed_without_settlement(
             DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_OPENED",
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize("role", ["editor", "admin", "owner"])
+def test_g72_fake_task_read_denies_unassigned_tenant_users_before_pagination(generation_context, role):
+    """Only original active project Owner may read the FAKE task's script/history."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake read " + role)
+    source = _g72_fake_visual_fixture(sessions, project)
+    body = _g72_fake_payload(client, project, source, key="g72-read-" + role)
+    for _ in range(3):
+        cap = client.get("/generation/providers/moneyprinter/capabilities")
+        assert cap.status_code == 200, cap.text
+        body["capabilitySnapshotHash"] = cap.json()["snapshotHash"]
+        created = client.post(
+            f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+            json=body,
+        )
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    path = f"/projects/{project['id']}/generation-tasks"
+    assert client.get(f"{path}/{task_id}").status_code == 200
+    owner_list = client.get(path, params={"pagination": "keyset", "pageSize": 1})
+    assert owner_list.status_code == 200, owner_list.text
+    assert owner_list.json()["items"][0]["taskId"] == task_id
+
+    actor_id, password = "g72-other-" + str(uuid.uuid4()), secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        db.add(DBUser(
+            id=actor_id, tenant_id=task.tenant_id,
+            email=f"{actor_id}@example.com", display_name="Other Tenant Member",
+            password_hash=hash_password(password), role=role, is_active=True,
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+        before = (task.status, task.request_hash, task.lease_owner)
+        event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{actor_id}@example.com", "password": password,
+    }).status_code == 200
+    denied = client.get(f"{path}/{task_id}")
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    for params in ({"provider": "deterministic-fake-talking-head"},
+                   {"pagination": "keyset", "pageSize": 1},
+                   {"pagination": "offset", "pageSize": 1}):
+        listed = client.get(path, params=params)
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["items"] == []
+        assert listed.json()["nextCursor"] is None
+        assert listed.json()["nextKeysetCursor"] is None
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert (task.status, task.request_hash, task.lease_owner) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == event_count
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_count
+    app.state.moneyprinter.assert_not_called()
+    assert media.uploads == 0
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    assert client.get(f"{path}/{task_id}").status_code == 200
