@@ -2203,6 +2203,19 @@ def create_app(
                 detail={"code": "CONCURRENCY_CONFLICT", "message": "项目版本冲突，请重新载入后再应用口播草稿"},
             )
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        # G72 FAKE-only: publishing a generated task into a draft is a project
+        # mutation, not a tenant-wide Editor privilege. Align with the
+        # existing Worker claim and task read/cancel originator fences.
+        if task.provider == "deterministic-fake-talking-head":
+            require_fake_talking_head_claim_authority(db, project, context)
+            if task.requested_by != context.user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
+                        "message": "当前身份无权应用此模拟口播任务",
+                    },
+                )
         task_rights = generation_rights(db, task)
         if not task_rights.get("allowed"):
             raise HTTPException(
@@ -2454,8 +2467,13 @@ def create_app(
         explicitly gated integration and this route fails closed.
         """
         require_roles(context, "owner")
-        project_for_tenant(db, project_id, context)
+        project = project_for_tenant(db, project_id, context)
         task = generation_task_for_tenant(db, project_id, task_id, context)
+        # G72 FAKE-only: original ownership alone is insufficient after a
+        # project transfer. Do not inspect/reconcile an old Owner's synthetic
+        # artifact or expose its history without current Worker claim authority.
+        if task.provider == "deterministic-fake-talking-head":
+            require_fake_talking_head_claim_authority(db, project, context)
         if context.user_id != task.requested_by:
             raise HTTPException(
                 status_code=403,
