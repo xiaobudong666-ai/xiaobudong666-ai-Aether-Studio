@@ -26,6 +26,7 @@ from starlette.datastructures import Headers
 from sqlalchemy import event, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import create_app
 from app.video_use_adapter import VideoUseError
@@ -409,6 +410,136 @@ def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context
             ).scalars()
         )
         assert len(attempts) == 1
+
+
+
+def test_g72_postgres_unassigned_editor_queued_reservation_unclaimable_diagnostic(
+    postgres_context,
+):
+    """FAKE-only PostgreSQL *diagnostic* of the still-OPEN G72 grant mismatch.
+
+    Current API accepts an unassigned same-tenant editor for typed preflight
+    and task creation; the Worker still requires the original active project
+    Owner. Assert the resulting QUEUED + RESERVED but unclaimable task on the
+    actual disposable PG service. PASS means the defect was reproduced, NOT
+    that project grants, delegation, or manual quota recovery were fixed.
+    """
+    client, sessions, app = postgres_context
+    project_response = client.post(
+        "/projects", json={"name": "G72 PG unassigned editor diagnostic"},
+    )
+    assert project_response.status_code == 201, project_response.text
+    project = project_response.json()
+    editor_id = "g72-pg-editor-" + str(uuid.uuid4())
+    editor_password = secrets.token_urlsafe(24)
+    source_id = str(uuid.uuid4())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBProject, project["id"])
+        assert row is not None
+        assert row.owner_id != editor_id
+        db.add(DBAssetVersion(
+            id=source_id, tenant_id=row.tenant_id, project_id=row.id,
+            media_id="g72-pg-unassigned-synthetic-" + source_id,
+            version_no=1, sha256="a" * 64, media_type="image",
+            content_type="image/png", size_bytes=53,
+            probe_json={"image": {"width": 16, "height": 16}},
+            created_by=row.owner_id, created_at=now,
+        ))
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=row.tenant_id, project_id=row.id,
+            asset_version_id=source_id, status="ALLOWED", purpose="REMIX",
+            territory="TEST", valid_from=None, valid_until=None,
+            evidence_ref="g72-pg-unassigned-disposable-only",
+            captured_by=row.owner_id, captured_at=now,
+        ))
+        db.add(DBUser(
+            id=editor_id, tenant_id=row.tenant_id,
+            email=f"{editor_id}@example.com",
+            display_name="Unassigned PostgreSQL Editor",
+            password_hash=hash_password(editor_password),
+            role="editor", is_active=True,
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+
+    logout = client.post("/auth/logout")
+    assert logout.status_code == 204, logout.text
+    login = client.post(
+        "/auth/login",
+        json={"email": f"{editor_id}@example.com", "password": editor_password},
+    )
+    assert login.status_code == 200, login.text
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    payload = {
+        "text": "synthetic isolated PG actor scope", "durationSeconds": 1,
+        "aspectRatio": "9:16", "resolution": "720p",
+        "voiceId": "synthetic-seed", "imageAssetVersionId": source_id,
+        "idempotencyKey": str(uuid.uuid4()),
+        "expectedProjectRevision": project["revision"],
+        "confirmSyntheticTestOnly": True,
+    }
+    created = None
+    for _ in range(4):
+        capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+        assert capabilities.status_code == 200, capabilities.text
+        payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+        preflight = client.post(base + "/validate", json=payload)
+        if preflight.status_code != 200:
+            if preflight.status_code == 409 and preflight.json().get(
+                "detail", {},
+            ).get("code") in {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}:
+                continue
+            pytest.fail("G72 PG unassigned editor preflight: " + preflight.text)
+        payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        created = client.post(base, json=payload)
+        if created.status_code == 202:
+            break
+        if created.status_code != 409 or created.json().get(
+            "detail", {},
+        ).get("code") not in {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}:
+            break
+    assert created is not None and created.status_code == 202, (
+        created.text if created is not None else "G72 PG create was not attempted"
+    )
+    task_id = created.json()["taskId"]
+    with sessions() as db:
+        queued = db.get(DBGenerationTask, task_id)
+        assert queued is not None
+        assert queued.project_id == project["id"]
+        assert queued.tenant_id == row.tenant_id
+        assert queued.requested_by == editor_id
+        assert queued.status == "QUEUED"
+        assert queued.lease_owner is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+
+    claim = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN,
+                 "X-Worker-Id": "worker-g72-pg-unassigned"},
+    )
+    assert claim.status_code == 204, claim.text
+    with sessions() as db:
+        still_queued = db.get(DBGenerationTask, task_id)
+        assert still_queued is not None and still_queued.status == "QUEUED"
+        assert still_queued.lease_owner is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+    assert app.state.video_use.media_objects == {}
+    app.state.moneyprinter.assert_not_called()
 
 
 def test_g76_postgres_artifact_success_waits_for_circuit_lock_and_preserves_reopen(postgres_context):
