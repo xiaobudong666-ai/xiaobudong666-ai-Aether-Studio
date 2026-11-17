@@ -295,6 +295,8 @@ def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
         "trackless_media",
         "video_negative_width",
         "audio_descriptor_is_string",
+        "media_type_contradicts_tracks",
+        "media_type_is_not_scalar",
     ],
 )
 def test_g70_g71_direct_media_malformed_sidecar_probe_keeps_hold_without_asset(
@@ -324,6 +326,10 @@ def test_g70_g71_direct_media_malformed_sidecar_probe_keeps_hold_without_asset(
             metadata["audio"] = None
         elif malformed_probe == "video_negative_width":
             metadata["video"]["width"] = -1
+        elif malformed_probe == "media_type_contradicts_tracks":
+            reply["mediaType"] = "audio"
+        elif malformed_probe == "media_type_is_not_scalar":
+            reply["mediaType"] = ["video"]
         else:
             metadata["audio"] = "not-an-audio-track-object"
         return reply
