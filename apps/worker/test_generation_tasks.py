@@ -51,6 +51,40 @@ def queue_mock():
     return queue
 
 
+@pytest.mark.parametrize("malformed_request", [
+    ["legacy-claim"], "legacy-string", 123,
+])
+def test_g72_worker_rejects_nonobject_fake_claim_without_submission(
+    monkeypatch, malformed_request,
+):
+    """FAKE-ONLY G72: invalid claim JSON must not crash Worker or submit work."""
+    from app.deterministic_fake_adapter import DeterministicFakeAdapter
+    from app.deterministic_fake_talking_head_adapter import (
+        DeterministicFakeTalkingHeadAdapter,
+    )
+
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "deterministic-fake")
+    queue = queue_mock()
+    generator = DeterministicFakeAdapter()
+    generator.generate_video = MagicMock(side_effect=AssertionError("unexpected fake submission"))
+    current = components(MagicMock(), queue)
+    current.talking_head_fake = DeterministicFakeTalkingHeadAdapter(generator)
+    current.talking_head = MagicMock()
+
+    result = process_generation_task(
+        current,
+        claimed_task(providerMode="talking-head-fake", request=malformed_request),
+        poll_interval=0,
+    )
+    assert result["status"] == "FAILED"
+    assert result["error_code"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
+    assert result["retryable"] is False
+    queue.transition.assert_called_once()
+    queue.artifact_intake.assert_not_called()
+    generator.generate_video.assert_not_called()
+    current.talking_head.submit.assert_not_called()
+
+
 def test_runtime_disabled_never_calls_provider():
     provider = MagicMock()
     queue = queue_mock()
