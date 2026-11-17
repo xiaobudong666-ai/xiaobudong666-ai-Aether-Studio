@@ -9,7 +9,7 @@ from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import apply_project_update, create_app
 from app.migrations import ensure_schema
-from app.models import DBAssetVersion, DBRenderTask, DBTenant, DBUser
+from app.models import DBAssetVersion, DBDirectMediaUploadHold, DBRenderTask, DBTenant, DBUser
 from app.schemas import UpdateProjectRequest, WorkerTaskUpdateRequest
 from app.task_status import canonical_task_status, database_status_values, legacy_task_status
 from fastapi import HTTPException
@@ -286,6 +286,83 @@ def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
     denied = isolated.post("/projects", json={"name": "Over Tenant B quota"})
     assert denied.status_code == 429
 
+
+
+@pytest.mark.parametrize(
+    "malformed_probe",
+    [
+        "video_descriptor_is_string",
+        "trackless_media",
+        "video_negative_width",
+        "audio_descriptor_is_string",
+    ],
+)
+def test_g70_g71_direct_media_malformed_sidecar_probe_keeps_hold_without_asset(
+    api_context, monkeypatch, malformed_probe,
+):
+    """G70/G71 FAKE-only: an ACK and matching bytes do not prove codec/track shape.
+
+    Existing policy: after dispatch, reject unsafe probe before asset registration;
+    retain the single durable HELD reservation and fence any repeated upload.
+    No trusted receipt, cancellation refund, or real Provider is simulated.
+    """
+    client, sessions = api_context
+    project = create_project(client, "G70 malformed FAKE Sidecar track")
+    media_store = client.app.state.video_use
+    original_upload = media_store.upload_media
+    dispatch_count = 0
+
+    def corrupted_upload(project_id, filename, content_type, stream, **kwargs):
+        nonlocal dispatch_count
+        dispatch_count += 1
+        reply = original_upload(project_id, filename, content_type, stream, **kwargs)
+        metadata = reply["metadata"]
+        if malformed_probe == "video_descriptor_is_string":
+            metadata["video"] = "not-a-video-track-object"
+        elif malformed_probe == "trackless_media":
+            metadata["video"] = None
+            metadata["audio"] = None
+        elif malformed_probe == "video_negative_width":
+            metadata["video"]["width"] = -1
+        else:
+            metadata["audio"] = "not-an-audio-track-object"
+        return reply
+
+    monkeypatch.setattr(media_store, "upload_media", corrupted_upload)
+    payload = b"synthetic-direct-media-invalid-sidecar-track"
+    path = f"/projects/{project['id']}/media"
+    request_data = {"expectedRevision": str(project["revision"])}
+    upload_file = {"file": ("untrusted.mp4", payload, "video/mp4")}
+    first = client.post(path, data=request_data, files=upload_file)
+    assert first.status_code == 409, first.text
+    assert first.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert dispatch_count == 1
+    assert client.get(f"/projects/{project['id']}/asset-versions").json() == []
+    current_project = client.get(f"/projects/{project['id']}").json()
+    assert current_project["revision"] == 1
+    assert current_project["materials"] == []
+
+    with sessions() as db:
+        holds = db.query(DBDirectMediaUploadHold).filter(
+            DBDirectMediaUploadHold.project_id == project["id"],
+        ).all()
+        assert len(holds) == 1
+        assert holds[0].state == "HELD"
+        assert holds[0].size_bytes == len(payload)
+        assert holds[0].source_sha256 == hashlib.sha256(payload).hexdigest()
+        tenant = db.get(DBTenant, holds[0].tenant_id)
+        assert tenant.used_storage_bytes == len(payload)
+
+    replay = client.post(path, data=request_data, files=upload_file)
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert dispatch_count == 1, "HELD must prevent a second Sidecar dispatch"
+    with sessions() as db:
+        holds = db.query(DBDirectMediaUploadHold).filter(
+            DBDirectMediaUploadHold.project_id == project["id"],
+        ).all()
+        assert len(holds) == 1 and holds[0].state == "HELD"
+        assert db.get(DBTenant, holds[0].tenant_id).used_storage_bytes == len(payload)
 
 def test_atomic_optimistic_lock_allows_exactly_one_competing_update(api_context):
     client, test_session = api_context
