@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, BinaryIO, Iterator
 from urllib.parse import quote
 
 import httpx
+
+
+# Matches the native video-use validate_identifier() contract.  Never permit
+# a persisted/Provider-supplied identifier to alter the internal HTTP route.
+_SIDECAR_IDENTIFIER = r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+_ALLOWED_MEDIA_STREAM = re.compile(
+    rf"/media/{_SIDECAR_IDENTIFIER}/{_SIDECAR_IDENTIFIER}"
+)
+_ALLOWED_JOB_ARTIFACT_STREAM = re.compile(
+    rf"/jobs/{_SIDECAR_IDENTIFIER}/artifact"
+)
 
 
 class VideoUseError(RuntimeError):
@@ -153,6 +165,16 @@ class VideoUseAdapter:
         path: str,
         headers: dict[str, str] | None = None,
     ) -> Iterator[httpx.Response]:
+        # A queued render stores an upstreamJobId returned by a separate
+        # process. A forged legacy identifier containing '/', '?', '#' or
+        # percent-escapes must not steer an authenticated proxy request to a
+        # different private video-use endpoint. Check the *whole* route,
+        # matching the existing sidecar's identifier rules, before HTTP.
+        if not (
+            _ALLOWED_MEDIA_STREAM.fullmatch(path)
+            or _ALLOWED_JOB_ARTIFACT_STREAM.fullmatch(path)
+        ):
+            raise VideoUseError("video-use stream path contains invalid identifiers")
         try:
             with httpx.Client(timeout=None, trust_env=False) as client:
                 with client.stream(
