@@ -999,6 +999,51 @@ def test_g70_g71_media_upload_rejects_malformed_sidecar_response_without_asset(
         assert db.query(DBAssetVersion).count() == 0
 
 @pytest.mark.parametrize("failure_kind", ["timeout_after_dispatch", "sidecar_503"])
+@pytest.mark.parametrize(
+    ("submit_method", "expected_path"),
+    [
+        ("submit_render", "/renders"),
+        ("submit_transcription", "/transcriptions"),
+        ("submit_timeline_view", "/timeline-views"),
+    ],
+)
+def test_g70_g71_sidecar_mutating_job_submission_fails_closed_on_lost_ack(
+    monkeypatch, failure_kind, submit_method, expected_path,
+):
+    """An ambiguous accepted Sidecar job must not be replayed as new work.
+
+    In particular /transcriptions can trigger a paid upstream call. FAKE-only
+    isolated HTTPX transport: no real Sidecar/Provider or billing calls.
+    """
+    import httpx
+    from app.video_use_adapter import (
+        VideoUseAdapter, VideoUseConnectionError, VideoUseTimeoutError,
+    )
+
+    outbound = []
+
+    def fake_request(client, method, url, **kwargs):
+        outbound.append((method, url, kwargs.get("json")))
+        request = httpx.Request(method, url)
+        if failure_kind == "timeout_after_dispatch":
+            raise httpx.ReadTimeout("synthetic Sidecar lost ACK", request=request)
+        return httpx.Response(503, request=request)
+
+    monkeypatch.setattr(httpx.Client, "request", fake_request)
+    adapter = VideoUseAdapter(
+        api_url="http://fake-sidecar.invalid", max_retries=2, backoff_factor=0,
+    )
+    with pytest.raises((VideoUseTimeoutError, VideoUseConnectionError)):
+        getattr(adapter, submit_method)({"projectId": "fake-project"})
+
+    assert len(outbound) == 1, "ambiguous mutating POST must not retry"
+    assert outbound[0] == (
+        "POST", f"http://fake-sidecar.invalid{expected_path}",
+        {"projectId": "fake-project"},
+    )
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout_after_dispatch", "sidecar_503"])
 @pytest.mark.parametrize("with_idempotency_headers", [False, True])
 def test_g70_g71_media_adapter_does_not_replay_ambiguous_upload_dispatch(monkeypatch, failure_kind, with_idempotency_headers):
     """FAKE-only transport test: an uncertain Sidecar POST must never be auto-replayed.
