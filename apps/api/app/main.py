@@ -4978,13 +4978,36 @@ def create_app(
                 duration_seconds = float(raw_duration or 0)
                 suffix = os.path.splitext(file.filename or "")[1].lower()
                 image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+                video_probe = metadata.get("video")
+                audio_probe = metadata.get("audio")
+                # G70/G71: the upload's matching bytes/hash do not certify its
+                # media probe. Never persist a video/audio asset from a malformed
+                # Sidecar stream descriptor or silently label a trackless video
+                # as audio. Since dispatch already happened, the existing outer
+                # exception fence preserves HELD for trusted reconciliation.
+                if video_probe is not None and (
+                    not isinstance(video_probe, dict)
+                    or type(video_probe.get("width")) is not int
+                    or video_probe["width"] <= 0
+                    or type(video_probe.get("height")) is not int
+                    or video_probe["height"] <= 0
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的视频轨信息无效"},
+                    )
+                if audio_probe is not None and (
+                    not isinstance(audio_probe, dict) or not audio_probe
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的音频轨信息无效"},
+                    )
                 if suffix in image_extensions:
-                    video_probe = metadata.get("video") or {}
                     if (
                         uploaded.get("mediaType") != "image"
-                        or not video_probe.get("width")
-                        or not video_probe.get("height")
-                        or metadata.get("audio") is not None
+                        or not video_probe
+                        or audio_probe is not None
                     ):
                         raise HTTPException(
                             status_code=422,
@@ -4992,7 +5015,12 @@ def create_app(
                         )
                     media_type = "image"
                 else:
-                    media_type = "video" if metadata.get("video") else "audio"
+                    if not video_probe and not audio_probe:
+                        raise HTTPException(
+                            status_code=422,
+                            detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务未返回有效的音视频轨信息"},
+                        )
+                    media_type = "video" if video_probe else "audio"
                 # Sidecar upload replies are not tenant-authority evidence. Before
                 # adding a durable asset/material, require the returned project
                 # identity to match the authenticated tenant-scoped project and
