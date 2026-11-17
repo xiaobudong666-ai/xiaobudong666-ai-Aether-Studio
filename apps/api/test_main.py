@@ -382,6 +382,48 @@ def test_g70_g71_direct_media_malformed_sidecar_probe_keeps_hold_without_asset(
         assert len(holds) == 1 and holds[0].state == "HELD"
         assert db.get(DBTenant, holds[0].tenant_id).used_storage_bytes == len(payload)
 
+
+@pytest.mark.parametrize(
+    ("filename", "caller_mime", "expected_mime"),
+    [
+        ("spoofed-video.mp4", "text/html", "video/mp4"),
+        ("spoofed-image.png", "image/svg+xml", "image/png"),
+    ],
+)
+def test_g70_g71_untrusted_multipart_mime_cannot_poison_catalog_or_download(
+    api_context, monkeypatch, filename, caller_mime, expected_mime,
+):
+    """FAKE-only: validated track type controls asset MIME, not caller/Sidecar headers."""
+    client, sessions = api_context
+    project = create_project(client, "G70 MIME evidence boundary")
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": (filename, b"fake-media-mime-probe", caller_mime)},
+    )
+    assert response.status_code == 201, response.text
+    asset = response.json()["assetVersion"]
+    material = response.json()["material"]
+    assert material["contentType"] == expected_mime
+    assert asset["contentType"] == expected_mime
+    with sessions() as db:
+        stored = db.get(DBAssetVersion, asset["id"])
+        assert stored is not None and stored.content_type == expected_mime
+
+    original_stream = client.app.state.video_use.stream
+
+    @contextmanager
+    def spoofed_upstream_content_type(path, headers=None):
+        with original_stream(path, headers=headers) as upstream:
+            upstream.headers["content-type"] = "text/html"
+            yield upstream
+
+    monkeypatch.setattr(client.app.state.video_use, "stream", spoofed_upstream_content_type)
+    download = client.get(f"/video-use/media/{project['id']}/{material['id']}")
+    assert download.status_code == 200, download.text
+    assert download.headers["content-type"] == expected_mime
+    assert download.headers["x-content-type-options"] == "nosniff"
+
 def test_atomic_optimistic_lock_allows_exactly_one_competing_update(api_context):
     client, test_session = api_context
     project = create_project(client, "Concurrency Test")

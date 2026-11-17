@@ -5080,10 +5080,25 @@ def create_app(
                     ".jpeg": "image/jpeg",
                     ".webp": "image/webp",
                 }.get(suffix, "video/mp4" if media_type == "video" else "audio/mpeg")
+                # G70/G71: the caller-controlled multipart MIME type is not a
+                # Sidecar-proven media classification. Never persist HTML/SVG
+                # as an authenticated video/image asset solely from that header.
+                # Keep acceptable video/audio MIME types; derive a safe fallback
+                # from the verified track class and known image file extension.
+                declared_mime = (file.content_type or "").split(";", 1)[0].strip().lower()
+                safe_media_mime = (
+                    declared_mime
+                    if media_type != "image"
+                    and declared_mime.startswith(f"{media_type}/")
+                    and re.fullmatch(r"[a-z0-9!#                material = {
+                    "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,^_.+-]+/[a-z0-9!#                material = {
+                    "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,^_.+-]+", declared_mime)
+                    else fallback_content_type
+                )
                 material = {
                     "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,
                     "url": f"/api/video-use/media/{project_id}/{media_id}", "type": media_type,
-                    "contentType": file.content_type or fallback_content_type,
+                    "contentType": safe_media_mime,
                     "duration": None if media_type == "image" else {
                         "value": max(1, round(duration_seconds * 24_000)), "timescale": 24_000,
                     },
@@ -5269,6 +5284,7 @@ def create_app(
         path: str,
         request: Request,
         media_type: str = "application/octet-stream",
+        prefer_catalog_mime: bool = False,
     ):
         forwarded_headers = {
             header: request.headers[header]
@@ -5308,10 +5324,14 @@ def create_app(
             finally:
                 stream_context.__exit__(None, None, None)
 
+        if prefer_catalog_mime:
+            # Only authenticated catalogued assets use their persisted,
+            # track-validated MIME rather than an upstream HTTP header.
+            response_headers["x-content-type-options"] = "nosniff"
         return StreamingResponse(
             body(),
             status_code=upstream.status_code,
-            media_type=upstream.headers.get("content-type", media_type),
+            media_type=media_type if prefer_catalog_mime else upstream.headers.get("content-type", media_type),
             headers=response_headers,
         )
 
@@ -5346,8 +5366,13 @@ def create_app(
                     },
                 )
 
-        media_type = material.get("contentType") or ("video/mp4" if material.get("type") == "video" else "audio/mpeg")
-        return proxy_video_use_stream(f"/media/{project_id}/{media_id}", request, media_type)
+        media_type = (asset.content_type if asset is not None else None) or material.get("contentType") or (
+            "video/mp4" if material.get("type") == "video" else "audio/mpeg"
+        )
+        return proxy_video_use_stream(
+            f"/media/{project_id}/{media_id}", request, media_type,
+            prefer_catalog_mime=asset is not None,
+        )
 
     @created_app.post("/projects/{project_id}/render", status_code=202)
     def start_render_task(project_id: str, context: AuthContext = Depends(context_dependency), db: Session = Depends(db_dependency)):
