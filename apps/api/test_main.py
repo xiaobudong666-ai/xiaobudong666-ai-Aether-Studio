@@ -997,3 +997,49 @@ def test_g70_g71_media_upload_rejects_malformed_sidecar_response_without_asset(
     with sessions() as db:
         assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes + len(b"real-media-bytes")
         assert db.query(DBAssetVersion).count() == 0
+
+@pytest.mark.parametrize("failure_kind", ["timeout_after_dispatch", "sidecar_503"])
+@pytest.mark.parametrize("with_idempotency_headers", [False, True])
+def test_g70_g71_media_adapter_does_not_replay_ambiguous_upload_dispatch(monkeypatch, failure_kind, with_idempotency_headers):
+    """FAKE-only transport test: an uncertain Sidecar POST must never be auto-replayed.
+
+    A timeout or 503 may occur after remote bytes were committed. Neither
+    auto-retry nor a guessed refund is permitted without a trusted receipt.
+    This test makes zero real network/Provider calls.
+    """
+    import io
+    import httpx
+    from app.video_use_adapter import (
+        VideoUseAdapter, VideoUseConnectionError, VideoUseTimeoutError,
+    )
+
+    outbound = []
+
+    def fake_request(client, method, url, **kwargs):
+        outbound.append((method, url, kwargs.get("headers")))
+        request = httpx.Request(method, url)
+        if failure_kind == "timeout_after_dispatch":
+            raise httpx.ReadTimeout("simulated ambiguous remote commit", request=request)
+        return httpx.Response(503, request=request)
+
+    monkeypatch.setattr(httpx.Client, "request", fake_request)
+    adapter = VideoUseAdapter(
+        api_url="http://fake-sidecar.invalid", max_retries=2, backoff_factor=0,
+    )
+    payload = b"fake-only-uncertain-media-commit"
+    binding = (
+        {"idempotency_key": "fake-only-upload-1",
+         "content_sha256": hashlib.sha256(payload).hexdigest()}
+        if with_idempotency_headers else {}
+    )
+    with pytest.raises((VideoUseTimeoutError, VideoUseConnectionError)):
+        adapter.upload_media(
+            "fake-project", "clip.mp4", "video/mp4",
+            io.BytesIO(payload), **binding,
+        )
+
+    assert len(outbound) == 1, "ambiguous upload must have exactly one dispatch"
+    assert outbound[0][0] == "POST"
+    assert outbound[0][1].endswith("/media")
+    if with_idempotency_headers:
+        assert outbound[0][2]["Idempotency-Key"] == "fake-only-upload-1"
