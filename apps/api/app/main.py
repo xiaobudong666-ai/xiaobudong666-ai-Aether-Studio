@@ -2757,6 +2757,13 @@ def create_app(
                 status_code=404,
                 detail={"code": "PROJECT_NOT_FOUND", "message": "未找到该项目"},
             )
+        # G72 FAKE-only: Sidecar inspection occurs outside the final DB write
+        # lock. A project Owner transfer or originator deactivation during that
+        # read-only call must not authorize a stale Owner to publish/recover the
+        # historical FAKE artifact. Recheck current claim authority inside the
+        # serialized final transaction, before any asset or quota changes.
+        if task.provider == "deterministic-fake-talking-head":
+            require_fake_talking_head_claim_authority(db, project, context)
         if task.asset_version_id:
             return generation_task_response(
                 db, task, rights=generation_rights(db, task), include_history=True
