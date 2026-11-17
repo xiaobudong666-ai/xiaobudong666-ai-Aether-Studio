@@ -88,6 +88,8 @@ class FakeMediaStore:
             "projectId": project_id,
             "fileName": filename,
             "contentType": content_type,
+            # Mirror the real Sidecar classification; keep production strict.
+            "mediaType": "video",
             "metadata": {
                 "durationSeconds": 1.0,
                 "sizeBytes": len(payload),
