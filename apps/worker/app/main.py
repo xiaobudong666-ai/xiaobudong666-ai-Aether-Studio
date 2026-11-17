@@ -291,6 +291,9 @@ def process_generation_task(
         if (
             operator_generation_mode() != "deterministic-fake"
             or not isinstance(fake_adapter, DeterministicFakeTalkingHeadAdapter)
+            # Legacy/corrupt claims may carry a non-object JSON request.
+            # Refuse before .get() or any synthetic job submission.
+            or not isinstance(request, dict)
             or request.get("fakeTaskType") != "talking-head"
             or not request.get("imageAssetId")
             or not task.get("projectId")
