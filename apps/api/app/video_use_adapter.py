@@ -40,7 +40,13 @@ class VideoUseAdapter:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        # G70/G71: POST /media can have committed remote bytes before the
+        # connection fails or the Sidecar returns 5xx. Even a supplied
+        # idempotency key is not independent evidence of a remote commit.
+        # Never replay this upload inside the adapter; the API keeps its
+        # durable HELD reservation for Owner-authorized reconciliation.
+        retry_budget = 0 if method.upper() == "POST" and path == "/media" else self.max_retries
+        for attempt in range(retry_budget + 1):
             files = kwargs.get("files")
             if isinstance(files, dict):
                 for part in files.values():
@@ -65,7 +71,7 @@ class VideoUseAdapter:
                 )
             except httpx.HTTPError as exc:
                 last_error = VideoUseConnectionError(f"video-use request failed: {exc}")
-            if attempt < self.max_retries:
+            if attempt < retry_budget:
                 time.sleep(self.backoff_factor * (2**attempt))
         assert last_error is not None
         raise last_error
