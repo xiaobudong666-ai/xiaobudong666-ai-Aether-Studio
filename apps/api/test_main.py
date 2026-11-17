@@ -1148,3 +1148,59 @@ def test_g70_g71_media_adapter_does_not_replay_ambiguous_upload_dispatch(monkeyp
     assert outbound[0][1].endswith("/media")
     if with_idempotency_headers:
         assert outbound[0][2]["Idempotency-Key"] == "fake-only-upload-1"
+
+
+@pytest.mark.parametrize("path", [
+    "/jobs/../../health?exfil=1/artifact",
+    "/jobs/%2e%2e%2fhealth/artifact",
+    "/jobs/job-1?route=capabilities/artifact",
+    "/jobs/job-1#fragment/artifact",
+    "/media/project-a/../../health",
+    "/media/project-a/media-1?route=/jobs",
+    "/jobs//artifact",
+])
+def test_video_use_stream_rejects_malformed_sidecar_routes(monkeypatch, path):
+    """FAKE-only: reject a poisoned persisted Sidecar ID before HTTP transport.
+
+    No real Provider/Sidecar call or protected storage read. The Sidecar itself
+    already validates identifiers; the authenticated API proxy must not rely on
+    downstream URL parsing to preserve the intended resource scope.
+    """
+    import httpx
+    from app.video_use_adapter import VideoUseAdapter, VideoUseError
+
+    def forbidden_client(*args, **kwargs):
+        raise AssertionError("invalid proxy route must not create an HTTP client")
+
+    monkeypatch.setattr(httpx, "Client", forbidden_client)
+    with pytest.raises(VideoUseError, match="invalid identifiers"):
+        with VideoUseAdapter().stream(path):
+            pytest.fail("malformed Sidecar path unexpectedly accepted")
+
+
+@pytest.mark.parametrize("path", [
+    "/jobs/11111111-1111-1111-1111-111111111111/artifact",
+    "/media/11111111-1111-1111-1111-111111111111/media-1",
+])
+def test_video_use_stream_valid_sidecar_routes_preserve_range(monkeypatch, path):
+    """FAKE HTTPX transport proves valid native routes are not regressed."""
+    import httpx
+    from app.video_use_adapter import VideoUseAdapter
+
+    seen = []
+    transport = httpx.MockTransport(
+        lambda request: (
+            seen.append((request.url.path, request.headers.get("range")))
+            or httpx.Response(206, headers={"Content-Type": "video/mp4"}, content=b"abc")
+        )
+    )
+    real_client = httpx.Client
+
+    def mocked_client(*args, **kwargs):
+        return real_client(*args, transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", mocked_client)
+    with VideoUseAdapter().stream(path, headers={"Range": "bytes=0-2"}) as response:
+        assert response.status_code == 206
+        assert b"".join(response.iter_bytes()) == b"abc"
+    assert seen == [(path, "bytes=0-2")]
