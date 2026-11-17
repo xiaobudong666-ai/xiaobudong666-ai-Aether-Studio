@@ -1,4 +1,6 @@
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import time
 import uuid
@@ -381,3 +383,70 @@ def test_canonical_timeline_render_preserves_gap_overlap_audio_and_idempotency(t
             capture_output=True,
         ).stdout
         assert gap_pixel and max(gap_pixel) < 20
+
+
+def test_idempotent_upload_conflict_is_serialized_across_independent_apps(tmp_path, monkeypatch):
+    # Two separate ASGI app instances with the same POSIX media directory
+    # mimic independent workers; this is not a PostgreSQL or host-crash test.
+    source = tmp_path / "original.mp4"
+    alternate = tmp_path / "alternate.mp4"
+    make_source(source)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=red:s=320x240:r=24",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(alternate),
+        ],
+        check=True,
+    )
+    assert source.read_bytes() != alternate.read_bytes()
+
+    media_root = tmp_path / "media"
+    app_a = create_app(media_root=media_root, upstream_root=tmp_path / "upstream")
+    app_b = create_app(media_root=media_root, upstream_root=tmp_path / "upstream")
+    original_replace = Path.replace
+    replace_barrier = threading.Barrier(2)
+
+    def synchronized_replace(self, target):
+        # Force an overlapping final-write window in the old implementation.
+        # Under the fix the first caller times out here and the second
+        # observes an already committed media file before trying to replace.
+        if self.name.endswith(".pending.mp4") and "project-shared" in self.parts:
+            try:
+                replace_barrier.wait(timeout=1.2)
+            except threading.BrokenBarrierError:
+                pass
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", synchronized_replace)
+
+    def upload(client, source_path):
+        payload = source_path.read_bytes()
+        with source_path.open("rb") as content:
+            return client.post(
+                "/media",
+                data={"projectId": "project-shared"},
+                files={"file": ("generated.mp4", content, "video/mp4")},
+                headers={
+                    "Idempotency-Key": "shared-key",
+                    "X-Content-SHA256": hashlib.sha256(payload).hexdigest(),
+                },
+            )
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(upload, client_a, source)
+            future_b = pool.submit(upload, client_b, alternate)
+            response_a = future_a.result(timeout=30)
+            response_b = future_b.result(timeout=30)
+
+    assert sorted([response_a.status_code, response_b.status_code]) == [201, 409], (
+        response_a.text, response_b.text
+    )
+    media_files = list(
+        (media_root / "projects" / "project-shared" / "media").glob("*.mp4")
+    )
+    assert len(media_files) == 1
+    winner = source if response_a.status_code == 201 else alternate
+    assert media_files[0].read_bytes() == winner.read_bytes()

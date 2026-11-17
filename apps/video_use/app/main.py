@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -823,8 +824,25 @@ def create_app(
                 await file.close()
 
         if idempotency_key is not None:
+            # asyncio.Lock covers only this ASGI instance. A shared POSIX
+            # media directory also needs an OS-released, cross-process fence
+            # around the idempotency lookup and final atomic replace.
+            # Locking the directory inode does not mutate stored media.
             async with upload_idempotency_lock:
-                return await persist_upload()
+                media_dir_fd = os.open(media_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    while True:
+                        try:
+                            fcntl.flock(media_dir_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            await asyncio.sleep(0.02)
+                    try:
+                        return await persist_upload()
+                    finally:
+                        fcntl.flock(media_dir_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(media_dir_fd)
         return await persist_upload()
 
     @app.get("/media/{project_id}/{media_id}")
