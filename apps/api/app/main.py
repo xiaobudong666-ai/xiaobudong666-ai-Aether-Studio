@@ -4987,6 +4987,8 @@ def create_app(
                 # exception fence preserves HELD for trusted reconciliation.
                 if video_probe is not None and (
                     not isinstance(video_probe, dict)
+                    or not isinstance(video_probe.get("codec"), str)
+                    or not video_probe["codec"].strip()
                     or type(video_probe.get("width")) is not int
                     or video_probe["width"] <= 0
                     or type(video_probe.get("height")) is not int
@@ -4997,7 +4999,9 @@ def create_app(
                         detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务返回的视频轨信息无效"},
                     )
                 if audio_probe is not None and (
-                    not isinstance(audio_probe, dict) or not audio_probe
+                    not isinstance(audio_probe, dict)
+                    or not isinstance(audio_probe.get("codec"), str)
+                    or not audio_probe["codec"].strip()
                 ):
                     raise HTTPException(
                         status_code=422,
