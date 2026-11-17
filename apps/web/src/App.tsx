@@ -146,6 +146,9 @@ export default function App() {
   const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
   const OPENREEL_URL = (import.meta.env.VITE_OPENREEL_URL || "").trim();
   const canEdit = authUser?.role === "owner" || authUser?.role === "editor";
+  // FAKE-only task claim is restricted to the active project Owner on the API.
+  // Editors/admins have no approved per-project delegation contract for G72.
+  const canCreateFakeTalkingHead = authUser?.role === "owner";
 
   const stateHeaders = { "X-Aether-CSRF": "1" };
 
@@ -473,8 +476,8 @@ export default function App() {
 
   const handleCreateFakeTalkingHead = async () => {
     if (visibleFakeEntryIdentity !== fakeEntryIdentityKey) return;
-    if (!canEdit) {
-      setActionMessage("当前账号为只读权限，不能创建口播任务。");
+    if (!canCreateFakeTalkingHead) {
+      setActionMessage("当前仅项目Owner本人可发起FAKE口播任务；管理员代操作需要独立授权，当前未开放。");
       return;
     }
     if (!currentProject) {
@@ -1079,7 +1082,7 @@ export default function App() {
               className="primary-cta"
               onClick={handleCreateFakeTalkingHead}
               disabled={
-                !canEdit || !currentProject || !scriptText.trim()
+                !canCreateFakeTalkingHead || !currentProject || !scriptText.trim()
                 || visibleFakeEntryIdentity !== fakeEntryIdentityKey
                 || selectedAvatar !== "upload" || !selectedAvatarAssetId
                 || isCreatingFakeTalkingHead
@@ -1088,6 +1091,7 @@ export default function App() {
               {isCreatingFakeTalkingHead ? "正在预检并入队…" : "生成口播测试样片（FAKE-ONLY）"}
             </button>
             <p className="generate-hint">
+              仅项目Owner本人可发起；管理员代操作须另行获得项目明确授权，当前不开放。
               仅 1 秒、9:16、720p 合成测试样片；服务端重新核验图片 REMIX 授权。
               输出标记为模拟素材，不可发布，不会自动采纳或写入时间线。
             </p>
