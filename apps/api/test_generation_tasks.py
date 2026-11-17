@@ -6577,6 +6577,102 @@ def test_g72_fake_draft_apply_unassigned_editor_is_denied_before_rights(
     assert owner_result.json()["detail"]["code"] == "RIGHTS_MISSING"
 
 
+@pytest.mark.parametrize("authority_change", ["transfer", "deactivate"])
+def test_g72_fake_orphan_recovery_rechecks_owner_after_sidecar_inspection(
+    generation_context, monkeypatch, authority_change,
+):
+    """An in-flight read-only Sidecar inspection cannot preserve stale FAKE Owner authority.
+
+    G72/G70/G71 FAKE-only native API+DB isolation: no live Provider, upload,
+    refund, release, issuance or policy change is authorized by this test.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G72 orphan inspection Owner TOCTOU")
+    task_id = _g72_create_owner_fake_for_mutation_fence(
+        client, sessions, project, f"g72-recovery-race-{authority_change}",
+    )
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id,
+    )
+    new_owner_id = "g72-recovery-successor-" + str(uuid.uuid4())
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        owner_id = task.requested_by
+        held_before = tenant.used_storage_bytes
+        revision_before = db.get(DBProject, project["id"]).revision
+        asset_count_before = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one()
+        event_count_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_count_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        if authority_change == "transfer":
+            now = datetime.datetime.now(datetime.timezone.utc)
+            db.add(DBUser(
+                id=new_owner_id, tenant_id=task.tenant_id,
+                email=f"{new_owner_id}@example.com",
+                display_name="Replacement FAKE Project Owner",
+                password_hash=hash_password(secrets.token_urlsafe(24)),
+                role="owner", is_active=True, created_at=now, updated_at=now,
+            ))
+            db.commit()
+
+    original_inspect = media_store.inspect_media
+    inspected_once = False
+
+    def inspect_during_authority_change(project_id, selected_media_id):
+        nonlocal inspected_once
+        result = original_inspect(project_id, selected_media_id)
+        assert selected_media_id == media_id
+        assert not inspected_once
+        with sessions() as db:
+            if authority_change == "transfer":
+                db.get(DBProject, project["id"]).owner_id = new_owner_id
+            else:
+                db.get(DBUser, owner_id).is_active = False
+            db.commit()
+        inspected_once = True
+        return result
+
+    monkeypatch.setattr(media_store, "inspect_media", inspect_during_authority_change)
+    denied = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "FAKE Owner authorization revoked during Sidecar inspection"},
+    )
+    assert inspected_once, "The owner change must occur AFTER the initial authorization check"
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        project_row = db.get(DBProject, project["id"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        assert task.status == "FAILED" and task.asset_version_id is None
+        assert task.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == held_before
+        assert project_row.revision == revision_before
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one() == asset_count_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == event_count_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_count_before
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g72_fake_transfer_blocks_old_owner_apply_and_orphan_recovery(
     generation_context,
 ):
