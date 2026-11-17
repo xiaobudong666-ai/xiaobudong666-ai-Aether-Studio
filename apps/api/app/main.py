@@ -2764,6 +2764,18 @@ def create_app(
         # serialized final transaction, before any asset or quota changes.
         if task.provider == "deterministic-fake-talking-head":
             require_fake_talking_head_claim_authority(db, project, context)
+        # Sidecar inspection runs outside the final write transaction. A
+        # concurrent change to the saved generation capability/policy snapshot
+        # invalidates the limits checked before the probe. Do not register an
+        # orphan using stale limits; keep the original HELD ledger unchanged.
+        if task.capability_snapshot_json != raw_snapshot:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_POLICY_CHANGED",
+                    "message": "恢复期间原任务能力或费用策略快照变化，保持 HELD，需重新核对",
+                },
+            )
         if task.asset_version_id:
             return generation_task_response(
                 db, task, rights=generation_rights(db, task), include_history=True

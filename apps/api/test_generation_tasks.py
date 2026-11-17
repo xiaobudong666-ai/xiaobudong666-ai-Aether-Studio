@@ -6827,3 +6827,83 @@ def test_g72_fake_retry_denies_unassigned_editor_before_task_state_disclosure(
     owner_response = client.post(path)
     assert owner_response.status_code == 409, owner_response.text
     assert owner_response.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
+
+
+@pytest.mark.parametrize("new_limit", [1, "unlimited"])
+def test_g70_g71_recovery_rejects_policy_change_during_sidecar_inspection(
+    generation_context, monkeypatch, new_limit,
+):
+    """The final write must not use policy limits cached before a Sidecar probe.
+
+    This is an isolated FAKE API+DB concurrency regression. It neither
+    settles HELD usage nor changes Owner policy, Provider, or production state.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G70/G71 policy change during Sidecar probe")
+    task = create_task(client, project, key="g70-g71-race-" + str(new_limit))
+    task_id = task["taskId"]
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id,
+    )
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        used_before = tenant.used_storage_bytes
+        task_events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        original_snapshot = dict(row.capability_snapshot_json)
+    original_inspect = media_store.inspect_media
+    touched = False
+
+    def inspect_and_change_saved_policy(project_id, selected_media_id):
+        nonlocal touched
+        result = original_inspect(project_id, selected_media_id)
+        assert selected_media_id == media_id
+        assert not touched
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            snapshot = dict(row.capability_snapshot_json)
+            policy = dict(snapshot.get("providerPolicy") or {})
+            policy["maxArtifactBytes"] = new_limit
+            snapshot["providerPolicy"] = policy
+            row.capability_snapshot_json = snapshot
+            db.commit()
+        touched = True
+        return result
+
+    monkeypatch.setattr(media_store, "inspect_media", inspect_and_change_saved_policy)
+    result = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner must recheck the immutable policy snapshot"},
+    )
+    assert touched, "The policy change must occur during the read-only probe"
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_CHANGED"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        assert row.status == "FAILED"
+        assert row.asset_version_id is None
+        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == used_before
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"], DBAssetVersion.media_id == media_id,
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == task_events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+        assert row.capability_snapshot_json != original_snapshot
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
