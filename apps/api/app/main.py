@@ -5090,9 +5090,7 @@ def create_app(
                     declared_mime
                     if media_type != "image"
                     and declared_mime.startswith(f"{media_type}/")
-                    and re.fullmatch(r"[a-z0-9!#                material = {
-                    "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,^_.+-]+/[a-z0-9!#                material = {
-                    "id": media_id, "name": uploaded.get("fileName") or file.filename or media_id,^_.+-]+", declared_mime)
+                    and re.fullmatch(r"[a-z0-9][a-z0-9_.+-]*/[a-z0-9][a-z0-9_.+-]*", declared_mime)
                     else fallback_content_type
                 )
                 material = {
