@@ -194,6 +194,21 @@ def test_generated_upload_idempotency_survives_lost_ack_without_duplicate_media(
         replay_payload = replay.json()
         assert replay_payload["mediaId"] == expected_media_id
         assert replay_payload["idempotentReplay"] is True
+
+        # G70/G71: a lost-ACK replay must preserve not only the byte hash,
+        # but also the original suffix/format binding. The same MP4 bytes
+        # labeled MOV must be rejected before the Sidecar can return an
+        # inconsistent media filename or format receipt.
+        with source.open("rb") as stream:
+            cross_suffix = client.post(
+                "/media",
+                data={"projectId": "project-idempotency"},
+                files={"file": ("generated.mov", stream, "video/quicktime")},
+                headers=headers,
+            )
+        assert cross_suffix.status_code == 409, cross_suffix.text
+        assert "different media parameters" in cross_suffix.json()["detail"]
+
         media_files = list(
             (media_root / "projects" / "project-idempotency" / "media").glob(
                 f"{expected_media_id}.*"

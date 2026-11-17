@@ -785,6 +785,14 @@ def create_app(
                         )
                     if matches:
                         existing = matches[0]
+                        # An idempotent replay must preserve the original media
+                        # extension as well as its bytes. Reusing the same key
+                        # with a different suffix changes the media contract.
+                        if existing.suffix.lower() != suffix:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Idempotency key was already used for different media parameters",
+                            )
                         if sha256_file(existing) != actual_sha256:
                             raise HTTPException(
                                 status_code=409,
