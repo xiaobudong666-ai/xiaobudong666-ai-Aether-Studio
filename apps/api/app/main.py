@@ -5021,6 +5021,18 @@ def create_app(
                             detail={"code": "MEDIA_PROBE_INVALID", "message": "媒体服务未返回有效的音视频轨信息"},
                         )
                     media_type = "video" if video_probe else "audio"
+                # G70/G71: a Sidecar mediaType that contradicts the validated
+                # stream descriptor must not be registered as an asset. A matching
+                # byte hash does not certify a corrupted media classification.
+                # Once dispatch began, the outer failure fence retains HELD.
+                if uploaded.get("mediaType") != media_type:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "MEDIA_PROBE_TYPE_MISMATCH",
+                            "message": "媒体服务返回的媒体分类与实际轨道不一致，禁止登记资产",
+                        },
+                    )
                 # Sidecar upload replies are not tenant-authority evidence. Before
                 # adding a durable asset/material, require the returned project
                 # identity to match the authenticated tenant-scoped project and
