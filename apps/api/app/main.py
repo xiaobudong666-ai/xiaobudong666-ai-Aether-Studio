@@ -4962,6 +4962,22 @@ def create_app(
             project = project_for_tenant(db, project_id, context)
             if project.revision != expectedRevision:
                 raise HTTPException(status_code=409, detail={"code": "CONCURRENCY_CONFLICT", "message": "项目版本冲突，请重新载入后再操作"})
+            if project.materials is not None and (
+                not isinstance(project.materials, list)
+                or any(not isinstance(item, dict) for item in project.materials)
+            ):
+                # G70/G71: do not debit quota or dispatch bytes before discovering
+                # corrupt historical catalog JSON. Otherwise the later append
+                # raises after remote I/O, leaving an avoidable HELD orphan.
+                # This check is read-only and grants no reconciliation authority.
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PROJECT_MATERIALS_INTEGRITY_REVIEW_REQUIRED",
+                        "message": "项目现存素材数据格式异常，未发起上传或占额，须人工核对",
+                    },
+                )
             # G70/G71: an uncertain prior Sidecar dispatch can outlive this
             # process and its session advisory lock. A durable HELD record
             # fences retransmission before a second quota debit or dispatch.
