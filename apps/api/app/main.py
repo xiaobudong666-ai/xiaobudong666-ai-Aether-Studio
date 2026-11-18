@@ -3460,6 +3460,23 @@ def create_app(
             )
         previous = task.status
         attempt = current_generation_attempt(db, task)
+        # G73: A persisted Attempt-level upstream receipt is independent
+        # evidence of an already submitted job. If it diverges from the task
+        # receipt (including a missing task-level ID), a leased Worker must
+        # not transition, replace the job identity, or settle/release usage.
+        # Preserve both records for explicit reconciliation: FAKE-only,
+        # read-only refusal before status, quota or event mutation.
+        if (
+            attempt.upstream_job_id is not None
+            and attempt.upstream_job_id != task.upstream_job_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "UPSTREAM_ATTEMPT_IDENTITY_CONFLICT",
+                    "message": "任务与尝试的持久上游回执不一致，须先人工核验",
+                },
+            )
         if req.upstreamJobId:
             task.upstream_job_id = req.upstreamJobId
             attempt.upstream_job_id = attempt.upstream_job_id or req.upstreamJobId
