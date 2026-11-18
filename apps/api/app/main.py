@@ -4984,7 +4984,7 @@ def create_app(
                         "message": "此前媒体占额结果待可信核对，禁止重复上传或重新占额",
                     },
                 )
-            if project.materials is not None and (
+            if (
                 not isinstance(project.materials, list)
                 or any(not isinstance(item, dict) for item in project.materials)
             ):
