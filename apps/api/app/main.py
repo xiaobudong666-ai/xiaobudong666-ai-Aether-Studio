@@ -3135,7 +3135,11 @@ def create_app(
             # disputed attempt and reservations untouched for reconciliation.
             if candidate_attempt.status in TERMINAL_GENERATION_STATES:
                 continue
-            if candidate.status == "QUEUED" and candidate_attempt.status != "QUEUED":
+            # G73: task and current-attempt states are committed together.
+            # A nonterminal disagreement (including an unknown legacy value)
+            # is not authority to recover or submit upstream work again.
+            # Quarantine read-only; do not change leases, receipts or quota.
+            if candidate_attempt.status != candidate.status:
                 continue
             candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
