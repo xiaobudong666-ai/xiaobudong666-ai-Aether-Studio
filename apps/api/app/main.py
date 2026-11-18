@@ -3129,6 +3129,12 @@ def create_app(
             # already terminal must not be claimed and silently re-submitted.
             # Preserve the disputed attempt/usage records for reconciliation;
             # do not invent a refund or transition policy.
+            # An active task may reference a terminal/ambiguous attempt after
+            # crash, legacy repair or out-of-order persistence.  Never re-lease
+            # such a row, including SUBMITTING/RUNNING/INGESTING tasks; leave the
+            # disputed attempt and reservations untouched for reconciliation.
+            if candidate_attempt.status in TERMINAL_GENERATION_STATES:
+                continue
             if candidate.status == "QUEUED" and candidate_attempt.status != "QUEUED":
                 continue
             candidate_mode = candidate_snapshot.get("mode")
