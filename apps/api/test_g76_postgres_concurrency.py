@@ -3482,6 +3482,77 @@ def test_g73_postgres_active_task_terminal_attempt_is_quarantined(postgres_conte
     app.state.moneyprinter.assert_not_called()
 
 
+
+@pytest.mark.parametrize(
+    ("task_status", "attempt_status"),
+    [
+        ("SUBMITTING", "QUEUED"),
+        ("RUNNING", "SUBMITTING"),
+        ("INGESTING", "RUNNING"),
+        ("SUBMITTING", "INVALID_LEGACY_STATUS"),
+    ],
+)
+def test_g73_postgres_active_task_nonterminal_attempt_mismatch_is_quarantined(
+    postgres_context, task_status, attempt_status,
+):
+    """A corrupted active task/attempt mismatch may not acquire a Worker lease.
+
+    FAKE-only disposable PostgreSQL: preserve the disputed history and allow
+    the later healthy task to progress. No reconciliation or refund is inferred.
+    """
+    client, sessions, app = postgres_context
+    damaged_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        assert damaged is not None and healthy is not None
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        damaged.status = task_status
+        damaged.created_at = now - datetime.timedelta(minutes=2)
+        damaged.lease_owner = None
+        damaged.lease_expires_at = None
+        attempt.status = attempt_status
+        attempt.submission_started_at = (
+            None if attempt_status == "QUEUED"
+            else now - datetime.timedelta(minutes=2)
+        )
+        healthy.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    with TestClient(app) as worker_client:
+        claimed = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={"X-Worker-Token": WORKER_TOKEN,
+                     "X-Worker-Id": "g73-mismatched-attempt-safe-worker"},
+        )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy_id
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        assert damaged.status == task_status
+        assert damaged.lease_owner is None
+        assert damaged.lease_expires_at is None
+        assert damaged.lease_epoch == 0
+        assert attempt.status == attempt_status
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+            DBGenerationEvent.event_type.in_(["TASK_CLAIMED", "LEASE_RECOVERED"]),
+        )).scalar_one() == 0
+        assert healthy.status == "SUBMITTING"
+        assert healthy.lease_owner == "g73-mismatched-attempt-safe-worker"
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_postgres_nested_talking_head_asset_id_poison_does_not_starve_claim(postgres_context):
     """Native disposable PostgreSQL must never bind a list-valued image ID."""
     client, sessions, app = postgres_context
