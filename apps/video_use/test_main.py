@@ -450,3 +450,107 @@ def test_idempotent_upload_conflict_is_serialized_across_independent_apps(tmp_pa
     assert len(media_files) == 1
     winner = source if response_a.status_code == 201 else alternate
     assert media_files[0].read_bytes() == winner.read_bytes()
+
+# G70/G71: independently started OS processes sharing one POSIX media directory.
+# FAKE-ONLY, localhost network only; not a multi-host/PG/Owner ACK release proof.
+def test_shared_posix_media_root_two_live_uvicorn_processes(tmp_path):
+    import os
+    import socket
+    import sys
+    import httpx
+
+    def make_clip(path, color):
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=c={color}:s=320x240:r=24",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+        ], check=True)
+
+    first, second = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    make_clip(first, "red")
+    make_clip(second, "blue")
+    assert first.read_bytes() != second.read_bytes()
+    media_root = tmp_path / "shared-media"
+    ports = []
+    for _ in range(2):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        assert port not in ports
+        ports.append(port)
+    env = {
+        **os.environ,
+        "VIDEO_USE_MEDIA_ROOT": str(media_root),
+        "VIDEO_USE_UPSTREAM_ROOT": str(tmp_path / "upstream"),
+        "VIDEO_USE_WORKERS": "1",
+    }
+    processes = []
+    try:
+        for port in ports:
+            process = subprocess.Popen([
+                sys.executable, "-m", "uvicorn", "app.main:app",
+                "--host", "127.0.0.1", "--port", str(port),
+                "--log-level", "error", "--no-access-log",
+            ], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            processes.append(process)
+        for port, process in zip(ports, processes):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                assert process.poll() is None, "Uvicorn child unexpectedly exited"
+                try:
+                    if httpx.get(
+                        f"http://127.0.0.1:{port}/openapi.json", timeout=0.5
+                    ).status_code == 200:
+                        break
+                except httpx.RequestError:
+                    time.sleep(0.1)
+            else:
+                raise AssertionError("Uvicorn process did not become ready")
+
+        def upload(port, idem_key, path):
+            body = path.read_bytes()
+            return httpx.post(
+                f"http://127.0.0.1:{port}/media",
+                data={"projectId": "ci-shared-posix"},
+                files={"file": ("generated.mp4", body, "video/mp4")},
+                headers={
+                    "Idempotency-Key": idem_key,
+                    "X-Content-SHA256": hashlib.sha256(body).hexdigest(),
+                },
+                timeout=25,
+            )
+
+        for i in range(3):
+            idem_key = f"cross-process-same-key-{i}"
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                a = executor.submit(upload, ports[0], idem_key, first)
+                b = executor.submit(upload, ports[1], idem_key, second)
+                response_a, response_b = a.result(timeout=35), b.result(timeout=35)
+            assert sorted([response_a.status_code, response_b.status_code]) == [201, 409], (
+                response_a.text, response_b.text
+            )
+            winner = first if response_a.status_code == 201 else second
+            winning_response = response_a if response_a.status_code == 201 else response_b
+            media_id = winning_response.json()["mediaId"]
+            stored = list(
+                (media_root / "projects" / "ci-shared-posix" / "media").glob(
+                    f"{media_id}.*"
+                )
+            )
+            assert len(stored) == 1
+            assert stored[0].read_bytes() == winner.read_bytes()
+            loser_port = ports[1] if response_a.status_code == 201 else ports[0]
+            replay = upload(loser_port, idem_key, winner)
+            assert replay.status_code == 201, replay.text
+            assert replay.json()["idempotentReplay"] is True
+            assert stored[0].read_bytes() == winner.read_bytes()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
