@@ -208,6 +208,7 @@ def _create_task(client: TestClient) -> str:
 def _g72_create_claimed_typed_fake_source(
     client, sessions, worker_id: str, *, source_sha: str,
     valid_until: datetime.datetime | None = None,
+    claim_after_create: bool = True,
 ):
     """Real typed FAKE creation/claim on disposable PG, not a converted paid task.
 
@@ -271,6 +272,8 @@ def _g72_create_claimed_typed_fake_source(
         created.text if created is not None else "Typed G72 task was not created"
     )
     task_id = created.json()["taskId"]
+    if not claim_after_create:
+        return task_id, source_id, project["id"], tenant_id, requested_by, 0
     claimed = client.post(
         "/internal/generation-tasks/claim",
         headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
@@ -303,6 +306,98 @@ def _wait_until_postgres_reports_lock_wait(
             return True
         time.sleep(0.05)
     return False
+
+
+def test_g72_postgres_historical_reserved_owner_transfer_is_quarantined_without_queue_starvation(
+    postgres_context,
+):
+    """A pre-transfer FAKE QUEUED+RESERVED task must not consume a Worker lease.
+
+    Exercise the native API against disposable PostgreSQL. This only tests the
+    safe hold-and-skip behavior. It does not scan real historical records,
+    authorize quota refunds, modify a protected store, or implement grants.
+    """
+    client, sessions, app = postgres_context
+    legacy_id, _, legacy_project_id, tenant_id, original_owner, _ = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, "unused-legacy", source_sha="a" * 64,
+            claim_after_create=False,
+        )
+    )
+    healthy_id, _, _, healthy_tenant_id, healthy_owner, _ = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, "unused-healthy", source_sha="b" * 64,
+            claim_after_create=False,
+        )
+    )
+    assert tenant_id == healthy_tenant_id and original_owner == healthy_owner
+    replacement_owner = str(uuid.uuid4())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        legacy = db.get(DBGenerationTask, legacy_id)
+        project = db.get(DBProject, legacy_project_id)
+        assert legacy is not None and project is not None
+        assert legacy.status == "QUEUED" and legacy.lease_owner is None
+        assert project.owner_id == original_owner
+        db.add(DBUser(
+            id=replacement_owner, tenant_id=tenant_id,
+            email=f"g72-legacy-transfer-{replacement_owner}@example.com",
+            display_name="Synthetic Replacement Owner",
+            password_hash=hash_password(secrets.token_urlsafe(24)),
+            role="owner", is_active=True, created_at=now, updated_at=now,
+        ))
+        project.owner_id = replacement_owner
+        db.commit()
+        legacy = db.get(DBGenerationTask, legacy_id)
+        assert legacy.requested_by != db.get(DBProject, legacy_project_id).owner_id
+        old_lease = (legacy.status, legacy.lease_owner, legacy.lease_epoch)
+        old_attempts = db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == legacy_id,
+        )).scalar_one()
+        old_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == legacy_id,
+        )).scalar_one()
+        old_usage = [
+            (entry.kind, entry.request_units, entry.generated_seconds)
+            for entry in db.execute(select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == legacy_id,
+            )).scalars()
+        ]
+        assert old_attempts == 1 and len(old_usage) == 1
+        assert old_usage[0][0] == "RESERVED"
+
+    # The older unclaimable reservation must not block a subsequent healthy job.
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": "worker-g72-legacy-readonly",
+    }
+    claimed = client.post("/internal/generation-tasks/claim", headers=worker_headers)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy_id
+    empty = client.post("/internal/generation-tasks/claim", headers=worker_headers)
+    assert empty.status_code == 204, empty.text
+
+    with sessions() as db:
+        old = db.get(DBGenerationTask, legacy_id)
+        new = db.get(DBGenerationTask, healthy_id)
+        assert old is not None and new is not None
+        assert (old.status, old.lease_owner, old.lease_epoch) == old_lease
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == legacy_id,
+        )).scalar_one() == old_attempts
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == legacy_id,
+        )).scalar_one() == old_events
+        current_usage = [
+            (entry.kind, entry.request_units, entry.generated_seconds)
+            for entry in db.execute(select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == legacy_id,
+            )).scalars()
+        ]
+        assert current_usage == old_usage
+        assert new.lease_owner == "worker-g72-legacy-readonly"
+    assert app.state.video_use.media_objects == {}
+    app.state.moneyprinter.assert_not_called()
 
 
 def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context):
