@@ -9,7 +9,7 @@ from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import apply_project_update, create_app
 from app.migrations import ensure_schema
-from app.models import DBAssetVersion, DBDirectMediaUploadHold, DBRenderTask, DBTenant, DBUser
+from app.models import DBAssetVersion, DBDirectMediaUploadHold, DBProject, DBRenderTask, DBTenant, DBUser
 from app.schemas import UpdateProjectRequest, WorkerTaskUpdateRequest
 from app.task_status import canonical_task_status, database_status_values, legacy_task_status
 from fastapi import HTTPException
@@ -286,6 +286,59 @@ def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
     denied = isolated.post("/projects", json={"name": "Over Tenant B quota"})
     assert denied.status_code == 429
 
+
+
+@pytest.mark.parametrize(
+    "corrupt_materials", [
+        {"legacy": "invalid object root"},
+        ["invalid string row"],
+        [None],
+    ],
+)
+def test_g70_g71_direct_media_corrupt_materials_fail_before_sidecar_and_quota(
+    api_context, monkeypatch, corrupt_materials,
+):
+    """FAKE-only: historical malformed catalog must not create a new remote orphan.
+
+    No Sidecar dispatch, storage reservation, asset, or revision mutation is
+    allowed. This is not trusted reconciliation of any existing HELD record.
+    """
+    client, sessions = api_context
+    project = create_project(client, "G70 corrupted historic materials")
+    with sessions() as db:
+        record = db.get(DBProject, project["id"])
+        record.materials = corrupt_materials
+        tenant_id = record.tenant_id
+        before_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+        db.commit()
+
+    sidecar_calls = []
+    adapter = client.app.state.video_use
+
+    def forbidden_dispatch(*args, **kwargs):
+        sidecar_calls.append(True)
+        raise AssertionError("corrupt project must be rejected before Sidecar")
+
+    monkeypatch.setattr(adapter, "upload_media", forbidden_dispatch)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", b"FAKE-only synthetic bytes", "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "PROJECT_MATERIALS_INTEGRITY_REVIEW_REQUIRED"
+    assert sidecar_calls == []
+    with sessions() as db:
+        saved = db.get(DBProject, project["id"])
+        assert saved.materials == corrupt_materials
+        assert saved.revision == project["revision"]
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == before_bytes
+        assert db.query(DBDirectMediaUploadHold).filter(
+            DBDirectMediaUploadHold.project_id == project["id"]
+        ).count() == 0
+        assert db.query(DBAssetVersion).filter(
+            DBAssetVersion.project_id == project["id"]
+        ).count() == 0
 
 
 @pytest.mark.parametrize(
