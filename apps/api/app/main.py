@@ -3154,6 +3154,22 @@ def create_app(
                 or candidate.upstream_job_id is not None
             ):
                 continue
+            # G73: an active legacy task without a persisted submit-start marker
+            # or usable task-level upstream ID cannot safely be re-leased.
+            # It would return submissionConsumed=False and could be resubmitted.
+            # Also reject conflicting attempt-level upstream identity. Keep all
+            # historical attempt, lease, usage and audit records unchanged.
+            if candidate.status != "QUEUED" and (
+                (
+                    not candidate.upstream_job_id
+                    and candidate_attempt.submission_started_at is None
+                )
+                or (
+                    candidate_attempt.upstream_job_id
+                    and candidate_attempt.upstream_job_id != candidate.upstream_job_id
+                )
+            ):
+                continue
             candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
