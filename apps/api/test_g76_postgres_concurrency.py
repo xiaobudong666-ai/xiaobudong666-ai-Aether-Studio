@@ -3389,6 +3389,80 @@ def test_g73_postgres_missing_current_attempt_does_not_starve_healthy_claim(post
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("task_upstream", "attempt_upstream", "incoming_upstream"),
+    [
+        (None, "prior-attempt-job", "new-worker-job"),
+        ("task-job", "other-attempt-job", None),
+    ],
+)
+def test_g73_postgres_worker_transition_attempt_upstream_identity_fenced(
+    postgres_context, task_upstream, attempt_upstream, incoming_upstream,
+):
+    """The native Worker transition cannot launder divergent durable job receipts.
+
+    FAKE-only disposable PostgreSQL: preserve status, lease, quota and events
+    for authorized reconciliation. Never issue another Provider submission.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    worker_id = "g73-attempt-upstream-identity-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    lease_epoch = claimed.json()["leaseEpoch"]
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        task.upstream_job_id = task_upstream
+        attempt.upstream_job_id = attempt_upstream
+        db.commit()
+        expected = (task.status, task.upstream_job_id, task.lease_epoch, task.lease_owner,
+                    attempt.status, attempt.upstream_job_id, attempt.reconciliation_state)
+        prior_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        prior_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+
+    worker_payload = {"status": "RUNNING", "progress": 20, "message": "synthetic running"}
+    if incoming_upstream is not None:
+        worker_payload["upstreamJobId"] = incoming_upstream
+    result = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(lease_epoch),
+        },
+        json=worker_payload,
+    )
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "UPSTREAM_ATTEMPT_IDENTITY_CONFLICT"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        assert (task.status, task.upstream_job_id, task.lease_epoch, task.lease_owner,
+                attempt.status, attempt.upstream_job_id, attempt.reconciliation_state) == expected
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == prior_events
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == prior_usage
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_postgres_terminal_attempt_is_not_reclaimed_from_queued_task(postgres_context):
     """Fail closed on an inconsistent QUEUED task/terminal attempt in native PG.
 
