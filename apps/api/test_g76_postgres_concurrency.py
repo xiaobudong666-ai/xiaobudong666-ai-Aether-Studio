@@ -346,6 +346,7 @@ def test_g72_postgres_historical_reserved_owner_transfer_is_quarantined_without_
             password_hash=hash_password(secrets.token_urlsafe(24)),
             role="owner", is_active=True, created_at=now, updated_at=now,
         ))
+        db.flush()  # PostgreSQL FK requires the replacement user before owner transfer.
         project.owner_id = replacement_owner
         db.commit()
         legacy = db.get(DBGenerationTask, legacy_id)
