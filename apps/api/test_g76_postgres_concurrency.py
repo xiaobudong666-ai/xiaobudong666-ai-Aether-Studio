@@ -460,18 +460,24 @@ def test_g72_postgres_inconsistent_reserved_ledger_never_gets_fake_worker_lease(
             DBGenerationAttempt.generation_task_id == healthy_id,
         )).scalar_one()
         assert usage.kind == "RESERVED" and usage.request_units == 1
+        # Corrupt disposable fixture via SQLAlchemy Core so ORM's append-only
+        # ledger guard remains enabled for the actual application under test.
+        usage_table = DBGenerationUsageEntry.__table__
         if damage == "missing":
-            db.delete(usage)
-        elif damage == "released":
-            usage.kind = "RELEASED"
-        elif damage == "wrong_project":
-            usage.project_id = healthy_project
-        elif damage == "wrong_attempt":
-            usage.attempt_id = healthy_attempt.id
-        elif damage == "wrong_key":
-            usage.reservation_key = f"generation:unrelated-{old_id}"
-        elif damage == "zero_units":
-            usage.request_units = 0
+            db.execute(usage_table.delete().where(usage_table.c.id == usage.id))
+        else:
+            corrupted_values = {
+                "released": {"kind": "RELEASED"},
+                "wrong_project": {"project_id": healthy_project},
+                "wrong_attempt": {"attempt_id": healthy_attempt.id},
+                "wrong_key": {"reservation_key": f"generation:unrelated-{old_id}"},
+                "zero_units": {"request_units": 0},
+            }[damage]
+            db.execute(
+                usage_table.update()
+                .where(usage_table.c.id == usage.id)
+                .values(**corrupted_values)
+            )
         db.commit()
         legacy = db.get(DBGenerationTask, old_id)
         before = (
