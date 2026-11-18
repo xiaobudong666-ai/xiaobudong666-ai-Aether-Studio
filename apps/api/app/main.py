@@ -3117,13 +3117,19 @@ def create_app(
             # persisted attempt record. Never lease that task: downstream
             # current_generation_attempt() would raise and starve the queue.
             # Read-only validation; do not repair protected usage/attempt data.
-            candidate_attempt_id = db.execute(
-                select(DBGenerationAttempt.id).where(
+            candidate_attempt = db.execute(
+                select(DBGenerationAttempt).where(
                     DBGenerationAttempt.generation_task_id == candidate.id,
                     DBGenerationAttempt.attempt_no == candidate.attempts,
                 )
             ).scalar_one_or_none()
-            if candidate_attempt_id is None:
+            if candidate_attempt is None:
+                continue
+            # G73: a legacy/corrupt QUEUED task whose current attempt is
+            # already terminal must not be claimed and silently re-submitted.
+            # Preserve the disputed attempt/usage records for reconciliation;
+            # do not invent a refund or transition policy.
+            if candidate.status == "QUEUED" and candidate_attempt.status != "QUEUED":
                 continue
             candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
