@@ -196,6 +196,25 @@ def test_generated_upload_idempotency_survives_lost_ack_without_duplicate_media(
         replay_payload = replay.json()
         assert replay_payload["mediaId"] == expected_media_id
         assert replay_payload["idempotentReplay"] is True
+        assert first_payload["fileName"] == f"{expected_media_id}.mp4"
+        assert replay_payload["fileName"] == first_payload["fileName"]
+        assert replay_payload["contentType"] == first_payload["contentType"] == "video/mp4"
+
+        # Same durable bytes/suffix and idempotency key, but a different
+        # multipart filename/MIME must not forge a different Sidecar receipt.
+        with source.open("rb") as stream:
+            replay_with_untrusted_metadata = client.post(
+                "/media",
+                data={"projectId": "project-idempotency"},
+                files={"file": ("renamed.mp4", stream, "application/octet-stream")},
+                headers=headers,
+            )
+        assert replay_with_untrusted_metadata.status_code == 201, replay_with_untrusted_metadata.text
+        replay_receipt = replay_with_untrusted_metadata.json()
+        assert replay_receipt["idempotentReplay"] is True
+        assert replay_receipt["mediaId"] == first_payload["mediaId"]
+        assert replay_receipt["fileName"] == first_payload["fileName"]
+        assert replay_receipt["contentType"] == first_payload["contentType"]
 
         # G70/G71: a lost-ACK replay must preserve not only the byte hash,
         # but also the original suffix/format binding. The same MP4 bytes
