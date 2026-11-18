@@ -293,6 +293,7 @@ def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
         {"legacy": "invalid object root"},
         ["invalid string row"],
         [None],
+        None,  # JSON null is not a safe empty catalog; *project.materials would fail after Sidecar.
     ],
 )
 def test_g70_g71_direct_media_corrupt_materials_fail_before_sidecar_and_quota(
