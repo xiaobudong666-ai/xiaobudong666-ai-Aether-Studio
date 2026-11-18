@@ -2679,11 +2679,36 @@ def test_g72_originator_revocation_fences_fake_worker_before_sidecar(
     payload = _g72_fake_payload(
         client, project, image_id, key=f"g72-owner-revoke-{phase}-{revocation}"
     )
-    create = client.post(
-        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
-        json=payload,
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    # The FAKE capability snapshot is an optimistic, quota-sensitive value.
+    # Revalidate only on its explicit stale-hash conflict (409), matching the
+    # normal typed create path; never relax the 202/rights/revocation assertions.
+    create = None
+    for _ in range(3):
+        preflight = client.post(path + "/validate", json=payload)
+        if preflight.status_code == 200:
+            payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+            create = client.post(path, json=payload)
+            if create.status_code == 202:
+                break
+            stale_code = create.json().get("detail", {}).get("code")
+            if create.status_code != 409 or stale_code not in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }:
+                break
+        else:
+            stale_code = preflight.json().get("detail", {}).get("code")
+            if preflight.status_code != 409 or stale_code not in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }:
+                create = preflight
+                break
+        capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+        assert capabilities.status_code == 200, capabilities.text
+        payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+    assert create is not None and create.status_code == 202, (
+        create.text if create is not None else "FAKE preflight remained stale"
     )
-    assert create.status_code == 202, create.text
     task_id = create.json()["taskId"]
     if phase == "claimed":
         claimed = claim(client)
