@@ -3183,6 +3183,32 @@ def create_app(
             if candidate.provider == "moneyprinter" and candidate_request.get("fakeTaskType") is not None:
                 continue
             if candidate.provider == "deterministic-fake-talking-head":
+                # G72: a stale/corrupt historical usage ledger is not proof of
+                # an active reservation. Quarantine before consuming a Worker
+                # lease or submitting to the FAKE-only Sidecar. In particular,
+                # never reclaim a released/settled reservation, a different
+                # tenant/project/attempt, or a missing/changed reservation key.
+                # This is only a read-only claim fence, not an M11 refund,
+                # Owner disposition policy or protected-history repair.
+                usage_rows = list(db.execute(
+                    select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == candidate.id,
+                    )
+                ).scalars())
+                if (
+                    len(usage_rows) != 1
+                    or any(
+                        usage.kind != "RESERVED"
+                        or usage.tenant_id != candidate.tenant_id
+                        or usage.project_id != candidate.project_id
+                        or usage.attempt_id != candidate_attempt.id
+                        or usage.reservation_key != f"generation:{candidate.id}"
+                        or usage.request_units != 1
+                        or usage.generated_seconds != 0
+                        for usage in usage_rows
+                    )
+                ):
+                    continue
                 # G72: a queued FAKE task is not a standing authority to act
                 # after the originating Owner is deactivated/downgraded or the
                 # project no longer belongs to that Owner. This is a read-only
