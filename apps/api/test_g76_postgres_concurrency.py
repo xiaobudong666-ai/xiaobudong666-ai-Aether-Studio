@@ -3553,6 +3553,86 @@ def test_g73_postgres_active_task_nonterminal_attempt_mismatch_is_quarantined(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "durable_evidence",
+    ["submission_started", "reconciled_submitted", "attempt_upstream", "task_upstream"],
+)
+def test_g73_postgres_queued_with_prior_submission_evidence_is_quarantined(
+    postgres_context, durable_evidence,
+):
+    """A QUEUED legacy attempt cannot be resubmitted if prior submission is plausible.
+
+    In disposable PostgreSQL only, keep its attempt, ledger and audit untouched;
+    a subsequent healthy FAKE task must remain claimable. No real Provider runs.
+    """
+    client, sessions, app = postgres_context
+    damaged_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        assert damaged is not None and healthy is not None
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        assert damaged.status == attempt.status == "QUEUED"
+        assert attempt.reconciliation_state == "NOT_SUBMITTED"
+        if durable_evidence == "submission_started":
+            attempt.submission_started_at = now - datetime.timedelta(minutes=5)
+        elif durable_evidence == "reconciled_submitted":
+            attempt.reconciliation_state = "SUBMITTED"
+        elif durable_evidence == "attempt_upstream":
+            attempt.upstream_job_id = "legacy-upstream-123"
+        else:
+            damaged.upstream_job_id = "legacy-upstream-123"
+        damaged.created_at = now - datetime.timedelta(minutes=2)
+        healthy.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    with TestClient(app) as worker_client:
+        claimed = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "g73-queued-submission-proof-fence",
+            },
+        )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy_id
+    assert claimed.json()["submissionConsumed"] is False
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        assert damaged.status == "QUEUED"
+        assert damaged.lease_owner is None
+        assert damaged.lease_expires_at is None
+        assert damaged.lease_epoch == 0
+        assert attempt.status == "QUEUED"
+        if durable_evidence == "submission_started":
+            assert attempt.submission_started_at is not None
+        elif durable_evidence == "reconciled_submitted":
+            assert attempt.reconciliation_state == "SUBMITTED"
+        elif durable_evidence == "attempt_upstream":
+            assert attempt.upstream_job_id == "legacy-upstream-123"
+        else:
+            assert damaged.upstream_job_id == "legacy-upstream-123"
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+            DBGenerationEvent.event_type.in_(["TASK_CLAIMED", "LEASE_RECOVERED"]),
+        )).scalar_one() == 0
+        assert healthy.status == "SUBMITTING"
+        assert healthy.lease_owner == "g73-queued-submission-proof-fence"
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_postgres_nested_talking_head_asset_id_poison_does_not_starve_claim(postgres_context):
     """Native disposable PostgreSQL must never bind a list-valued image ID."""
     client, sessions, app = postgres_context
