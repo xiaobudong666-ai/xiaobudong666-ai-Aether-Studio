@@ -718,6 +718,69 @@ def test_18_upstream_id_is_immutable_and_illegal_transition_rejected(generation_
     assert transition(client, task["taskId"], "SUBMITTING").status_code == 409
 
 
+@pytest.mark.parametrize(
+    ("task_upstream", "attempt_upstream", "incoming_upstream"),
+    [
+        (None, "prior-attempt-job", "new-worker-job"),
+        ("task-job", "different-attempt-job", None),
+    ],
+)
+def test_g73_transition_fences_attempt_upstream_identity_mismatch(
+    generation_context, task_upstream, attempt_upstream, incoming_upstream,
+):
+    """A Worker lease cannot silently rewrite a discrepant durable Attempt receipt.
+
+    This simulates legacy/corrupt history in a disposable DB, not real
+    Provider work. The original attempt/job and RESERVED usage stay untouched.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G73 transition identity quarantine")
+    task = create_task(client, project, key="g73-transition-upstream-mismatch")
+    claimed = claim(client)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task["taskId"]
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task["taskId"],
+                DBGenerationAttempt.attempt_no == row.attempts,
+            )
+        ).scalar_one()
+        row.upstream_job_id = task_upstream
+        attempt.upstream_job_id = attempt_upstream
+        db.commit()
+        before = (row.status, row.upstream_job_id, attempt.status, attempt.upstream_job_id)
+        event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task["taskId"],
+        )).scalar_one()
+        usage_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task["taskId"],
+        )).scalar_one()
+
+    kwargs = {"upstreamJobId": incoming_upstream} if incoming_upstream else {}
+    rejected = transition(client, task["taskId"], "RUNNING", **kwargs)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "UPSTREAM_ATTEMPT_IDENTITY_CONFLICT"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task["taskId"],
+            DBGenerationAttempt.attempt_no == row.attempts,
+        )).scalar_one()
+        assert (row.status, row.upstream_job_id, attempt.status, attempt.upstream_job_id) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task["taskId"],
+        )).scalar_one() == event_count
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task["taskId"],
+        )).scalar_one() == usage_count
+    app.state.moneyprinter.assert_not_called()
+    assert media.uploads == 0
+
+
 def test_19_cancel_is_idempotent_and_late_success_isolated(generation_context):
     client, _, _, _ = generation_context
     project = create_project(client)
