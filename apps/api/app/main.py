@@ -3460,6 +3460,18 @@ def create_app(
             )
         previous = task.status
         attempt = current_generation_attempt(db, task)
+        # G73: a Worker transition must not convert a legacy/partially
+        # persisted current Attempt out of a terminal or divergent status.
+        # Both statuses are written together by the normal transition path;
+        # leave conflicting history, usage and lease untouched for review.
+        if attempt.status != task.status:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_ATTEMPT_STATUS_CONFLICT",
+                    "message": "任务与当前尝试的持久状态不一致，须先人工核验",
+                },
+            )
         # G73: A persisted Attempt-level upstream receipt is independent
         # evidence of an already submitted job. If it diverges from the task
         # receipt (including a missing task-level ID), a leased Worker must
