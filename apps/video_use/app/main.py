@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -811,8 +812,15 @@ def create_app(
                 return {
                     "mediaId": media_id,
                     "projectId": projectId,
-                    "fileName": filename or destination.name,
-                    "contentType": file.content_type,
+                    # G70/G71: a lost-ACK replay must return the same
+                    # durable filename and media MIME, regardless of later
+                    # untrusted multipart name/Content-Type header changes.
+                    # Non-idempotent user uploads retain their display name.
+                    "fileName": destination.name if idempotency_key is not None else (filename or destination.name),
+                    "contentType": (
+                        mimetypes.guess_type(destination.name)[0] or "application/octet-stream"
+                        if idempotency_key is not None else file.content_type
+                    ),
                     "mediaType": media_type,
                     "metadata": metadata,
                     "idempotentReplay": idempotent_replay,
