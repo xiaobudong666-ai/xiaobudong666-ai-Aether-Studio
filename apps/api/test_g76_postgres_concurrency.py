@@ -3367,6 +3367,62 @@ def test_g73_postgres_missing_current_attempt_does_not_starve_healthy_claim(post
     app.state.moneyprinter.assert_not_called()
 
 
+def test_g73_postgres_terminal_attempt_is_not_reclaimed_from_queued_task(postgres_context):
+    """Fail closed on an inconsistent QUEUED task/terminal attempt in native PG.
+
+    Historical/corrupt rows must remain untouched for authorized reconciliation.
+    A healthy FAKE-only task must not be starved; no real Provider is contacted.
+    """
+    client, sessions, app = postgres_context
+    damaged_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        assert damaged is not None and healthy is not None
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        assert damaged.status == "QUEUED" and current.status == "QUEUED"
+        current.status = "SUCCEEDED"
+        damaged.created_at = now - datetime.timedelta(minutes=2)
+        healthy.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    with TestClient(app) as worker_client:
+        result = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "g73-terminal-attempt-safe-worker",
+            },
+        )
+    assert result.status_code == 200, result.text
+    assert result.json()["taskId"] == healthy_id
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        assert damaged.status == "QUEUED"
+        assert damaged.lease_owner is None
+        assert damaged.lease_epoch == 0
+        assert current.status == "SUCCEEDED"
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+        assert healthy.status == "SUBMITTING"
+        assert healthy.lease_owner == "g73-terminal-attempt-safe-worker"
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_postgres_nested_talking_head_asset_id_poison_does_not_starve_claim(postgres_context):
     """Native disposable PostgreSQL must never bind a list-valued image ID."""
     client, sessions, app = postgres_context
