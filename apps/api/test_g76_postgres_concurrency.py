@@ -195,11 +195,33 @@ def _create_task(client: TestClient) -> str:
         "expectedProjectRevision": project["revision"],
         "confirmExternalGeneration": True,
     }
-    response = client.post(
-        f"/projects/{project['id']}/generation-tasks",
-        headers={"Idempotency-Key": key},
-        json=payload,
-    )
+    path = f"/projects/{project['id']}/generation-tasks"
+    response = client.post(path, headers={"Idempotency-Key": key}, json=payload)
+    # An optimistic capability snapshot may go stale while other synthetic
+    # usage entries are created or the rolling window advances. Retry ONLY the
+    # documented stale-hash 409; preserve every other error as a test failure.
+    for _ in range(4):
+        if response.status_code == 202:
+            break
+        detail = response.json().get("detail", {})
+        if response.status_code != 409 or detail.get("code") not in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }:
+            break
+        capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+        assert capabilities.status_code == 200, capabilities.text
+        payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+        preflight = client.post(path + "/validate", json=payload)
+        if preflight.status_code == 200:
+            payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        elif (
+            preflight.status_code != 409
+            or preflight.json().get("detail", {}).get("code") not in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }
+        ):
+            assert preflight.status_code == 200, preflight.text
+        response = client.post(path, headers={"Idempotency-Key": key}, json=payload)
     assert response.status_code == 202, response.text
     return response.json()["taskId"]
 
