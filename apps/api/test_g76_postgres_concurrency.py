@@ -3463,6 +3463,78 @@ def test_g73_postgres_worker_transition_attempt_upstream_identity_fenced(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("corrupt_attempt_status", ["QUEUED", "SUCCEEDED"])
+def test_g73_postgres_worker_transition_current_attempt_status_is_fenced(
+    postgres_context, corrupt_attempt_status,
+):
+    """An already-leased Worker cannot overwrite a divergent durable Attempt.
+
+    Disposable PostgreSQL + FAKE-only: preserve Task, Attempt, lease, usage,
+    and event evidence on a legacy/partial-persistence status mismatch.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    worker_id = "g73-divergent-attempt-transition-worker"
+    claim = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claim.status_code == 200, claim.text
+    assert claim.json()["taskId"] == task_id
+    lease_epoch = claim.json()["leaseEpoch"]
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        assert task.status == "SUBMITTING" and attempt.status == "SUBMITTING"
+        attempt.status = corrupt_attempt_status
+        db.commit()
+        expected = (
+            task.status, task.lease_owner, task.lease_epoch,
+            task.upstream_job_id, attempt.status, attempt.upstream_job_id,
+            attempt.reconciliation_state,
+        )
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/transition",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": worker_id,
+            "X-Worker-Lease-Epoch": str(lease_epoch),
+        },
+        json={"status": "RUNNING", "progress": 20, "message": "synthetic progress"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "GENERATION_ATTEMPT_STATUS_CONFLICT"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        assert (
+            task.status, task.lease_owner, task.lease_epoch,
+            task.upstream_job_id, attempt.status, attempt.upstream_job_id,
+            attempt.reconciliation_state,
+        ) == expected
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_postgres_terminal_attempt_is_not_reclaimed_from_queued_task(postgres_context):
     """Fail closed on an inconsistent QUEUED task/terminal attempt in native PG.
 
