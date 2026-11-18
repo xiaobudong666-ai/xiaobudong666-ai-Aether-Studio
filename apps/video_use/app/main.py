@@ -816,11 +816,24 @@ def create_app(
                 canonical_generation_receipt = bool(
                     idempotency_key and idempotency_key.startswith("generation:")
                 )
+                generation_key_suffix = (
+                    idempotency_key.removeprefix("generation:")
+                    if canonical_generation_receipt else ""
+                )
+                # The API normally names generated files generation-{taskId}.mp4.
+                # Preserve that human-readable name across replays without
+                # trusting the current multipart filename; an invalid legacy
+                # key falls back to the durable MediaStore filename.
+                canonical_generation_name = (
+                    f"generation-{generation_key_suffix}{suffix}"
+                    if generation_key_suffix and IDENTIFIER.fullmatch(generation_key_suffix)
+                    else destination.name
+                )
                 return {
                     "mediaId": media_id,
                     "projectId": projectId,
                     "fileName": (
-                        destination.name if canonical_generation_receipt
+                        canonical_generation_name if canonical_generation_receipt
                         else (filename or destination.name)
                     ),
                     "contentType": (
