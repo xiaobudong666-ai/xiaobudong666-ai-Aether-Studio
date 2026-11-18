@@ -423,6 +423,104 @@ def test_g72_postgres_historical_reserved_owner_transfer_is_quarantined_without_
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "damage",
+    ["missing", "released", "wrong_project", "wrong_attempt", "wrong_key", "zero_units"],
+)
+def test_g72_postgres_inconsistent_reserved_ledger_never_gets_fake_worker_lease(
+    postgres_context, damage,
+):
+    """Disposable PostgreSQL: fail closed on historical usage drift.
+
+    The normal typed G72 entry and a later healthy FAKE task both exist.
+    Only the legacy candidate's ledger is corrupted; no Provider, recovery,
+    refund or production record is touched.
+    """
+    client, sessions, app = postgres_context
+    old_id, _old_source, _old_project, tenant_id, owner, _ = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, "unused-reservation-old",
+            source_sha="c" * 64, claim_after_create=False,
+        )
+    )
+    healthy_id, _healthy_source, healthy_project, new_tenant, new_owner, _ = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, "unused-reservation-healthy",
+            source_sha="d" * 64, claim_after_create=False,
+        )
+    )
+    assert tenant_id == new_tenant and owner == new_owner
+    with sessions() as db:
+        legacy = db.get(DBGenerationTask, old_id)
+        assert legacy is not None and legacy.status == "QUEUED"
+        usage = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == old_id,
+        )).scalar_one()
+        healthy_attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == healthy_id,
+        )).scalar_one()
+        assert usage.kind == "RESERVED" and usage.request_units == 1
+        if damage == "missing":
+            db.delete(usage)
+        elif damage == "released":
+            usage.kind = "RELEASED"
+        elif damage == "wrong_project":
+            usage.project_id = healthy_project
+        elif damage == "wrong_attempt":
+            usage.attempt_id = healthy_attempt.id
+        elif damage == "wrong_key":
+            usage.reservation_key = f"generation:unrelated-{old_id}"
+        elif damage == "zero_units":
+            usage.request_units = 0
+        db.commit()
+        legacy = db.get(DBGenerationTask, old_id)
+        before = (
+            legacy.status, legacy.lease_owner, legacy.lease_epoch,
+            legacy.attempts, legacy.updated_at,
+        )
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == old_id,
+        )).scalar_one()
+        before_ledger = [
+            (u.id, u.kind, u.tenant_id, u.project_id, u.attempt_id,
+             u.reservation_key, u.request_units, u.generated_seconds)
+            for u in db.execute(select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == old_id,
+            )).scalars()
+        ]
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": "worker-g72-bad-reservation",
+    }
+    claimed = client.post("/internal/generation-tasks/claim", headers=headers)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy_id
+    no_more = client.post("/internal/generation-tasks/claim", headers=headers)
+    assert no_more.status_code == 204, no_more.text
+    with sessions() as db:
+        legacy = db.get(DBGenerationTask, old_id)
+        assert (
+            legacy.status, legacy.lease_owner, legacy.lease_epoch,
+            legacy.attempts, legacy.updated_at,
+        ) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == old_id,
+        )).scalar_one() == before_events
+        after_ledger = [
+            (u.id, u.kind, u.tenant_id, u.project_id, u.attempt_id,
+             u.reservation_key, u.request_units, u.generated_seconds)
+            for u in db.execute(select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == old_id,
+            )).scalars()
+        ]
+        assert after_ledger == before_ledger
+        assert db.get(DBGenerationTask, healthy_id).lease_owner == (
+            "worker-g72-bad-reservation"
+        )
+    assert app.state.video_use.media_objects == {}
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context):
     """The normal G72 FAKE entry creates its task/attempt and reaches the Worker queue on PostgreSQL."""
     client, sessions, _app = postgres_context
