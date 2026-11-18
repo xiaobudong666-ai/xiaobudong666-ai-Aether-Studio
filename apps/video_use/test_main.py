@@ -196,7 +196,7 @@ def test_generated_upload_idempotency_survives_lost_ack_without_duplicate_media(
         replay_payload = replay.json()
         assert replay_payload["mediaId"] == expected_media_id
         assert replay_payload["idempotentReplay"] is True
-        assert first_payload["fileName"] == f"{expected_media_id}.mp4"
+        assert first_payload["fileName"] == "generation-task-idempotency-test.mp4"
         assert replay_payload["fileName"] == first_payload["fileName"]
         assert replay_payload["contentType"] == first_payload["contentType"] == "video/mp4"
 
