@@ -809,17 +809,23 @@ def create_app(
                 else:
                     temporary.replace(destination)
 
+                # The durable generation artifact is named by project/task
+                # idempotency, not multipart metadata. Keep this hardening
+                # strictly within the internal generation: path; regular
+                # user uploads and other idempotent clients retain their API.
+                canonical_generation_receipt = bool(
+                    idempotency_key and idempotency_key.startswith("generation:")
+                )
                 return {
                     "mediaId": media_id,
                     "projectId": projectId,
-                    # G70/G71: a lost-ACK replay must return the same
-                    # durable filename and media MIME, regardless of later
-                    # untrusted multipart name/Content-Type header changes.
-                    # Non-idempotent user uploads retain their display name.
-                    "fileName": destination.name if idempotency_key is not None else (filename or destination.name),
+                    "fileName": (
+                        destination.name if canonical_generation_receipt
+                        else (filename or destination.name)
+                    ),
                     "contentType": (
                         mimetypes.guess_type(destination.name)[0] or "application/octet-stream"
-                        if idempotency_key is not None else file.content_type
+                        if canonical_generation_receipt else file.content_type
                     ),
                     "mediaType": media_type,
                     "metadata": metadata,
