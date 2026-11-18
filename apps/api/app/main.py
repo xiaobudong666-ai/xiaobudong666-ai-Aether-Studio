@@ -3141,6 +3141,19 @@ def create_app(
             # Quarantine read-only; do not change leases, receipts or quota.
             if candidate_attempt.status != candidate.status:
                 continue
+            # G73: QUEUED is safe to submit only for an attempt that has
+            # *never* entered upstream submission.  A historical/crashed
+            # QUEUED row can retain durable submission evidence even when
+            # the task and attempt statuses both say QUEUED.  Re-leasing it
+            # would incorrectly return submissionConsumed=False and risk
+            # double submission. Preserve all such rows for reconciliation.
+            if candidate.status == "QUEUED" and (
+                candidate_attempt.submission_started_at is not None
+                or candidate_attempt.reconciliation_state != "NOT_SUBMITTED"
+                or candidate_attempt.upstream_job_id is not None
+                or candidate.upstream_job_id is not None
+            ):
+                continue
             candidate_mode = candidate_snapshot.get("mode")
             if candidate_mode != created_app.state.generation_provider_mode:
                 continue
