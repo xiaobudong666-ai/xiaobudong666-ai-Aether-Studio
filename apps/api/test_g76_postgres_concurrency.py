@@ -3633,6 +3633,91 @@ def test_g73_postgres_queued_with_prior_submission_evidence_is_quarantined(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "submitting_missing_submit_proof",
+        "running_missing_submit_proof",
+        "attempt_only_upstream",
+        "conflicting_upstream",
+    ],
+)
+def test_g73_postgres_active_claim_missing_or_conflicting_submission_identity_is_quarantined(
+    postgres_context, scenario,
+):
+    """An inconsistent active task must not acquire at-most-once submission rights.
+
+    Disposable native PostgreSQL, deterministic FAKE-only; preserve all damaged
+    rows and admit the next healthy task without a real Provider request.
+    """
+    client, sessions, app = postgres_context
+    damaged_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        assert damaged is not None and healthy is not None
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        damaged.status = (
+            "SUBMITTING" if scenario == "submitting_missing_submit_proof"
+            else "INGESTING" if scenario == "conflicting_upstream" else "RUNNING"
+        )
+        attempt.status = damaged.status
+        damaged.created_at = now - datetime.timedelta(minutes=2)
+        healthy.created_at = now - datetime.timedelta(minutes=1)
+        if scenario == "attempt_only_upstream":
+            attempt.submission_started_at = now - datetime.timedelta(minutes=5)
+            attempt.upstream_job_id = "legacy-attempt-only-job"
+        elif scenario == "conflicting_upstream":
+            attempt.submission_started_at = now - datetime.timedelta(minutes=5)
+            damaged.upstream_job_id = "legacy-task-job"
+            attempt.upstream_job_id = "different-attempt-job"
+        assert damaged.lease_owner is None
+        assert damaged.lease_epoch == 0
+        db.commit()
+
+    with TestClient(app) as worker_client:
+        claimed = worker_client.post(
+            "/internal/generation-tasks/claim",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "g73-inconsistent-submit-identity-fence",
+            },
+        )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy_id
+    assert claimed.json()["submissionConsumed"] is False
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, damaged_id)
+        healthy = db.get(DBGenerationTask, healthy_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == damaged.attempts,
+        )).scalar_one()
+        assert damaged.status == attempt.status
+        assert damaged.lease_owner is None
+        assert damaged.lease_expires_at is None
+        assert damaged.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+            DBGenerationEvent.event_type.in_(["TASK_CLAIMED", "LEASE_RECOVERED"]),
+        )).scalar_one() == 0
+        assert healthy.status == "SUBMITTING"
+        assert healthy.lease_owner == "g73-inconsistent-submit-identity-fence"
+        if scenario == "attempt_only_upstream":
+            assert attempt.upstream_job_id == "legacy-attempt-only-job"
+        elif scenario == "conflicting_upstream":
+            assert damaged.upstream_job_id == "legacy-task-job"
+            assert attempt.upstream_job_id == "different-attempt-job"
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g73_postgres_nested_talking_head_asset_id_poison_does_not_starve_claim(postgres_context):
     """Native disposable PostgreSQL must never bind a list-valued image ID."""
     client, sessions, app = postgres_context
