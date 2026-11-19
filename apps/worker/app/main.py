@@ -232,10 +232,12 @@ def process_render_task(components: WorkerComponents, task: dict, poll_interval:
         raise TimeoutError("Render exceeded the worker timeout")
     except Exception as exc:
         logger.exception("Render task %s failed in worker", task_id)
+        # A timeout/transport failure can occur *after* a Sidecar accepted
+        # the task. No durable acceptance receipt means UNKNOWN, not retryable.
         return components.queue.update(
-            task_id, status="failed", progress=int(task.get("progress", 0)),
-            message="工作节点将在短暂故障后自动重试", upstream_job_id=upstream_job_id,
-            error=str(exc), retryable=True,
+            task_id, status="UNKNOWN", progress=int(task.get("progress", 0)),
+            message="渲染交接或轮询结果UNKNOWN；需人工核验，禁止自动重派",
+            upstream_job_id=upstream_job_id, error=str(exc), retryable=False,
         )
 
 
