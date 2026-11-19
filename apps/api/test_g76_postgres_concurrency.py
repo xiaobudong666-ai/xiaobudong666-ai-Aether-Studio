@@ -6203,3 +6203,141 @@ def test_g70_g71_postgres_direct_media_success_settles_durable_hold_atomically(
         assert db.query(DBTenant).one().used_storage_bytes == len(payload)
         assert db.query(DBAssetVersion).count() == 1
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_recover_skips_locked_worker_renewal_without_erasing_lease(
+    postgres_context,
+):
+    """FAKE-only native PG dual session: recovery must not overwrite a renewing Worker.
+
+    Hold a real PostgreSQL row lock while /recover scans another stale row.
+    The endpoint must skip the locked row, process the independent expired row,
+    and still observe the renewed lease after the first transaction commits.
+    This proves SELECT FOR UPDATE SKIP LOCKED under contention, not independent
+    trusted Sidecar receipts or durable human ACK.
+    """
+    from app.models import DBRenderTask
+
+    client, sessions, app = postgres_context
+    created = client.post(
+        "/projects", json={"name": "FAKE PG dual-session recover/renew race"}
+    )
+    assert created.status_code == 201, created.text
+    project_id = created.json()["id"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    locked_id = f"fake-locked-renewal-{uuid.uuid4().hex}"
+    independent_id = f"fake-unlocked-expired-{uuid.uuid4().hex}"
+    with sessions() as db:
+        owner = db.execute(
+            select(DBUser).where(
+                DBUser.email == "g76-postgres-owner@example.com"
+            )
+        ).scalar_one()
+        common = dict(
+            tenant_id=owner.tenant_id,
+            project_id=project_id,
+            requested_by=owner.id,
+            status="RUNNING",
+            progress=17,
+            message="FAKE leased Worker",
+            engine="video-use",
+            render_payload={"requestId": "fake-only-pg-lock-fence"},
+            attempts=1,
+            max_attempts=3,
+            reserved_seconds=0,
+            lease_owner="worker-old",
+            lease_expires_at=now - datetime.timedelta(seconds=45),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(DBRenderTask(
+            id=locked_id, upstream_job_id=f"fake-locked-upstream-{uuid.uuid4().hex}",
+            **common,
+        ))
+        db.add(DBRenderTask(
+            id=independent_id, upstream_job_id=None, **common,
+        ))
+        db.commit()
+
+    locker = sessions()
+    try:
+        locked = locker.execute(
+            select(DBRenderTask)
+            .where(DBRenderTask.id == locked_id)
+            .with_for_update()
+        ).scalar_one()
+        assert locked.lease_owner == "worker-old"
+        headers = {
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": "worker-recovery",
+        }
+
+        def concurrent_recover():
+            with TestClient(app) as recovery_client:
+                return recovery_client.post(
+                    "/internal/render-tasks/recover", headers=headers
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(concurrent_recover)
+            try:
+                # The endpoint must finish despite the unrelated row being
+                # locked. A blocking SELECT would fail this bounded future.
+                result = future.result(timeout=10)
+                assert result.status_code == 200, result.text
+                assert result.json()["recoveredTaskIds"] == [independent_id]
+                # Commit a renewed Worker claim while holding the original
+                # row lock; the recovery scan has already skipped this row.
+                locked.lease_owner = "worker-new"
+                locked.lease_expires_at = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(minutes=5)
+                )
+                locked.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                locker.commit()
+            finally:
+                if locker.in_transaction():
+                    locker.rollback()
+
+        repeated = client.post(
+            "/internal/render-tasks/recover", headers=headers
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["recoveredTaskIds"] == []
+
+        with sessions() as db:
+            current = db.get(DBRenderTask, locked_id)
+            assert current.status == "RUNNING"
+            assert current.lease_owner == "worker-new"
+            assert current.lease_expires_at > datetime.datetime.now(
+                datetime.timezone.utc
+            )
+            assert current.progress == 17
+            assert current.upstream_job_id.startswith("fake-locked-upstream-")
+
+            unacked = db.get(DBRenderTask, independent_id)
+            assert unacked.status == "UNKNOWN"
+            assert unacked.upstream_job_id is None
+            assert unacked.lease_owner is None
+            assert unacked.lease_expires_at is None
+            assert unacked.completed_at is not None
+
+        # An old Worker cannot commit after the new lease has been accepted.
+        stale = client.post(
+            f"/internal/render-tasks/{locked_id}/update",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "worker-old",
+            },
+            json={
+                "status": "SUCCEEDED",
+                "progress": 100,
+                "message": "FAKE stale completion",
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["detail"]["code"] == "LEASE_LOST"
+        app.state.moneyprinter.assert_not_called()
+    finally:
+        locker.rollback()
+        locker.close()

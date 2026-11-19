@@ -1539,3 +1539,73 @@ def test_g70_g71_worker_update_rejects_expired_lease_and_upstream_id_rebind(api_
     )
     assert valid.status_code == 200, valid.text
     assert valid.json()["canonicalStatus"] == "RUNNING"
+
+
+def test_g70_g71_recover_only_expired_leases_preserves_receipts(api_context):
+    """FAKE-only: recovery holds unacknowledged tasks, resumes only known IDs."""
+    client, sessions = api_context
+    project = create_project(client, "FAKE selective recovery fence")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    db = sessions()
+    try:
+        owner = db.query(DBUser).filter(DBUser.email == "owner@example.com").one()
+        common = dict(
+            tenant_id=owner.tenant_id, project_id=project["id"],
+            requested_by=owner.id, status="RUNNING", progress=12,
+            message="FAKE job", engine="video-use",
+            render_payload={"requestId": "fake-only-recovery-lock"},
+            attempts=1, max_attempts=3, reserved_seconds=0,
+            lease_owner="old-worker", created_at=now, updated_at=now,
+        )
+        db.add(DBRenderTask(
+            id="fake-recover-no-receipt", upstream_job_id=None,
+            lease_expires_at=now - datetime.timedelta(seconds=30), **common,
+        ))
+        db.add(DBRenderTask(
+            id="fake-recover-has-receipt", upstream_job_id="fake-durable-job",
+            lease_expires_at=now - datetime.timedelta(seconds=30), **common,
+        ))
+        db.add(DBRenderTask(
+            id="fake-recover-fresh", upstream_job_id="fake-fresh-job",
+            lease_expires_at=now + datetime.timedelta(minutes=5), **common,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "new-worker"}
+    recovered = client.post("/internal/render-tasks/recover", headers=headers)
+    assert recovered.status_code == 200, recovered.text
+    assert set(recovered.json()["recoveredTaskIds"]) == {
+        "fake-recover-no-receipt", "fake-recover-has-receipt",
+    }
+    again = client.post("/internal/render-tasks/recover", headers=headers)
+    assert again.status_code == 200 and again.json()["recoveredTaskIds"] == []
+
+    db = sessions()
+    try:
+        unacked = db.get(DBRenderTask, "fake-recover-no-receipt")
+        assert canonical_task_status(unacked.status) == "UNKNOWN"
+        assert unacked.upstream_job_id is None
+        assert unacked.lease_owner is None and unacked.lease_expires_at is None
+        assert unacked.completed_at is not None
+        known = db.get(DBRenderTask, "fake-recover-has-receipt")
+        assert canonical_task_status(known.status) == "RUNNING"
+        assert known.upstream_job_id == "fake-durable-job"
+        assert known.attempts == 1
+        assert known.lease_owner is None and known.lease_expires_at is None
+        fresh = db.get(DBRenderTask, "fake-recover-fresh")
+        assert canonical_task_status(fresh.status) == "RUNNING"
+        assert fresh.lease_owner == "old-worker"
+        assert fresh.lease_expires_at is not None
+        assert fresh.upstream_job_id == "fake-fresh-job"
+    finally:
+        db.close()
+
+    # The recovered known-ID row can only resume polling; no new submission.
+    resumed = client.post("/internal/render-tasks/claim", headers=headers)
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["taskId"] == "fake-recover-has-receipt"
+    assert resumed.json()["upstreamJobId"] == "fake-durable-job"
+    assert resumed.json()["attempts"] == 1
+    assert client.post("/internal/render-tasks/claim", headers=headers).status_code == 204

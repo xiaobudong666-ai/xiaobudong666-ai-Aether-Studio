@@ -5639,8 +5639,22 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
+        # Recovery and claim/update must serialize on the same task row.
+        # A plain SELECT can race with a renewed Worker lease and incorrectly
+        # quarantine a live task or erase the new lease owner.
+        begin_serialized_write(db)
         now = utc_now()
-        stale = list(db.execute(select(DBRenderTask).where(DBRenderTask.status.in_(database_status_values("RUNNING")), DBRenderTask.lease_expires_at < now)).scalars())
+        stale_query = (
+            select(DBRenderTask)
+            .where(
+                DBRenderTask.status.in_(database_status_values("RUNNING")),
+                DBRenderTask.lease_expires_at < now,
+            )
+            .order_by(DBRenderTask.created_at.asc())
+        )
+        if app_engine.dialect.name != "sqlite":
+            stale_query = stale_query.with_for_update(skip_locked=True)
+        stale = list(db.execute(stale_query).scalars())
         recovered = []
         for task in stale:
             # A Worker may have submitted the render before losing the upstream
