@@ -968,3 +968,41 @@ def test_render_id_conflict_never_mutates_foreign_or_different_input_record(
     assert path.read_bytes() == before, (
         "rejected cross-tenant/request-hash replay mutated prior owner's state"
     )
+
+
+def test_jobstore_unacknowledged_legacy_retry_flag_never_requeues(tmp_path):
+    """FAKE-only: historical retryable=True is not an Owner-approved manual ACK.
+
+    A previous writer may have flagged a failed paid/render task retryable.
+    The normal create-or-get request must not launch another execution, even
+    when its tenant and request fingerprint match.
+    """
+    from app.main import JobStore
+
+    root = tmp_path / "synthetic-unacknowledged-legacy"
+    original = JobStore(root)
+    first, should_execute = original.create_or_get(
+        "synthetic-tenant", "render", "synthetic-legacy-retry",
+        request_hash="a" * 64,
+    )
+    assert should_execute
+    original.update(
+        first["jobId"],
+        status="failed",
+        progress=100,
+        retryable=True,
+        message="synthetic historical retry marker without Owner ACK",
+    )
+    durable_path = root / "jobs" / "synthetic-legacy-retry.json"
+    before = durable_path.read_bytes()
+
+    restarted = JobStore(root)
+    replay, should_execute = restarted.create_or_get(
+        "synthetic-tenant", "render", "synthetic-legacy-retry",
+        request_hash="a" * 64,
+    )
+    assert should_execute is False, "Unacknowledged historical flag re-dispatched work"
+    assert replay["status"] == "failed"
+    assert durable_path.read_bytes() == before, (
+        "A read/replay mutated the durable failed outcome without Owner ACK"
+    )
