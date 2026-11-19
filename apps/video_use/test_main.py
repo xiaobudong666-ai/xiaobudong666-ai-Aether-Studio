@@ -930,3 +930,41 @@ uvicorn.run(app, host="127.0.0.1", port=port, access_log=False, log_level="error
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "other_project, other_request_hash, expected_message",
+    [
+        ("tenant-beta", "stable-render-input-a", "another job"),
+        ("tenant-alpha", "different-render-input", "different render inputs"),
+    ],
+)
+def test_render_id_conflict_never_mutates_foreign_or_different_input_record(
+    tmp_path, other_project, other_request_hash, expected_message
+):
+    """FAKE-only: conflicting idempotency claims cannot mutate original job state.
+
+    Two separate JobStore objects model a stale owner after restart; do not
+    access production data or dispatch any real worker/provider operation.
+    """
+    from app.main import JobStore
+
+    original = JobStore(tmp_path)
+    initial, should_execute = original.create_or_get(
+        "tenant-alpha", "render", "shared-render-request",
+        request_hash="stable-render-input-a",
+    )
+    assert should_execute is True
+    assert initial["status"] == "queued"
+    path = tmp_path / "jobs" / "shared-render-request.json"
+    before = path.read_bytes()
+
+    other = JobStore(tmp_path)
+    with pytest.raises(ValueError, match=expected_message):
+        other.create_or_get(
+            other_project, "render", "shared-render-request",
+            request_hash=other_request_hash,
+        )
+    assert path.read_bytes() == before, (
+        "rejected cross-tenant/request-hash replay mutated prior owner's state"
+    )
