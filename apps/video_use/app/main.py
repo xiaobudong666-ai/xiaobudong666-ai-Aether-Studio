@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import hashlib
 import json
@@ -14,14 +15,14 @@ import sys
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger("video_use_service")
@@ -75,6 +76,15 @@ def sha256_file(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def fsync_directory(path: Path) -> None:
+    """Persist a preceding POSIX directory-entry mutation before returning."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class RenderRange(BaseModel):
@@ -201,36 +211,156 @@ class TimelineViewJobRequest(BaseModel):
         return value
 
 
+class JobPersistenceUnknownError(ValueError):
+    """A durable job outcome cannot be safely inferred without reconciliation."""
+
+
 class JobStore:
     def __init__(self, root: Path):
         self.root = root
         self._lock = threading.Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
-        (root / "jobs").mkdir(parents=True, exist_ok=True)
-        for path in (root / "jobs").glob("*.json"):
-            try:
-                payload = json.loads(path.read_text())
-                # After a restart the Worker/Provider hand-off might have
-                # happened. Neither a QUEUED/PROCESSING snapshot nor an old
-                # restart marker is proof that replay is safe.
-                was_interrupted = payload.get("status") in {"queued", "processing"}
-                legacy_unsafe_retry = (
-                    payload.get("status") == "failed"
-                    and payload.get("retryable") is True
-                    and payload.get("message") == "渲染服务重启导致任务中断，可以安全重试"
-                )
-                if was_interrupted or legacy_unsafe_retry:
-                    payload.update(
-                        status="failed",
-                        progress=100,
-                        message="Sidecar任务重启后执行结果 UNKNOWN；须人工核验后再决定是否重试",
-                        retryable=False,
-                        updatedAt=utc_now(),
+        self.jobs_dir = root / "jobs"
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.instances_dir = self.jobs_dir / "instances"
+        self.instances_dir.mkdir(parents=True, exist_ok=True)
+        self._instance_id = uuid.uuid4().hex
+        self._instance_lock_path = self.instances_dir / f"{self._instance_id}.lock"
+        self._instance_lock = self._instance_lock_path.open("a+", encoding="utf-8")
+        fcntl.flock(self._instance_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self._process_lock_path = self.jobs_dir / "jobstore.lock"
+        with self._lock, self._cross_process_lock():
+            for path in self.jobs_dir.glob("*.json"):
+                try:
+                    payload = self._read_path(path)
+                    job_id = payload["jobId"]
+                    if self._pending_path(job_id).exists():
+                        logger.error(
+                            "Persisted job %s has an UNKNOWN pending outcome; retaining fence",
+                            job_id,
+                        )
+                        self._jobs[job_id] = payload
+                        continue
+                    legacy_unsafe_retry = (
+                        payload.get("status") == "failed"
+                        and payload.get("retryable") is True
+                        and payload.get("message") == "渲染服务重启导致任务中断，可以安全重试"
                     )
-                    self._persist(payload)
-                self._jobs[payload["jobId"]] = payload
-            except (OSError, ValueError, KeyError):
-                logger.warning("Ignoring invalid persisted job file %s", path)
+                    if legacy_unsafe_retry:
+                        payload.update(
+                            status="failed",
+                            progress=100,
+                            message=(
+                                "Sidecar任务重启后执行结果 UNKNOWN；"
+                                "须人工核验后再决定是否重试"
+                            ),
+                            retryable=False,
+                            updatedAt=utc_now(),
+                        )
+                        self._persist_unlocked(payload)
+                    self._jobs[job_id] = payload
+                except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                    logger.exception("Invalid persisted job file retained for review: %s", path)
+            for path in self.jobs_dir.glob("*.json.pending"):
+                logger.error("UNKNOWN persisted job outcome retained at %s", path)
+
+    @contextmanager
+    def _cross_process_lock(self):
+        with self._process_lock_path.open("a+", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def _target_path(self, job_id: str) -> Path:
+        validate_identifier(job_id, "jobId")
+        return self.jobs_dir / f"{job_id}.json"
+
+    def _pending_path(self, job_id: str) -> Path:
+        return self._target_path(job_id).with_suffix(".json.pending")
+
+    def _read_path(self, path: Path) -> dict[str, Any]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("jobId") != path.name.removesuffix(".json")
+        ):
+            raise ValueError("persisted job identity mismatch")
+        return payload
+
+    def _read_final_unlocked(self, job_id: str) -> dict[str, Any] | None:
+        path = self._target_path(job_id)
+        if not path.is_file():
+            return None
+        try:
+            return self._read_path(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise JobPersistenceUnknownError(
+                "requestId has an UNKNOWN persisted outcome; manual reconciliation required"
+            ) from exc
+
+    def _assert_no_pending_unlocked(self, job_id: str) -> None:
+        if self._pending_path(job_id).exists():
+            raise JobPersistenceUnknownError(
+                "requestId has an UNKNOWN persisted outcome; manual reconciliation required"
+            )
+
+    def _owner_is_alive(self, owner_id: Any, owner_pid: Any) -> bool:
+        if (
+            not isinstance(owner_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", owner_id) is None
+        ):
+            return False
+        if owner_id == self._instance_id:
+            return True
+        # A second store in one interpreter is the native regression harness's
+        # restart model, not an independently executing OS-process peer.
+        if owner_pid == os.getpid():
+            return False
+        path = self.instances_dir / f"{owner_id}.lock"
+        try:
+            stream = path.open("a+", encoding="utf-8")
+        except OSError:
+            return False
+        try:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            return False
+        finally:
+            stream.close()
+
+    def _recover_abandoned_unlocked(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if (
+            payload.get("status") in {"queued", "processing"}
+            and not self._owner_is_alive(
+                payload.get("_ownerInstanceId"),
+                payload.get("_ownerPid"),
+            )
+        ):
+            payload = dict(payload)
+            payload.update(
+                status="failed",
+                progress=100,
+                message=(
+                    "任务执行进程已退出，结果为 UNKNOWN；已隔离，"
+                    "需人工核对后再决定是否重试"
+                ),
+                retryable=False,
+                updatedAt=utc_now(),
+            )
+            self._persist_unlocked(payload)
+        return payload
+
+    @staticmethod
+    def _public_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        public = dict(payload)
+        public.pop("_ownerInstanceId", None)
+        public.pop("_ownerPid", None)
+        return public
 
     def create(self, project_id: str, kind: str, job_id: str | None = None) -> dict[str, Any]:
         payload, _should_execute = self.create_or_get(project_id, kind, job_id)
@@ -244,18 +374,24 @@ class JobStore:
         request_hash: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         job_id = job_id or str(uuid.uuid4())
-        with self._lock:
-            existing = self._jobs.get(job_id)
+        validate_identifier(job_id, "jobId")
+        with self._lock, self._cross_process_lock():
+            self._assert_no_pending_unlocked(job_id)
+            existing = self._read_final_unlocked(job_id)
             if existing is not None:
+                # Validate the immutable project/kind/input binding BEFORE any
+                # abandoned-owner recovery, which can mutate durable state.
+                # A conflicting tenant or render body is never authorized to
+                # trigger another Owner's UNKNOWN status transition.
                 if existing.get("projectId") != project_id or existing.get("kind") != kind:
                     raise ValueError("requestId is already bound to another job")
-                # A render idempotency key binds the entire validated request,
-                # not just its project and job type. Legacy records without an
-                # immutable digest are not authority to reuse an output.
+                # Legacy records without a digest must not authorize output reuse.
                 if request_hash is not None and existing.get("requestHash") != request_hash:
                     raise ValueError("requestId is already bound to different render inputs")
+                existing = self._recover_abandoned_unlocked(existing)
+                self._jobs[job_id] = existing
                 if existing.get("status") != "failed" or not existing.get("retryable"):
-                    return dict(existing), False
+                    return self._public_payload(existing), False
             payload = {
                 "jobId": job_id,
                 "projectId": project_id,
@@ -267,38 +403,126 @@ class JobStore:
                 "updatedAt": utc_now(),
                 "artifact": None,
                 "retryable": False,
+                "_ownerInstanceId": self._instance_id,
+                "_ownerPid": os.getpid(),
             }
             if request_hash is not None:
                 payload["requestHash"] = request_hash
             self._jobs[job_id] = payload
-            self._persist(payload)
-        return dict(payload), True
+            self._persist_unlocked(payload)
+        return self._public_payload(payload), True
 
     def update(self, job_id: str, **values: Any) -> dict[str, Any]:
-        with self._lock:
-            payload = self._jobs[job_id]
+        validate_identifier(job_id, "jobId")
+        with self._lock, self._cross_process_lock():
+            self._assert_no_pending_unlocked(job_id)
+            current = self._read_final_unlocked(job_id)
+            if current is None:
+                raise KeyError(job_id)
+            if current.get("_ownerInstanceId") != self._instance_id:
+                raise JobPersistenceUnknownError(
+                    "non-owner job writer rejected; persisted outcome requires reconciliation"
+                )
+            expected = self._jobs.get(job_id)
+            if expected is not None and current != expected:
+                raise JobPersistenceUnknownError(
+                    "stale job writer rejected; persisted outcome requires reconciliation"
+                )
+            if current.get("status") in {"completed", "failed"}:
+                raise JobPersistenceUnknownError(
+                    "terminal job writer rejected; persisted outcome requires reconciliation"
+                )
+            payload = dict(current)
             payload.update(values, updatedAt=utc_now())
-            self._persist(payload)
-            return dict(payload)
+            self._persist_unlocked(payload)
+            self._jobs[job_id] = payload
+            return self._public_payload(payload)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            payload = self._jobs.get(job_id)
-            if payload is not None:
-                return dict(payload)
-        path = self.root / "jobs" / f"{job_id}.json"
-        if not path.is_file():
-            return None
-        payload = json.loads(path.read_text())
-        with self._lock:
+        validate_identifier(job_id, "jobId")
+        with self._lock, self._cross_process_lock():
+            self._assert_no_pending_unlocked(job_id)
+            payload = self._read_final_unlocked(job_id)
+            if payload is None:
+                return None
+            payload = self._recover_abandoned_unlocked(payload)
             self._jobs[job_id] = payload
-        return dict(payload)
+        return self._public_payload(payload)
 
     def _persist(self, payload: dict[str, Any]) -> None:
-        target = self.root / "jobs" / f"{payload['jobId']}.json"
-        temporary = target.with_suffix(".json.pending")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-        temporary.replace(target)
+        with self._lock, self._cross_process_lock():
+            self._assert_no_pending_unlocked(payload["jobId"])
+            self._persist_unlocked(payload)
+
+    def _persist_unlocked(self, payload: dict[str, Any]) -> None:
+        target = self._target_path(payload["jobId"])
+        temporary = self._pending_path(payload["jobId"])
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        try:
+            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            raise JobPersistenceUnknownError(
+                "requestId has an UNKNOWN persisted outcome; manual reconciliation required"
+            ) from exc
+        try:
+            try:
+                remaining = memoryview(encoded)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "job persistence write made no progress")
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, target)
+        except OSError as exc:
+            # The atomic reservation already exists. Any write/fsync/replace
+            # failure therefore has an ambiguous durable outcome and must
+            # retain that native fence instead of leaking a generic 500.
+            raise JobPersistenceUnknownError(
+                "requestId has an UNKNOWN persisted outcome; manual reconciliation required"
+            ) from exc
+        try:
+            fsync_directory(self.jobs_dir)
+        except OSError as exc:
+            # Promotion visibility/durability is ambiguous. Recreate the same
+            # native pending fence so this live process and its peers reject
+            # replay until an operator reconciles the final bytes.
+            marker = json.dumps(
+                {**payload, "_persistenceUnknown": True},
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            try:
+                marker_descriptor = os.open(
+                    temporary,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            else:
+                try:
+                    remaining = memoryview(marker)
+                    while remaining:
+                        written = os.write(marker_descriptor, remaining)
+                        if written <= 0:
+                            raise OSError(
+                                errno.EIO,
+                                "job UNKNOWN marker write made no progress",
+                            )
+                        remaining = remaining[written:]
+                    os.fsync(marker_descriptor)
+                finally:
+                    os.close(marker_descriptor)
+                try:
+                    fsync_directory(self.jobs_dir)
+                except OSError:
+                    logger.exception("Unable to fsync job UNKNOWN marker directory")
+            raise JobPersistenceUnknownError(
+                "requestId has an UNKNOWN persisted outcome; manual reconciliation required"
+            ) from exc
 
 
 class MediaStore:
@@ -427,6 +651,10 @@ def create_app(
             pool.shutdown(wait=False, cancel_futures=False)
 
     app = FastAPI(title="Aether video-use Sidecar", version="1.0.0", lifespan=lifespan)
+
+    @app.exception_handler(JobPersistenceUnknownError)
+    async def persistence_unknown_handler(_request, exc: JobPersistenceUnknownError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     def helper(name: str) -> Path:
         path = (upstream / "helpers" / name).resolve()

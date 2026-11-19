@@ -797,3 +797,174 @@ def test_render_same_request_id_changed_payload_fails_closed_before_redispatch(t
         assert client.post("/renders", json=payload).status_code == 202
         assert client.post("/renders", json=changed_timeline).status_code == 409
         assert pool.calls == 1
+
+
+def test_render_request_id_two_live_uvicorn_processes_fail_closed_on_owner_exit(tmp_path):
+    """FAKE-only shared POSIX root: exactly one dispatch, then UNKNOWN after owner exit.
+
+    No FFmpeg, helper, Provider, paid API, credentials, user assets or production traffic.
+    Both servers are independent localhost OS processes with NOOP executors.
+    """
+    import json
+    import os
+    import socket
+    import sys
+    import httpx
+
+    root = tmp_path / "shared-persistent-jobs"
+    dispatch_log = tmp_path / "fake-dispatches.jsonl"
+    launch_script = '''
+import json, os, sys
+from concurrent.futures import Future
+from pathlib import Path
+import uvicorn
+from app.main import create_app
+
+root, output_log, port = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+class FakeNoopExecutor:
+    def submit(self, _handler, job, _request):
+        record = {"pid": os.getpid(), "jobId": job["jobId"], "FAKE_ONLY": True}
+        fd = os.open(output_log, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, (json.dumps(record) + "\\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        future = Future()
+        future.set_result(None)
+        return future
+app = create_app(media_root=root, upstream_root=root / "synthetic-upstream", executor=FakeNoopExecutor())
+uvicorn.run(app, host="127.0.0.1", port=port, access_log=False, log_level="error")
+'''
+    ports = []
+    for _ in range(2):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            ports.append(listener.getsockname()[1])
+    assert ports[0] != ports[1]
+    env = {
+        **os.environ,
+        "VIDEO_USE_MEDIA_ROOT": str(tmp_path / "never-used-global-app"),
+        "HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": "",
+        "http_proxy": "", "https_proxy": "", "all_proxy": "",
+        "NO_PROXY": "127.0.0.1,localhost",
+    }
+    processes = []
+    try:
+        for port in ports:
+            processes.append(subprocess.Popen(
+                [sys.executable, "-u", "-c", launch_script, str(root), str(dispatch_log), str(port)],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ))
+        with httpx.Client(timeout=5, trust_env=False) as client:
+            for port, process in zip(ports, processes):
+                deadline = time.monotonic() + 20
+                while True:
+                    assert process.poll() is None, "Synthetic Uvicorn child exited"
+                    try:
+                        if client.get(f"http://127.0.0.1:{port}/openapi.json").status_code == 200:
+                            break
+                    except httpx.RequestError:
+                        pass
+                    assert time.monotonic() < deadline, "Synthetic Uvicorn readiness expired"
+                    time.sleep(0.05)
+
+            payload = {
+                "projectId": "synthetic-renders-scope", "requestId": "same-render-id",
+                "mode": "preview", "canonicalTimeline": {
+                    "version": "1.1", "duration": {"value": 1, "timescale": 1},
+                    "output": {"width": 640, "height": 360},
+                    "materials": [],
+                    "tracks": [{"id": "sub", "type": "subtitle", "order": 0, "clips": []}],
+                },
+            }
+            def call(which, data):
+                with httpx.Client(timeout=15, trust_env=False) as scoped_client:
+                    return scoped_client.post(f"http://127.0.0.1:{ports[which]}/renders", json=data)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                responses = [future.result(timeout=20) for future in [
+                    pool.submit(call, i % 2, payload) for i in range(8)
+                ]]
+            assert [res.status_code for res in responses] == [202] * 8, [
+                (res.status_code, res.text[:300]) for res in responses
+            ]
+            assert {res.json()["jobId"] for res in responses} == {"same-render-id"}
+            records = [json.loads(line) for line in dispatch_log.read_text().splitlines()]
+            assert len(records) == 1, records
+            assert records[0]["FAKE_ONLY"] is True
+            changed = json.loads(json.dumps(payload))
+            changed["canonicalTimeline"]["duration"]["value"] = 2
+            changed_mode = {**payload, "mode": "final"}
+            changed_project = {**payload, "projectId": "synthetic-other-project"}
+            for i, altered in enumerate((changed, changed_mode, changed_project)):
+                response = call(i % 2, altered)
+                assert response.status_code == 409, response.text
+            assert len(dispatch_log.read_text().splitlines()) == 1
+
+            stored_path = root / "jobs" / "same-render-id.json"
+            durable = json.loads(stored_path.read_text())
+            assert durable["status"] == "queued"
+            assert durable["requestHash"] == responses[0].json()["requestHash"]
+            owner_idx = next(i for i, p in enumerate(processes) if p.pid == durable["_ownerPid"])
+            processes[owner_idx].terminate()
+            processes[owner_idx].wait(timeout=5)
+            other_port = ports[1 - owner_idx]
+            survivor = client.get(f"http://127.0.0.1:{other_port}/jobs/same-render-id")
+            assert survivor.status_code == 200, survivor.text
+            assert survivor.json()["status"] == "failed"
+            assert survivor.json()["retryable"] is False
+            assert "UNKNOWN" in survivor.json()["message"]
+            identical = call(1 - owner_idx, payload)
+            assert identical.status_code == 202, identical.text
+            assert identical.json()["status"] == "failed"
+            assert call(1 - owner_idx, changed).status_code == 409
+            assert len(dispatch_log.read_text().splitlines()) == 1
+            assert json.loads(stored_path.read_text())["status"] == "failed"
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "other_project, other_request_hash, expected_message",
+    [
+        ("tenant-beta", "stable-render-input-a", "another job"),
+        ("tenant-alpha", "different-render-input", "different render inputs"),
+    ],
+)
+def test_render_id_conflict_never_mutates_foreign_or_different_input_record(
+    tmp_path, other_project, other_request_hash, expected_message
+):
+    """FAKE-only: conflicting idempotency claims cannot mutate original job state.
+
+    Two separate JobStore objects model a stale owner after restart; do not
+    access production data or dispatch any real worker/provider operation.
+    """
+    from app.main import JobStore
+
+    original = JobStore(tmp_path)
+    initial, should_execute = original.create_or_get(
+        "tenant-alpha", "render", "shared-render-request",
+        request_hash="stable-render-input-a",
+    )
+    assert should_execute is True
+    assert initial["status"] == "queued"
+    path = tmp_path / "jobs" / "shared-render-request.json"
+    before = path.read_bytes()
+
+    other = JobStore(tmp_path)
+    with pytest.raises(ValueError, match=expected_message):
+        other.create_or_get(
+            other_project, "render", "shared-render-request",
+            request_hash=other_request_hash,
+        )
+    assert path.read_bytes() == before, (
+        "rejected cross-tenant/request-hash replay mutated prior owner's state"
+    )

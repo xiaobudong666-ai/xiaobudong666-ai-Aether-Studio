@@ -494,7 +494,7 @@ jobs:
     # Independent nonproduction evidence only. The primary Node/Python security
     # audit remains the mandatory release gate; do not treat this as a waiver.
     name: G72 + G70/G71 FAKE-only Compose persistence and recovery smoke (not a release gate)
-    if: (github.event_name == 'push' && (github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route' || github.ref == 'refs/heads/feat/g70-g71-artifact-usage-hold' || github.ref == 'refs/heads/feat/g72-generation-task-keyset-client-20261104' || github.ref == 'refs/heads/feat/fusion-m0-g72-normal-entry-scope-fence-20261110' || github.ref == 'refs/heads/feat/fusion-m0-g72-preflight-context-guard-20261110' || github.ref == 'refs/heads/feat/fusion-m0-g70-g71-abrupt-upload-compensation-20261110')) || (github.event_name == 'pull_request' && (github.head_ref == 'feat/fusion-m0-g72-fake-only-route' || github.head_ref == 'feat/g70-g71-artifact-usage-hold' || github.head_ref == 'feat/g72-generation-task-keyset-client-20261104' || github.head_ref == 'feat/fusion-m0-g72-normal-entry-scope-fence-20261110' || github.head_ref == 'feat/fusion-m0-g72-preflight-context-guard-20261110' || github.head_ref == 'feat/fusion-m0-g70-g71-abrupt-upload-compensation-20261110'))
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/feat/fusion-m0-g72-fake-only-route' || github.ref == 'refs/heads/feat/g70-g71-artifact-usage-hold' || github.ref == 'refs/heads/feat/g72-generation-task-keyset-client-20261104' || github.ref == 'refs/heads/feat/fusion-m0-g72-normal-entry-scope-fence-20261110' || github.ref == 'refs/heads/feat/fusion-m0-g72-preflight-context-guard-20261110' || github.ref == 'refs/heads/feat/fusion-m0-g70-g71-abrupt-upload-compensation-20261110' || github.ref == 'refs/heads/feat/fusion-m0-g70g71-v35-jobstore-shared-http-20261119')) || (github.event_name == 'pull_request' && (github.head_ref == 'feat/fusion-m0-g72-fake-only-route' || github.head_ref == 'feat/g70-g71-artifact-usage-hold' || github.head_ref == 'feat/g72-generation-task-keyset-client-20261104' || github.head_ref == 'feat/fusion-m0-g72-normal-entry-scope-fence-20261110' || github.head_ref == 'feat/fusion-m0-g72-preflight-context-guard-20261110' || github.head_ref == 'feat/fusion-m0-g70-g71-abrupt-upload-compensation-20261110' || github.head_ref == 'feat/fusion-m0-g70g71-v35-jobstore-shared-http-20261119'))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -566,6 +566,12 @@ jobs:
           docker compose -f infra/docker/docker-compose.yml \
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             cp infra/docker/g70-g71-worker-transfer-failure-smoke.py api:/tmp/g70-g71-worker-transfer-failure-smoke.py
+
+      - name: Verify real two-container shared JobStore owner fence (synthetic-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          AETHER_JOBSTORE_CI_LAB=synthetic-only python infra/docker/g70-g71-two-container-jobstore-smoke.py orchestrate
 
       - name: Prove real Worker network, FFmpeg, sidecar persistence and audit
         shell: bash
