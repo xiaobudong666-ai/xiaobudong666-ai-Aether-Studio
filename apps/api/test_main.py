@@ -1476,16 +1476,18 @@ def test_g70_g71_worker_update_rejects_expired_lease_and_upstream_id_rebind(api_
             requested_by=owner.id, status="RUNNING", progress=10,
             message="FAKE render leased", engine="video-use",
             render_payload={"requestId": "fake-only-lease-fence"},
-            upstream_job_id="fake-original-job", attempts=1, max_attempts=3,
+            attempts=1, max_attempts=3,
             reserved_seconds=0, lease_owner="fake-worker",
             created_at=now, updated_at=now,
         )
         db.add(DBRenderTask(
             id="fake-expired-lease", lease_expires_at=now - datetime.timedelta(seconds=10),
+            upstream_job_id="fake-original-expired-job",
             **common,
         ))
         db.add(DBRenderTask(
             id="fake-live-lease", lease_expires_at=now + datetime.timedelta(minutes=5),
+            upstream_job_id="fake-original-live-job",
             **common,
         ))
         db.commit()
@@ -1516,7 +1518,10 @@ def test_g70_g71_worker_update_rejects_expired_lease_and_upstream_id_rebind(api_
         for task_id in ("fake-expired-lease", "fake-live-lease"):
             task = db.query(DBRenderTask).filter(DBRenderTask.id == task_id).one()
             assert canonical_task_status(task.status) == "RUNNING"
-            assert task.upstream_job_id == "fake-original-job"
+            assert task.upstream_job_id == {
+                "fake-expired-lease": "fake-original-expired-job",
+                "fake-live-lease": "fake-original-live-job",
+            }[task_id]
             assert task.progress == 10
             assert task.lease_owner == "fake-worker"
             assert task.completed_at is None
@@ -1529,7 +1534,7 @@ def test_g70_g71_worker_update_rejects_expired_lease_and_upstream_id_rebind(api_
         headers=headers,
         json={
             "status": "RUNNING", "progress": 45, "message": "poll only",
-            "upstreamJobId": "fake-original-job",
+            "upstreamJobId": "fake-original-live-job",
         },
     )
     assert valid.status_code == 200, valid.text
