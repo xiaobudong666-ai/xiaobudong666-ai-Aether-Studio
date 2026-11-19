@@ -241,6 +241,7 @@ class JobStore:
         project_id: str,
         kind: str,
         job_id: str | None = None,
+        request_hash: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         job_id = job_id or str(uuid.uuid4())
         with self._lock:
@@ -248,6 +249,11 @@ class JobStore:
             if existing is not None:
                 if existing.get("projectId") != project_id or existing.get("kind") != kind:
                     raise ValueError("requestId is already bound to another job")
+                # A render idempotency key binds the entire validated request,
+                # not just its project and job type. Legacy records without an
+                # immutable digest are not authority to reuse an output.
+                if request_hash is not None and existing.get("requestHash") != request_hash:
+                    raise ValueError("requestId is already bound to different render inputs")
                 if existing.get("status") != "failed" or not existing.get("retryable"):
                     return dict(existing), False
             payload = {
@@ -262,6 +268,8 @@ class JobStore:
                 "artifact": None,
                 "retryable": False,
             }
+            if request_hash is not None:
+                payload["requestHash"] = request_hash
             self._jobs[job_id] = payload
             self._persist(payload)
         return dict(payload), True
@@ -936,7 +944,19 @@ def create_app(
                     except FileNotFoundError as exc:
                         raise HTTPException(status_code=404, detail=f"未找到媒体文件：{clip.materialId}") from exc
         try:
-            job, should_execute = jobs.create_or_get(request.projectId, "render", request.requestId)
+            # The same requestId must never return a different render's output
+            # after retry, restart or a lost hand-off ACK. Hash the validated
+            # full render contract (including timeline, mode and audio policy).
+            render_contract = json.dumps(
+                request.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            render_hash = hashlib.sha256(render_contract.encode("utf-8")).hexdigest()
+            job, should_execute = jobs.create_or_get(
+                request.projectId, "render", request.requestId, request_hash=render_hash
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not should_execute:
