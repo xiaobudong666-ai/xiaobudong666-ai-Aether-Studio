@@ -342,6 +342,53 @@ describe("Aether Studio 中文工作台", () => {
     expect(adoptionKeys[0]).toBe(adoptionKeys[1]);
   });
 
+  test("G72 normal FAKE-only entry denies editor before any preflight or enqueue", async () => {
+    const projectWithImage = {
+      ...createdProject,
+      materials: [{
+        id: "editor-portrait", name: "portrait.png", url: "/api/media/editor-portrait",
+        type: "image", contentType: "image/png", sizeBytes: 100,
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            id: "editor-1", email: "editor@example.com", displayName: "Editor", role: "editor",
+            tenant: { id: "tenant-1", name: "Aether Test", slug: "aether-test" },
+            quotas: {
+              projects: 50, storageBytes: 1000, storageBytesUsed: 0,
+              concurrentRenders: 2, monthlyRenderSeconds: 1000,
+              monthlyRenderSecondsUsed: 0, period: "2026-11",
+            },
+          }),
+        } as Response;
+      }
+      if (url === "/api/projects") {
+        return { ok: true, status: 200, json: async () => [projectWithImage] } as Response;
+      }
+      if (url === "/api/projects/project-1") {
+        return { ok: true, status: 200, json: async () => projectWithImage } as Response;
+      }
+      return { ok: true, status: 200, json: async () => [] } as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    // The same-tenant Editor can view the project but must not be offered an
+    // action the G72 API/Worker will always reject until Owner grants exist.
+    expect(await screen.findByRole("option", { name: "发布预告片（版本 1）" })).toBeTruthy();
+    const createButton = screen.getByRole("button", { name: "生成口播测试样片（FAKE-ONLY）" });
+    expect((createButton as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/仅项目Owner本人可发起/)).toBeTruthy();
+    fireEvent.click(createButton);
+    expect(fetchMock.mock.calls.some(([input]) =>
+      String(input).includes("/talking-head/fake-generation-tasks")
+    )).toBe(false);
+  });
+
   test("G72 normal oral-broadcast entry validates and enqueues only FAKE-only work", async () => {
     const projectWithImage = {
       ...createdProject,

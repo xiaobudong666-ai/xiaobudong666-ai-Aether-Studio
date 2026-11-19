@@ -9,7 +9,7 @@ from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import apply_project_update, create_app
 from app.migrations import ensure_schema
-from app.models import DBAssetVersion, DBRenderTask, DBTenant, DBUser
+from app.models import DBAssetVersion, DBDirectMediaUploadHold, DBProject, DBRenderTask, DBTenant, DBUser
 from app.schemas import UpdateProjectRequest, WorkerTaskUpdateRequest
 from app.task_status import canonical_task_status, database_status_values, legacy_task_status
 from fastapi import HTTPException
@@ -29,6 +29,7 @@ class FakeVideoUseAdapter:
     def __init__(self):
         self.jobs = {}
         self.status_calls = {}
+        self.media_objects = {}
 
     def check_health(self):
         return {"status": "healthy", "service": "video-use"}
@@ -39,6 +40,7 @@ class FakeVideoUseAdapter:
     def upload_media(self, project_id, filename, content_type, stream):
         payload = stream.read()
         assert payload
+        self.media_objects[(project_id, "media-1")] = payload
         if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
             return {
                 "mediaId": "media-1",
@@ -68,6 +70,13 @@ class FakeVideoUseAdapter:
                 "audio": {"codec": "aac", "sampleRate": 48000},
             },
         }
+
+    def inspect_media(self, project_id, media_id):
+        payload = self.media_objects.get((project_id, media_id))
+        if payload is None:
+            raise RuntimeError("FAKE media not found")
+        return {"projectId": project_id, "mediaId": media_id,
+                "sizeBytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
 
     def submit_render(self, payload):
         assert payload["ranges"] == [
@@ -277,6 +286,197 @@ def test_auth_rbac_tenant_isolation_and_project_quota(api_context):
     denied = isolated.post("/projects", json={"name": "Over Tenant B quota"})
     assert denied.status_code == 429
 
+
+
+@pytest.mark.parametrize(
+    "corrupt_materials", [
+        {"legacy": "invalid object root"},
+        ["invalid string row"],
+        [None],
+        None,  # JSON null is not a safe empty catalog; *project.materials would fail after Sidecar.
+    ],
+)
+def test_g70_g71_direct_media_corrupt_materials_fail_before_sidecar_and_quota(
+    api_context, monkeypatch, corrupt_materials,
+):
+    """FAKE-only: historical malformed catalog must not create a new remote orphan.
+
+    No Sidecar dispatch, storage reservation, asset, or revision mutation is
+    allowed. This is not trusted reconciliation of any existing HELD record.
+    """
+    client, sessions = api_context
+    project = create_project(client, "G70 corrupted historic materials")
+    with sessions() as db:
+        record = db.get(DBProject, project["id"])
+        record.materials = corrupt_materials
+        tenant_id = record.tenant_id
+        before_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+        db.commit()
+
+    sidecar_calls = []
+    adapter = client.app.state.video_use
+
+    def forbidden_dispatch(*args, **kwargs):
+        sidecar_calls.append(True)
+        raise AssertionError("corrupt project must be rejected before Sidecar")
+
+    monkeypatch.setattr(adapter, "upload_media", forbidden_dispatch)
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("synthetic.mp4", b"FAKE-only synthetic bytes", "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "PROJECT_MATERIALS_INTEGRITY_REVIEW_REQUIRED"
+    assert sidecar_calls == []
+    with sessions() as db:
+        saved = db.get(DBProject, project["id"])
+        assert saved.materials == corrupt_materials
+        assert saved.revision == project["revision"]
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == before_bytes
+        assert db.query(DBDirectMediaUploadHold).filter(
+            DBDirectMediaUploadHold.project_id == project["id"]
+        ).count() == 0
+        assert db.query(DBAssetVersion).filter(
+            DBAssetVersion.project_id == project["id"]
+        ).count() == 0
+
+
+@pytest.mark.parametrize(
+    "malformed_probe",
+    [
+        "video_descriptor_is_string",
+        "trackless_media",
+        "video_negative_width",
+        "audio_descriptor_is_string",
+        "video_missing_codec",
+        "video_codec_not_scalar",
+        "audio_missing_codec",
+        "audio_codec_not_scalar",
+        "media_type_contradicts_tracks",
+        "media_type_is_not_scalar",
+    ],
+)
+def test_g70_g71_direct_media_malformed_sidecar_probe_keeps_hold_without_asset(
+    api_context, monkeypatch, malformed_probe,
+):
+    """G70/G71 FAKE-only: an ACK and matching bytes do not prove codec/track shape.
+
+    Existing policy: after dispatch, reject unsafe probe before asset registration;
+    retain the single durable HELD reservation and fence any repeated upload.
+    No trusted receipt, cancellation refund, or real Provider is simulated.
+    """
+    client, sessions = api_context
+    project = create_project(client, "G70 malformed FAKE Sidecar track")
+    media_store = client.app.state.video_use
+    original_upload = media_store.upload_media
+    dispatch_count = 0
+
+    def corrupted_upload(project_id, filename, content_type, stream, **kwargs):
+        nonlocal dispatch_count
+        dispatch_count += 1
+        reply = original_upload(project_id, filename, content_type, stream, **kwargs)
+        metadata = reply["metadata"]
+        if malformed_probe == "video_descriptor_is_string":
+            metadata["video"] = "not-a-video-track-object"
+        elif malformed_probe == "trackless_media":
+            metadata["video"] = None
+            metadata["audio"] = None
+        elif malformed_probe == "video_negative_width":
+            metadata["video"]["width"] = -1
+        elif malformed_probe == "video_missing_codec":
+            metadata["video"].pop("codec")
+        elif malformed_probe == "video_codec_not_scalar":
+            metadata["video"]["codec"] = ["h264"]
+        elif malformed_probe == "audio_missing_codec":
+            metadata["audio"].pop("codec")
+        elif malformed_probe == "audio_codec_not_scalar":
+            metadata["audio"]["codec"] = ["aac"]
+        elif malformed_probe == "media_type_contradicts_tracks":
+            reply["mediaType"] = "audio"
+        elif malformed_probe == "media_type_is_not_scalar":
+            reply["mediaType"] = ["video"]
+        else:
+            metadata["audio"] = "not-an-audio-track-object"
+        return reply
+
+    monkeypatch.setattr(media_store, "upload_media", corrupted_upload)
+    payload = b"synthetic-direct-media-invalid-sidecar-track"
+    path = f"/projects/{project['id']}/media"
+    request_data = {"expectedRevision": str(project["revision"])}
+    upload_file = {"file": ("untrusted.mp4", payload, "video/mp4")}
+    first = client.post(path, data=request_data, files=upload_file)
+    assert first.status_code == 409, first.text
+    assert first.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert dispatch_count == 1
+    assert client.get(f"/projects/{project['id']}/asset-versions").json() == []
+    current_project = client.get(f"/projects/{project['id']}").json()
+    assert current_project["revision"] == 1
+    assert current_project["materials"] == []
+
+    with sessions() as db:
+        holds = db.query(DBDirectMediaUploadHold).filter(
+            DBDirectMediaUploadHold.project_id == project["id"],
+        ).all()
+        assert len(holds) == 1
+        assert holds[0].state == "HELD"
+        assert holds[0].size_bytes == len(payload)
+        assert holds[0].source_sha256 == hashlib.sha256(payload).hexdigest()
+        tenant = db.get(DBTenant, holds[0].tenant_id)
+        assert tenant.used_storage_bytes == len(payload)
+
+    replay = client.post(path, data=request_data, files=upload_file)
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert dispatch_count == 1, "HELD must prevent a second Sidecar dispatch"
+    with sessions() as db:
+        holds = db.query(DBDirectMediaUploadHold).filter(
+            DBDirectMediaUploadHold.project_id == project["id"],
+        ).all()
+        assert len(holds) == 1 and holds[0].state == "HELD"
+        assert db.get(DBTenant, holds[0].tenant_id).used_storage_bytes == len(payload)
+
+
+@pytest.mark.parametrize(
+    ("filename", "caller_mime", "expected_mime"),
+    [
+        ("spoofed-video.mp4", "text/html", "video/mp4"),
+        ("spoofed-image.png", "image/svg+xml", "image/png"),
+    ],
+)
+def test_g70_g71_untrusted_multipart_mime_cannot_poison_catalog_or_download(
+    api_context, monkeypatch, filename, caller_mime, expected_mime,
+):
+    """FAKE-only: validated track type controls asset MIME, not caller/Sidecar headers."""
+    client, sessions = api_context
+    project = create_project(client, "G70 MIME evidence boundary")
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": (filename, b"fake-media-mime-probe", caller_mime)},
+    )
+    assert response.status_code == 201, response.text
+    asset = response.json()["assetVersion"]
+    material = response.json()["material"]
+    assert material["contentType"] == expected_mime
+    assert asset["contentType"] == expected_mime
+    with sessions() as db:
+        stored = db.get(DBAssetVersion, asset["id"])
+        assert stored is not None and stored.content_type == expected_mime
+
+    original_stream = client.app.state.video_use.stream
+
+    @contextmanager
+    def spoofed_upstream_content_type(path, headers=None):
+        with original_stream(path, headers=headers) as upstream:
+            upstream.headers["content-type"] = "text/html"
+            yield upstream
+
+    monkeypatch.setattr(client.app.state.video_use, "stream", spoofed_upstream_content_type)
+    download = client.get(f"/video-use/media/{project['id']}/{material['id']}")
+    assert download.status_code == 200, download.text
+    assert download.headers["content-type"] == expected_mime
+    assert download.headers["x-content-type-options"] == "nosniff"
 
 def test_atomic_optimistic_lock_allows_exactly_one_competing_update(api_context):
     client, test_session = api_context
@@ -840,3 +1040,221 @@ def test_additive_migration_preserves_legacy_project_and_creates_typed_tables(tm
             text("SELECT name FROM projects WHERE id = 'legacy-project'")
         ).scalar_one() == "Legacy"
     legacy_engine.dispose()
+
+
+@pytest.mark.parametrize("bad_field,bad_value", [
+    ("sizeBytes", True),
+    ("sizeBytes", "17"),
+    ("sizeBytes", 17.5),
+    ("sizeBytes", {"bytes": 17}),
+    ("sizeBytes", None),
+    ("durationSeconds", True),
+    ("durationSeconds", "1.0"),
+    ("durationSeconds", float("nan")),
+    ("durationSeconds", float("inf")),
+    ("durationSeconds", {"seconds": 1}),
+])
+def test_g70_g71_media_upload_rejects_untrusted_sidecar_probe_and_retains_hold(
+    api_context, monkeypatch, bad_field, bad_value,
+):
+    """Malformed FAKE Sidecar evidence must not persist an asset or refund unknown remote bytes."""
+    client, sessions = api_context
+    project = create_project(client, "Strict Sidecar probe")
+    adapter = client.app.state.video_use
+    original_upload = adapter.upload_media
+
+    def poisoned_sidecar(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        return {**result, "metadata": {**result["metadata"], bad_field: bad_value}}
+
+    monkeypatch.setattr(adapter, "upload_media", poisoned_sidecar)
+    with sessions() as db:
+        baseline_bytes = db.query(DBTenant).one().used_storage_bytes
+
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("source.mp4", b"real-media-bytes", "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    updated = client.get(f"/projects/{project['id']}").json()
+    assert updated["revision"] == project["revision"]
+    assert updated["materials"] == []
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes + len(b"real-media-bytes")
+        assert db.query(DBAssetVersion).count() == 0
+
+
+@pytest.mark.parametrize("bad_response", [None, [], "not-a-mapping", {"metadata": []}])
+def test_g70_g71_media_upload_rejects_malformed_sidecar_response_without_asset(
+    api_context, monkeypatch, bad_response,
+):
+    """Reject an invalid Sidecar response root without speculative quota refund."""
+    client, sessions = api_context
+    project = create_project(client, "Strict Sidecar response")
+    adapter = client.app.state.video_use
+    monkeypatch.setattr(adapter, "upload_media", lambda *a, **kw: bad_response)
+    with sessions() as db:
+        baseline_bytes = db.query(DBTenant).one().used_storage_bytes
+
+    response = client.post(
+        f"/projects/{project['id']}/media",
+        data={"expectedRevision": str(project["revision"])},
+        files={"file": ("source.mp4", b"real-media-bytes", "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    updated = client.get(f"/projects/{project['id']}").json()
+    assert updated["revision"] == project["revision"]
+    assert updated["materials"] == []
+    with sessions() as db:
+        assert db.query(DBTenant).one().used_storage_bytes == baseline_bytes + len(b"real-media-bytes")
+        assert db.query(DBAssetVersion).count() == 0
+
+@pytest.mark.parametrize("failure_kind", ["timeout_after_dispatch", "sidecar_503"])
+@pytest.mark.parametrize(
+    ("submit_method", "expected_path"),
+    [
+        ("submit_render", "/renders"),
+        ("submit_transcription", "/transcriptions"),
+        ("submit_timeline_view", "/timeline-views"),
+    ],
+)
+def test_g70_g71_sidecar_mutating_job_submission_fails_closed_on_lost_ack(
+    monkeypatch, failure_kind, submit_method, expected_path,
+):
+    """An ambiguous accepted Sidecar job must not be replayed as new work.
+
+    In particular /transcriptions can trigger a paid upstream call. FAKE-only
+    isolated HTTPX transport: no real Sidecar/Provider or billing calls.
+    """
+    import httpx
+    from app.video_use_adapter import (
+        VideoUseAdapter, VideoUseConnectionError, VideoUseTimeoutError,
+    )
+
+    outbound = []
+
+    def fake_request(client, method, url, **kwargs):
+        outbound.append((method, url, kwargs.get("json")))
+        request = httpx.Request(method, url)
+        if failure_kind == "timeout_after_dispatch":
+            raise httpx.ReadTimeout("synthetic Sidecar lost ACK", request=request)
+        return httpx.Response(503, request=request)
+
+    monkeypatch.setattr(httpx.Client, "request", fake_request)
+    adapter = VideoUseAdapter(
+        api_url="http://fake-sidecar.invalid", max_retries=2, backoff_factor=0,
+    )
+    with pytest.raises((VideoUseTimeoutError, VideoUseConnectionError)):
+        getattr(adapter, submit_method)({"projectId": "fake-project"})
+
+    assert len(outbound) == 1, "ambiguous mutating POST must not retry"
+    assert outbound[0] == (
+        "POST", f"http://fake-sidecar.invalid{expected_path}",
+        {"projectId": "fake-project"},
+    )
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout_after_dispatch", "sidecar_503"])
+@pytest.mark.parametrize("with_idempotency_headers", [False, True])
+def test_g70_g71_media_adapter_does_not_replay_ambiguous_upload_dispatch(monkeypatch, failure_kind, with_idempotency_headers):
+    """FAKE-only transport test: an uncertain Sidecar POST must never be auto-replayed.
+
+    A timeout or 503 may occur after remote bytes were committed. Neither
+    auto-retry nor a guessed refund is permitted without a trusted receipt.
+    This test makes zero real network/Provider calls.
+    """
+    import io
+    import httpx
+    from app.video_use_adapter import (
+        VideoUseAdapter, VideoUseConnectionError, VideoUseTimeoutError,
+    )
+
+    outbound = []
+
+    def fake_request(client, method, url, **kwargs):
+        outbound.append((method, url, kwargs.get("headers")))
+        request = httpx.Request(method, url)
+        if failure_kind == "timeout_after_dispatch":
+            raise httpx.ReadTimeout("simulated ambiguous remote commit", request=request)
+        return httpx.Response(503, request=request)
+
+    monkeypatch.setattr(httpx.Client, "request", fake_request)
+    adapter = VideoUseAdapter(
+        api_url="http://fake-sidecar.invalid", max_retries=2, backoff_factor=0,
+    )
+    payload = b"fake-only-uncertain-media-commit"
+    binding = (
+        {"idempotency_key": "fake-only-upload-1",
+         "content_sha256": hashlib.sha256(payload).hexdigest()}
+        if with_idempotency_headers else {}
+    )
+    with pytest.raises((VideoUseTimeoutError, VideoUseConnectionError)):
+        adapter.upload_media(
+            "fake-project", "clip.mp4", "video/mp4",
+            io.BytesIO(payload), **binding,
+        )
+
+    assert len(outbound) == 1, "ambiguous upload must have exactly one dispatch"
+    assert outbound[0][0] == "POST"
+    assert outbound[0][1].endswith("/media")
+    if with_idempotency_headers:
+        assert outbound[0][2]["Idempotency-Key"] == "fake-only-upload-1"
+
+
+@pytest.mark.parametrize("path", [
+    "/jobs/../../health?exfil=1/artifact",
+    "/jobs/%2e%2e%2fhealth/artifact",
+    "/jobs/job-1?route=capabilities/artifact",
+    "/jobs/job-1#fragment/artifact",
+    "/media/project-a/../../health",
+    "/media/project-a/media-1?route=/jobs",
+    "/jobs//artifact",
+])
+def test_video_use_stream_rejects_malformed_sidecar_routes(monkeypatch, path):
+    """FAKE-only: reject a poisoned persisted Sidecar ID before HTTP transport.
+
+    No real Provider/Sidecar call or protected storage read. The Sidecar itself
+    already validates identifiers; the authenticated API proxy must not rely on
+    downstream URL parsing to preserve the intended resource scope.
+    """
+    import httpx
+    from app.video_use_adapter import VideoUseAdapter, VideoUseError
+
+    def forbidden_client(*args, **kwargs):
+        raise AssertionError("invalid proxy route must not create an HTTP client")
+
+    monkeypatch.setattr(httpx, "Client", forbidden_client)
+    with pytest.raises(VideoUseError, match="invalid identifiers"):
+        with VideoUseAdapter().stream(path):
+            pytest.fail("malformed Sidecar path unexpectedly accepted")
+
+
+@pytest.mark.parametrize("path", [
+    "/jobs/11111111-1111-1111-1111-111111111111/artifact",
+    "/media/11111111-1111-1111-1111-111111111111/media-1",
+])
+def test_video_use_stream_valid_sidecar_routes_preserve_range(monkeypatch, path):
+    """FAKE HTTPX transport proves valid native routes are not regressed."""
+    import httpx
+    from app.video_use_adapter import VideoUseAdapter
+
+    seen = []
+    transport = httpx.MockTransport(
+        lambda request: (
+            seen.append((request.url.path, request.headers.get("range")))
+            or httpx.Response(206, headers={"Content-Type": "video/mp4"}, content=b"abc")
+        )
+    )
+    real_client = httpx.Client
+
+    def mocked_client(*args, **kwargs):
+        return real_client(*args, transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", mocked_client)
+    with VideoUseAdapter().stream(path, headers={"Range": "bytes=0-2"}) as response:
+        assert response.status_code == 206
+        assert b"".join(response.iter_bytes()) == b"abc"
+    assert seen == [(path, "bytes=0-2")]

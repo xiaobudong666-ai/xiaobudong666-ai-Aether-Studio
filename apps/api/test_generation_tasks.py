@@ -14,6 +14,8 @@ import pytest
 from app.auth import hash_password
 from app.database import Base, build_engine
 from app.main import create_app
+from app.generation_tasks import request_hash as generation_request_hash
+from app.schemas import TalkingHeadFakeGenerationRequest
 from app.video_use_adapter import VideoUseError, VideoUseNotFoundError
 from app.models import (
     DBAdoption,
@@ -35,6 +37,7 @@ from app.models import (
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 
 OWNER_PASSWORD = secrets.token_urlsafe(24)
 WORKER_TOKEN = secrets.token_urlsafe(32)
@@ -713,6 +716,69 @@ def test_18_upstream_id_is_immutable_and_illegal_transition_rejected(generation_
     assert transition(client, task["taskId"], "RUNNING", upstreamJobId="upstream-a").status_code == 200
     assert transition(client, task["taskId"], "RUNNING", upstreamJobId="upstream-b").status_code == 409
     assert transition(client, task["taskId"], "SUBMITTING").status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("task_upstream", "attempt_upstream", "incoming_upstream"),
+    [
+        (None, "prior-attempt-job", "new-worker-job"),
+        ("task-job", "different-attempt-job", None),
+    ],
+)
+def test_g73_transition_fences_attempt_upstream_identity_mismatch(
+    generation_context, task_upstream, attempt_upstream, incoming_upstream,
+):
+    """A Worker lease cannot silently rewrite a discrepant durable Attempt receipt.
+
+    This simulates legacy/corrupt history in a disposable DB, not real
+    Provider work. The original attempt/job and RESERVED usage stay untouched.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G73 transition identity quarantine")
+    task = create_task(client, project, key="g73-transition-upstream-mismatch")
+    claimed = claim(client)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task["taskId"]
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task["taskId"],
+                DBGenerationAttempt.attempt_no == row.attempts,
+            )
+        ).scalar_one()
+        row.upstream_job_id = task_upstream
+        attempt.upstream_job_id = attempt_upstream
+        db.commit()
+        before = (row.status, row.upstream_job_id, attempt.status, attempt.upstream_job_id)
+        event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task["taskId"],
+        )).scalar_one()
+        usage_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task["taskId"],
+        )).scalar_one()
+
+    kwargs = {"upstreamJobId": incoming_upstream} if incoming_upstream else {}
+    rejected = transition(client, task["taskId"], "RUNNING", **kwargs)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "UPSTREAM_ATTEMPT_IDENTITY_CONFLICT"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task["taskId"],
+            DBGenerationAttempt.attempt_no == row.attempts,
+        )).scalar_one()
+        assert (row.status, row.upstream_job_id, attempt.status, attempt.upstream_job_id) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task["taskId"],
+        )).scalar_one() == event_count
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task["taskId"],
+        )).scalar_one() == usage_count
+    app.state.moneyprinter.assert_not_called()
+    assert media.uploads == 0
 
 
 def test_19_cancel_is_idempotent_and_late_success_isolated(generation_context):
@@ -1620,6 +1686,176 @@ def test_g70_g71_owner_recovery_rejects_orphan_hash_mismatch(generation_context)
 
 
 
+@pytest.mark.parametrize(
+    ("dimension", "malformed_value"),
+    [
+        ("width", "not-a-width"),
+        ("height", []),
+        ("width", True),
+        ("height", "240"),
+        ("durationSeconds", "1.0"),
+        ("durationSeconds", True),
+    ],
+)
+def test_g70_g71_owner_recovery_invalid_sidecar_probe_is_422_and_keeps_held(
+    generation_context, dimension, malformed_value
+):
+    """Untrusted Sidecar dimensions cannot crash Owner recovery or alter HELD."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, f"g70-malformed-sidecar-{dimension}")
+    task = create_task(client, project, key=f"g70-malformed-sidecar-{dimension}")
+    task_id = task["taskId"]
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    probe = media_store.media_objects[(project["id"], media_id)]["metadata"]
+    if dimension == "durationSeconds":
+        probe[dimension] = malformed_value
+    else:
+        probe["video"][dimension] = malformed_value
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner validates corrupted sidecar probe without retry"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_PROBE_INVALID"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        tenant = db.get(DBTenant, stored.tenant_id)
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0
+        assert sum(1 for item in usage if item.kind == "RESERVED") == 1
+        assert all(item.kind not in {"RELEASED", "SETTLED"} for item in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+
+
+@pytest.mark.parametrize("invalid_size", [True, "31", 31.0, {"value": 31}])
+def test_g70_g71_owner_recovery_rejects_coerced_sidecar_storage_bytes(
+    generation_context, monkeypatch, invalid_size
+):
+    """No malformed Sidecar size can authorize storage or an asset in Owner recovery."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-orphan-recovery-sidecar-size-type")
+    task = create_task(client, project, key="g70-orphan-recovery-sidecar-size-type")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    original_inspect = media_store.inspect_media
+
+    def invalid_inspection(project_id, media_id):
+        inspected = original_inspect(project_id, media_id)
+        inspected["sizeBytes"] = invalid_size
+        return inspected
+
+    monkeypatch.setattr(media_store, "inspect_media", invalid_inspection)
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner refuses malformed Sidecar byte evidence"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_INTEGRITY_MISMATCH"
+    with sessions() as db:
+        task_row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task_row.tenant_id)
+        attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )
+        ).scalar_one()
+        entries = list(db.execute(
+            select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id
+            )
+        ).scalars())
+        assert task_row.status == "FAILED"
+        assert task_row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one() == 0
+        assert sum(entry.kind == "RESERVED" for entry in entries) == 1
+        assert all(entry.kind not in {"SETTLED", "RELEASED"} for entry in entries)
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_size", ["invalid-size", {"malformed": True}])
+def test_g70_g71_recovery_conflicting_material_invalid_size_is_409_not_500(
+    generation_context, invalid_size
+):
+    """Corrupt pre-existing project material cannot crash Owner orphan recovery."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-recovery-material-conflict")
+    task = create_task(client, project, key="g70-recovery-material-conflict")
+    task_id = task["taskId"]
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        project_row.materials = [{
+            "id": media_id,
+            "name": "preexisting-conflicting-media",
+            "url": f"/api/video-use/media/{project['id']}/{media_id}",
+            "type": "video",
+            "sizeBytes": invalid_size,
+        }]
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner refuses corrupt preexisting project material"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        tenant = db.get(DBTenant, stored.tenant_id)
+        project_row = db.get(DBProject, project["id"])
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0
+        assert project_row.materials[0]["sizeBytes"] == invalid_size
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"SETTLED", "RELEASED"} for entry in usage)
+
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_g71_recovery_rejects_admin_without_delegation_and_foreign_tenant_owner(generation_context):
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-recovery-owner-and-tenant-scope")
@@ -2489,6 +2725,121 @@ def test_g72_native_fake_http_db_create_claim_and_idempotency(generation_context
         )).scalars())) == 1
 
 
+
+@pytest.mark.parametrize("phase", ["queued", "claimed"])
+@pytest.mark.parametrize("revocation", ["inactive", "downgraded", "project_reassigned"])
+def test_g72_originator_revocation_fences_fake_worker_before_sidecar(
+    generation_context, phase, revocation,
+):
+    """FAKE-only HTTP/SQLite: no stale Owner authority after account/project changes.
+
+    This does not create delegated grants or choose the pending Owner project
+    membership policy. Existing RESERVED usage stays untouched for reconciliation.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 original Owner revocation fence")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, image_id, key=f"g72-owner-revoke-{phase}-{revocation}"
+    )
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    # The FAKE capability snapshot is an optimistic, quota-sensitive value.
+    # Revalidate only on its explicit stale-hash conflict (409), matching the
+    # normal typed create path; never relax the 202/rights/revocation assertions.
+    create = None
+    for _ in range(3):
+        preflight = client.post(path + "/validate", json=payload)
+        if preflight.status_code == 200:
+            payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+            create = client.post(path, json=payload)
+            if create.status_code == 202:
+                break
+            stale_code = create.json().get("detail", {}).get("code")
+            if create.status_code != 409 or stale_code not in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }:
+                break
+        else:
+            stale_code = preflight.json().get("detail", {}).get("code")
+            if preflight.status_code != 409 or stale_code not in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }:
+                create = preflight
+                break
+        capabilities = client.get("/generation/providers/moneyprinter/capabilities")
+        assert capabilities.status_code == 200, capabilities.text
+        payload["capabilitySnapshotHash"] = capabilities.json()["snapshotHash"]
+    assert create is not None and create.status_code == 202, (
+        create.text if create is not None else "FAKE preflight remained stale"
+    )
+    task_id = create.json()["taskId"]
+    if phase == "claimed":
+        claimed = claim(client)
+        assert claimed.status_code == 200, claimed.text
+        assert claimed.json()["taskId"] == task_id
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        owner = db.get(DBUser, task.requested_by)
+        project_row = db.get(DBProject, task.project_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert owner is not None and project_row is not None and tenant is not None
+        assert owner.role == "owner" and owner.is_active
+        assert project_row.owner_id == owner.id
+        before_state = (task.status, task.lease_owner, task.lease_epoch, task.asset_version_id)
+        before_bytes = tenant.used_storage_bytes
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        if revocation == "inactive":
+            owner.is_active = False
+        elif revocation == "downgraded":
+            owner.role = "editor"
+        else:
+            substitute = DBUser(
+                id=str(uuid.uuid4()), tenant_id=owner.tenant_id,
+                email=f"g72-reassigned-{phase}@example.com",
+                display_name="Synthetic Replacement Owner",
+                password_hash=hash_password(secrets.token_urlsafe(24)),
+                role="owner", is_active=True,
+                created_at=datetime.datetime.now(datetime.timezone.utc),
+                updated_at=datetime.datetime.now(datetime.timezone.utc),
+            )
+            db.add(substitute)
+            db.flush()
+            project_row.owner_id = substitute.id
+        db.commit()
+
+    if phase == "queued":
+        assert claim(client).status_code == 204
+    else:
+        rejected = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "synthetic-revoked-owner"},
+            files={"file": ("synthetic.mp4", b"synthetic-test-video", "video/mp4")},
+        )
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        assert (task.status, task.lease_owner, task.lease_epoch, task.asset_version_id) == before_state
+        assert tenant.used_storage_bytes == before_bytes
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == before_events
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == before_usage
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g72_native_fake_missing_asset_or_missing_rights_fail_closed(generation_context):
     client, sessions, _app, _ = generation_context
     project = create_project(client)
@@ -2599,6 +2950,60 @@ def test_g72_native_fake_rights_revoke_after_enqueue_blocks_claim(generation_con
     assert before_usage == after_usage
     assert before_reserved == after_reserved == 1
     assert before_settled == after_settled == 0
+
+
+
+
+def test_g72_preflight_success_does_not_authorize_create_after_revocation(generation_context):
+    """A stale successful FAKE-only preview is never an authorization grant.
+
+    Native HTTP + database negative case, not the unresolved final
+    rights-read versus commit concurrency test. No real Provider or production.
+    """
+    client, sessions, app, _ = generation_context
+    project = create_project(client)
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-stale-preflight-after-revoke"
+    )
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    preview = client.post(path + "/validate", json=payload)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["allowed"] is True
+    payload["capabilitySnapshotHash"] = preview.json()["capabilitySnapshotHash"]
+
+    with sessions() as db:
+        prior = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == asset_id
+        )).scalar_one()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.project_id == project["id"]
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=prior.tenant_id,
+            project_id=prior.project_id, asset_version_id=asset_id,
+            status="REVOKED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="synthetic-post-preview-revocation",
+            captured_by=prior.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+
+    # The client replays the old approved preview; POST must recheck live rights.
+    rejected = client.post(path, json=payload)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_VISUAL_RIGHTS_BLOCKED"
+    fresh_preview = client.post(path + "/validate", json=payload)
+    assert fresh_preview.status_code == 409, fresh_preview.text
+    assert fresh_preview.json()["detail"]["code"] == "FAKE_VISUAL_RIGHTS_BLOCKED"
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id)).where(
+            DBGenerationTask.project_id == project["id"]
+        )).scalar_one() == before_tasks
+    assert claim(client).status_code == 204
+    app.state.moneyprinter.assert_not_called()
 
 
 def test_g72_native_fake_revoked_input_rejected_at_artifact_intake(generation_context):
@@ -2851,6 +3256,181 @@ def test_g72_changed_payload_same_idempotency_key_is_rejected(generation_context
         assert len(tasks) == 1 and tasks[0].id == first.json()["taskId"]
         assert len(list(db.execute(select(DBGenerationAttempt)).scalars())) == 1
         assert len(list(db.execute(select(DBGenerationUsageEntry)).scalars())) == 1
+
+
+@pytest.mark.parametrize("mutation", [
+    "exact", "changed_bytes_same_length", "changed_bytes_different_length",
+    "wrong_mime", "wrong_artifact_id",
+])
+def test_g70_g71_completed_intake_replay_requires_exact_committed_asset(
+    generation_context, mutation,
+):
+    """Completed HTTP 201 is only an ACK for the same stored bytes, not any replay.
+
+    Disposable FAKE-only API fixture; no new Sidecar call, asset, usage, or
+    storage mutation is allowed even when the replay is rejected.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G70/G71 terminal replay digest guard")
+    result = ingest_success(client, project, key="g70-g71-terminal-digest-" + mutation)
+    task_id = result["taskId"]
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.asset_version_id is not None
+        tenant_id = task.tenant_id
+        original_asset_id = task.asset_version_id
+        before_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+        before_assets = db.execute(select(func.count(DBAssetVersion.id))).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        before_events = db.execute(select(func.count(DBGenerationEvent.id))).scalar_one()
+    before_uploads = media.uploads
+
+    original = b"deterministic-video"
+    payload = {
+        "exact": original,
+        "changed_bytes_same_length": b"X" + original[1:],
+        "changed_bytes_different_length": original + b"!",
+        "wrong_mime": original,
+        "wrong_artifact_id": original,
+    }[mutation]
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "artifact-2" if mutation == "wrong_artifact_id" else "artifact-1"},
+        files={"file": (
+            "artifact.mp4", payload,
+            "image/png" if mutation == "wrong_mime" else "video/mp4",
+        )},
+    )
+    if mutation == "exact":
+        assert response.status_code == 201, response.text
+        assert response.json()["results"][0]["assetVersionId"] == original_asset_id
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "ARTIFACT_REPLAY_MISMATCH"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.asset_version_id == original_asset_id
+        assert task.status == "RIGHTS_BLOCKED"
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == before_bytes
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == before_assets
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == before_usage
+        assert db.execute(select(func.count(DBGenerationEvent.id))).scalar_one() == before_events
+    assert media.uploads == before_uploads
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("corruption", [
+    "response_not_object",
+    "metadata_not_object",
+    "size_bool",
+    "size_string",
+    "size_float",
+    "size_mismatch",
+    "duration_bool",
+    "duration_nan",
+    "duration_infinity",
+    "duration_zero",
+    "video_not_object",
+    "video_width_bool",
+    "video_height_string",
+    "project_scope_mismatch",
+    "top_level_size_mismatch",
+    "top_level_hash_mismatch",
+])
+def test_g70_g71_artifact_intake_strict_sidecar_probe_compensates_quota(
+    generation_context, monkeypatch, corruption,
+):
+    """FAKE-only corrupted Sidecar ACK cannot become asset/settlement evidence.
+
+    Isolated FastAPI/SQLite fixture; this is NOT a real Provider, protected
+    storage, crash reconciliation or PostgreSQL acceptance proof.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G70/G71 typed artifact probe " + corruption)
+    task = create_task(client, project, key="g70-g71-probe-" + corruption)
+    task_id = task["taskId"]
+    leased = claim(client, worker_id="worker-a")
+    assert leased.status_code == 200, leased.text
+    assert leased.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="fake-probe-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-probe-upstream",
+        providerArtifactId="fake-probe-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        before_bytes = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    original_upload = media.upload_media
+
+    def corrupted_upload(*args, **kwargs):
+        ack = original_upload(*args, **kwargs)
+        ack = {**ack, "metadata": dict(ack["metadata"])}
+        ack["metadata"]["video"] = dict(ack["metadata"]["video"])
+        if corruption == "response_not_object":
+            return ["invalid", "response"]
+        if corruption == "metadata_not_object":
+            ack["metadata"] = ["invalid"]
+        elif corruption == "size_bool":
+            ack["metadata"]["sizeBytes"] = True
+        elif corruption == "size_string":
+            ack["metadata"]["sizeBytes"] = "123"
+        elif corruption == "size_float":
+            ack["metadata"]["sizeBytes"] = 123.0
+        elif corruption == "size_mismatch":
+            ack["metadata"]["sizeBytes"] += 1
+        elif corruption == "duration_bool":
+            ack["metadata"]["durationSeconds"] = True
+        elif corruption == "duration_nan":
+            ack["metadata"]["durationSeconds"] = float("nan")
+        elif corruption == "duration_infinity":
+            ack["metadata"]["durationSeconds"] = float("inf")
+        elif corruption == "duration_zero":
+            ack["metadata"]["durationSeconds"] = 0
+        elif corruption == "video_not_object":
+            ack["metadata"]["video"] = ["h264"]
+        elif corruption == "video_width_bool":
+            ack["metadata"]["video"]["width"] = True
+        elif corruption == "video_height_string":
+            ack["metadata"]["video"]["height"] = "240"
+        elif corruption == "project_scope_mismatch":
+            ack["projectId"] = "different-tenant-project"
+        elif corruption == "top_level_size_mismatch":
+            ack["sizeBytes"] = 999999
+        elif corruption == "top_level_hash_mismatch":
+            ack["sha256"] = "0" * 64
+        return ack
+
+    monkeypatch.setattr(media, "upload_media", corrupted_upload)
+    denied = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "fake-probe-artifact"},
+        files={"file": ("synthetic.mp4", b"g70-g71-fake-only-upload", "video/mp4")},
+    )
+    assert denied.status_code == 422, denied.text
+    assert denied.json()["detail"]["code"] == "ARTIFACT_VALIDATION_FAILED"
+    assert media.uploads == 1
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        assert stored is not None and stored.status == "FAILED"
+        assert stored.asset_version_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == before_bytes
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
 
 
 def test_g72_native_worker_ffmpeg_to_durable_local_file_and_audit(
@@ -3666,24 +4246,26 @@ def test_g72_foreign_tenant_admin_cannot_preflight_create_or_read(generation_con
 
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "G72 project-grant/Owner delegation contract is not approved or implemented: "
-        "tenant-wide editor access is currently accepted without an explicit project grant"
+@pytest.mark.parametrize("action", [
+    pytest.param(
+        "read",
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason="G72 per-project read grant/delegated-admin contract remains unapproved",
+        ),
     ),
-)
-@pytest.mark.parametrize("action", ["read", "preflight", "create"])
+    "preflight",
+    "create",
+])
 def test_g72_unassigned_same_tenant_editor_is_denied_by_project_grant(
     generation_context, action,
 ):
-    """Approval-gated diagnostic only: prove the G72 per-project actor-scope gap.
+    """FAKE-only typed entry must reject unassigned editor before reservation.
 
-    A same-tenant editor, not the project's owner and without a recorded
-    project grant, must not infer access from the tenant-wide editor role.
-    This XFAIL does NOT implement a membership model or pick an Owner policy.
-    Once an authoritative issuer/delegation contract exists, replace the
-    XFAIL with a normal native denial/positive-grant/revocation regression.
+    A tenant-wide Editor has no currently approved project grant. The typed
+    preflight/create are fail-closed to match existing Worker claim authority;
+    only project-read remains strict XFAIL awaiting the Owner grant contract.
+    This does not decide grants or delegated-admin policy.
     """
     client, sessions, app, media = generation_context
     project = create_project(client, "G72 unassigned actor scope")
@@ -3747,6 +4329,45 @@ def test_g72_unassigned_same_tenant_editor_is_denied_by_project_grant(
         accepted_status = 200 if action == "preflight" else 202
         expected_status = 403
 
+    # G72 same-XFAIL diagnostic: verify the exact queued/RESERVED side effect
+    # of the accepted unassigned-editor create, then prove the existing
+    # read-only Worker claim fence cannot lease it. This adds no new XFAIL
+    # or policy; do not grant editor access or auto-refund the reservation.
+    # If Owner later adopts a project-grant contract and denies this route,
+    # the branch will be skipped and the existing strict XFAIL becomes XPASS
+    # until the approval-gated test is promoted to a normal regression.
+    if action == "create" and response.status_code == accepted_status:
+        task_id = response.json()["taskId"]
+        with sessions() as db:
+            queued = db.get(DBGenerationTask, task_id)
+            assert queued is not None
+            assert queued.tenant_id == tenant_id
+            assert queued.project_id == project["id"]
+            assert queued.requested_by == editor_id
+            assert queued.provider == "deterministic-fake-talking-head"
+            assert queued.status == "QUEUED"
+            assert queued.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "RESERVED",
+            )).scalar_one() == 1
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one() == 0
+        worker_claim = claim(client, worker_id="worker-g72-unassigned-editor")
+        assert worker_claim.status_code == 204, worker_claim.text
+        with sessions() as db:
+            unclaimed = db.get(DBGenerationTask, task_id)
+            assert unclaimed is not None
+            assert unclaimed.status == "QUEUED"
+            assert unclaimed.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "RESERVED",
+            )).scalar_one() == 1
+        assert media.uploads == 0
+
     # The current implementation answers 200/202 because role + tenant
     # matches; project.owner_id is not part of project_for_tenant().
     # The strict XFAIL keeps this explicit, unclosed, and CI-visible.
@@ -3759,6 +4380,94 @@ def test_g72_unassigned_same_tenant_editor_is_denied_by_project_grant(
     assert media.uploads == 0
 
 
+
+
+
+def test_g72_fake_owner_task_cannot_be_canceled_by_unassigned_same_tenant_editor(
+    generation_context,
+):
+    """FAKE-only: an Editor cannot mutate another Owner's queue or quota.
+
+    No delegated project grant has been approved. A 403 must preserve
+    the queued task, RESERVED usage, event history and original Owner path.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 cancel actor scope")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, image_id, key="g72-editor-cannot-cancel-owner-fake"
+    )
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created is not None and created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    editor_password = secrets.token_urlsafe(24)
+    editor_id = "g72-cancel-unassigned-" + str(uuid.uuid4())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        owner_id = db.get(DBProject, project["id"]).owner_id
+        assert task is not None and task.requested_by == owner_id
+        db.add(DBUser(
+            id=editor_id, tenant_id=task.tenant_id,
+            email=f"{editor_id}@example.com",
+            display_name="Synthetic Unassigned Editor",
+            password_hash=hash_password(editor_password),
+            role="editor", is_active=True,
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+        before = (task.status, task.lease_owner, task.cancel_requested_at)
+        events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{editor_id}@example.com", "password": editor_password,
+    }).status_code == 200
+    denied = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/cancel"
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert (task.status, task.lease_owner, task.cancel_requested_at) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RELEASED",
+        )).scalar_one() == 0
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    claimed = claim(client, worker_id="worker-g72-owner-post-denial")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    app.state.moneyprinter.assert_not_called()
 
 @pytest.fixture()
 def postgres_generation_context():
@@ -4117,3 +4826,2172 @@ def test_g73_keyset_claim_scans_past_foreign_tenant_ineligible_queue_rows(genera
         assert foreign_claim_events == 0
 
     assert media.uploads == 0
+
+def test_g73_corrupt_durable_candidate_does_not_starve_healthy_fake_worker(generation_context, monkeypatch):
+    """Malformed legacy task JSON cannot take down every FAKE Worker claim.
+
+    Synthetic fixture contains five queued tasks. Expand ONLY the disposable
+    FAKE concurrency capacity; do not change real policy or financial ledgers.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 5)
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 fail-closed legacy queue")
+    malformed_snapshot = create_task(client, project, key="g73-poisoned-snapshot")
+    malformed_request = create_task(client, project, key="g73-poisoned-talk-request")
+    malformed_generic = create_task(client, project, key="g73-poisoned-fake-request")
+    malformed_nested_policy = create_task(client, project, key="g73-poisoned-nested-policy")
+    healthy = create_task(client, project, key="g73-healthy-after-poisoned")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        first = db.get(DBGenerationTask, malformed_snapshot["taskId"])
+        second = db.get(DBGenerationTask, malformed_request["taskId"])
+        third = db.get(DBGenerationTask, malformed_generic["taskId"])
+        fourth = db.get(DBGenerationTask, malformed_nested_policy["taskId"])
+        eligible = db.get(DBGenerationTask, healthy["taskId"])
+        assert all(row is not None for row in (first, second, third, fourth, eligible))
+        first.created_at = now - datetime.timedelta(minutes=4)
+        first.capability_snapshot_json = ["malformed", "legacy", "snapshot"]
+        second.created_at = now - datetime.timedelta(minutes=3)
+        # Exercise FAKE talking-head input validation before image/rights lookup.
+        second.provider = "deterministic-fake-talking-head"
+        second.request_json = ["malformed", "legacy", "request"]
+        third.created_at = now - datetime.timedelta(minutes=3)
+        # Ordinary deterministic-fake tasks must obey the same fail-closed fence.
+        third.request_json = ["malformed", "generic-fake", "request"]
+        fourth.created_at = now - datetime.timedelta(minutes=2)
+        # Historical nested policy corruption must not reach the Worker.
+        fourth.capability_snapshot_json = {
+            **fourth.capability_snapshot_json,
+            "providerPolicy": ["legacy", "corrupt", "policy"],
+        }
+        eligible.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    claimed = claim(client, worker_id="g73-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+    assert claimed.json()["providerMode"] == "deterministic-fake"
+    assert claimed.json()["leaseEpoch"] == 1
+
+    with sessions() as db:
+        for poisoned_id in (
+            malformed_snapshot["taskId"], malformed_request["taskId"],
+            malformed_generic["taskId"], malformed_nested_policy["taskId"],
+        ):
+            poisoned = db.get(DBGenerationTask, poisoned_id)
+            assert poisoned.status == "QUEUED"
+            assert poisoned.lease_owner is None
+            assert poisoned.lease_epoch == 0
+            poisoned_claims = db.execute(
+                select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == poisoned_id,
+                    DBGenerationEvent.event_type == "TASK_CLAIMED",
+                )
+            ).scalar_one()
+            assert poisoned_claims == 0
+        live = db.get(DBGenerationTask, healthy["taskId"])
+        assert live.status == "SUBMITTING"
+        assert live.lease_owner == "g73-safe-worker"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_quota", [
+    ["malformed", "quota"],
+    {"monthlyGeneratedSecondsLimit": ["corrupt"]},
+    {"monthlyGeneratedSecondsLimit": 0},
+    {"monthlyGeneratedSecondsLimit": True},
+    {"monthlyGeneratedSecondsLimit": -3},
+])
+def test_g73_corrupt_snapshot_quota_does_not_lease_or_starve_healthy_worker(
+    generation_context, monkeypatch, bad_quota,
+):
+    """Corrupt historical quota cannot reach the Worker or its Sidecar.
+
+    Only disposable FAKE fixtures change. No Provider, Owner policy, protected
+    ledger, production configuration or persisted approval is modified.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 2)
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 malformed durable quota fail-closed")
+    poisoned = create_task(client, project, key="g73-corrupt-quota")
+    healthy = create_task(client, project, key="g73-healthy-after-quota")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, poisoned["taskId"])
+        eligible = db.get(DBGenerationTask, healthy["taskId"])
+        assert damaged is not None and eligible is not None
+        damaged.capability_snapshot_json = {
+            **damaged.capability_snapshot_json, "quota": bad_quota,
+        }
+        damaged.created_at = now - datetime.timedelta(minutes=2)
+        eligible.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+        initial_usage = db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one()
+
+    claimed = claim(client, worker_id="g73-quota-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        damaged = db.get(DBGenerationTask, poisoned["taskId"])
+        eligible = db.get(DBGenerationTask, healthy["taskId"])
+        assert damaged.status == "QUEUED"
+        assert damaged.lease_owner is None
+        assert damaged.lease_epoch == 0
+        assert eligible.status == "SUBMITTING"
+        assert eligible.lease_owner == "g73-quota-safe-worker"
+        assert db.execute(
+            select(func.count(DBGenerationUsageEntry.id))
+        ).scalar_one() == initial_usage
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == poisoned["taskId"],
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+
+@pytest.mark.parametrize("poisoned_provider, forged_fake_marker", [
+    ("moneyprinter", True),
+    ("unexpected-provider", False),
+])
+def test_g72_g73_fake_route_cannot_claim_forged_provider_or_marker(
+    generation_context, monkeypatch, poisoned_provider, forged_fake_marker,
+):
+    """A legacy row cannot bypass the talking-head FAKE-only rights route.
+
+    An ordinary moneyprinter task is still claimable in deterministic-fake
+    mode. The poisoned row must neither lease nor consume usage; this is a
+    disposable SQLite fixture, not a protected policy or Provider change.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 2)
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G72/G73 fake-route discriminant")
+    poisoned = create_task(client, project, key=f"g72-g73-poison-{poisoned_provider}")
+    healthy = create_task(client, project, key=f"g72-g73-safe-{poisoned_provider}")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        bad.provider = poisoned_provider
+        if forged_fake_marker:
+            bad.request_json = {**bad.request_json, "fakeTaskType": "talking-head"}
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+
+    claimed = claim(client, worker_id="g72-g73-fake-route-safe-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+    assert claimed.json()["providerMode"] == "deterministic-fake"
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None and bad.lease_epoch == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g72-g73-fake-route-safe-worker"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == bad.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g73_missing_current_attempt_does_not_starve_healthy_fake_worker(generation_context):
+    """A queued legacy row without its current attempt must never block the Worker.
+
+    Simulate a historical mismatch by advancing the task attempt pointer in an
+    isolated SQLite fixture. Do not delete or rewrite any actual usage ledger.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 missing-attempt fail-closed")
+    damaged = create_task(client, project, key="g73-missing-attempt")
+    healthy = create_task(client, project, key="g73-healthy-after-missing-attempt")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, damaged["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        bad.attempts += 1
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    result = claim(client, worker_id="g73-missing-attempt-safe-worker")
+    assert result.status_code == 200, result.text
+    assert result.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, damaged["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None
+        assert bad.lease_epoch == 0
+        assert db.execute(
+            select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == bad.id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )
+        ).scalar_one() == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g73-missing-attempt-safe-worker"
+
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g73_nested_talking_head_asset_id_poison_does_not_starve_fake_worker(generation_context):
+    """A list-valued imageAssetId must not enter a SQL bind or block the queue."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 nested-JSON poison isolation")
+    poisoned = create_task(client, project, key="g73-nested-poison")
+    healthy = create_task(client, project, key="g73-nested-healthy")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        bad.provider = "deterministic-fake-talking-head"
+        bad.request_json = {
+            "fakeTaskType": "talking-head",
+            "imageAssetId": ["legacy", "bad-nested-asset-identifier"],
+            "sourceAssetSha256": "0" * 64,
+        }
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+
+    result = claim(client, worker_id="g73-nested-safe-worker")
+    assert result.status_code == 200, result.text
+    assert result.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned["taskId"])
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None and bad.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == bad.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g73-nested-safe-worker"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g75_ineligible_foreign_tenant_open_circuit_remains_open_after_other_tenant_claim(
+    provider_control_context,
+):
+    """A wrong-config queued task must not consume a foreign tenant's cooldown.
+
+    Reproduces a scheduler ordering bug: candidate OPEN -> HALF_OPEN happened
+    before its published config and worker attestation were checked, then a
+    different tenant's valid claim committed that stale transition. All
+    Provider credentials/attestations here are synthetic; no adapter call.
+    """
+    client, sessions, app, _engine = provider_control_context
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    project = create_project(client, "G75 healthy own tenant")
+    eligible = create_task(client, project, key="g75-foreign-open-valid-tenant")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    foreign_id = "g75-foreign-expired-open-tenant"
+    task_id = str(uuid.uuid4())
+
+    with sessions() as db:
+        eligible_row = db.get(DBGenerationTask, eligible["taskId"])
+        assert eligible_row is not None
+        foreign_tenant = DBTenant(
+            id=foreign_id, name="G75 Foreign Circuit Tenant", slug=foreign_id,
+            project_quota=50, storage_quota_bytes=1024**3,
+            used_storage_bytes=0, concurrent_render_quota=2,
+            monthly_render_seconds_quota=3600, render_seconds_used=0,
+            quota_period=now.strftime("%Y-%m"), created_at=now, updated_at=now,
+        )
+        foreign_owner = DBUser(
+            id="g75-foreign-owner", tenant_id=foreign_id,
+            email="g75-foreign-owner@example.com",
+            display_name="G75 Foreign Owner", password_hash=hash_password("unused-g75-fixture"),
+            role="owner", is_active=True, created_at=now, updated_at=now,
+        )
+        foreign_project = DBProject(
+            id="g75-foreign-project", tenant_id=foreign_id,
+            owner_id=foreign_owner.id, name="Foreign ineligible G75 project",
+            timeline={"version": "1.1", "output": None, "tracks": []},
+            materials=[], revision=1, created_at=now, updated_at=now,
+        )
+        older = now - datetime.timedelta(days=1)
+        stale_task = DBGenerationTask(
+            id=task_id, tenant_id=foreign_id, project_id=foreign_project.id,
+            requested_by=foreign_owner.id, provider="moneyprinter", status="QUEUED",
+            progress=0, message="G75 synthetic stale-config candidate",
+            request_json=dict(eligible_row.request_json),
+            request_hash=eligible_row.request_hash,
+            capability_snapshot_json={
+                **dict(eligible_row.capability_snapshot_json),
+                "configVersionId": "g75-nonexistent-published-config",
+            },
+            capability_snapshot_hash=eligible_row.capability_snapshot_hash,
+            idempotency_key=idempotency_uuid("g75-foreign-stale-config"),
+            attempts=1, max_attempts=1, lease_owner=None, lease_epoch=0,
+            circuit_probe_epoch=None, lease_expires_at=None,
+            cancel_requested_at=None, error_code=None, error_message=None,
+            created_at=older, updated_at=older,
+        )
+        attempt = DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=1, status="QUEUED", submission_started_at=None,
+            upstream_job_id=None, reconciliation_state="NOT_SUBMITTED",
+            error_code=None, error_message=None, created_at=older, completed_at=None,
+        )
+        foreign_circuit = DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=foreign_id, provider="moneyprinter",
+            state="OPEN", failure_timestamps_json=[older.isoformat()],
+            opened_at=older, cooldown_until=now - datetime.timedelta(seconds=5),
+            half_open_task_id=None, probe_epoch=4, half_open_lease_epoch=None,
+            half_open_issuer=None, disabled_reason_code=None, updated_at=older,
+        )
+        db.add_all([foreign_tenant, foreign_owner, foreign_project, stale_task, attempt, foreign_circuit])
+        db.commit()
+
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == eligible["taskId"]
+
+    with sessions() as db:
+        foreign = db.execute(
+            select(DBGenerationCircuitState).where(
+                DBGenerationCircuitState.tenant_id == foreign_id,
+                DBGenerationCircuitState.provider == "moneyprinter",
+            )
+        ).scalar_one()
+        assert foreign.state == "OPEN", (
+            "Ineligible foreign tenant must not transition to HALF_OPEN "
+            "when another tenant's valid Worker claim commits"
+        )
+        assert foreign.probe_epoch == 4
+        assert foreign.half_open_task_id is None
+        assert db.get(DBGenerationTask, task_id).lease_owner is None
+        stale_half_open_events = db.execute(
+            select(func.count(DBGenerationProviderEvent.id)).where(
+                DBGenerationProviderEvent.tenant_id == foreign_id,
+                DBGenerationProviderEvent.event_type == "CIRCUIT_HALF_OPENED",
+            )
+        ).scalar_one()
+        assert stale_half_open_events == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["project_read", "talking_head_preflight"])
+def test_g72_admin_without_delegation_read_preflight_diagnostic(generation_context, action):
+    """FAKE-only diagnostic of same-tenant admin impersonation without delegation.
+
+    Existing G72 create-denial covers writes; neither project read nor preflight
+    should be treated as verified project-scoped delegation merely because a
+    tenant-wide admin role exists. This does not choose an Owner policy, alter
+    credentials, grant access, change protected storage, or call a Provider.
+    A 200 response is retained as an explicit open XFAIL after side effects
+    have been checked; do not treat that as acceptance.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 admin read/preflight scope diagnostic")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, asset_id, key="g72-admin-no-delegation-" + action
+    )
+    password = secrets.token_urlsafe(24)
+    email = "g72-admin-scope-" + action + "@example.com"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        tenant_id = db.execute(select(DBTenant.id)).scalar_one()
+        project_row = db.get(DBProject, project["id"])
+        assert project_row is not None
+        admin_id = str(uuid.uuid4())
+        assert project_row.owner_id != admin_id
+        db.add(DBUser(
+            id=admin_id, tenant_id=tenant_id, email=email,
+            display_name="G72 Unassigned Tenant Admin",
+            password_hash=hash_password(password), role="admin",
+            is_active=True, created_at=now, updated_at=now,
+        ))
+        db.commit()
+        before_tasks = db.execute(select(func.count(DBGenerationTask.id))).scalar_one()
+        before_usage = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        before_assets = db.execute(select(func.count(DBAssetVersion.id))).scalar_one()
+
+    assert client.post("/auth/logout").status_code == 204
+    logged_in = client.post("/auth/login", json={"email": email, "password": password})
+    assert logged_in.status_code == 200, logged_in.text
+    if action == "project_read":
+        response = client.get(f"/projects/{project['id']}")
+    else:
+        response = client.post(
+            f"/projects/{project['id']}/talking-head/fake-generation-tasks/validate",
+            json=payload,
+        )
+
+    with sessions() as db:
+        assert db.execute(select(func.count(DBGenerationTask.id))).scalar_one() == before_tasks
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == before_usage
+        assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == before_assets
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+    if response.status_code == 200:
+        pytest.xfail(
+            "G72 OPEN POLICY-GATED: same-tenant admin without project delegation "
+            f"was accepted for {action}; no Owner-approved grant/issuer contract"
+        )
+    assert response.status_code in (403, 404), response.text
+
+
+
+@pytest.mark.parametrize("bad_limit", [
+    "unlimited", {"bytes": 1024}, [1024], False, 0, None, 1.5, -3,
+    2 * 1024**3 + 1,
+])
+def test_g70_g71_recovery_corrupt_nested_artifact_limit_is_fail_closed(
+    generation_context, bad_limit
+):
+    """Persisted malformed maxArtifactBytes cannot silently widen recovery limit.
+
+    This is Owner self-service and FAKE-only; malformed historical evidence must
+    remain HELD for explicit reconciliation, without a Provider retry or storage
+    ledger change. An absent limit remains a separate compatibility case.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-malformed-nested-policy")
+    task = create_task(
+        client, project, key="g70-g71-malformed-limit-" + str(bad_limit)
+    )
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        snapshot = dict(row.capability_snapshot_json)
+        policy = dict(snapshot.get("providerPolicy") or {})
+        policy["maxArtifactBytes"] = bad_limit
+        snapshot["providerPolicy"] = policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner verifies immutable invalid size limit before recovery"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        asset_count = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert asset_count == 0 and recovery_count == 0
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_policy", [[], ["legacy-policy"], "invalid-policy"])
+def test_g70_g71_recovery_corrupt_snapshot_policy_is_fail_closed(generation_context, bad_policy):
+    """Corrupt persisted provider policy must not turn Owner recovery into a 500 or a quota mutation."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-malformed-snapshot-policy")
+    task = create_task(client, project, key="g70-g71-bad-policy-" + str(type(bad_policy).__name__))
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        snapshot = dict(row.capability_snapshot_json)
+        snapshot["providerPolicy"] = bad_policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    result = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Inspect malformed legacy policy without changing held usage"},
+    )
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        entries = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0 and recovery_events == 0
+        assert sum(e.kind == "RESERVED" for e in entries) == 1
+        assert not any(e.kind in {"RELEASED", "SETTLED"} for e in entries)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize(
+    "bad_snapshot", [[], ["legacy-snapshot"], "legacy-snapshot", 12, False, None],
+)
+def test_g70_g71_recovery_corrupt_snapshot_root_is_fail_closed(generation_context, bad_snapshot):
+    """Non-object persisted capability snapshot is not evidence of a missing limit.
+
+    A corrupt JSON root must not fall back to the global upload cap. Preserve
+    HELD and original reservation; never create a recovered asset or call Provider.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-invalid-snapshot-root")
+    task = create_task(client, project, key="g70-g71-invalid-root")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        row.capability_snapshot_json = bad_snapshot
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checks malformed immutable snapshot root before recovery"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert assets == 0 and recovery_events == 0
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_inspection", [None, [], "malformed-sidecar-response", False, 7])
+def test_g70_g71_recovery_malformed_sidecar_inspection_preserves_held(
+    generation_context, monkeypatch, bad_inspection
+):
+    """FAKE-only: a non-object Sidecar inspection is not recoverable media proof.
+
+    A malformed external response must return a stable error while keeping the
+    original task FAILED/HELD, its one RESERVED usage and zero new assets.
+    This test does not call Provider or alter protected storage policies.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-malformed-sidecar-inspection")
+    task = create_task(client, project, key="g70-g71-sidecar-inspection-root")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+
+    def invalid_inspection(_project_id, _media_id):
+        media_store.inspections += 1
+        return bad_inspection
+
+    monkeypatch.setattr(media_store, "inspect_media", invalid_inspection)
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner checks malformed Sidecar receipt before recovery"},
+    )
+    assert response.status_code == 502, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_RECOVERY_INSPECTION_UNAVAILABLE"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        asset_count = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert asset_count == 0 and recovery_count == 0
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("malformed_materials", [
+    {"unexpected": "object-instead-of-array"},
+    "string-instead-of-array",
+    17,
+    ["not-an-object-row"],
+    [{"id": "other-valid-material"}, None],
+])
+def test_g70_g71_recovery_corrupt_materials_root_or_entry_preserves_held(
+    generation_context, malformed_materials
+):
+    """FAKE-only: malformed project materials cannot be silently rewritten.
+
+    This tests the Owner self-service recovery gate only. No Provider or
+    protected-store policy is changed; no new asset, quota or settlement entry.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-g71-invalid-materials-json")
+    task = create_task(client, project, key="g70-g71-invalid-materials-json")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        project_row.materials = malformed_materials
+        db.commit()
+
+    response = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner must reconcile malformed project materials first"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_INVALID"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        asset_count = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one()
+        recovery_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one()
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert asset_count == 0 and recovery_count == 0
+        assert db.get(DBProject, project["id"]).materials == malformed_materials
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(("policy_field", "bad_value"), [
+    ("maxArtifactBytes", "bad-number"), ("maxArtifactBytes", None),
+    ("maxArtifactBytes", False), ("maxArtifactBytes", 0),
+    ("maxArtifactBytes", -1), ("maxArtifactBytes", []),
+    ("maxArtifactBytes", {}),
+    # Values which int(...) used to coerce must never qualify a live canary.
+    ("enabledIntent", "false"), ("enabledIntent", 1),
+    ("concurrentTaskLimit", True), ("concurrentTaskLimit", "1"),
+    ("concurrentTaskLimit", 1.9),
+    ("monthlyRequestLimit", True), ("monthlyRequestLimit", "1"),
+    ("monthlyGeneratedSecondsLimit", "10"),
+    ("monthlyGeneratedSecondsLimit", 9.9),
+    ("maxClipDurationSeconds", "10"), ("maxClipDurationSeconds", 5.9),
+    ("maxOutputs", True), ("maxOutputs", "1"),
+])
+def test_g73_corrupt_published_canary_policy_is_not_leased(
+    provider_control_context, policy_field, bad_value,
+):
+    """FAKE-only disposable DB: malformed persisted canary policy never leases a Worker.
+
+    This corrupts only synthetic storage, after authentic config and task creation;
+    it does not edit protected policies or contact a real Provider.
+    """
+    client, sessions, app, engine = provider_control_context
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    project = create_project(client, "G73 persisted artifact limit corruption")
+    task = create_task(client, project, key="g73-invalid-artifact-byte-limit")
+    with sessions() as db:
+        config_row = db.get(DBGenerationProviderConfigVersion, config["id"])
+        assert config_row is not None and config_row.policy_json["maxArtifactBytes"] > 0
+        corrupt_policy = {**config_row.policy_json, policy_field: bad_value}
+    # Bypass ORM immutability in disposable test DB only.
+    with engine.begin() as connection:
+        assert connection.execute(
+            DBGenerationProviderConfigVersion.__table__.update()
+            .where(DBGenerationProviderConfigVersion.id == config["id"])
+            .values(policy_json=corrupt_policy)
+        ).rowcount == 1
+    readiness = client.get("/generation/providers/moneyprinter/readiness")
+    assert readiness.status_code == 200, readiness.text
+    assert readiness.json()["enabled"] is False
+    assert readiness.json()["reasonCode"] == "CANARY_POLICY_MISMATCH"
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 204, claimed.text
+    with sessions() as db:
+        persisted = db.get(DBGenerationTask, task["taskId"])
+        assert persisted is not None and persisted.status == "QUEUED"
+        assert persisted.lease_owner is None and persisted.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == persisted.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_policy", [[], "legacy-corrupt-policy", 42, None])
+def test_g73_malformed_published_policy_root_fails_closed_without_claim(
+    provider_control_context, bad_policy,
+):
+    """Nonproduction native DB: corrupt published JSON cannot crash a Worker claim.
+
+    The valid task/attestation are created before synthetic database corruption;
+    neither this test nor the repair changes any Owner policy or Provider.
+    """
+    client, sessions, app, _engine = provider_control_context
+    app.state.moneyprinter = MagicMock()
+    config = publish_provider_config(client, create_provider_config(client))
+    assert attest_provider(client, sessions, config).status_code == 201
+    project = create_project(client, "G73 malformed published policy")
+    task = create_task(client, project, key="g73-malformed-published-policy")
+
+    # Inject synthetic corruption through the disposable fixture's DB connection.
+    # Published provider config versions are deliberately immutable via ORM events;
+    # exercising an unsupported production policy edit is NOT the behavior tested.
+    with _engine.begin() as connection:
+        result = connection.execute(
+            DBGenerationProviderConfigVersion.__table__.update()
+            .where(DBGenerationProviderConfigVersion.id == config["id"])
+            .values(policy_json=bad_policy)
+        )
+        assert result.rowcount == 1
+
+    readiness = client.get("/generation/providers/moneyprinter/readiness")
+    assert readiness.status_code == 200, readiness.text
+    assert readiness.json()["enabled"] is False
+    assert readiness.json()["reasonCode"] == "OWNER_POLICY_INVALID"
+    assert readiness.json()["ownerPolicy"]["enabledIntent"] is False
+
+    claimed = claim(client, worker_id="worker-proof")
+    assert claimed.status_code == 204, claimed.text
+    with sessions() as db:
+        persisted = db.get(DBGenerationTask, task["taskId"])
+        assert persisted is not None
+        assert persisted.status == "QUEUED"
+        assert persisted.lease_owner is None
+        assert persisted.lease_epoch == 0
+        claimed_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == persisted.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one()
+        assert claimed_events == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("simulatedOutput", False),
+    ("publishable", True),
+    ("confirmSyntheticTestOnly", False),
+    ("outputCount", 4),
+    ("inputAssetVersionIds", ["other-immutable-asset"]),
+])
+def test_g72_poisoned_persisted_fake_labels_are_not_leased(
+    generation_context, monkeypatch, field, bad_value,
+):
+    """A typed FAKE talking-head row must keep consent, nonpublishability and source binding.
+
+    This uses actual FastAPI+disposable SQLite tasks and synthetic REMIX rights.
+    A malformed older task must not receive a lease, create an audit claim,
+    consume usage, or starve a later healthy deterministic-FAKE task.
+    It does not establish Owner project grants or the revoke/commit race.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 2)
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 persisted FAKE-only claim fence")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        payload = _g72_fake_payload(
+            client, project, asset_id, key="g72-guard-" + field,
+        )
+        preview = client.post(path + "/validate", json=payload)
+        assert preview.status_code == 200, preview.text
+        payload["capabilitySnapshotHash"] = preview.json()["capabilitySnapshotHash"]
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        assert created.status_code == 409, created.text
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created is not None and created.status_code == 202, (
+        created.text if created is not None else "FAKE typed creation not reached"
+    )
+    poisoned_id = created.json()["taskId"]
+    healthy = create_task(client, project, key="g72-safe-after-" + field)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned_id)
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad is not None and good is not None
+        assert bad.provider == "deterministic-fake-talking-head"
+        bad.request_json = {**bad.request_json, field: bad_value}
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one()
+        storage_before = db.execute(select(DBTenant.used_storage_bytes)).scalar_one()
+
+    response = claim(client, worker_id="g72-fake-contract-worker")
+    assert response.status_code == 200, response.text
+    assert response.json()["taskId"] == healthy["taskId"]
+    assert response.json()["providerMode"] == "deterministic-fake"
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, poisoned_id)
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        assert bad.status == "QUEUED"
+        assert bad.lease_owner is None and bad.lease_epoch == 0
+        assert good.status == "SUBMITTING"
+        assert good.lease_owner == "g72-fake-contract-worker"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == usage_before
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == storage_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == poisoned_id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("fakeTaskType", "normal-generation"),
+    ("simulatedOutput", False),
+    ("publishable", True),
+    ("confirmSyntheticTestOnly", False),
+    ("outputCount", 4),
+    ("inputAssetVersionIds", ["forged-input-version"]),
+])
+def test_g72_postclaim_fake_promise_poison_rejected_before_sidecar(
+    generation_context, field, bad_value,
+):
+    """FAKE-only lease does not authorize intake after persisted consent/labels drift.
+
+    Nonproduction FastAPI + disposable SQLite; deliberately edits a test row,
+    without modifying policy, Provider, protected store or actual customer data.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 postclaim fake contract")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, image_id, key="g72-postclaim-" + field,
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    leased = claim(client, worker_id="worker-a")
+    assert leased.status_code == 200, leased.text
+    assert leased.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="fake-g72-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-g72-upstream",
+        providerArtifactId="fake-g72-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        task.request_json = {**task.request_json, field: bad_value}
+        before_storage = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+        db.commit()
+
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "fake-g72-artifact"},
+        files={"file": ("fake.mp4", b"g72-synthetic-test-media", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+    assert media.uploads == 0
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.asset_version_id is None
+        assert task.status == "INGESTING"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == before_storage
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_midupload_fake_promise_poison_is_rejected_at_final_commit(
+    generation_context, monkeypatch,
+):
+    """A changed publishable flag during Sidecar upload must not settle or ingest."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 midupload fake contract")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, image_id, key="g72-midupload-promise-drift",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    leased = claim(client, worker_id="worker-a")
+    assert leased.status_code == 200, leased.text
+    assert leased.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="fake-midupload-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="fake-midupload-upstream",
+        providerArtifactId="fake-midupload-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        before_storage = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+
+    actual_upload = media.upload_media
+
+    def persist_then_poison(*args, **kwargs):
+        uploaded = actual_upload(*args, **kwargs)
+        # The API already committed its temporary storage reservation; this
+        # independent transaction models a persisted row changed in flight.
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            task.request_json = {**task.request_json, "publishable": True}
+            db.commit()
+        return uploaded
+
+    monkeypatch.setattr(media, "upload_media", persist_then_poison)
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "fake-midupload-artifact"},
+        files={"file": ("fake.mp4", b"g72-synthetic-test-media", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+    assert media.uploads == 1
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.asset_version_id is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == before_storage
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+        )).scalar_one() == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["before_claim", "after_claim", "during_upload"])
+def test_g72_fake_source_swap_must_match_authenticated_create_receipt(
+    generation_context, monkeypatch, phase,
+):
+    """Correlated replacement with another REMIX-allowed image is still a forgery.
+
+    All four persisted request fields are made mutually consistent, and the
+    replacement asset has its own currently ALLOWED REMIX evidence. The
+    authenticated TASK_CREATED receipt must nevertheless remain the source of
+    truth through Worker claim, pre-upload and final upload transaction.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 immutable original-source receipt " + phase)
+    original_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, original_id, key="g72-receipt-source-swap-" + phase,
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+
+    with sessions() as db:
+        original = db.get(DBAssetVersion, original_id)
+        assert original is not None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        replacement = DBAssetVersion(
+            id=str(uuid.uuid4()), tenant_id=original.tenant_id,
+            project_id=original.project_id, media_id="fake-replacement-" + phase,
+            version_no=1, sha256="b" * 64, media_type="image",
+            content_type="image/png", size_bytes=100, probe_json={},
+            created_by=original.created_by, created_at=now,
+        )
+        db.add(replacement)
+        db.flush()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=original.tenant_id,
+            project_id=original.project_id, asset_version_id=replacement.id,
+            status="ALLOWED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="synthetic-replacement-only", captured_by=original.created_by,
+            captured_at=now,
+        ))
+        db.commit()
+        replacement_id = replacement.id
+
+    def poison_request():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task is not None
+            task.request_json = {
+                **task.request_json,
+                "imageAssetVersionId": replacement_id,
+                "imageAssetId": replacement_id,
+                "sourceAssetSha256": "b" * 64,
+                "inputAssetVersionIds": [replacement_id],
+            }
+            db.commit()
+
+    with sessions() as db:
+        old_storage = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+
+    if phase == "before_claim":
+        poison_request()
+        denied = claim(client, worker_id="worker-a")
+        assert denied.status_code == 204, denied.text
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )).scalar_one() == 0
+        assert media.uploads == 0
+    else:
+        leased = claim(client, worker_id="worker-a")
+        assert leased.status_code == 200, leased.text
+        assert leased.json()["taskId"] == task_id
+        assert transition(
+            client, task_id, "RUNNING",
+            upstreamJobId="fake-receipt-upstream",
+        ).status_code == 200
+        assert transition(
+            client, task_id, "INGESTING", progress=95,
+            upstreamJobId="fake-receipt-upstream",
+            providerArtifactId="fake-receipt-artifact",
+        ).status_code == 200
+        if phase == "after_claim":
+            poison_request()
+        else:
+            actual_upload = media.upload_media
+            def persist_then_swap(*args, **kwargs):
+                result = actual_upload(*args, **kwargs)
+                poison_request()
+                return result
+            monkeypatch.setattr(media, "upload_media", persist_then_swap)
+        denied = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "worker-a",
+                "X-Worker-Lease-Epoch": str(leased.json()["leaseEpoch"]),
+            },
+            data={"providerArtifactId": "fake-receipt-artifact"},
+            files={"file": ("fake.mp4", b"fake-receipt-media", "video/mp4")},
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+        assert media.uploads == (1 if phase == "during_upload" else 0)
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task.asset_version_id is None
+            assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one() == 0
+
+    with sessions() as db:
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == old_storage
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("field,new_value", [
+    ("text", "FAKE-only tampered script never approved by the owner"),
+    ("videoSubject", "FAKE-only substituted Worker narration"),
+    ("videoAspect", "16:9"),
+    ("videoClipDuration", 999),
+    ("voiceId", "unexpected-voice"),
+    ("videoClipDuration", True),
+])
+@pytest.mark.parametrize("phase", ["before_claim", "after_claim", "during_upload"])
+def test_g72_fake_typed_or_worker_alias_drift_is_rejected(
+    generation_context, monkeypatch, phase, field, new_value,
+):
+    """G72: original user text and all Worker aliases must remain consistent.
+
+    The typed request hash covers the owner's text/duration, but cannot by
+    itself detect a change to derived Worker-only fields such as videoSubject
+    and voiceId. Isolated FAKE-only lifecycle tests reject drift at claim,
+    pre-upload and final intake without touching provider/storage policy.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 immutable script receipt " + phase)
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, image_id, key="g72-script-binding-" + phase,
+    )
+    # Capability snapshots can change between fixture acquisition and create
+    # under the shared CI clock. Retry only explicit stale-snapshot responses;
+    # preserve all security denials and the original tamper assertions.
+    create_path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    for _ in range(3):
+        created = client.post(create_path, json=payload)
+        if created.status_code == 202:
+            break
+        detail = created.json().get("detail", {})
+        if (
+            created.status_code != 409
+            or detail.get("code") not in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }
+        ):
+            break
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        preflight = client.post(create_path + "/validate", json=payload)
+        if preflight.status_code == 200:
+            payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        elif preflight.status_code != 409 or preflight.json().get("detail", {}).get("code") not in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }:
+            assert preflight.status_code == 200, preflight.text
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    with sessions() as db:
+        original = db.get(DBGenerationTask, task_id)
+        assert original is not None
+        original_hash = original.request_hash
+        original_field_value = original.request_json[field]
+        storage_before = db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one()
+
+    def change_script_after_creation():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            task.request_json = {
+                **task.request_json,
+                field: new_value,
+            }
+            assert (
+                task.request_json[field] != original_field_value
+                or type(task.request_json[field]) is not type(original_field_value)
+            )
+            # SQLAlchemy compares Python dicts by value; True == 1, so an
+            # assigned JSON object with only int -> bool drift could be
+            # mistaken for unchanged without explicitly marking it dirty.
+            flag_modified(task, "request_json")
+            assert task.request_hash == original_hash
+            db.commit()
+        with sessions() as db:
+            persisted = db.get(DBGenerationTask, task_id).request_json[field]
+            assert persisted == new_value and type(persisted) is type(new_value)
+
+    if phase == "before_claim":
+        change_script_after_creation()
+        response = claim(client, worker_id="worker-a")
+        assert response.status_code == 204, response.text
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task.lease_owner is None
+            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "TASK_CLAIMED",
+            )).scalar_one() == 0
+        assert media.uploads == 0
+    else:
+        leased = claim(client, worker_id="worker-a")
+        assert leased.status_code == 200, leased.text
+        assert leased.json()["taskId"] == task_id
+        assert transition(
+            client, task_id, "RUNNING", upstreamJobId="fake-script-upstream",
+        ).status_code == 200
+        assert transition(
+            client, task_id, "INGESTING", progress=95,
+            upstreamJobId="fake-script-upstream",
+            providerArtifactId="fake-script-artifact",
+        ).status_code == 200
+        if phase == "after_claim":
+            change_script_after_creation()
+        else:
+            upload = media.upload_media
+
+            def persist_then_change(*args, **kwargs):
+                result = upload(*args, **kwargs)
+                change_script_after_creation()
+                return result
+
+            monkeypatch.setattr(media, "upload_media", persist_then_change)
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={
+                "X-Worker-Token": WORKER_TOKEN,
+                "X-Worker-Id": "worker-a",
+                "X-Worker-Lease-Epoch": str(leased.json()["leaseEpoch"]),
+            },
+            data={"providerArtifactId": "fake-script-artifact"},
+            files={"file": ("fake.mp4", b"fake-script-media", "video/mp4")},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+        assert media.uploads == (1 if phase == "during_upload" else 0)
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.request_hash == original_hash
+        assert row.asset_version_id is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.sum(DBTenant.used_storage_bytes))).scalar_one() == storage_before
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_correlated_typed_request_and_hash_rewrite_is_rejected(generation_context):
+    """Nonproduction negative diagnostic; never changes a production/audit store.
+
+    This narrow regression changes BOTH mutable task fields but leaves the
+    original TASK_CREATED event intact. The event digest comparison must reject
+    the fake Worker claim; it does not prove independent trusted receipt security.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 correlated typed request/hash diagnostic")
+    asset_id = _g72_fake_visual_fixture(sessions, project)
+    typed = _g72_fake_payload(
+        client, project, asset_id, key="g72-correlated-typed-hash-diagnostic",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=typed,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    attacker_text = "unapproved synthetic script injected after task creation"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row is not None and row.request_json["text"] != attacker_text
+        created_event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        original_event_metadata = json.loads(json.dumps(created_event.metadata_json))
+        assert original_event_metadata.get("typedRequestHash") == row.request_hash
+        typed_original = {
+            field: row.request_json[field]
+            for field in TalkingHeadFakeGenerationRequest.model_fields
+        }
+        assert generation_request_hash(typed_original) == row.request_hash
+        typed_forged = {**typed_original, "text": attacker_text}
+        forged_digest = generation_request_hash(typed_forged)
+        assert forged_digest != row.request_hash
+        row.request_json = {
+            **row.request_json,
+            "text": attacker_text,
+            "videoSubject": attacker_text,
+        }
+        row.request_hash = forged_digest
+        db.commit()
+
+    with sessions() as db:
+        event_after = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        assert event_after.metadata_json == original_event_metadata
+        assert db.get(DBGenerationTask, task_id).request_hash == forged_digest
+
+    result = claim(client, worker_id="worker-a")
+    assert result.status_code == 204, result.text
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row is not None and row.lease_owner is None
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "G72 OPEN / OWNER POLICY: an attacker who can rewrite both the task "
+        "row and TASK_CREATED event can forge their two matching digests. "
+        "A separate immutable issuer/receipt is not approved or implemented."
+    ),
+)
+def test_g72_correlated_task_and_audit_event_rewrite_needs_trusted_receipt(
+    generation_context,
+):
+    """Diagnostic on disposable FAKE-only SQLite, not a trusted receipt acceptance."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 independent receipt gap")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    typed = _g72_fake_payload(
+        client, project, image_id, key="g72-task-and-event-rewrite-diagnostic",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=typed,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        event = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CREATED",
+        )).scalar_one()
+        original = {
+            name: task.request_json[name]
+            for name in TalkingHeadFakeGenerationRequest.model_fields
+        }
+        attacker_text = "correlated unauthorized request and audit edit"
+        forged = generation_request_hash({**original, "text": attacker_text})
+        task.request_json = {
+            **task.request_json,
+            "text": attacker_text,
+            "videoSubject": attacker_text,
+        }
+        task.request_hash = forged
+        event.metadata_json = {**event.metadata_json, "typedRequestHash": forged}
+        db.commit()
+    claimed = claim(client, worker_id="g72-audit-coedit-worker")
+    # This remains XFAIL until an independent, Owner-authorized receipt
+    # rejects co-edits to TWO ordinary mutable rows.
+    assert claimed.status_code == 204, claimed.text
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+# G73: circuit governance readback, after real request creation, FAKE-only.
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("failureWindow", "300"),
+    ("failureWindow", None),
+    ("failureWindow", 10**12),   # Timedelta fits, datetime subtraction does not.
+    ("failureWindow", 10**100),  # No timedelta representable: reject before lease.
+    ("failureThreshold", True),
+    ("failureThreshold", 0),
+    ("cooldownSeconds", []),
+    ("cooldownSeconds", {"unexpected": 60}),
+    ("cooldownSeconds", 10**12),  # Timedelta fits, datetime addition does not.
+    ("cooldownSeconds", 10**100),  # No timedelta representable: reject before lease.
+])
+def test_g73_corrupt_failure_policy_skips_poisoned_queue_without_starvation(
+    generation_context, field, bad_value,
+):
+    """Invalid persisted circuit metadata must not receive a Worker lease."""
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 failure policy claim fence")
+    poisoned = create_task(client, project, key="g73-poison-" + field)
+    healthy = create_task(client, project, key="g73-healthy-" + field)
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, poisoned["taskId"])
+        snapshot = dict(row.capability_snapshot_json)
+        policy = dict(snapshot.get("providerPolicy") or {})
+        policy[field] = bad_value
+        snapshot["providerPolicy"] = policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    claimed = claim(client, "g73-failure-policy-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, poisoned["taskId"])
+        assert row.status == "QUEUED"
+        assert row.lease_owner is None and row.lease_epoch == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("failureWindow", "300"),
+    ("failureWindow", 10**12),
+    ("failureWindow", 10**100),
+    ("failureThreshold", False),
+    ("cooldownSeconds", []),
+    ("cooldownSeconds", 10**12),
+    ("cooldownSeconds", 10**100),
+])
+def test_g73_corrupt_failure_policy_after_claim_returns_409_without_commit(
+    generation_context, field, bad_value,
+):
+    """A post-claim poisoned snapshot cannot produce a 500 or circuit mutation."""
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 failure policy post-claim fence")
+    task = create_task(client, project, key="g73-postclaim-" + field)
+    assert claim(client, "g73-postclaim-worker").json()["taskId"] == task["taskId"]
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        snapshot = dict(row.capability_snapshot_json)
+        policy = dict(snapshot.get("providerPolicy") or {})
+        policy[field] = bad_value
+        snapshot["providerPolicy"] = policy
+        row.capability_snapshot_json = snapshot
+        db.commit()
+
+    result = transition(
+        client, task["taskId"], "FAILED", worker_id="g73-postclaim-worker",
+        errorCode="PROVIDER_5XX", retryable=False,
+    )
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "GENERATION_FAILURE_POLICY_INVALID"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        assert row.status == "SUBMITTING"
+        assert row.lease_owner == "g73-postclaim-worker"
+        assert row.error_code is None
+        assert db.execute(select(func.count(DBGenerationProviderEvent.id)).where(
+            DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_OPENED"
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == row.id,
+            DBGenerationUsageEntry.kind.in_(("SETTLED", "RELEASED")),
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+# G73: read-only corruption fences for persisted tenant circuit history.
+# No Owner policy, schema, protected-store reconciliation or Provider changes.
+@pytest.mark.parametrize("bad_history", [
+    42,
+    {"broken": "history"},
+    [17],
+    ["2026-11-13T10:20:00"],  # Timestamp lacks a timezone; aware cutoff compare would raise.
+])
+def test_g73_bad_circuit_history_denies_claim_without_lease(
+    generation_context, bad_history,
+):
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 corrupted durable circuit claim")
+    task = create_task(client, project, key="g73-history-claim")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        db.add(DBGenerationCircuitState(
+            id=str(uuid.uuid4()), tenant_id=row.tenant_id, provider="moneyprinter",
+            state="CLOSED", failure_timestamps_json=bad_history, updated_at=now,
+        ))
+        db.commit()
+
+    response = claim(client, "g73-circuit-history-worker")
+    assert response.status_code == 204, response.text
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert row.status == "QUEUED" and row.lease_owner is None
+        assert row.lease_epoch == 0
+        assert circuit.state == "CLOSED"
+        assert circuit.failure_timestamps_json == bad_history
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+            DBGenerationEvent.event_type == "TASK_CLAIMED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_history", [
+    42,
+    {"broken": "history"},
+    [17],
+    ["2026-11-13T10:20:00"],
+])
+def test_g73_bad_circuit_history_after_claim_fails_closed_without_settlement(
+    generation_context, bad_history,
+):
+    client, sessions, app, _ = generation_context
+    project = create_project(client, "G73 corrupted durable circuit transition")
+    task = create_task(client, project, key="g73-history-after-claim")
+    assert claim(client, "g73-circuit-history-worker").json()["taskId"] == task["taskId"]
+    with sessions() as db:
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        circuit.failure_timestamps_json = bad_history
+        db.commit()
+
+    response = transition(
+        client, task["taskId"], "FAILED",
+        worker_id="g73-circuit-history-worker",
+        errorCode="PROVIDER_5XX", retryable=False,
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "GENERATION_CIRCUIT_HISTORY_INVALID"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
+        assert row.status == "SUBMITTING" and row.lease_owner == "g73-circuit-history-worker"
+        assert row.error_code is None
+        assert circuit.state == "CLOSED"
+        assert circuit.failure_timestamps_json == bad_history
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == row.id,
+            DBGenerationUsageEntry.kind.in_(("SETTLED", "RELEASED")),
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationProviderEvent.id)).where(
+            DBGenerationProviderEvent.event_type == "GENERATION_CIRCUIT_OPENED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize("role", ["editor", "admin", "owner"])
+def test_g72_fake_task_read_denies_unassigned_tenant_users_before_pagination(generation_context, role):
+    """Only original active project Owner may read the FAKE task's script/history."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake read " + role)
+    source = _g72_fake_visual_fixture(sessions, project)
+    body = _g72_fake_payload(client, project, source, key="g72-read-" + role)
+    for _ in range(3):
+        cap = client.get("/generation/providers/moneyprinter/capabilities")
+        assert cap.status_code == 200, cap.text
+        body["capabilitySnapshotHash"] = cap.json()["snapshotHash"]
+        created = client.post(
+            f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+            json=body,
+        )
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    path = f"/projects/{project['id']}/generation-tasks"
+    assert client.get(f"{path}/{task_id}").status_code == 200
+    owner_list = client.get(path, params={"pagination": "keyset", "pageSize": 1})
+    assert owner_list.status_code == 200, owner_list.text
+    assert owner_list.json()["items"][0]["taskId"] == task_id
+
+    actor_id, password = "g72-other-" + str(uuid.uuid4()), secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        db.add(DBUser(
+            id=actor_id, tenant_id=task.tenant_id,
+            email=f"{actor_id}@example.com", display_name="Other Tenant Member",
+            password_hash=hash_password(password), role=role, is_active=True,
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+        before = (task.status, task.request_hash, task.lease_owner)
+        event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{actor_id}@example.com", "password": password,
+    }).status_code == 200
+    denied = client.get(f"{path}/{task_id}")
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    for params in ({"provider": "deterministic-fake-talking-head"},
+                   {"pagination": "keyset", "pageSize": 1},
+                   {"pagination": "offset", "pageSize": 1}):
+        listed = client.get(path, params=params)
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["items"] == []
+        assert listed.json()["nextCursor"] is None
+        assert listed.json()["nextKeysetCursor"] is None
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert (task.status, task.request_hash, task.lease_owner) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == event_count
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_count
+    app.state.moneyprinter.assert_not_called()
+    assert media.uploads == 0
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    assert client.get(f"{path}/{task_id}").status_code == 200
+
+def test_g72_fake_task_read_owner_transfer_does_not_expose_previous_owner_request(generation_context):
+    """After a project owner change, neither Owner may read the old FAKE script."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 historical FAKE transfer read fence")
+    source = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, source, key="g72-transfer-owner-no-disclosure",
+    )
+    for _ in range(3):
+        cap = client.get("/generation/providers/moneyprinter/capabilities")
+        assert cap.status_code == 200, cap.text
+        payload["capabilitySnapshotHash"] = cap.json()["snapshotHash"]
+        created = client.post(
+            f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+            json=payload,
+        )
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    new_owner_id = "g72-new-owner-" + str(uuid.uuid4())
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        task = db.get(DBGenerationTask, task_id)
+        old_owner_id = project_row.owner_id
+        assert task.requested_by == old_owner_id
+        db.add(DBUser(
+            id=new_owner_id, tenant_id=task.tenant_id,
+            email=f"{new_owner_id}@example.com",
+            display_name="G72 Changed Project Owner",
+            password_hash=hash_password(password), role="owner",
+            is_active=True, created_at=now, updated_at=now,
+        ))
+        project_row.owner_id = new_owner_id
+        db.commit()
+    path = f"/projects/{project['id']}/generation-tasks"
+    # New project Owner cannot see the old originator's task.
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{new_owner_id}@example.com", "password": password,
+    }).status_code == 200
+    assert client.get(f"{path}/{task_id}").status_code == 403
+    for query in ({}, {"pagination": "keyset", "pageSize": 1},
+                  {"provider": "deterministic-fake-talking-head"}):
+        result = client.get(path, params=query)
+        assert result.status_code == 200, result.text
+        assert result.json()["items"] == []
+    # Original requester has lost the project authority; the row stays untouched.
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    assert client.get(f"{path}/{task_id}").status_code == 403
+    assert client.get(path).json()["items"] == []
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "QUEUED"
+        assert task.requested_by == old_owner_id
+        assert task.lease_owner is None
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def _g72_create_owner_fake_for_mutation_fence(client, sessions, project, key):
+    """Create a FAKE job via the real typed route; no Provider or media upload."""
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(client, project, image_id, key=key)
+    route = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        created = client.post(route, json=payload)
+        if created.status_code == 202:
+            return created.json()["taskId"]
+        assert created.status_code == 409 and (
+            created.json().get("detail", {}).get("code") in {
+                "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+            }
+        ), created.text
+    raise AssertionError(f"FAKE job create did not succeed: {created.text if created else 'not attempted'}")
+
+
+def test_g72_fake_draft_apply_unassigned_editor_is_denied_before_rights(
+    generation_context,
+):
+    """An unrelated tenant Editor must not apply another Owner's FAKE draft.
+
+    Even without a rights-cleared result, the authority fence must run before
+    result validation, and cannot change the project, audit or reserved quota.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake draft apply scope")
+    task_id = _g72_create_owner_fake_for_mutation_fence(
+        client, sessions, project, "g72-fake-editor-draft-apply",
+    )
+    actor_id = "g72-fake-editor-apply-" + str(uuid.uuid4())
+    actor_password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        proj = db.get(DBProject, project["id"])
+        assert task.requested_by == proj.owner_id
+        tenant_id = task.tenant_id
+        db.add(DBUser(
+            id=actor_id, tenant_id=tenant_id,
+            email=f"{actor_id}@example.com",
+            display_name="Unassigned Editor",
+            password_hash=hash_password(actor_password),
+            role="editor", is_active=True, created_at=now, updated_at=now,
+        ))
+        db.commit()
+        project_revision = proj.revision
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+
+    route = f"/projects/{project['id']}/generation-tasks/{task_id}/apply-talking-head-draft"
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{actor_id}@example.com", "password": actor_password,
+    }).status_code == 200
+    denied = client.post(route, json={
+        "expectedRevision": project_revision, "aspect": "9:16", "subtitles": [],
+    })
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    with sessions() as db:
+        assert db.get(DBProject, project["id"]).revision == project_revision
+        assert db.get(DBGenerationTask, task_id).status == "QUEUED"
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    owner_result = client.post(route, json={
+        "expectedRevision": project_revision, "aspect": "9:16", "subtitles": [],
+    })
+    assert owner_result.status_code == 422, owner_result.text
+    assert owner_result.json()["detail"]["code"] == "RIGHTS_MISSING"
+
+
+@pytest.mark.parametrize("authority_change", ["transfer", "deactivate"])
+def test_g72_fake_orphan_recovery_rechecks_owner_after_sidecar_inspection(
+    generation_context, monkeypatch, authority_change,
+):
+    """An in-flight read-only Sidecar inspection cannot preserve stale FAKE Owner authority.
+
+    G72/G70/G71 FAKE-only native API+DB isolation: no live Provider, upload,
+    refund, release, issuance or policy change is authorized by this test.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G72 orphan inspection Owner TOCTOU")
+    task_id = _g72_create_owner_fake_for_mutation_fence(
+        client, sessions, project, f"g72-recovery-race-{authority_change}",
+    )
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id,
+    )
+    new_owner_id = "g72-recovery-successor-" + str(uuid.uuid4())
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        owner_id = task.requested_by
+        held_before = tenant.used_storage_bytes
+        revision_before = db.get(DBProject, project["id"]).revision
+        asset_count_before = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one()
+        event_count_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_count_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        if authority_change == "transfer":
+            now = datetime.datetime.now(datetime.timezone.utc)
+            db.add(DBUser(
+                id=new_owner_id, tenant_id=task.tenant_id,
+                email=f"{new_owner_id}@example.com",
+                display_name="Replacement FAKE Project Owner",
+                password_hash=hash_password(secrets.token_urlsafe(24)),
+                role="owner", is_active=True, created_at=now, updated_at=now,
+            ))
+            db.commit()
+
+    original_inspect = media_store.inspect_media
+    inspected_once = False
+
+    def inspect_during_authority_change(project_id, selected_media_id):
+        nonlocal inspected_once
+        result = original_inspect(project_id, selected_media_id)
+        assert selected_media_id == media_id
+        assert not inspected_once
+        with sessions() as db:
+            if authority_change == "transfer":
+                db.get(DBProject, project["id"]).owner_id = new_owner_id
+            else:
+                db.get(DBUser, owner_id).is_active = False
+            db.commit()
+        inspected_once = True
+        return result
+
+    monkeypatch.setattr(media_store, "inspect_media", inspect_during_authority_change)
+    denied = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "FAKE Owner authorization revoked during Sidecar inspection"},
+    )
+    assert inspected_once, "The owner change must occur AFTER the initial authorization check"
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        project_row = db.get(DBProject, project["id"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        assert task.status == "FAILED" and task.asset_version_id is None
+        assert task.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == held_before
+        assert project_row.revision == revision_before
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"],
+        )).scalar_one() == asset_count_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == event_count_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_count_before
+    assert media_store.uploads == 0
+    assert media_store.inspections == 1
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_fake_transfer_blocks_old_owner_apply_and_orphan_recovery(
+    generation_context,
+):
+    """Neither old nor new project Owner can mutate a historical FAKE job.
+
+    Ownership transfer does not grant historical synthetic task rights;
+    originator alone does not preserve authority after the transfer.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake project transfer fence")
+    task_id = _g72_create_owner_fake_for_mutation_fence(
+        client, sessions, project, "g72-fake-owner-transfer-apply-recover",
+    )
+    successor_id = "g72-successor-owner-" + str(uuid.uuid4())
+    successor_password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        proj = db.get(DBProject, project["id"])
+        assert task.requested_by == proj.owner_id
+        db.add(DBUser(
+            id=successor_id, tenant_id=task.tenant_id,
+            email=f"{successor_id}@example.com",
+            display_name="Successor Owner",
+            password_hash=hash_password(successor_password),
+            role="owner", is_active=True, created_at=now, updated_at=now,
+        ))
+        proj.owner_id = successor_id
+        db.commit()
+        revision = proj.revision
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+    draft_route = f"/projects/{project['id']}/generation-tasks/{task_id}/apply-talking-head-draft"
+    recovery_route = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    draft_body = {"expectedRevision": revision, "aspect": "9:16", "subtitles": []}
+    recovery_body = {"reason": "Synthetic task owner-transfer isolation audit"}
+
+    for route, payload in [(draft_route, draft_body), (recovery_route, recovery_body)]:
+        result = client.post(route, json=payload)
+        assert result.status_code == 403, result.text
+        assert result.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{successor_id}@example.com", "password": successor_password,
+    }).status_code == 200
+    result = client.post(draft_route, json=draft_body)
+    assert result.status_code == 403, result.text
+    assert result.json()["detail"]["code"] == "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    result = client.post(recovery_route, json=recovery_body)
+    assert result.status_code == 403, result.text
+    assert result.json()["detail"]["code"] == "OWNER_SELF_ONLY"
+
+    with sessions() as db:
+        assert db.get(DBProject, project["id"]).revision == revision
+        assert db.get(DBGenerationTask, task_id).status == "QUEUED"
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+    assert media.uploads == 0
+    assert media.inspections == 0
+    app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_fake_retry_denies_unassigned_editor_before_task_state_disclosure(
+    generation_context,
+):
+    """FAKE-only shared retry route must preserve Owner, task and quota fences.
+
+    This is a nonproduction negative case, not an approval of retries or grants.
+    Synthetic talking-head jobs currently have max_attempts=1; the test
+    confirms unauthorized users receive 403 before learning retryability.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 fake retry project scope")
+    visual_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, visual_id, key="g72-fake-retry-editor-denial"
+    )
+    base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        caps = client.get("/generation/providers/moneyprinter/capabilities")
+        assert caps.status_code == 200, caps.text
+        payload["capabilitySnapshotHash"] = caps.json()["snapshotHash"]
+        created = client.post(base, json=payload)
+        if created.status_code == 202:
+            break
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created is not None and created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    editor_id = "g72-retry-editor-" + str(uuid.uuid4())
+    password = secrets.token_urlsafe(24)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.max_attempts == 1
+        before = (task.status, task.attempts, task.lease_owner, task.error_code)
+        events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        attempts = db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        db.add(DBUser(
+            id=editor_id, tenant_id=task.tenant_id,
+            email=f"{editor_id}@example.com", display_name="Synthetic Editor",
+            password_hash=hash_password(password),
+            role="editor", is_active=True, created_at=now, updated_at=now,
+        ))
+        db.commit()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": f"{editor_id}@example.com", "password": password,
+    }).status_code == 200
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
+    denied = client.post(path)
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert (task.status, task.attempts, task.lease_owner, task.error_code) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one() == attempts
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+    assert client.post("/auth/logout").status_code == 204
+    assert client.post("/auth/login", json={
+        "email": "owner@example.com", "password": OWNER_PASSWORD,
+    }).status_code == 200
+    owner_response = client.post(path)
+    assert owner_response.status_code == 409, owner_response.text
+    assert owner_response.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
+
+
+@pytest.mark.parametrize("new_limit", [1, "unlimited"])
+def test_g70_g71_recovery_rejects_policy_change_during_sidecar_inspection(
+    generation_context, monkeypatch, new_limit,
+):
+    """The final write must not use policy limits cached before a Sidecar probe.
+
+    This is an isolated FAKE API+DB concurrency regression. It neither
+    settles HELD usage nor changes Owner policy, Provider, or production state.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G70/G71 policy change during Sidecar probe")
+    task = create_task(client, project, key="g70-g71-race-" + str(new_limit))
+    task_id = task["taskId"]
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id,
+    )
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        used_before = tenant.used_storage_bytes
+        task_events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        original_snapshot = dict(row.capability_snapshot_json)
+    original_inspect = media_store.inspect_media
+    touched = False
+
+    def inspect_and_change_saved_policy(project_id, selected_media_id):
+        nonlocal touched
+        result = original_inspect(project_id, selected_media_id)
+        assert selected_media_id == media_id
+        assert not touched
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            snapshot = dict(row.capability_snapshot_json)
+            policy = dict(snapshot.get("providerPolicy") or {})
+            policy["maxArtifactBytes"] = new_limit
+            snapshot["providerPolicy"] = policy
+            row.capability_snapshot_json = snapshot
+            db.commit()
+        touched = True
+        return result
+
+    monkeypatch.setattr(media_store, "inspect_media", inspect_and_change_saved_policy)
+    result = client.post(
+        f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Owner must recheck the immutable policy snapshot"},
+    )
+    assert touched, "The policy change must occur during the read-only probe"
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "ARTIFACT_RECOVERY_POLICY_CHANGED"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        assert row.status == "FAILED"
+        assert row.asset_version_id is None
+        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == used_before
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"], DBAssetVersion.media_id == media_id,
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == task_events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+        assert row.capability_snapshot_json != original_snapshot
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()

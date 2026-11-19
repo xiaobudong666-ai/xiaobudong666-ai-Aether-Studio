@@ -1,4 +1,6 @@
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import time
 import uuid
@@ -194,6 +196,40 @@ def test_generated_upload_idempotency_survives_lost_ack_without_duplicate_media(
         replay_payload = replay.json()
         assert replay_payload["mediaId"] == expected_media_id
         assert replay_payload["idempotentReplay"] is True
+        assert first_payload["fileName"] == "generation-task-idempotency-test.mp4"
+        assert replay_payload["fileName"] == first_payload["fileName"]
+        assert replay_payload["contentType"] == first_payload["contentType"] == "video/mp4"
+
+        # Same durable bytes/suffix and idempotency key, but a different
+        # multipart filename/MIME must not forge a different Sidecar receipt.
+        with source.open("rb") as stream:
+            replay_with_untrusted_metadata = client.post(
+                "/media",
+                data={"projectId": "project-idempotency"},
+                files={"file": ("renamed.mp4", stream, "application/octet-stream")},
+                headers=headers,
+            )
+        assert replay_with_untrusted_metadata.status_code == 201, replay_with_untrusted_metadata.text
+        replay_receipt = replay_with_untrusted_metadata.json()
+        assert replay_receipt["idempotentReplay"] is True
+        assert replay_receipt["mediaId"] == first_payload["mediaId"]
+        assert replay_receipt["fileName"] == first_payload["fileName"]
+        assert replay_receipt["contentType"] == first_payload["contentType"]
+
+        # G70/G71: a lost-ACK replay must preserve not only the byte hash,
+        # but also the original suffix/format binding. The same MP4 bytes
+        # labeled MOV must be rejected before the Sidecar can return an
+        # inconsistent media filename or format receipt.
+        with source.open("rb") as stream:
+            cross_suffix = client.post(
+                "/media",
+                data={"projectId": "project-idempotency"},
+                files={"file": ("generated.mov", stream, "video/quicktime")},
+                headers=headers,
+            )
+        assert cross_suffix.status_code == 409, cross_suffix.text
+        assert "different media parameters" in cross_suffix.json()["detail"]
+
         media_files = list(
             (media_root / "projects" / "project-idempotency" / "media").glob(
                 f"{expected_media_id}.*"
@@ -366,3 +402,398 @@ def test_canonical_timeline_render_preserves_gap_overlap_audio_and_idempotency(t
             capture_output=True,
         ).stdout
         assert gap_pixel and max(gap_pixel) < 20
+
+
+def test_idempotent_upload_conflict_is_serialized_across_independent_apps(tmp_path, monkeypatch):
+    # Two separate ASGI app instances with the same POSIX media directory
+    # mimic independent workers; this is not a PostgreSQL or host-crash test.
+    source = tmp_path / "original.mp4"
+    alternate = tmp_path / "alternate.mp4"
+    make_source(source)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=red:s=320x240:r=24",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(alternate),
+        ],
+        check=True,
+    )
+    assert source.read_bytes() != alternate.read_bytes()
+
+    media_root = tmp_path / "media"
+    app_a = create_app(media_root=media_root, upstream_root=tmp_path / "upstream")
+    app_b = create_app(media_root=media_root, upstream_root=tmp_path / "upstream")
+    original_replace = Path.replace
+    replace_barrier = threading.Barrier(2)
+
+    def synchronized_replace(self, target):
+        # Force an overlapping final-write window in the old implementation.
+        # Under the fix the first caller times out here and the second
+        # observes an already committed media file before trying to replace.
+        if self.name.endswith(".pending.mp4") and "project-shared" in self.parts:
+            try:
+                replace_barrier.wait(timeout=1.2)
+            except threading.BrokenBarrierError:
+                pass
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", synchronized_replace)
+
+    def upload(client, source_path):
+        payload = source_path.read_bytes()
+        with source_path.open("rb") as content:
+            return client.post(
+                "/media",
+                data={"projectId": "project-shared"},
+                files={"file": ("generated.mp4", content, "video/mp4")},
+                headers={
+                    "Idempotency-Key": "shared-key",
+                    "X-Content-SHA256": hashlib.sha256(payload).hexdigest(),
+                },
+            )
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(upload, client_a, source)
+            future_b = pool.submit(upload, client_b, alternate)
+            response_a = future_a.result(timeout=30)
+            response_b = future_b.result(timeout=30)
+
+    assert sorted([response_a.status_code, response_b.status_code]) == [201, 409], (
+        response_a.text, response_b.text
+    )
+    media_files = list(
+        (media_root / "projects" / "project-shared" / "media").glob("*.mp4")
+    )
+    assert len(media_files) == 1
+    winner = source if response_a.status_code == 201 else alternate
+    assert media_files[0].read_bytes() == winner.read_bytes()
+
+# G70/G71: independently started OS processes sharing one POSIX media directory.
+# FAKE-ONLY, localhost network only; not a multi-host/PG/Owner ACK release proof.
+def test_shared_posix_media_root_two_live_uvicorn_processes(tmp_path):
+    import os
+    import socket
+    import sys
+    import httpx
+
+    def make_clip(path, color):
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=c={color}:s=320x240:r=24",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+        ], check=True)
+
+    first, second = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    make_clip(first, "red")
+    make_clip(second, "blue")
+    assert first.read_bytes() != second.read_bytes()
+    media_root = tmp_path / "shared-media"
+    ports = []
+    for _ in range(2):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        assert port not in ports
+        ports.append(port)
+    env = {
+        **os.environ,
+        "VIDEO_USE_MEDIA_ROOT": str(media_root),
+        "VIDEO_USE_UPSTREAM_ROOT": str(tmp_path / "upstream"),
+        "VIDEO_USE_WORKERS": "1",
+    }
+    processes = []
+    try:
+        for port in ports:
+            process = subprocess.Popen([
+                sys.executable, "-m", "uvicorn", "app.main:app",
+                "--host", "127.0.0.1", "--port", str(port),
+                "--log-level", "error", "--no-access-log",
+            ], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            processes.append(process)
+        for port, process in zip(ports, processes):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                assert process.poll() is None, "Uvicorn child unexpectedly exited"
+                try:
+                    if httpx.get(
+                        f"http://127.0.0.1:{port}/openapi.json", timeout=0.5
+                    ).status_code == 200:
+                        break
+                except httpx.RequestError:
+                    time.sleep(0.1)
+            else:
+                raise AssertionError("Uvicorn process did not become ready")
+
+        def upload(port, idem_key, path):
+            body = path.read_bytes()
+            return httpx.post(
+                f"http://127.0.0.1:{port}/media",
+                data={"projectId": "ci-shared-posix"},
+                files={"file": ("generated.mp4", body, "video/mp4")},
+                headers={
+                    "Idempotency-Key": idem_key,
+                    "X-Content-SHA256": hashlib.sha256(body).hexdigest(),
+                },
+                timeout=25,
+            )
+
+        for i in range(3):
+            idem_key = f"cross-process-same-key-{i}"
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                a = executor.submit(upload, ports[0], idem_key, first)
+                b = executor.submit(upload, ports[1], idem_key, second)
+                response_a, response_b = a.result(timeout=35), b.result(timeout=35)
+            assert sorted([response_a.status_code, response_b.status_code]) == [201, 409], (
+                response_a.text, response_b.text
+            )
+            winner = first if response_a.status_code == 201 else second
+            winning_response = response_a if response_a.status_code == 201 else response_b
+            media_id = winning_response.json()["mediaId"]
+            stored = list(
+                (media_root / "projects" / "ci-shared-posix" / "media").glob(
+                    f"{media_id}.*"
+                )
+            )
+            assert len(stored) == 1
+            assert stored[0].read_bytes() == winner.read_bytes()
+            loser_port = ports[1] if response_a.status_code == 201 else ports[0]
+            replay = upload(loser_port, idem_key, winner)
+            assert replay.status_code == 201, replay.text
+            assert replay.json()["idempotentReplay"] is True
+            assert stored[0].read_bytes() == winner.read_bytes()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+
+
+def test_render_executor_submission_rejection_fails_closed(tmp_path):
+    """Synthetic failure: durable queued job must not be presented as running."""
+    import json
+
+    class RejectingExecutor:
+        calls = 0
+
+        def submit(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("synthetic rejected hand-off")
+
+    pool = RejectingExecutor()
+    media_root = tmp_path / "media"
+    payload = {
+        "projectId": "fake-project-a",
+        "requestId": "fake-render-submit-failure",
+        "canonicalTimeline": {
+            "version": "1.1",
+            "duration": {"value": 1, "timescale": 1},
+            "output": {
+                "width": 1280,
+                "height": 720,
+                "fps": {"value": 24, "timescale": 1},
+                "backgroundColor": "black",
+            },
+            "materials": [],
+            "tracks": [
+                {"id": "subtitles", "type": "subtitle", "order": 0, "clips": []}
+            ],
+        },
+    }
+    app = create_app(
+        media_root=media_root,
+        upstream_root=tmp_path / "upstream",
+        executor=pool,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        failure = client.post("/renders", json=payload)
+        assert failure.status_code == 409, failure.text
+        first = client.get("/jobs/fake-render-submit-failure")
+        assert first.status_code == 200
+        assert first.json()["status"] == "failed"
+        assert first.json()["retryable"] is False
+        assert "UNKNOWN" in first.json()["message"]
+        replay = client.post("/renders", json=payload)
+        assert replay.status_code == 202
+        assert replay.json()["status"] == "failed"
+        assert pool.calls == 1
+        changed_project = dict(payload, projectId="fake-project-b")
+        denied = client.post("/renders", json=changed_project)
+        assert denied.status_code == 409
+        assert pool.calls == 1
+    persisted = json.loads(
+        (media_root / "jobs" / "fake-render-submit-failure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted["status"] == "failed"
+    assert persisted["retryable"] is False
+    assert persisted["artifact"] is None
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload", "kind"),
+    [
+        ("/transcriptions", {"projectId": "fake-project-a", "mediaId": "fake-input", "language": "en"}, "transcription"),
+        ("/timeline-views", {"projectId": "fake-project-a", "mediaId": "fake-input", "start": 0, "end": 1}, "timeline-view"),
+    ],
+)
+def test_auxiliary_executor_submission_rejection_fails_closed(
+    tmp_path, monkeypatch, endpoint, payload, kind
+):
+    """FAKE-only: a refused Sidecar hand-off cannot leave a durable QUEUED job."""
+    import json
+
+    from app.main import MediaStore
+
+    class RejectingExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def submit(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("synthetic auxiliary executor refusal")
+
+    # No real media, helper, generation Provider, network or billable work.
+    monkeypatch.setattr(
+        MediaStore,
+        "find_media",
+        lambda _self, _project_id, _media_id: tmp_path / "synthetic.mp4",
+    )
+    pool = RejectingExecutor()
+    media_root = tmp_path / "media"
+    app = create_app(media_root=media_root, upstream_root=tmp_path / "upstream", executor=pool)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(endpoint, json=payload)
+        assert response.status_code == 409, response.text
+        assert "UNKNOWN" in response.text
+        assert pool.calls == 1
+        job_files = list((media_root / "jobs").glob("*.json"))
+        assert len(job_files) == 1
+        persisted = json.loads(job_files[0].read_text(encoding="utf-8"))
+        assert persisted["kind"] == kind
+        assert persisted["projectId"] == payload["projectId"]
+        assert persisted["status"] == "failed"
+        assert persisted["retryable"] is False
+        assert "UNKNOWN" in persisted["message"]
+        assert persisted["artifact"] is None
+        lookup = client.get("/jobs/" + persisted["jobId"])
+        assert lookup.status_code == 200
+        assert lookup.json()["status"] == "failed"
+        assert lookup.json()["retryable"] is False
+
+
+@pytest.mark.parametrize("stalled_status", ["queued", "processing"])
+def test_jobstore_restart_unknown_requires_manual_reconciliation(tmp_path, stalled_status):
+    """FAKE-only crash: restart must not silently re-run a possibly accepted job."""
+    from app.main import JobStore
+
+    media_root = tmp_path / "fake-media"
+    original = JobStore(media_root)
+    first, should_execute = original.create_or_get(
+        "fake-project-a", "render", "fake-unknown-restart"
+    )
+    assert should_execute is True
+    if stalled_status == "processing":
+        original.update(first["jobId"], status="processing", progress=30)
+
+    restarted = JobStore(media_root)
+    held = restarted.get(first["jobId"])
+    assert held["status"] == "failed"
+    assert held["retryable"] is False
+    assert "UNKNOWN" in held["message"]
+    assert held["projectId"] == "fake-project-a"
+    replay, should_execute = restarted.create_or_get(
+        "fake-project-a", "render", first["jobId"]
+    )
+    assert should_execute is False
+    assert replay["status"] == "failed"
+    with pytest.raises(ValueError, match="another job"):
+        restarted.create_or_get("fake-project-b", "render", first["jobId"])
+    persisted = JobStore(media_root).get(first["jobId"])
+    assert persisted["retryable"] is False
+
+
+def test_jobstore_legacy_restart_retry_marker_fails_closed(tmp_path):
+    """Prior durable restart marker must not authorize automatic replay."""
+    from app.main import JobStore
+
+    media_root = tmp_path / "fake-media"
+    original = JobStore(media_root)
+    first, _ = original.create_or_get("fake-project-a", "render", "legacy-restart")
+    original.update(
+        first["jobId"],
+        status="failed",
+        progress=100,
+        retryable=True,
+        message="渲染服务重启导致任务中断，可以安全重试",
+    )
+    restarted = JobStore(media_root)
+    held = restarted.get(first["jobId"])
+    assert held["status"] == "failed"
+    assert held["retryable"] is False
+    assert "UNKNOWN" in held["message"]
+    replay, should_execute = restarted.create_or_get(
+        "fake-project-a", "render", first["jobId"]
+    )
+    assert should_execute is False
+    assert replay["status"] == "failed"
+
+
+def test_render_same_request_id_changed_payload_fails_closed_before_redispatch(tmp_path):
+    """FAKE-only: requestId must identify one exact render contract, even after restart."""
+    import json
+
+    class RejectingExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def submit(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("synthetic handoff refusal")
+
+    payload = {
+        "projectId": "fake-fingerprint-project",
+        "requestId": "fake-fingerprint-render",
+        "canonicalTimeline": {
+            "version": "1.1",
+            "duration": {"value": 1, "timescale": 1},
+            "output": {
+                "width": 1280,
+                "height": 720,
+                "fps": {"value": 24, "timescale": 1},
+                "backgroundColor": "black",
+            },
+            "materials": [],
+            "tracks": [
+                {"id": "subtitle", "type": "subtitle", "order": 0, "clips": []}
+            ],
+        },
+    }
+    media_root = tmp_path / "media"
+    pool = RejectingExecutor()
+    app = create_app(media_root=media_root, upstream_root=tmp_path / "upstream", executor=pool)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        first = client.post("/renders", json=payload)
+        assert first.status_code == 409, first.text
+        same = client.post("/renders", json=payload)
+        assert same.status_code == 202, same.text
+        assert same.json()["status"] == "failed"
+        changed_timeline = json.loads(json.dumps(payload))
+        changed_timeline["canonicalTimeline"]["duration"]["value"] = 2
+        assert client.post("/renders", json=changed_timeline).status_code == 409
+        changed_mode = dict(payload, mode="final")
+        assert client.post("/renders", json=changed_mode).status_code == 409
+        assert pool.calls == 1
+
+    restarted = create_app(media_root=media_root, upstream_root=tmp_path / "upstream", executor=pool)
+    with TestClient(restarted, raise_server_exceptions=False) as client:
+        assert client.post("/renders", json=payload).status_code == 202
+        assert client.post("/renders", json=changed_timeline).status_code == 409
+        assert pool.calls == 1

@@ -114,11 +114,11 @@ def proxy_stats() -> dict:
     return response.json()
 
 
-def arm_proxy(mode: str, project_id: str) -> dict:
+def arm_proxy(mode: str, project_id: str, *, failures: int = 3) -> dict:
     response = proxy_request(
         "POST",
         "/__fault/arm",
-        json={"mode": mode, "projectId": project_id, "failures": 3},
+        json={"mode": mode, "projectId": project_id, "failures": failures},
     )
     assert response.status_code == 200, response.text[:300]
     payload = response.json()
@@ -173,7 +173,9 @@ def create_fake_task(client: httpx.Client, mode: str) -> tuple[str, str, int]:
     # Arm only after all setup/preflight work. The proxy additionally matches
     # the multipart projectId, so another project's upload cannot consume this
     # task's bounded three-request fault plan.
-    arm_proxy(mode, project_id)
+    # A lost ACK is ambiguous; the adapter now makes exactly one outbound
+    # upload attempt. Keep fault injection scoped to that single dispatch.
+    arm_proxy(mode, project_id, failures=1)
     created = client.post(base, json=payload)
     assert created.status_code == 202, f"{mode} create={created.status_code} {created.text[:300]}"
     task_id = created.json()["taskId"]
@@ -630,26 +632,26 @@ def main() -> None:
     committed = committed_orphan["proxy"]
     pre_storage = pre_storage_failure["proxy"]
     assert committed["mode"] == "forward_then_drop_ack"
-    assert committed["arm_attempts"] == 3
-    assert committed["arm_forwarded"] == 3
-    assert committed["arm_dropped_success"] == 3
-    assert committed["arm_upstream_statuses"] == [201, 201, 201]
-    assert committed["arm_replay_flags"] == [False, True, True]
+    assert committed["arm_attempts"] == 1
+    assert committed["arm_forwarded"] == 1
+    assert committed["arm_dropped_success"] == 1
+    assert committed["arm_upstream_statuses"] == [201]
+    assert committed["arm_replay_flags"] == [False]
     assert len(set(committed["arm_media_ids"])) == 1
     assert committed["arm_media_ids"][0] == committed_orphan["mediaId"]
-    assert committed["arm_replay_flags"] == [False, True, True]
+    assert committed["arm_replay_flags"] == [False]
     assert committed["project_id"] == committed_orphan["projectId"]
-    assert committed["arm_matched_project_ids"] == [committed_orphan["projectId"]] * 3
+    assert committed["arm_matched_project_ids"] == [committed_orphan["projectId"]]
 
     assert pre_storage["mode"] == "fail_before_forward"
-    assert pre_storage["arm_attempts"] == 3
+    assert pre_storage["arm_attempts"] == 1
     assert pre_storage["arm_forwarded"] == 0
     assert pre_storage["arm_dropped_success"] == 0
     assert pre_storage["arm_upstream_statuses"] == []
     assert pre_storage["arm_media_ids"] == []
     assert pre_storage["arm_replay_flags"] == []
     assert pre_storage["project_id"] == pre_storage_failure["projectId"]
-    assert pre_storage["arm_matched_project_ids"] == [pre_storage_failure["projectId"]] * 3
+    assert pre_storage["arm_matched_project_ids"] == [pre_storage_failure["projectId"]]
     assert proxy["armed"] is False and proxy["remaining"] == 0
 
     evidence = {
@@ -662,8 +664,8 @@ def main() -> None:
             "realProviderCalls": 0,
         },
         "command": "python /tmp/g70-g71-worker-transfer-failure-smoke.py",
-        "adapterRetries": 2,
-        "requestsPerFaultPlan": 3,
+        "adapterRetries": 0,
+        "requestsPerFaultPlan": 1,
         "commitThenLostAck": committed_orphan,
         "preStorageFailure": pre_storage_failure,
         "concurrentProjectScope": {

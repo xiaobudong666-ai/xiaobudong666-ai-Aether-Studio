@@ -12,6 +12,7 @@ from app.main import (
     attest_worker_provider,
     initialize_worker,
     process_generation_task,
+    private_canary_policy_valid,
 )
 from app.moneyprinter_adapter import ADAPTER_VERSION, UPSTREAM_PIN, MoneyPrinterTurboAdapter
 
@@ -48,6 +49,40 @@ def queue_mock():
     queue.heartbeat.return_value = {"leaseExpiresAt": "later"}
     queue.artifact_intake.return_value = {"taskId": "generation-1", "status": "RIGHTS_BLOCKED"}
     return queue
+
+
+@pytest.mark.parametrize("malformed_request", [
+    ["legacy-claim"], "legacy-string", 123,
+])
+def test_g72_worker_rejects_nonobject_fake_claim_without_submission(
+    monkeypatch, malformed_request,
+):
+    """FAKE-ONLY G72: invalid claim JSON must not crash Worker or submit work."""
+    from app.deterministic_fake_adapter import DeterministicFakeAdapter
+    from app.deterministic_fake_talking_head_adapter import (
+        DeterministicFakeTalkingHeadAdapter,
+    )
+
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "deterministic-fake")
+    queue = queue_mock()
+    generator = DeterministicFakeAdapter()
+    generator.generate_video = MagicMock(side_effect=AssertionError("unexpected fake submission"))
+    current = components(MagicMock(), queue)
+    current.talking_head_fake = DeterministicFakeTalkingHeadAdapter(generator)
+    current.talking_head = MagicMock()
+
+    result = process_generation_task(
+        current,
+        claimed_task(providerMode="talking-head-fake", request=malformed_request),
+        poll_interval=0,
+    )
+    assert result["status"] == "FAILED"
+    assert result["error_code"] == "FAKE_TALKING_HEAD_SCOPE_INVALID"
+    assert result["retryable"] is False
+    queue.transition.assert_called_once()
+    queue.artifact_intake.assert_not_called()
+    generator.generate_video.assert_not_called()
+    current.talking_head.submit.assert_not_called()
 
 
 def test_runtime_disabled_never_calls_provider():
@@ -330,3 +365,60 @@ def test_worker_stops_without_overwriting_queue_governance(code, expected_status
     }
     queue.transition.assert_not_called()
     provider.get_task_status.assert_not_called()
+
+@pytest.mark.parametrize(("policy_field", "bad_value"), [
+    ("maxArtifactBytes", "bad-number"), ("maxArtifactBytes", None),
+    ("maxArtifactBytes", False), ("maxArtifactBytes", 0),
+    ("maxArtifactBytes", -1), ("maxArtifactBytes", []),
+    ("maxArtifactBytes", {}),
+    # Values which int(...) used to coerce must never qualify a live canary.
+    ("enabledIntent", "false"), ("enabledIntent", 1),
+    ("concurrentTaskLimit", True), ("concurrentTaskLimit", "1"),
+    ("concurrentTaskLimit", 1.9),
+    ("monthlyRequestLimit", True), ("monthlyRequestLimit", "1"),
+    ("monthlyGeneratedSecondsLimit", "10"),
+    ("monthlyGeneratedSecondsLimit", 9.9),
+    ("maxClipDurationSeconds", "10"), ("maxClipDurationSeconds", 5.9),
+    ("maxOutputs", True), ("maxOutputs", "1"),
+])
+def test_g73_worker_corrupt_canary_policy_refused_before_provider_call(
+    monkeypatch, policy_field, bad_value,
+):
+    """Second fence rejects a poisoned claim without a Provider request."""
+    monkeypatch.setenv("AETHER_GENERATION_PROVIDER_MODE", "moneyprinter")
+    monkeypatch.setenv("AETHER_GENERATION_CONFIG_VERSION_ID", "config-1")
+    monkeypatch.setenv("AETHER_GENERATION_POLICY_HASH", "a" * 64)
+    monkeypatch.setenv("AETHER_GENERATION_CREDENTIAL_STATE", "PRESENT")
+    monkeypatch.setenv("AETHER_GENERATION_NETWORK_ISOLATION", "ENFORCED")
+    monkeypatch.setenv("AETHER_GENERATION_CANARY_PROFILE", "private-one-task-v1")
+    provider = MoneyPrinterTurboAdapter(api_url="http://moneyprinter-sidecar:8080")
+    provider.generate_video = MagicMock()
+    queue = queue_mock()
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=2)
+    policy = {
+        "enabledIntent": True, "concurrentTaskLimit": 1,
+        "monthlyRequestLimit": 1, "monthlyGeneratedSecondsLimit": 10,
+        "maxClipDurationSeconds": 10, "maxOutputs": 1,
+        "artifactPathPrefixes": ["/tasks/"], "maxArtifactBytes": 1024,
+    }
+    policy[policy_field] = bad_value
+    assert private_canary_policy_valid(policy) is False
+    task = claimed_task(
+        providerMode="moneyprinter", configVersionId="config-1",
+        policyHash="a" * 64, providerPolicy=policy,
+        workerProof={
+            "expiresAt": expires.isoformat().replace("+00:00", "Z"),
+            "adapterVersion": ADAPTER_VERSION, "upstreamPin": UPSTREAM_PIN,
+            "credentialState": "PRESENT", "networkIsolation": "ENFORCED",
+            "canaryProfile": "private-one-task-v1",
+        },
+    )
+    result = process_generation_task(components(provider, queue), task, poll_interval=0)
+    assert result["error_code"] == "WORKER_PROOF_MISMATCH"
+    provider.generate_video.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_root", [["corrupt-policy"], "legacy-policy", 1])
+def test_g73_worker_rejects_nonobject_claim_policy_root(bad_root):
+    """Claim-provided policy JSON root must never be coercible to an active canary."""
+    assert private_canary_policy_valid(bad_root) is False

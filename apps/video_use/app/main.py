@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -208,12 +210,21 @@ class JobStore:
         for path in (root / "jobs").glob("*.json"):
             try:
                 payload = json.loads(path.read_text())
-                if payload.get("status") in {"queued", "processing"}:
+                # After a restart the Worker/Provider hand-off might have
+                # happened. Neither a QUEUED/PROCESSING snapshot nor an old
+                # restart marker is proof that replay is safe.
+                was_interrupted = payload.get("status") in {"queued", "processing"}
+                legacy_unsafe_retry = (
+                    payload.get("status") == "failed"
+                    and payload.get("retryable") is True
+                    and payload.get("message") == "渲染服务重启导致任务中断，可以安全重试"
+                )
+                if was_interrupted or legacy_unsafe_retry:
                     payload.update(
                         status="failed",
                         progress=100,
-                        message="渲染服务重启导致任务中断，可以安全重试",
-                        retryable=True,
+                        message="Sidecar任务重启后执行结果 UNKNOWN；须人工核验后再决定是否重试",
+                        retryable=False,
                         updatedAt=utc_now(),
                     )
                     self._persist(payload)
@@ -230,6 +241,7 @@ class JobStore:
         project_id: str,
         kind: str,
         job_id: str | None = None,
+        request_hash: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         job_id = job_id or str(uuid.uuid4())
         with self._lock:
@@ -237,6 +249,11 @@ class JobStore:
             if existing is not None:
                 if existing.get("projectId") != project_id or existing.get("kind") != kind:
                     raise ValueError("requestId is already bound to another job")
+                # A render idempotency key binds the entire validated request,
+                # not just its project and job type. Legacy records without an
+                # immutable digest are not authority to reuse an output.
+                if request_hash is not None and existing.get("requestHash") != request_hash:
+                    raise ValueError("requestId is already bound to different render inputs")
                 if existing.get("status") != "failed" or not existing.get("retryable"):
                     return dict(existing), False
             payload = {
@@ -251,6 +268,8 @@ class JobStore:
                 "artifact": None,
                 "retryable": False,
             }
+            if request_hash is not None:
+                payload["requestHash"] = request_hash
             self._jobs[job_id] = payload
             self._persist(payload)
         return dict(payload), True
@@ -785,6 +804,14 @@ def create_app(
                         )
                     if matches:
                         existing = matches[0]
+                        # An idempotent replay must preserve the original media
+                        # extension as well as its bytes. Reusing the same key
+                        # with a different suffix changes the media contract.
+                        if existing.suffix.lower() != suffix:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Idempotency key was already used for different media parameters",
+                            )
                         if sha256_file(existing) != actual_sha256:
                             raise HTTPException(
                                 status_code=409,
@@ -799,11 +826,37 @@ def create_app(
                 else:
                     temporary.replace(destination)
 
+                # The durable generation artifact is named by project/task
+                # idempotency, not multipart metadata. Keep this hardening
+                # strictly within the internal generation: path; regular
+                # user uploads and other idempotent clients retain their API.
+                canonical_generation_receipt = bool(
+                    idempotency_key and idempotency_key.startswith("generation:")
+                )
+                generation_key_suffix = (
+                    idempotency_key.removeprefix("generation:")
+                    if canonical_generation_receipt else ""
+                )
+                # The API normally names generated files generation-{taskId}.mp4.
+                # Preserve that human-readable name across replays without
+                # trusting the current multipart filename; an invalid legacy
+                # key falls back to the durable MediaStore filename.
+                canonical_generation_name = (
+                    f"generation-{generation_key_suffix}{suffix}"
+                    if generation_key_suffix and IDENTIFIER.fullmatch(generation_key_suffix)
+                    else destination.name
+                )
                 return {
                     "mediaId": media_id,
                     "projectId": projectId,
-                    "fileName": filename or destination.name,
-                    "contentType": file.content_type,
+                    "fileName": (
+                        canonical_generation_name if canonical_generation_receipt
+                        else (filename or destination.name)
+                    ),
+                    "contentType": (
+                        mimetypes.guess_type(destination.name)[0] or "application/octet-stream"
+                        if canonical_generation_receipt else file.content_type
+                    ),
                     "mediaType": media_type,
                     "metadata": metadata,
                     "idempotentReplay": idempotent_replay,
@@ -815,8 +868,25 @@ def create_app(
                 await file.close()
 
         if idempotency_key is not None:
+            # asyncio.Lock covers only this ASGI instance. A shared POSIX
+            # media directory also needs an OS-released, cross-process fence
+            # around the idempotency lookup and final atomic replace.
+            # Locking the directory inode does not mutate stored media.
             async with upload_idempotency_lock:
-                return await persist_upload()
+                media_dir_fd = os.open(media_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    while True:
+                        try:
+                            fcntl.flock(media_dir_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            await asyncio.sleep(0.02)
+                    try:
+                        return await persist_upload()
+                    finally:
+                        fcntl.flock(media_dir_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(media_dir_fd)
         return await persist_upload()
 
     @app.get("/media/{project_id}/{media_id}")
@@ -874,13 +944,74 @@ def create_app(
                     except FileNotFoundError as exc:
                         raise HTTPException(status_code=404, detail=f"未找到媒体文件：{clip.materialId}") from exc
         try:
-            job, should_execute = jobs.create_or_get(request.projectId, "render", request.requestId)
+            # The same requestId must never return a different render's output
+            # after retry, restart or a lost hand-off ACK. Hash the validated
+            # full render contract (including timeline, mode and audio policy).
+            render_contract = json.dumps(
+                request.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            render_hash = hashlib.sha256(render_contract.encode("utf-8")).hexdigest()
+            job, should_execute = jobs.create_or_get(
+                request.projectId, "render", request.requestId, request_hash=render_hash
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not should_execute:
             return job
-        pool.submit(execute_render, job, request)
+        try:
+            pool.submit(execute_render, job, request)
+        except Exception as exc:
+            # The reservation may already be durable, but the hand-off outcome
+            # is uncertain. Never silently reuse QUEUED as proof of execution.
+            logger.exception("Render executor hand-off UNKNOWN for job %s", job["jobId"])
+            try:
+                jobs.update(
+                    job["jobId"],
+                    status="failed",
+                    progress=100,
+                    retryable=False,
+                    message="渲染派发结果 UNKNOWN；须人工核验后再决定是否重试",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist render hand-off UNKNOWN for job %s",
+                    job["jobId"],
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Render executor hand-off UNKNOWN; manual reconciliation required",
+            ) from exc
         return job
+
+    def submit_auxiliary_or_fail_closed(job: dict[str, Any], handler, request) -> None:
+        """Keep durable auxiliary jobs out of QUEUED after an uncertain hand-off."""
+        try:
+            pool.submit(handler, job, request)
+        except Exception as exc:
+            logger.exception(
+                "Auxiliary %s executor hand-off UNKNOWN for job %s",
+                job["kind"], job["jobId"],
+            )
+            try:
+                jobs.update(
+                    job["jobId"],
+                    status="failed",
+                    progress=100,
+                    retryable=False,
+                    message="Sidecar任务派发结果 UNKNOWN；须人工核验后再决定是否重试",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist auxiliary hand-off UNKNOWN for job %s",
+                    job["jobId"],
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Sidecar executor hand-off UNKNOWN; manual reconciliation required",
+            ) from exc
 
     @app.post("/transcriptions", status_code=status.HTTP_202_ACCEPTED)
     def create_transcription(request: TranscriptionJobRequest):
@@ -889,7 +1020,7 @@ def create_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         job = jobs.create(request.projectId, "transcription")
-        pool.submit(execute_transcription, job, request)
+        submit_auxiliary_or_fail_closed(job, execute_transcription, request)
         return job
 
     @app.post("/timeline-views", status_code=status.HTTP_202_ACCEPTED)
@@ -899,7 +1030,7 @@ def create_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         job = jobs.create(request.projectId, "timeline-view")
-        pool.submit(execute_timeline_view, job, request)
+        submit_auxiliary_or_fail_closed(job, execute_timeline_view, request)
         return job
 
     @app.get("/jobs/{job_id}")

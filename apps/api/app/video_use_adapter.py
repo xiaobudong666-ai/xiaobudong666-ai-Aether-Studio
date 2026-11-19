@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, BinaryIO, Iterator
 from urllib.parse import quote
 
 import httpx
+
+
+# Matches the native video-use validate_identifier() contract.  Never permit
+# a persisted/Provider-supplied identifier to alter the internal HTTP route.
+_SIDECAR_IDENTIFIER = r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+_ALLOWED_MEDIA_STREAM = re.compile(
+    rf"/media/{_SIDECAR_IDENTIFIER}/{_SIDECAR_IDENTIFIER}"
+)
+_ALLOWED_JOB_ARTIFACT_STREAM = re.compile(
+    rf"/jobs/{_SIDECAR_IDENTIFIER}/artifact"
+)
 
 
 class VideoUseError(RuntimeError):
@@ -40,7 +52,14 @@ class VideoUseAdapter:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        # A Sidecar POST may have committed its operation before an ambiguous
+        # timeout/5xx response. /media persists bytes; /renders creates jobs;
+        # /transcriptions may invoke a paid provider; /timeline-views creates
+        # work. Request identifiers alone do not prove a lost ACK is safe to
+        # replay. Keep retries for reads, but dispatch mutating POSTs only once.
+        # Callers must reconcile uncertain outcomes instead of auto-replaying.
+        retry_budget = 0 if method.upper() == "POST" else self.max_retries
+        for attempt in range(retry_budget + 1):
             files = kwargs.get("files")
             if isinstance(files, dict):
                 for part in files.values():
@@ -65,7 +84,7 @@ class VideoUseAdapter:
                 )
             except httpx.HTTPError as exc:
                 last_error = VideoUseConnectionError(f"video-use request failed: {exc}")
-            if attempt < self.max_retries:
+            if attempt < retry_budget:
                 time.sleep(self.backoff_factor * (2**attempt))
         assert last_error is not None
         raise last_error
@@ -146,6 +165,16 @@ class VideoUseAdapter:
         path: str,
         headers: dict[str, str] | None = None,
     ) -> Iterator[httpx.Response]:
+        # A queued render stores an upstreamJobId returned by a separate
+        # process. A forged legacy identifier containing '/', '?', '#' or
+        # percent-escapes must not steer an authenticated proxy request to a
+        # different private video-use endpoint. Check the *whole* route,
+        # matching the existing sidecar's identifier rules, before HTTP.
+        if not (
+            _ALLOWED_MEDIA_STREAM.fullmatch(path)
+            or _ALLOWED_JOB_ARTIFACT_STREAM.fullmatch(path)
+        ):
+            raise VideoUseError("video-use stream path contains invalid identifiers")
         try:
             with httpx.Client(timeout=None, trust_env=False) as client:
                 with client.stream(

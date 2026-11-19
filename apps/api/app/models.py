@@ -302,6 +302,29 @@ class DBGenerationProviderEvent(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, index=True)
 
 
+class DBDirectMediaUploadHold(Base):
+    """FAKE-only durable evidence that a direct-media storage debit may exist.
+
+    HELD means unknown until independent Owner-authorized reconciliation;
+    SETTLED is written in the same transaction as the asset and project edit.
+    A row is not an independently signed Sidecar receipt or refund approval.
+    """
+
+    __tablename__ = "direct_media_upload_holds"
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False, index=True)
+    requested_by = Column(String, ForeignKey("users.id"), nullable=False)
+    project_revision = Column(Integer, nullable=False)
+    source_sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False)
+    state = Column(String, nullable=False, index=True)
+    media_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class DBAssetVersion(Base):
     __tablename__ = "asset_versions"
     __table_args__ = (

@@ -66,12 +66,12 @@ async def arm(request: Request) -> dict[str, Any]:
     )
     if (
         mode not in {"fail_before_forward", "forward_then_drop_ack"}
-        or failures != 3
+        or failures not in {1, 3}
         or not safe_project_id
     ):
         raise HTTPException(
             status_code=422,
-            detail="Only bounded three-request FAKE-only plans with a valid projectId are allowed",
+            detail="Only bounded one- or three-request FAKE-only plans with a valid projectId are allowed",
         )
     async with _lock:
         if _state["armed"] or _state["remaining"]:
