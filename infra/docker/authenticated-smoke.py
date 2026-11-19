@@ -121,9 +121,39 @@ def run_smoke(ffmpeg: str, ffprobe: str, source: Path, artifact: Path) -> None:
         artifact_path = str(completed["artifactUrl"])
         if BASE_URL.endswith("/api") and artifact_path.startswith("/api/"):
             artifact_path = artifact_path.removeprefix("/api")
+        # Missing EXPORT rights must fail closed even for a completed render;
+        # the CI source grant below is synthetic nonproduction evidence only.
+        unauthorized = client.get(artifact_path)
+        if unauthorized.status_code != 403:
+            raise RuntimeError(f"Direct download without EXPORT rights was not denied: {unauthorized.status_code}")
+        if unauthorized.json().get("detail", {}).get("code") != "RIGHTS_CHECK_FAILED":
+            raise RuntimeError("Direct artifact rights failure has the wrong error code")
+        source_asset_id = uploaded["assetVersion"]["id"]
+        rights_path = f"/projects/{project['id']}/asset-versions/{source_asset_id}/rights-snapshots"
+        response_json(client.post(
+            rights_path,
+            headers=csrf,
+            json={
+                "status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL",
+                "evidenceRef": "evidence://ci-nonproduction-source-export",
+            },
+        ))
         download = client.get(artifact_path)
         download.raise_for_status()
         artifact.write_bytes(download.content)
+        # Revocation after a successful render must also block Range access;
+        # never change application policy to force legacy smoke success.
+        response_json(client.post(
+            rights_path,
+            headers=csrf,
+            json={
+                "status": "REVOKED", "purpose": "EXPORT", "territory": "GLOBAL",
+                "evidenceRef": "evidence://ci-nonproduction-source-revocation",
+            },
+        ))
+        revoked = client.get(artifact_path, headers={"Range": "bytes=0-2"})
+        if revoked.status_code != 403:
+            raise RuntimeError(f"Revoked render artifact remained downloadable: {revoked.status_code}")
         metadata = json.loads(
             subprocess.run(  # noqa: S603 - executable and argv are controlled by this CI script
                 [
