@@ -932,7 +932,29 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not should_execute:
             return job
-        pool.submit(execute_render, job, request)
+        try:
+            pool.submit(execute_render, job, request)
+        except Exception as exc:
+            # The reservation may already be durable, but the hand-off outcome
+            # is uncertain. Never silently reuse QUEUED as proof of execution.
+            logger.exception("Render executor hand-off UNKNOWN for job %s", job["jobId"])
+            try:
+                jobs.update(
+                    job["jobId"],
+                    status="failed",
+                    progress=100,
+                    retryable=False,
+                    message="渲染派发结果 UNKNOWN；须人工核验后再决定是否重试",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist render hand-off UNKNOWN for job %s",
+                    job["jobId"],
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Render executor hand-off UNKNOWN; manual reconciliation required",
+            ) from exc
         return job
 
     @app.post("/transcriptions", status_code=status.HTTP_202_ACCEPTED)
