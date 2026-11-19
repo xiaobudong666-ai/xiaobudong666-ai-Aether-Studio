@@ -1461,3 +1461,81 @@ def test_g70_g71_render_retryable_worker_failure_becomes_unknown_not_queued(api_
         assert task.lease_owner is None and task.lease_expires_at is None
     finally:
         db.close()
+
+
+def test_g70_g71_worker_update_rejects_expired_lease_and_upstream_id_rebind(api_context):
+    """FAKE-only DB: stale callbacks and changed Sidecar IDs cannot alter tasks."""
+    client, sessions = api_context
+    project = create_project(client, "FAKE Worker lease and immutable receipt")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    db = sessions()
+    try:
+        owner = db.query(DBUser).filter(DBUser.email == "owner@example.com").one()
+        common = dict(
+            tenant_id=owner.tenant_id, project_id=project["id"],
+            requested_by=owner.id, status="RUNNING", progress=10,
+            message="FAKE render leased", engine="video-use",
+            render_payload={"requestId": "fake-only-lease-fence"},
+            attempts=1, max_attempts=3,
+            reserved_seconds=0, lease_owner="fake-worker",
+            created_at=now, updated_at=now,
+        )
+        db.add(DBRenderTask(
+            id="fake-expired-lease", lease_expires_at=now - datetime.timedelta(seconds=10),
+            upstream_job_id="fake-original-expired-job",
+            **common,
+        ))
+        db.add(DBRenderTask(
+            id="fake-live-lease", lease_expires_at=now + datetime.timedelta(minutes=5),
+            upstream_job_id="fake-original-live-job",
+            **common,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "fake-worker"}
+    attempted_update = {
+        "status": "SUCCEEDED", "progress": 100, "message": "stale completed",
+        "upstreamJobId": "fake-other-job",
+    }
+    expired = client.post(
+        "/internal/render-tasks/fake-expired-lease/update",
+        headers=headers, json=attempted_update,
+    )
+    assert expired.status_code == 409, expired.text
+    assert expired.json()["detail"]["code"] == "LEASE_EXPIRED"
+
+    rebind = client.post(
+        "/internal/render-tasks/fake-live-lease/update",
+        headers=headers, json=attempted_update,
+    )
+    assert rebind.status_code == 409, rebind.text
+    assert rebind.json()["detail"]["code"] == "UPSTREAM_JOB_ID_CONFLICT"
+
+    db = sessions()
+    try:
+        for task_id in ("fake-expired-lease", "fake-live-lease"):
+            task = db.query(DBRenderTask).filter(DBRenderTask.id == task_id).one()
+            assert canonical_task_status(task.status) == "RUNNING"
+            assert task.upstream_job_id == {
+                "fake-expired-lease": "fake-original-expired-job",
+                "fake-live-lease": "fake-original-live-job",
+            }[task_id]
+            assert task.progress == 10
+            assert task.lease_owner == "fake-worker"
+            assert task.completed_at is None
+    finally:
+        db.close()
+
+    # An unexpired Worker with the *same* durable upstream ID can still poll.
+    valid = client.post(
+        "/internal/render-tasks/fake-live-lease/update",
+        headers=headers,
+        json={
+            "status": "RUNNING", "progress": 45, "message": "poll only",
+            "upstreamJobId": "fake-original-live-job",
+        },
+    )
+    assert valid.status_code == 200, valid.text
+    assert valid.json()["canonicalStatus"] == "RUNNING"

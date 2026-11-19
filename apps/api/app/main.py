@@ -5721,13 +5721,33 @@ def create_app(
         db: Session = Depends(db_dependency),
     ):
         require_internal_token(x_worker_token)
-        task = db.execute(select(DBRenderTask).where(DBRenderTask.id == task_id)).scalar_one_or_none()
+        # G70/G71: lock the row before validating a Worker heartbeat/update.
+        # Otherwise recovery or a new claim can race with a stale completion.
+        begin_serialized_write(db)
+        task_query = select(DBRenderTask).where(DBRenderTask.id == task_id)
+        if app_engine.dialect.name != "sqlite":
+            task_query = task_query.with_for_update()
+        task = db.execute(task_query).scalar_one_or_none()
         if task is None:
             raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "未找到该任务"})
         if task.lease_owner != x_worker_id:
             raise HTTPException(status_code=409, detail={"code": "LEASE_LOST", "message": "当前工作节点已失去该任务租约"})
         now = utc_now()
+        # Use a SQL predicate for expiry: SQLite may deserialize datetimes
+        # without tzinfo, while the PostgreSQL column is timezone-aware.
+        live_lease = db.execute(
+            select(DBRenderTask.id).where(
+                DBRenderTask.id == task_id,
+                DBRenderTask.lease_expires_at > now,
+            )
+        ).scalar_one_or_none()
+        if canonical_task_status(task.status) != "RUNNING" or live_lease is None:
+            raise HTTPException(status_code=409, detail={"code": "LEASE_EXPIRED", "message": "任务已结束或租约已过期，禁止迟到回写"})
+        # Once a Sidecar ID has been accepted, a later callback cannot replace
+        # it with a different job (which could attach another task's output).
         if req.upstreamJobId:
+            if task.upstream_job_id and task.upstream_job_id != req.upstreamJobId:
+                raise HTTPException(status_code=409, detail={"code": "UPSTREAM_JOB_ID_CONFLICT", "message": "上游任务身份已绑定，禁止改写"})
             task.upstream_job_id = req.upstreamJobId
         task.progress = req.progress
         task.message = req.message
