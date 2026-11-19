@@ -611,6 +611,21 @@ def test_render_and_sse_emit_real_task_progress_event(api_context):
     assert '"status":"completed"' in completed_snapshot.text
     persisted = client.get(f"/render-tasks?projectId={project['id']}").json()
     assert persisted[0]["status"] == "completed"
+    # A completed task cannot be downloaded before source EXPORT approval.
+    rights_denied = client.get(f"/renders/{task_id}/artifact")
+    assert rights_denied.status_code == 403
+    assert rights_denied.json()["detail"]["code"] == "RIGHTS_CHECK_FAILED"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rights_grant = client.post(
+        f"/projects/{project['id']}/asset-versions/{upload.json()['assetVersion']['id']}/rights-snapshots",
+        json={
+            "status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL",
+            "validFrom": (now - datetime.timedelta(minutes=1)).isoformat(),
+            "validUntil": (now + datetime.timedelta(days=1)).isoformat(),
+            "evidenceRef": "evidence://fake-render-source-export",
+        },
+    )
+    assert rights_grant.status_code == 201, rights_grant.text
     assert client.get(f"/renders/{task_id}/artifact").content == b"media"
     artifact_range = client.get(
         f"/renders/{task_id}/artifact",
@@ -867,7 +882,7 @@ def test_asset_version_hash_rights_window_and_immutability(api_context):
         db.close()
 
 
-def _complete_render_candidate(client: TestClient, project: dict) -> tuple[dict, dict]:
+def _complete_render_candidate(client: TestClient, project: dict, *, include_text_subtitle: bool = False) -> tuple[dict, dict]:
     upload = client.post(
         f"/projects/{project['id']}/media",
         data={"expectedRevision": "1"},
@@ -886,6 +901,18 @@ def _complete_render_candidate(client: TestClient, project: dict) -> tuple[dict,
             }],
         }],
     }
+    if include_text_subtitle:
+        # Text-only subtitle has no physical media ID; video source still does.
+        timeline["tracks"].append({
+            "id": "subtitle", "name": "Subtitles", "type": "subtitle",
+            "clips": [{
+                "id": "subtitle-clip", "trackId": "subtitle", "materialId": "",
+                "start": {"value": 0, "timescale": 24},
+                "duration": {"value": 24, "timescale": 24},
+                "sourceIn": {"value": 0, "timescale": 24},
+                "text": "FAKE-only subtitle text",
+            }],
+        })
     assert client.put(
         f"/projects/{project['id']}",
         json={"timeline": timeline, "expectedRevision": 2},
@@ -911,6 +938,98 @@ def _complete_render_candidate(client: TestClient, project: dict) -> tuple[dict,
     assert len(candidates) == 1
     assert candidates[0]["status"] == "READY"
     return upload, candidates[0]
+
+
+def test_render_artifact_export_rights_revocation_and_missing_provenance(api_context):
+    """FAKE-only: direct artifact download must not bypass adopted EXPORT rules."""
+    client, sessions = api_context
+    project = create_project(client, "FAKE direct export rights fence")
+    upload, _candidate = _complete_render_candidate(client, project)
+    db = sessions()
+    try:
+        task = db.query(DBRenderTask).filter(DBRenderTask.project_id == project["id"]).one()
+        task_id = task.id
+    finally:
+        db.close()
+
+    url = f"/renders/{task_id}/artifact"
+    missing = client.get(url)
+    assert missing.status_code == 403
+    assert missing.json()["detail"]["failures"][0]["code"] == "RIGHTS_MISSING"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    source = f"/projects/{project['id']}/asset-versions/{upload['assetVersion']['id']}/rights-snapshots"
+    granted = client.post(source, json={
+        "status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL",
+        "validFrom": (now - datetime.timedelta(minutes=1)).isoformat(),
+        "validUntil": (now + datetime.timedelta(days=1)).isoformat(),
+        "evidenceRef": "evidence://fake-direct-export-grant",
+    })
+    assert granted.status_code == 201, granted.text
+    assert client.get(url).content == b"media"
+
+    revoked = client.post(source, json={
+        "status": "REVOKED", "purpose": "EXPORT", "territory": "GLOBAL",
+        "evidenceRef": "evidence://fake-export-revocation",
+    })
+    assert revoked.status_code == 201, revoked.text
+    denied = client.get(url, headers={"Range": "bytes=0-2"})
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "RIGHTS_CHECK_FAILED"
+
+    # A malformed durable render payload must not bypass provenance checking.
+    db = sessions()
+    try:
+        task = db.query(DBRenderTask).filter(DBRenderTask.id == task_id).one()
+        task.render_payload = {"canonicalTimeline": {"tracks": []}}
+        db.commit()
+    finally:
+        db.close()
+    malformed = client.get(url)
+    assert malformed.status_code == 403
+    assert malformed.json()["detail"]["failures"][0]["code"] == "RENDER_SOURCE_PROVENANCE_MISSING"
+
+
+
+def test_render_artifact_text_only_subtitle_keeps_media_export_gate(api_context):
+    """A valid text-only subtitle must not be mistaken for missing media provenance."""
+    client, sessions = api_context
+    project = create_project(client, "FAKE subtitle and EXPORT gate")
+    upload, _candidate = _complete_render_candidate(
+        client, project, include_text_subtitle=True,
+    )
+    db = sessions()
+    try:
+        task = db.query(DBRenderTask).filter(DBRenderTask.project_id == project["id"]).one()
+        task_id = task.id
+        tracks = task.render_payload["canonicalTimeline"]["tracks"]
+        assert tracks[1]["type"] == "subtitle"
+        assert tracks[1]["clips"][0]["materialId"] == ""
+    finally:
+        db.close()
+
+    url = f"/renders/{task_id}/artifact"
+    assert client.get(url).status_code == 403
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rights_url = (
+        f"/projects/{project['id']}/asset-versions/"
+        f"{upload['assetVersion']['id']}/rights-snapshots"
+    )
+    grant = client.post(rights_url, json={
+        "status": "ALLOWED", "purpose": "EXPORT", "territory": "GLOBAL",
+        "validFrom": (now - datetime.timedelta(minutes=1)).isoformat(),
+        "validUntil": (now + datetime.timedelta(days=1)).isoformat(),
+        "evidenceRef": "evidence://synthetic-subtitle-export-grant",
+    })
+    assert grant.status_code == 201, grant.text
+    assert client.get(url).content == b"media"
+    assert client.get(url, headers={"Range": "bytes=0-2"}).content == b"med"
+    revoke = client.post(rights_url, json={
+        "status": "REVOKED", "purpose": "EXPORT", "territory": "GLOBAL",
+        "evidenceRef": "evidence://synthetic-subtitle-revoked",
+    })
+    assert revoke.status_code == 201
+    assert client.get(url).status_code == 403
 
 
 def test_upload_image_creates_image_asset_without_fake_video_duration(api_context):

@@ -5557,6 +5557,79 @@ def create_app(
         task = db.execute(select(DBRenderTask).where(DBRenderTask.id == task_id, DBRenderTask.tenant_id == context.tenant_id)).scalar_one_or_none()
         if task is None or canonical_task_status(task.status) != "SUCCEEDED" or not task.upstream_job_id:
             raise HTTPException(status_code=404, detail={"code": "ARTIFACT_NOT_FOUND", "message": "未找到可下载的渲染成片"})
+
+        # G70/G71: adoption checks EXPORT rights, but the direct artifact route
+        # is also a download path. Reuse the existing per-source EXPORT rules
+        # on every request, including after a source's rights are revoked.
+        # A completed render is NOT independently trusted export authorization.
+        render_payload = task.render_payload if isinstance(task.render_payload, dict) else {}
+        timeline = render_payload.get("canonicalTimeline")
+        tracks = timeline.get("tracks") if isinstance(timeline, dict) else None
+        source_ids: set[str] = set()
+        malformed = not isinstance(tracks, list) or not tracks
+        if not malformed:
+            for track in tracks:
+                clips = track.get("clips") if isinstance(track, dict) else None
+                if not isinstance(clips, list):
+                    malformed = True
+                    break
+                for clip in clips:
+                    media_id = clip.get("materialId") if isinstance(clip, dict) else None
+                    # Canonical subtitles may be text-only with materialId="".
+                    # They are not media sources. The actual video/audio clips
+                    # still need current EXPORT evidence; never drop a present
+                    # subtitle materialId from the rights scan.
+                    if isinstance(track, dict) and track.get("type") == "subtitle" and media_id == "":
+                        if not isinstance(clip.get("text"), str) or not clip["text"].strip():
+                            malformed = True
+                            break
+                        continue
+                    if not isinstance(media_id, str) or not media_id:
+                        malformed = True
+                        break
+                    source_ids.add(media_id)
+                if malformed:
+                    break
+
+        failures = []
+        if malformed or not source_ids:
+            failures.append({"code": "RENDER_SOURCE_PROVENANCE_MISSING"})
+        else:
+            for media_id in sorted(source_ids):
+                asset = db.execute(
+                    select(DBAssetVersion)
+                    .where(
+                        DBAssetVersion.project_id == task.project_id,
+                        DBAssetVersion.tenant_id == context.tenant_id,
+                        DBAssetVersion.media_id == media_id,
+                    )
+                    .order_by(DBAssetVersion.version_no.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if asset is None:
+                    failures.append({"mediaId": media_id, "code": "ASSET_VERSION_MISSING"})
+                    continue
+                decision = generated_asset_export_rights(db, asset)
+                if decision is None:
+                    decision = rights_decision(
+                        latest_rights_snapshot(db, asset.id, "EXPORT"), utc_now()
+                    )
+                if not decision.get("allowed"):
+                    failures.append({
+                        "mediaId": media_id,
+                        "assetVersionId": asset.id,
+                        "code": decision.get("code", "RIGHTS_MISSING"),
+                    })
+
+        if failures:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "RIGHTS_CHECK_FAILED",
+                    "message": "渲染产物下载需要当前有效的原始资产 EXPORT 权利证据",
+                    "failures": failures,
+                },
+            )
         return proxy_video_use_stream(f"/jobs/{task.upstream_job_id}/artifact", request, "video/mp4")
 
     @created_app.post("/internal/render-tasks/recover")
