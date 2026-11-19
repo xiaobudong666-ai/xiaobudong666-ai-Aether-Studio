@@ -379,15 +379,17 @@ class JobStore:
             self._assert_no_pending_unlocked(job_id)
             existing = self._read_final_unlocked(job_id)
             if existing is not None:
-                existing = self._recover_abandoned_unlocked(existing)
-                self._jobs[job_id] = existing
+                # Validate the immutable project/kind/input binding BEFORE any
+                # abandoned-owner recovery, which can mutate durable state.
+                # A conflicting tenant or render body is never authorized to
+                # trigger another Owner's UNKNOWN status transition.
                 if existing.get("projectId") != project_id or existing.get("kind") != kind:
                     raise ValueError("requestId is already bound to another job")
-                # A render idempotency key binds the entire validated request,
-                # not just its project and job type. Legacy records without an
-                # immutable digest are not authority to reuse an output.
+                # Legacy records without a digest must not authorize output reuse.
                 if request_hash is not None and existing.get("requestHash") != request_hash:
                     raise ValueError("requestId is already bound to different render inputs")
+                existing = self._recover_abandoned_unlocked(existing)
+                self._jobs[job_id] = existing
                 if existing.get("status") != "failed" or not existing.get("retryable"):
                     return self._public_payload(existing), False
             payload = {
