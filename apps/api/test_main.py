@@ -1258,3 +1258,87 @@ def test_video_use_stream_valid_sidecar_routes_preserve_range(monkeypatch, path)
         assert response.status_code == 206
         assert b"".join(response.iter_bytes()) == b"abc"
     assert seen == [(path, "bytes=0-2")]
+
+
+def test_g70_g71_render_worker_lost_ack_lease_is_never_auto_redispatched(api_context):
+    """FAKE-only native API DB: no durable upstream receipt means quarantine."""
+    client, sessions = api_context
+    project = create_project(client, "FAKE render lost ACK")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    db = sessions()
+    try:
+        owner = db.query(DBUser).filter(DBUser.email == "owner@example.com").one()
+        base = dict(
+            tenant_id=owner.tenant_id, project_id=project["id"],
+            requested_by=owner.id, status="RUNNING", progress=5,
+            message="FAKE Worker submitted; ACK unknown", engine="video-use",
+            render_payload={"requestId": "fake-only-lost-ack"},
+            attempts=1, max_attempts=3, reserved_seconds=0,
+            lease_owner="dead-worker", lease_expires_at=now - datetime.timedelta(minutes=1),
+            created_at=now - datetime.timedelta(minutes=2), updated_at=now,
+        )
+        db.add(DBRenderTask(id="fake-only-lost-ack", upstream_job_id=None, **base))
+        db.commit()
+    finally:
+        db.close()
+
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "another-worker"}
+    # Claim must not bypass /recover and re-submit a historical RUNNING row.
+    assert client.post("/internal/render-tasks/claim", headers=headers).status_code == 204
+    recovered = client.post("/internal/render-tasks/recover", headers=headers)
+    assert recovered.status_code == 200
+    assert "fake-only-lost-ack" in recovered.json()["recoveredTaskIds"]
+    assert client.post("/internal/render-tasks/claim", headers=headers).status_code == 204
+    db = sessions()
+    try:
+        held = db.query(DBRenderTask).filter(DBRenderTask.id == "fake-only-lost-ack").one()
+        assert canonical_task_status(held.status) == "UNKNOWN"
+        assert held.attempts == 1
+        assert held.upstream_job_id is None
+        assert held.lease_owner is None and held.lease_expires_at is None
+        assert held.completed_at is not None
+    finally:
+        db.close()
+
+
+def test_g70_g71_render_retryable_worker_failure_becomes_unknown_not_queued(api_context):
+    """FAKE-only: retryable is not independently trusted rejection evidence."""
+    client, sessions = api_context
+    project = create_project(client, "FAKE render retry fence")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    db = sessions()
+    try:
+        owner = db.query(DBUser).filter(DBUser.email == "owner@example.com").one()
+        db.add(DBRenderTask(
+            id="fake-only-worker-retry", tenant_id=owner.tenant_id,
+            project_id=project["id"], requested_by=owner.id, status="RUNNING",
+            progress=10, message="FAKE Sidecar maybe accepted",
+            engine="video-use", render_payload={"requestId": "fake-only-worker-retry"},
+            upstream_job_id="fake-only-upstream-id", attempts=1, max_attempts=3,
+            reserved_seconds=0, lease_owner="synthetic-worker",
+            lease_expires_at=now + datetime.timedelta(minutes=1),
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "synthetic-worker"}
+    result = client.post(
+        "/internal/render-tasks/fake-only-worker-retry/update",
+        headers=headers,
+        json={"status": "FAILED", "progress": 100,
+              "message": "FAKE ambiguous transport", "retryable": True},
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["canonicalStatus"] == "UNKNOWN"
+    assert client.post("/internal/render-tasks/claim", headers=headers).status_code == 204
+    db = sessions()
+    try:
+        task = db.query(DBRenderTask).filter(DBRenderTask.id == "fake-only-worker-retry").one()
+        assert canonical_task_status(task.status) == "UNKNOWN"
+        assert task.upstream_job_id == "fake-only-upstream-id"
+        assert task.attempts == 1
+        assert task.lease_owner is None and task.lease_expires_at is None
+    finally:
+        db.close()

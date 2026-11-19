@@ -5570,10 +5570,18 @@ def create_app(
         stale = list(db.execute(select(DBRenderTask).where(DBRenderTask.status.in_(database_status_values("RUNNING")), DBRenderTask.lease_expires_at < now)).scalars())
         recovered = []
         for task in stale:
-            task.status = "RUNNING" if task.upstream_job_id else "QUEUED"
+            # A Worker may have submitted the render before losing the upstream
+            # acknowledgement. Without a durable upstream ID, a new dispatch
+            # could duplicate a charged render. Preserve UNKNOWN for Owner review.
+            if task.upstream_job_id:
+                task.status = "RUNNING"
+                task.message = "已记录上游任务，仅允许继续查询，不得重新提交"
+            else:
+                task.status = "UNKNOWN"
+                task.message = "Worker租约到期且缺少可信上游任务回执；须人工核验，禁止自动重派"
+                task.completed_at = now
             task.lease_owner = None
             task.lease_expires_at = None
-            task.message = "工作节点租约过期后已恢复任务"
             task.updated_at = now
             recovered.append(task.id)
         db.commit()
@@ -5592,7 +5600,19 @@ def create_app(
         claim_query = (
             select(DBRenderTask)
             .where(
-                DBRenderTask.status.in_(database_status_values("QUEUED", "RUNNING")),
+                # Existing QUEUED rows that were already leased may represent a
+                # lost submission ACK. Only never-leased work may first submit;
+                # RUNNING work may be resumed solely with a durable upstream ID.
+                or_(
+                    and_(
+                        DBRenderTask.status.in_(database_status_values("QUEUED")),
+                        DBRenderTask.attempts == 0,
+                    ),
+                    and_(
+                        DBRenderTask.status.in_(database_status_values("RUNNING")),
+                        DBRenderTask.upstream_job_id.is_not(None),
+                    ),
+                ),
                 or_(DBRenderTask.lease_expires_at.is_(None), DBRenderTask.lease_expires_at < now),
             )
             .order_by(DBRenderTask.created_at.asc())
@@ -5639,19 +5659,19 @@ def create_app(
         task.progress = req.progress
         task.message = req.message
         task.error = req.error
-        if req.status == "FAILED" and req.retryable and task.attempts < task.max_attempts:
-            task.status = "QUEUED"
-            task.upstream_job_id = None
+        # A retryable Worker failure is not evidence that Sidecar rejected the
+        # original dispatch. Never discard a prior upstream ID or auto-requeue.
+        if req.status == "FAILED" and req.retryable:
+            task.status = "UNKNOWN"
+            task.message = "渲染失败回执不确定；须人工核验，禁止自动重派"
+        else:
+            task.status = req.status
+        if task.status in {"SUCCEEDED", "FAILED", "CANCELED", "PARTIAL", "UNKNOWN"}:
+            task.completed_at = now
             task.lease_owner = None
             task.lease_expires_at = None
         else:
-            task.status = req.status
-            if req.status in {"SUCCEEDED", "FAILED", "CANCELED", "PARTIAL"}:
-                task.completed_at = now
-                task.lease_owner = None
-                task.lease_expires_at = None
-            else:
-                task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
+            task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         task.updated_at = now
         if req.status == "SUCCEEDED":
             existing_candidate = db.execute(

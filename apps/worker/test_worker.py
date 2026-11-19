@@ -165,7 +165,7 @@ def test_worker_claimed_render_is_submitted_polled_and_persisted():
     assert queue.update.call_args.kwargs["upstream_job_id"] == "upstream-1"
 
 
-def test_worker_requeues_transient_video_use_failure():
+def test_worker_unknown_video_use_handoff_never_retries_without_ack():
     queue = MagicMock()
     queue.update.side_effect = lambda _task_id, **values: values
     video_use = MagicMock()
@@ -179,5 +179,30 @@ def test_worker_requeues_transient_video_use_failure():
         {"taskId": "task-retry", "progress": 0, "renderPayload": {"projectId": "p"}},
         poll_interval=0,
     )
-    assert result["status"] == "failed"
-    assert result["retryable"] is True
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    assert result["upstream_job_id"] is None
+    video_use.submit_render.assert_called_once()
+
+
+def test_worker_unknown_poll_keeps_durable_upstream_id_for_manual_reconcile():
+    """FAKE-only: no second Sidecar submit after status polling times out."""
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    video_use = MagicMock()
+    video_use.get_job_status.side_effect = TimeoutError("FAKE lost polling ACK")
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=video_use, queue=queue,
+    )
+    result = process_render_task(
+        components,
+        {"taskId": "fake-poll-lost-ack", "progress": 50,
+         "renderPayload": {"projectId": "synthetic"}, "upstreamJobId": "upstream-already-accepted"},
+        poll_interval=0,
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    assert result["upstream_job_id"] == "upstream-already-accepted"
+    video_use.submit_render.assert_not_called()
+    video_use.get_job_status.assert_called_once_with("upstream-already-accepted")
