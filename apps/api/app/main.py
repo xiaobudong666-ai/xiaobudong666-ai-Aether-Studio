@@ -5575,6 +5575,15 @@ def create_app(
                     break
                 for clip in clips:
                     media_id = clip.get("materialId") if isinstance(clip, dict) else None
+                    # Canonical subtitles may be text-only with materialId="".
+                    # They are not media sources. The actual video/audio clips
+                    # still need current EXPORT evidence; never drop a present
+                    # subtitle materialId from the rights scan.
+                    if isinstance(track, dict) and track.get("type") == "subtitle" and media_id == "":
+                        if not isinstance(clip.get("text"), str) or not clip["text"].strip():
+                            malformed = True
+                            break
+                        continue
                     if not isinstance(media_id, str) or not media_id:
                         malformed = True
                         break
