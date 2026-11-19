@@ -136,8 +136,13 @@ def orchestrate():
             )
             if result.stdout.strip() == "ready":
                 break
-            if any(p.poll() is not None for p in processes):
-                raise RuntimeError("Claimant exited before both results persisted")
+            for i, candidate in enumerate(processes):
+                if candidate.poll() is not None:
+                    output = candidate.communicate(timeout=5)[0]
+                    raise RuntimeError(
+                        f"Claimant {i} exited early with code {candidate.returncode}: "
+                        f"{output[-6000:]}"
+                    )
             if time.monotonic() >= deadline:
                 raise TimeoutError("Two-container claim barrier not reached")
             time.sleep(0.15)
