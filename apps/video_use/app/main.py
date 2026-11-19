@@ -390,8 +390,11 @@ class JobStore:
                     raise ValueError("requestId is already bound to different render inputs")
                 existing = self._recover_abandoned_unlocked(existing)
                 self._jobs[job_id] = existing
-                if existing.get("status") != "failed" or not existing.get("retryable"):
-                    return self._public_payload(existing), False
+                # A historical retryable flag is not a durable, verified Owner
+                # acknowledgement. Replaying the normal requestId must NEVER
+                # create a new execution after an uncertain failed outcome.
+                # Explicit manual reconciliation remains a separate gated path.
+                return self._public_payload(existing), False
             payload = {
                 "jobId": job_id,
                 "projectId": project_id,
