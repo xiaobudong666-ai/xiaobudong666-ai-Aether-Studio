@@ -567,6 +567,12 @@ jobs:
             -f infra/docker/docker-compose.g72-fake-only.override.yml \
             cp infra/docker/g70-g71-worker-transfer-failure-smoke.py api:/tmp/g70-g71-worker-transfer-failure-smoke.py
 
+      - name: Verify real two-container shared JobStore owner fence (synthetic-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          AETHER_JOBSTORE_CI_LAB=synthetic-only python infra/docker/g70-g71-two-container-jobstore-smoke.py orchestrate
+
       - name: Prove real Worker network, FFmpeg, sidecar persistence and audit
         shell: bash
         run: |
