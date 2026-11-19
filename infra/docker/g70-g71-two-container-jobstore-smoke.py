@@ -120,7 +120,7 @@ def orchestrate():
         for container in (primary, peer):
             checked(["docker", "cp", __file__, container + ":" + script],
                     stdout=subprocess.DEVNULL)
-        env = ["-e", "AETHER_JOBSTORE_CI_LAB=synthetic-only"]
+        env = ["-e", "AETHER_JOBSTORE_CI_LAB=synthetic-only", "-e", "PYTHONPATH=/service"]
         checked(["docker", "exec", *env, primary, "python", script, "mark", root])
         checked(["docker", "exec", *env, peer, "python", script, "see", root])
         for label, container in [("primary", primary), ("peer", peer)]:
