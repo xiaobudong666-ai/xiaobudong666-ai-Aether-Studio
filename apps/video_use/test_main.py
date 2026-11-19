@@ -573,3 +573,65 @@ def test_shared_posix_media_root_two_live_uvicorn_processes(tmp_path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.communicate(timeout=5)
+
+
+def test_render_executor_submission_rejection_fails_closed(tmp_path):
+    """Synthetic failure: durable queued job must not be presented as running."""
+    import json
+
+    class RejectingExecutor:
+        calls = 0
+
+        def submit(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("synthetic rejected hand-off")
+
+    pool = RejectingExecutor()
+    media_root = tmp_path / "media"
+    payload = {
+        "projectId": "fake-project-a",
+        "requestId": "fake-render-submit-failure",
+        "canonicalTimeline": {
+            "version": "1.1",
+            "duration": {"value": 1, "timescale": 1},
+            "output": {
+                "width": 1280,
+                "height": 720,
+                "fps": {"value": 24, "timescale": 1},
+                "backgroundColor": "black",
+            },
+            "materials": [],
+            "tracks": [
+                {"id": "subtitles", "type": "subtitle", "order": 0, "clips": []}
+            ],
+        },
+    }
+    app = create_app(
+        media_root=media_root,
+        upstream_root=tmp_path / "upstream",
+        executor=pool,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        failure = client.post("/renders", json=payload)
+        assert failure.status_code == 409, failure.text
+        first = client.get("/jobs/fake-render-submit-failure")
+        assert first.status_code == 200
+        assert first.json()["status"] == "failed"
+        assert first.json()["retryable"] is False
+        assert "UNKNOWN" in first.json()["message"]
+        replay = client.post("/renders", json=payload)
+        assert replay.status_code == 202
+        assert replay.json()["status"] == "failed"
+        assert pool.calls == 1
+        changed_project = dict(payload, projectId="fake-project-b")
+        denied = client.post("/renders", json=changed_project)
+        assert denied.status_code == 409
+        assert pool.calls == 1
+    persisted = json.loads(
+        (media_root / "jobs" / "fake-render-submit-failure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted["status"] == "failed"
+    assert persisted["retryable"] is False
+    assert persisted["artifact"] is None
