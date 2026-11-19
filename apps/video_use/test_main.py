@@ -744,3 +744,56 @@ def test_jobstore_legacy_restart_retry_marker_fails_closed(tmp_path):
     )
     assert should_execute is False
     assert replay["status"] == "failed"
+
+
+def test_render_same_request_id_changed_payload_fails_closed_before_redispatch(tmp_path):
+    """FAKE-only: requestId must identify one exact render contract, even after restart."""
+    import json
+
+    class RejectingExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def submit(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("synthetic handoff refusal")
+
+    payload = {
+        "projectId": "fake-fingerprint-project",
+        "requestId": "fake-fingerprint-render",
+        "canonicalTimeline": {
+            "version": "1.1",
+            "duration": {"value": 1, "timescale": 1},
+            "output": {
+                "width": 1280,
+                "height": 720,
+                "fps": {"value": 24, "timescale": 1},
+                "backgroundColor": "black",
+            },
+            "materials": [],
+            "tracks": [
+                {"id": "subtitle", "type": "subtitle", "order": 0, "clips": []}
+            ],
+        },
+    }
+    media_root = tmp_path / "media"
+    pool = RejectingExecutor()
+    app = create_app(media_root=media_root, upstream_root=tmp_path / "upstream", executor=pool)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        first = client.post("/renders", json=payload)
+        assert first.status_code == 409, first.text
+        same = client.post("/renders", json=payload)
+        assert same.status_code == 202, same.text
+        assert same.json()["status"] == "failed"
+        changed_timeline = json.loads(json.dumps(payload))
+        changed_timeline["canonicalTimeline"]["duration"]["value"] = 2
+        assert client.post("/renders", json=changed_timeline).status_code == 409
+        changed_mode = dict(payload, mode="final")
+        assert client.post("/renders", json=changed_mode).status_code == 409
+        assert pool.calls == 1
+
+    restarted = create_app(media_root=media_root, upstream_root=tmp_path / "upstream", executor=pool)
+    with TestClient(restarted, raise_server_exceptions=False) as client:
+        assert client.post("/renders", json=payload).status_code == 202
+        assert client.post("/renders", json=changed_timeline).status_code == 409
+        assert pool.calls == 1
