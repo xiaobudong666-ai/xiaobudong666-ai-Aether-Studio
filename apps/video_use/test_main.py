@@ -635,3 +635,55 @@ def test_render_executor_submission_rejection_fails_closed(tmp_path):
     assert persisted["status"] == "failed"
     assert persisted["retryable"] is False
     assert persisted["artifact"] is None
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload", "kind"),
+    [
+        ("/transcriptions", {"projectId": "fake-project-a", "mediaId": "fake-input", "language": "en"}, "transcription"),
+        ("/timeline-views", {"projectId": "fake-project-a", "mediaId": "fake-input", "start": 0, "end": 1}, "timeline-view"),
+    ],
+)
+def test_auxiliary_executor_submission_rejection_fails_closed(
+    tmp_path, monkeypatch, endpoint, payload, kind
+):
+    """FAKE-only: a refused Sidecar hand-off cannot leave a durable QUEUED job."""
+    import json
+
+    from app.main import MediaStore
+
+    class RejectingExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def submit(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("synthetic auxiliary executor refusal")
+
+    # No real media, helper, generation Provider, network or billable work.
+    monkeypatch.setattr(
+        MediaStore,
+        "find_media",
+        lambda _self, _project_id, _media_id: tmp_path / "synthetic.mp4",
+    )
+    pool = RejectingExecutor()
+    media_root = tmp_path / "media"
+    app = create_app(media_root=media_root, upstream_root=tmp_path / "upstream", executor=pool)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(endpoint, json=payload)
+        assert response.status_code == 409, response.text
+        assert "UNKNOWN" in response.text
+        assert pool.calls == 1
+        job_files = list((media_root / "jobs").glob("*.json"))
+        assert len(job_files) == 1
+        persisted = json.loads(job_files[0].read_text(encoding="utf-8"))
+        assert persisted["kind"] == kind
+        assert persisted["projectId"] == payload["projectId"]
+        assert persisted["status"] == "failed"
+        assert persisted["retryable"] is False
+        assert "UNKNOWN" in persisted["message"]
+        assert persisted["artifact"] is None
+        lookup = client.get("/jobs/" + persisted["jobId"])
+        assert lookup.status_code == 200
+        assert lookup.json()["status"] == "failed"
+        assert lookup.json()["retryable"] is False
