@@ -210,12 +210,21 @@ class JobStore:
         for path in (root / "jobs").glob("*.json"):
             try:
                 payload = json.loads(path.read_text())
-                if payload.get("status") in {"queued", "processing"}:
+                # After a restart the Worker/Provider hand-off might have
+                # happened. Neither a QUEUED/PROCESSING snapshot nor an old
+                # restart marker is proof that replay is safe.
+                was_interrupted = payload.get("status") in {"queued", "processing"}
+                legacy_unsafe_retry = (
+                    payload.get("status") == "failed"
+                    and payload.get("retryable") is True
+                    and payload.get("message") == "渲染服务重启导致任务中断，可以安全重试"
+                )
+                if was_interrupted or legacy_unsafe_retry:
                     payload.update(
                         status="failed",
                         progress=100,
-                        message="渲染服务重启导致任务中断，可以安全重试",
-                        retryable=True,
+                        message="Sidecar任务重启后执行结果 UNKNOWN；须人工核验后再决定是否重试",
+                        retryable=False,
                         updatedAt=utc_now(),
                     )
                     self._persist(payload)
