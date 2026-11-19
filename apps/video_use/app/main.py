@@ -957,6 +957,33 @@ def create_app(
             ) from exc
         return job
 
+    def submit_auxiliary_or_fail_closed(job: dict[str, Any], handler, request) -> None:
+        """Keep durable auxiliary jobs out of QUEUED after an uncertain hand-off."""
+        try:
+            pool.submit(handler, job, request)
+        except Exception as exc:
+            logger.exception(
+                "Auxiliary %s executor hand-off UNKNOWN for job %s",
+                job["kind"], job["jobId"],
+            )
+            try:
+                jobs.update(
+                    job["jobId"],
+                    status="failed",
+                    progress=100,
+                    retryable=False,
+                    message="Sidecar任务派发结果 UNKNOWN；须人工核验后再决定是否重试",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist auxiliary hand-off UNKNOWN for job %s",
+                    job["jobId"],
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Sidecar executor hand-off UNKNOWN; manual reconciliation required",
+            ) from exc
+
     @app.post("/transcriptions", status_code=status.HTTP_202_ACCEPTED)
     def create_transcription(request: TranscriptionJobRequest):
         try:
@@ -964,7 +991,7 @@ def create_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         job = jobs.create(request.projectId, "transcription")
-        pool.submit(execute_transcription, job, request)
+        submit_auxiliary_or_fail_closed(job, execute_transcription, request)
         return job
 
     @app.post("/timeline-views", status_code=status.HTTP_202_ACCEPTED)
@@ -974,7 +1001,7 @@ def create_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="未找到该媒体文件") from exc
         job = jobs.create(request.projectId, "timeline-view")
-        pool.submit(execute_timeline_view, job, request)
+        submit_auxiliary_or_fail_closed(job, execute_timeline_view, request)
         return job
 
     @app.get("/jobs/{job_id}")
