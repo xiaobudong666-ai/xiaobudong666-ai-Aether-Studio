@@ -687,3 +687,60 @@ def test_auxiliary_executor_submission_rejection_fails_closed(
         assert lookup.status_code == 200
         assert lookup.json()["status"] == "failed"
         assert lookup.json()["retryable"] is False
+
+
+@pytest.mark.parametrize("stalled_status", ["queued", "processing"])
+def test_jobstore_restart_unknown_requires_manual_reconciliation(tmp_path, stalled_status):
+    """FAKE-only crash: restart must not silently re-run a possibly accepted job."""
+    from app.main import JobStore
+
+    media_root = tmp_path / "fake-media"
+    original = JobStore(media_root)
+    first, should_execute = original.create_or_get(
+        "fake-project-a", "render", "fake-unknown-restart"
+    )
+    assert should_execute is True
+    if stalled_status == "processing":
+        original.update(first["jobId"], status="processing", progress=30)
+
+    restarted = JobStore(media_root)
+    held = restarted.get(first["jobId"])
+    assert held["status"] == "failed"
+    assert held["retryable"] is False
+    assert "UNKNOWN" in held["message"]
+    assert held["projectId"] == "fake-project-a"
+    replay, should_execute = restarted.create_or_get(
+        "fake-project-a", "render", first["jobId"]
+    )
+    assert should_execute is False
+    assert replay["status"] == "failed"
+    with pytest.raises(ValueError, match="another job"):
+        restarted.create_or_get("fake-project-b", "render", first["jobId"])
+    persisted = JobStore(media_root).get(first["jobId"])
+    assert persisted["retryable"] is False
+
+
+def test_jobstore_legacy_restart_retry_marker_fails_closed(tmp_path):
+    """Prior durable restart marker must not authorize automatic replay."""
+    from app.main import JobStore
+
+    media_root = tmp_path / "fake-media"
+    original = JobStore(media_root)
+    first, _ = original.create_or_get("fake-project-a", "render", "legacy-restart")
+    original.update(
+        first["jobId"],
+        status="failed",
+        progress=100,
+        retryable=True,
+        message="渲染服务重启导致任务中断，可以安全重试",
+    )
+    restarted = JobStore(media_root)
+    held = restarted.get(first["jobId"])
+    assert held["status"] == "failed"
+    assert held["retryable"] is False
+    assert "UNKNOWN" in held["message"]
+    replay, should_execute = restarted.create_or_get(
+        "fake-project-a", "render", first["jobId"]
+    )
+    assert should_execute is False
+    assert replay["status"] == "failed"
