@@ -2492,6 +2492,13 @@ def create_app(
             # missing receipt is ambiguous after a crash/timeout, not proof
             # that no billable request was accepted; never replay blindly.
             or prior_attempt.submission_started_at is not None
+            # G70/G71: a legacy FAILED status does not revoke an orphaned
+            # Worker lease. Even an expired/missing counterpart lease marker
+            # means the previous dispatch might still be executing upstream.
+            # Do not erase the lease or create a new potentially billable attempt
+            # without independently trusted stop/reconciliation evidence.
+            or task.lease_owner is not None
+            or task.lease_expires_at is not None
             or task.upstream_job_id is not None
             or task.provider_artifact_id is not None
             or task.media_id is not None
