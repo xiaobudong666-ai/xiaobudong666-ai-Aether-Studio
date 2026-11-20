@@ -246,6 +246,17 @@ def process_render_task(components: WorkerComponents, task: dict, poll_interval:
         deadline = time.monotonic() + float(os.environ.get("AETHER_RENDER_TIMEOUT_SECONDS", "3600"))
         while time.monotonic() < deadline:
             upstream = components.video_use.get_job_status(upstream_job_id)
+            # GET is read-only but its body still crosses the Sidecar trust
+            # boundary. A mismatched status must never close a different
+            # task/project as completed, including on resumed Worker claims.
+            if (
+                not isinstance(upstream, dict)
+                or upstream.get("jobId") != upstream_job_id
+                or upstream.get("projectId") != render_payload["projectId"]
+            ):
+                raise TaskQueueError(
+                    "Sidecar poll identity mismatch; manual reconciliation required"
+                )
             upstream_status = str(upstream.get("status", "processing"))
             progress = int(upstream.get("progress", 0))
             message = str(upstream.get("message", upstream_status))
