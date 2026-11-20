@@ -2335,7 +2335,22 @@ def create_app(
         if task.cancel_requested_at is None and task.status not in TERMINAL_GENERATION_STATES:
             now = utc_now()
             previous = task.status
-            attempt = current_generation_attempt(db, task)
+            # A historical QUEUED task can outlive its current Attempt row.
+            # Missing durable evidence is a reconciliation case, not HTTP 500.
+            attempt = db.execute(
+                select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no == task.attempts,
+                )
+            ).scalar_one_or_none()
+            if attempt is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "GENERATION_CANCEL_RECONCILIATION_REQUIRED",
+                        "message": "当前尝试的持久记录缺失，禁止取消或释放额度；须人工对账",
+                    },
+                )
             # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
             # submission can still be executing or billable upstream even
             # when the API has no upstream job ID. Without an independently
@@ -2363,6 +2378,42 @@ def create_app(
                     detail={
                         "code": "GENERATION_CANCEL_RECONCILIATION_REQUIRED",
                         "message": "任务可能已被上游受理，缺少可信停止回执，禁止释放预留用量；须人工对账",
+                    },
+                )
+            # A QUEUED label is not proof of a live, correctly scoped
+            # RESERVED ledger entry. Releasing an absent/zero-unit reservation
+            # would create spurious monthly quota credit for OTHER tasks.
+            # Do not invent any settlement: isolate historical mismatches.
+            ledger = db.execute(
+                select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.reservation_key == f"generation:{task.id}",
+                    DBGenerationUsageEntry.kind.in_(("RESERVED", "RELEASED", "SETTLED")),
+                )
+            ).scalars().all()
+            reservation = ledger[0] if len(ledger) == 1 and ledger[0].kind == "RESERVED" else None
+            reservation_attempt = (
+                db.execute(
+                    select(DBGenerationAttempt.id).where(
+                        DBGenerationAttempt.id == reservation.attempt_id,
+                        DBGenerationAttempt.generation_task_id == task.id,
+                    )
+                ).scalar_one_or_none()
+                if reservation is not None else None
+            )
+            if (
+                reservation is None
+                or reservation.tenant_id != task.tenant_id
+                or reservation.project_id != task.project_id
+                or reservation.task_id != task.id
+                or reservation.request_units != 1
+                or reservation.generated_seconds != 0
+                or reservation_attempt is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "GENERATION_CANCEL_USAGE_EVIDENCE_INVALID",
+                        "message": "预留用量账本缺失或不一致，禁止取消与释放额度；须人工对账",
                     },
                 )
             task.cancel_requested_at = now
