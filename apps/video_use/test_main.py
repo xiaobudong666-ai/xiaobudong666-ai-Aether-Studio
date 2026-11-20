@@ -1009,6 +1009,70 @@ def test_jobstore_unacknowledged_legacy_retry_flag_never_requeues(tmp_path):
     )
 
 
+def test_g70g71_artifact_download_streams_verified_snapshot_not_swapped_path(tmp_path, monkeypatch):
+    """FAKE-only FFmpeg: a post-validation swap cannot alter served bytes."""
+    import app.main as sidecar_main
+
+    upstream = tmp_path / "upstream"
+    make_fake_upstream(upstream)
+    source = tmp_path / "source.mp4"
+    make_source(source)
+    media_root = tmp_path / "media"
+    project_id, request_id = "verified-snapshot-project", "verified-snapshot-job"
+    with TestClient(create_app(media_root=media_root, upstream_root=upstream)) as client:
+        with source.open("rb") as stream:
+            upload = client.post(
+                "/media", data={"projectId": project_id},
+                files={"file": ("source.mp4", stream, "video/mp4")},
+            )
+        assert upload.status_code == 201, upload.text
+        submitted = client.post(
+            "/renders", json={
+                "projectId": project_id, "requestId": request_id,
+                "ranges": [{"mediaId": upload.json()["mediaId"], "start": 0, "end": 0.8}],
+                "mode": "preview",
+            },
+        )
+        assert submitted.status_code == 202, submitted.text
+        job = wait_for_job(client, request_id)
+        assert job["status"] == "completed"
+        path = media_root / job["artifact"]
+        original = path.read_bytes()
+        altered = bytes([original[0] ^ 1]) + original[1:]
+        original_file = sidecar_main.FileResponse
+        original_stream = getattr(sidecar_main, "StreamingResponse", None)
+        mutations = [0]
+
+        def mutate_before_response_stream(response_class):
+            def swap(*args, **kwargs):
+                path.write_bytes(altered)
+                mutations[0] += 1
+                return response_class(*args, **kwargs)
+            return swap
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sidecar_main, "FileResponse", mutate_before_response_stream(original_file))
+            if original_stream is not None:
+                patch.setattr(
+                    sidecar_main, "StreamingResponse",
+                    mutate_before_response_stream(original_stream),
+                )
+            downloaded = client.get(f"/jobs/{request_id}/artifact")
+        assert mutations[0] == 1, "mutation hook was not executed"
+        assert downloaded.status_code == 200, downloaded.text
+        assert downloaded.content == original, "download read a swapped mutable path"
+        assert downloaded.headers["content-length"] == str(len(original))
+        assert client.get(f"/jobs/{request_id}").status_code == 409
+        # Download clients also need byte ranges: preserve FileResponse 206.
+        path.write_bytes(original)
+        part = client.get(
+            f"/jobs/{request_id}/artifact",
+            headers={"Range": "bytes=0-31"},
+        )
+        assert part.status_code == 206, part.text
+        assert part.content == original[:32]
+
+
 def test_g70g71_completed_render_byte_proof_blocks_missing_corrupt_and_aliased_output(tmp_path):
     """Native Sidecar + FFmpeg regression, disposable media only (no Provider)."""
     upstream = tmp_path / "upstream"

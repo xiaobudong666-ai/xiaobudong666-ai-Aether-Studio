@@ -10,6 +10,8 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
+import tempfile
 import subprocess
 import sys
 import threading
@@ -22,6 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from starlette.background import BackgroundTask
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -1338,7 +1341,47 @@ def create_app(
             raise HTTPException(status_code=404, detail="成片文件尚不可用") from exc
         if not artifact.is_file():
             raise HTTPException(status_code=404, detail="成片文件尚不可用")
-        return FileResponse(artifact, filename=artifact.name)
+        if job.get("kind") != "render":
+            return FileResponse(artifact, filename=artifact.name)
+
+        # FileResponse would otherwise reopen an unchecked mutable original
+        # path. Capture into a private 0700 directory and verify the captured
+        # bytes before passing the private snapshot to FileResponse; this also
+        # preserves HTTP Range and existing download headers.
+        snapshot_dir = tempfile.TemporaryDirectory(prefix="aether-verified-render-")
+        snapshot_path = Path(snapshot_dir.name) / "final.mp4"
+        try:
+            digest = hashlib.sha256()
+            actual_size = 0
+            descriptor = os.open(artifact, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "rb") as source, snapshot_path.open("wb") as dest:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError("artifact is not a regular file")
+                while chunk := source.read(1024 * 1024):
+                    actual_size += len(chunk)
+                    if actual_size > job["artifactSizeBytes"]:
+                        raise ValueError("artifact exceeds frozen size")
+                    digest.update(chunk)
+                    dest.write(chunk)
+            if (actual_size != job["artifactSizeBytes"]
+                    or digest.hexdigest() != job["artifactSha256"]):
+                raise ValueError("snapshot mismatches frozen artifact proof")
+        except (OSError, ValueError) as exc:
+            snapshot_dir.cleanup()
+            raise HTTPException(
+                status_code=409,
+                detail="Completed render byte proof unavailable; manual reconciliation required",
+            ) from exc
+
+        # Keep the private directory alive until the response is consumed, then
+        # remove it even for Range downloads. This is a FAKE-only draft:
+        # temporary disk I/O/space requires Owner operational review.
+        return FileResponse(
+            snapshot_path,
+            filename="final.mp4",
+            media_type="video/mp4",
+            background=BackgroundTask(snapshot_dir.cleanup),
+        )
 
     return app
 
