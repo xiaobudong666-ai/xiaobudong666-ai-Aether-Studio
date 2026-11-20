@@ -7238,3 +7238,64 @@ def test_g70_g71_recovery_rejects_policy_change_during_sidecar_inspection(
         assert row.capability_snapshot_json != original_snapshot
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("ambiguous_evidence", [
+    "HELD_NO_RECEIPT", "ACCEPTED_NO_RECEIPT", "ORPHAN_LEASE_OWNER", "ORPHAN_LEASE_EXPIRY",
+])
+def test_g70g71_m11_queued_ambiguous_evidence_cannot_cancel_and_release(
+    generation_context, ambiguous_evidence
+):
+    """FAKE-only: inconsistent durable reconciliation/lease markers must fail closed."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key=f"queued-ambiguous-cancel-{ambiguous_evidence.lower()}")
+    task_id = task["taskId"]
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == row.attempts,
+        )).scalar_one()
+        assert row.status == attempt.status == "QUEUED"
+        assert attempt.reconciliation_state == "NOT_SUBMITTED"
+        if ambiguous_evidence == "HELD_NO_RECEIPT":
+            attempt.reconciliation_state = "HELD"
+        elif ambiguous_evidence == "ACCEPTED_NO_RECEIPT":
+            attempt.reconciliation_state = "UPSTREAM_ACCEPTED"
+        elif ambiguous_evidence == "ORPHAN_LEASE_OWNER":
+            row.lease_owner = "legacy-worker-without-claim-status"
+        else:
+            row.lease_expires_at = datetime.datetime.now(datetime.timezone.utc)
+        db.commit()
+
+    def persisted_snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == row.attempts,
+            )).scalar_one()
+            usage = tuple(db.execute(select(DBGenerationUsageEntry.kind).where(
+                DBGenerationUsageEntry.task_id == task_id,
+            )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (
+                row.status, row.cancel_requested_at, row.completed_at,
+                row.lease_owner, row.lease_expires_at, row.lease_epoch,
+                attempt.status, attempt.reconciliation_state,
+                attempt.submission_started_at, attempt.upstream_job_id,
+                usage, events,
+            )
+
+    before = persisted_snapshot()
+    assert before[-2] == ("RESERVED",)
+    for _ in range(2):
+        result = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/cancel")
+        assert result.status_code == 409, result.text
+        assert result.json()["detail"]["code"] == "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+        assert persisted_snapshot() == before, "rejected cancel mutated receipt, lease, quota or audit"
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
