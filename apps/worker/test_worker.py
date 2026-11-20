@@ -147,7 +147,7 @@ def test_worker_claimed_render_is_submitted_polled_and_persisted():
     }
     video_use.get_job_status.side_effect = [
         {"jobId": "task-1", "projectId": "project-1", "status": "processing", "progress": 50, "message": "Rendering"},
-        {"jobId": "task-1", "projectId": "project-1", "status": "completed", "progress": 100, "message": "Done"},
+        {"jobId": "task-1", "projectId": "project-1", "status": "completed", "progress": 100, "message": "Done", "artifact": "projects/project-1/renders/task-1/final.mp4"},
     ]
     components = WorkerComponents(
         ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
@@ -342,6 +342,92 @@ def test_render_sidecar_poll_identity_must_match_job_and_project(sidecar_status,
         for call in queue.update.call_args_list
     )
 
+
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        None,
+        "",
+        "/absolute/path/final.mp4",
+        "projects/project-other/renders/task-bound/final.mp4",
+        "projects/project-1/renders/another-task/final.mp4",
+        "projects/project-1/renders/task-bound/../../another-task/final.mp4",
+        "projects/project-1/renders/task-bound/preview.mp4",
+        {"path": "projects/project-1/renders/task-bound/final.mp4"},
+    ],
+)
+@pytest.mark.parametrize("resume", [False, True])
+def test_render_completed_sidecar_status_requires_bound_final_artifact(artifact, resume):
+    """FAKE-only: a status-only completed claim must not create a READY candidate."""
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    sidecar = MagicMock()
+    sidecar.submit_render.return_value = {
+        "jobId": "task-bound", "projectId": "project-1", "status": "queued",
+    }
+    sidecar.get_job_status.return_value = {
+        "jobId": "task-bound", "projectId": "project-1",
+        "status": "completed", "progress": 100,
+        "artifact": artifact,
+    }
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
+    )
+    task = {
+        "taskId": "task-bound", "progress": 15,
+        "renderPayload": {"projectId": "project-1", "requestId": "task-bound"},
+    }
+    if resume:
+        task["upstreamJobId"] = "task-bound"
+    result = process_render_task(components, task, poll_interval=0)
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    assert result["upstream_job_id"] == "task-bound"
+    assert not any(
+        call.kwargs.get("status") == "completed"
+        for call in queue.update.call_args_list
+    )
+    sidecar.get_job_status.assert_called_once_with("task-bound")
+    if resume:
+        sidecar.submit_render.assert_not_called()
+    else:
+        sidecar.submit_render.assert_called_once()
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_render_completed_sidecar_status_accepts_only_exact_bound_final_path(resume):
+    """FAKE-only positive contract: normal completed path remains usable."""
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    sidecar = MagicMock()
+    sidecar.submit_render.return_value = {
+        "jobId": "task-bound", "projectId": "project-1", "status": "queued",
+    }
+    sidecar.get_job_status.return_value = {
+        "jobId": "task-bound", "projectId": "project-1",
+        "status": "completed", "progress": 100,
+        "artifact": "projects/project-1/renders/task-bound/final.mp4",
+    }
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
+    )
+    task = {
+        "taskId": "task-bound", "progress": 0,
+        "renderPayload": {"projectId": "project-1", "requestId": "task-bound"},
+    }
+    if resume:
+        task["upstreamJobId"] = "task-bound"
+    result = process_render_task(components, task, poll_interval=0)
+    assert result["status"] == "completed"
+    assert result["upstream_job_id"] == "task-bound"
+    if resume:
+        sidecar.submit_render.assert_not_called()
+    else:
+        sidecar.submit_render.assert_called_once()
 
 
 from app.video_use_adapter import VideoUseAdapter, VideoUseError
