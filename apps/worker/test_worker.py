@@ -206,3 +206,73 @@ def test_worker_unknown_poll_keeps_durable_upstream_id_for_manual_reconcile():
     assert result["upstream_job_id"] == "upstream-already-accepted"
     video_use.submit_render.assert_not_called()
     video_use.get_job_status.assert_called_once_with("upstream-already-accepted")
+
+
+from app.video_use_adapter import VideoUseAdapter, VideoUseError
+
+
+@pytest.mark.parametrize("failure", ["lost_ack_timeout", "http_503"])
+def test_g70_g71_worker_sidecar_post_ambiguous_ack_never_replays(monkeypatch, failure):
+    """FAKE-only: POST may have been committed before a lost ACK or HTTP 503."""
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            request = httpx.Request(method, url)
+            if failure == "lost_ack_timeout":
+                raise httpx.ReadTimeout("FAKE render accepted; ACK lost", request=request)
+            return httpx.Response(
+                503, json={"detail": "FAKE ambiguous upstream"}, request=request
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    adapter = VideoUseAdapter(
+        api_url="http://fake-sidecar", max_retries=3, backoff_factor=0
+    )
+    with pytest.raises(VideoUseError):
+        adapter.submit_render({"projectId": "p", "requestId": "id"})
+    assert calls == [("POST", "http://fake-sidecar/renders")]
+
+
+def test_g70_g71_worker_sidecar_read_only_status_get_can_retry(monkeypatch):
+    """Read-only polling remains retriable; this must not relax the POST fence."""
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            request = httpx.Request(method, url)
+            if len(calls) == 1:
+                raise httpx.ReadTimeout("FAKE status read timeout", request=request)
+            return httpx.Response(
+                200,
+                json={"jobId": "fake-job", "status": "processing"},
+                request=request,
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    adapter = VideoUseAdapter(
+        api_url="http://fake-sidecar", max_retries=2, backoff_factor=0
+    )
+    assert adapter.get_job_status("fake-job")["status"] == "processing"
+    assert calls == [("GET", "http://fake-sidecar/jobs/fake-job")] * 2
+
