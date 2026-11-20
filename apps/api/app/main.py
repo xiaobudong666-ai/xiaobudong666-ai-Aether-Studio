@@ -2346,6 +2346,12 @@ def create_app(
                 task.status != "QUEUED"
                 or attempt.status != "QUEUED"
                 or attempt.submission_started_at is not None
+                # Durable HELD/accepted evidence is not a preclaim cancellation.
+                or attempt.reconciliation_state != "NOT_SUBMITTED"
+                # Orphaned lease markers imply possible Worker ownership even
+                # when historical status fields still read QUEUED.
+                or task.lease_owner is not None
+                or task.lease_expires_at is not None
                 or task.upstream_job_id is not None
                 or attempt.upstream_job_id is not None
                 or task.provider_artifact_id is not None
