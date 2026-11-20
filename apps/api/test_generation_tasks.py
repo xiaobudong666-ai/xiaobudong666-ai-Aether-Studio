@@ -781,11 +781,11 @@ def test_g73_transition_fences_attempt_upstream_identity_mismatch(
     assert media.uploads == 0
 
 
-def test_19_cancel_is_idempotent_and_late_success_isolated(generation_context):
+def test_19_preclaim_cancel_is_idempotent_and_late_transition_isolated(generation_context):
+    """Before any Worker claim, cancellation may safely release once."""
     client, _, _, _ = generation_context
     project = create_project(client)
     task = create_task(client, project)
-    claim(client)
     path = f"/projects/{project['id']}/generation-tasks/{task['taskId']}/cancel"
     assert client.post(path).json()["status"] == "CANCELED"
     assert client.post(path).json()["status"] == "CANCELED"
@@ -4803,16 +4803,31 @@ def test_g76_postgres_task_row_lock_serializes_heartbeat_and_owner_cancel(
         pool.shutdown(wait=True, cancel_futures=True)
         blocker.close()
 
-    assert cancel_response.status_code == 200, cancel_response.text
+    # Row-lock serialization is preserved, but an already claimed task must
+    # not be relabeled CANCELED or release quota without trusted upstream STOP.
+    assert cancel_response.status_code == 409, cancel_response.text
+    assert cancel_response.json()["detail"]["code"] == "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
     assert heartbeat_response.status_code in {200, 409}, heartbeat_response.text
     with sessions() as db:
         persisted = db.execute(
             select(DBGenerationTask).where(DBGenerationTask.id == task_id)
         ).scalar_one()
-        assert persisted.status == "CANCELED"
-        assert persisted.cancel_requested_at is not None
-        assert persisted.lease_owner is None
-        assert persisted.lease_expires_at is None
+        assert persisted.status != "CANCELED"
+        assert persisted.cancel_requested_at is None
+        assert persisted.lease_owner == worker_id
+        assert persisted.lease_expires_at is not None
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == persisted.attempts,
+        )).scalar_one()
+        assert attempt.submission_started_at is not None
+        assert list(db.execute(select(DBGenerationUsageEntry.kind).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalars()) == ["RESERVED"]
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CANCELED",
+        )).scalar_one() == 0
 
 def test_g75_ineligible_provider_candidate_does_not_pin_half_open_probe(provider_control_context):
     """An ineligible FIFO candidate must not consume the tenant's HALF_OPEN probe."""
