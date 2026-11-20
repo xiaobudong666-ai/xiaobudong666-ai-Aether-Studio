@@ -247,7 +247,7 @@ def test_render_sidecar_ack_must_match_immutable_task_and_project(sidecar_ack):
     [
         {"projectId": "project-1"},
         {"projectId": "project-1", "requestId": "wrong-task"},
-        {"projectId": "project-1", "requestId": "task-bound", "project": None},
+        {"projectId": "", "requestId": "task-bound"},
         {"requestId": "task-bound"},
     ],
 )
@@ -260,10 +260,6 @@ def test_render_unbound_request_never_reaches_sidecar(payload):
         ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
         moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
     )
-    # The extra 'project' metadata is not a problem by itself; the
-    # third case explicitly invalidates the mandatory projectId binding.
-    if "project" in payload:
-        payload = dict(payload, projectId="")
     result = process_render_task(
         components, {"taskId": "task-bound", "progress": 0,
                      "renderPayload": payload}, poll_interval=0,
