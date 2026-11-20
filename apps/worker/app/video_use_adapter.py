@@ -26,7 +26,10 @@ class VideoUseAdapter:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        # An ambiguous POST may already have created a durable Sidecar job.
+        # Never replay submissions before independent trusted reconciliation.
+        retry_budget = 0 if method.upper() == "POST" else self.max_retries
+        for attempt in range(retry_budget + 1):
             try:
                 with httpx.Client(timeout=self.timeout, trust_env=False) as client:
                     response = client.request(method, f"{self.api_url}{path}", **kwargs)
@@ -37,7 +40,7 @@ class VideoUseAdapter:
                 return payload
             except (httpx.HTTPError, ValueError, VideoUseError) as exc:
                 last_error = exc
-            if attempt < self.max_retries:
+            if attempt < retry_budget:
                 time.sleep(self.backoff_factor * (2**attempt))
         raise VideoUseError(f"video-use request failed: {last_error}") from last_error
 
