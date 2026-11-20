@@ -2336,6 +2336,22 @@ def create_app(
             now = utc_now()
             previous = task.status
             attempt = current_generation_attempt(db, task)
+            # A QUEUED current attempt does not prove older attempts were
+            # never submitted. Legacy multi-attempt rows can retain a HELD
+            # or accepted upstream result after task-level IDs were cleared.
+            # Never release this task's RESERVED usage without an independent
+            # reconciliation/STOP ACK for every prior submission.
+            unresolved_prior = db.execute(
+                select(DBGenerationAttempt.id).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no < task.attempts,
+                    or_(
+                        DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
+                        DBGenerationAttempt.submission_started_at.is_not(None),
+                        DBGenerationAttempt.upstream_job_id.is_not(None),
+                    ),
+                ).limit(1)
+            ).scalar_one_or_none()
             # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
             # submission can still be executing or billable upstream even
             # when the API has no upstream job ID. Without an independently
@@ -2348,6 +2364,7 @@ def create_app(
                 or attempt.submission_started_at is not None
                 # Durable HELD/accepted evidence is not a preclaim cancellation.
                 or attempt.reconciliation_state != "NOT_SUBMITTED"
+                or unresolved_prior is not None
                 # Orphaned lease markers imply possible Worker ownership even
                 # when historical status fields still read QUEUED.
                 or task.lease_owner is not None
