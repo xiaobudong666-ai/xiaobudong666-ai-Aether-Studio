@@ -10,6 +10,8 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
+import tempfile
 import subprocess
 import sys
 import threading
@@ -22,7 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger("video_use_service")
@@ -1338,7 +1340,51 @@ def create_app(
             raise HTTPException(status_code=404, detail="成片文件尚不可用") from exc
         if not artifact.is_file():
             raise HTTPException(status_code=404, detail="成片文件尚不可用")
-        return FileResponse(artifact, filename=artifact.name)
+        if job.get("kind") != "render":
+            return FileResponse(artifact, filename=artifact.name)
+
+        # Capture and validate a private byte snapshot before returning ASGI
+        # control. FileResponse(path) can reopen different bytes after check.
+        snapshot = tempfile.SpooledTemporaryFile(mode="w+b", max_size=8 * 1024 * 1024)
+        try:
+            digest = hashlib.sha256()
+            actual_size = 0
+            descriptor = os.open(artifact, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError("artifact is not a regular file")
+                while chunk := source.read(1024 * 1024):
+                    actual_size += len(chunk)
+                    if actual_size > job["artifactSizeBytes"]:
+                        raise ValueError("artifact size exceeds frozen proof")
+                    digest.update(chunk)
+                    snapshot.write(chunk)
+            if (actual_size != job["artifactSizeBytes"]
+                    or digest.hexdigest() != job["artifactSha256"]):
+                raise ValueError("snapshot mismatches frozen artifact proof")
+            snapshot.seek(0)
+        except (OSError, ValueError) as exc:
+            snapshot.close()
+            raise HTTPException(
+                status_code=409,
+                detail="Completed render byte proof unavailable; manual reconciliation required",
+            ) from exc
+
+        def send_verified_snapshot():
+            try:
+                while chunk := snapshot.read(1024 * 1024):
+                    yield chunk
+            finally:
+                snapshot.close()
+
+        return StreamingResponse(
+            send_verified_snapshot(),
+            media_type="video/mp4",
+            headers={
+                "Content-Length": str(actual_size),
+                "Content-Disposition": 'attachment; filename="final.mp4"',
+            },
+        )
 
     return app
 
