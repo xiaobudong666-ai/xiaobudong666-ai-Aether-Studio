@@ -6344,3 +6344,110 @@ def test_g70_g71_postgres_recover_skips_locked_worker_renewal_without_erasing_le
     finally:
         locker.rollback()
         locker.close()
+
+
+@pytest.mark.parametrize("older_evidence", [
+    "HELD", "UPSTREAM_ACCEPTED", "SUBMISSION_STARTED",
+    "UPSTREAM_JOB_ID", "CLEAN_NOT_SUBMITTED",
+])
+def test_g70g71_postgres_earlier_submission_history_blocks_retry_without_mutation(
+    postgres_context, older_evidence,
+):
+    """FAKE-only PostgreSQL regression: earlier durable attempt evidence must
+    fence retry even when the current attempt is clean and task IDs were reset.
+    No Provider calls, storage writes, settlement decisions or real billing.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.attempts == 1 and task.status == "QUEUED"
+        project_id = task.project_id
+        older = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )
+        ).scalar_one()
+        older.status = "FAILED"
+        older.error_code = "TEMPORARY"
+        older.completed_at = now
+        assert older.reconciliation_state == "NOT_SUBMITTED"
+        if older_evidence in ("HELD", "UPSTREAM_ACCEPTED"):
+            older.reconciliation_state = older_evidence
+        elif older_evidence == "SUBMISSION_STARTED":
+            older.submission_started_at = now
+        elif older_evidence == "UPSTREAM_JOB_ID":
+            older.upstream_job_id = "fake-pg-earlier-accepted"
+        else:
+            assert older_evidence == "CLEAN_NOT_SUBMITTED"
+        # Legacy attempt #2 failed locally without an upstream submission.
+        # Clear task-level IDs deliberately; the older attempt must still win.
+        task.attempts = 2
+        task.max_attempts = 4
+        task.status = "FAILED"
+        task.error_code = "TEMPORARY"
+        task.completed_at = now
+        task.upstream_job_id = None
+        task.provider_artifact_id = None
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="FAILED", error_code="TEMPORARY",
+            reconciliation_state="NOT_SUBMITTED", created_at=now, completed_at=now,
+        ))
+        db.commit()
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(
+                    select(DBGenerationAttempt).where(
+                        DBGenerationAttempt.generation_task_id == task_id,
+                    ).order_by(DBGenerationAttempt.attempt_no)
+                ).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(
+                    select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id,
+                    ).order_by(DBGenerationUsageEntry.kind)
+                ).scalars()
+            )
+            event_count = db.execute(
+                select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )
+            ).scalar_one()
+            return (
+                task.status, task.attempts, task.error_code,
+                task.upstream_job_id, task.provider_artifact_id,
+                task.media_id, task.asset_version_id,
+                attempts, usage, event_count,
+            )
+
+    before = durable_snapshot()
+    assert len(before[7]) == 2
+    assert [u[0] for u in before[8]] == ["RESERVED"]
+    endpoint = f"/projects/{project_id}/generation-tasks/{task_id}/retry"
+    if older_evidence == "CLEAN_NOT_SUBMITTED":
+        allowed = client.post(endpoint)
+        assert allowed.status_code == 202, allowed.text
+        after = durable_snapshot()
+        assert after[0:2] == ("QUEUED", 3)
+        assert len(after[7]) == 3
+        assert after[8] == before[8]  # no extra reservation or settlement
+        assert after[9] == before[9] + 1  # original retry event
+    else:
+        for _ in range(2):
+            refused = client.post(endpoint)
+            assert refused.status_code == 409, refused.text
+            assert refused.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
+            assert durable_snapshot() == before, (
+                "Rejected PostgreSQL retry changed attempt, usage or audit state"
+            )
+    app.state.moneyprinter.assert_not_called()
