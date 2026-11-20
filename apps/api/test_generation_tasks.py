@@ -819,6 +819,100 @@ def test_21_unknown_submission_cannot_blindly_retry(generation_context):
     assert response.status_code == 409
 
 
+
+@pytest.mark.parametrize(
+    "unsafe_receipt",
+    [
+        "task_upstream_accepted",
+        "attempt_upstream_orphan",
+        "attempt_unknown",
+        "attempt_status_conflict",
+        "task_artifact_orphan",
+    ],
+)
+def test_g70g71_failed_retry_refuses_unreconciled_prior_attempt_without_mutation(
+    generation_context, unsafe_receipt,
+):
+    """FAKE-only: a failed/retryable status never proves no prior submission.
+
+    Preserve original job, ledger and history until independent durable Owner
+    ACK/HELD reconciliation exists. No real Provider or protected data.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key=f"fake-retry-receipt-{unsafe_receipt}")
+    task_id = task["taskId"]
+    assert claim(client).status_code == 200
+    if unsafe_receipt == "task_upstream_accepted":
+        assert transition(
+            client, task_id, "RUNNING", upstreamJobId="fake-already-accepted",
+        ).status_code == 200
+    assert transition(
+        client, task_id, "FAILED", errorCode="TEMPORARY",
+        errorMessage="synthetic retryable failure", retryable=True,
+    ).status_code == 200
+
+    with sessions() as db:
+        stored_task = db.get(DBGenerationTask, task_id)
+        prior_attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == stored_task.attempts,
+            )
+        ).scalar_one()
+        if unsafe_receipt == "attempt_upstream_orphan":
+            prior_attempt.upstream_job_id = "fake-orphan-accepted"
+        elif unsafe_receipt == "attempt_unknown":
+            prior_attempt.reconciliation_state = "UNKNOWN"
+        elif unsafe_receipt == "attempt_status_conflict":
+            prior_attempt.status = "RUNNING"
+        elif unsafe_receipt == "task_artifact_orphan":
+            stored_task.provider_artifact_id = "fake-orphan-output"
+        db.commit()
+        durable_before = (
+            stored_task.status, stored_task.attempts, stored_task.upstream_job_id,
+            stored_task.provider_artifact_id, stored_task.error_code,
+            prior_attempt.status, prior_attempt.reconciliation_state,
+            prior_attempt.upstream_job_id,
+        )
+        events_before = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        usage_before = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one()
+        attempts_before = db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+
+    response = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
+    with sessions() as db:
+        stored_task = db.get(DBGenerationTask, task_id)
+        prior_attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == stored_task.attempts,
+        )).scalar_one()
+        assert (
+            stored_task.status, stored_task.attempts, stored_task.upstream_job_id,
+            stored_task.provider_artifact_id, stored_task.error_code,
+            prior_attempt.status, prior_attempt.reconciliation_state,
+            prior_attempt.upstream_job_id,
+        ) == durable_before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == events_before
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalar_one() == usage_before
+        assert db.execute(select(func.count(DBGenerationAttempt.id)).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one() == attempts_before
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
+
+
 def test_22_expired_lease_is_recovered_without_new_attempt(generation_context):
     client, sessions, _, _ = generation_context
     project = create_project(client)
