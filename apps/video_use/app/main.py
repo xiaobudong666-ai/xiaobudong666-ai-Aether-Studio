@@ -1310,7 +1310,7 @@ def create_app(
                 raise ValueError("render artifact path is missing or aliased")
             if resolved.stat().st_size != size or sha256_file(resolved) != digest:
                 raise ValueError("render artifact size/hash changed")
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=409, detail=message) from exc
 
     @app.get("/jobs/{job_id}")
