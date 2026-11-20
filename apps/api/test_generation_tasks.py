@@ -7385,3 +7385,92 @@ def test_g70g71_m11_prior_attempt_submission_evidence_blocks_cancel(
             assert snapshot() == before, "rejected cancel mutated prior attempt or usage"
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("earlier_receipt", [
+    "HELD_NO_RECEIPT", "UPSTREAM_ACCEPTED_NO_RECEIPT",
+    "SUBMISSION_STARTED", "UPSTREAM_ID", "CLEAN_NOT_SUBMITTED",
+])
+def test_g70g71_m11_earlier_attempt_receipt_must_block_new_retry(
+    generation_context, earlier_receipt,
+):
+    """FAKE-only: even a clean CURRENT failed attempt cannot erase an earlier
+    upstream submission. No Provider call, external storage or accounting policy.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key="retry-history-" + earlier_receipt.lower())
+    task_id = task["taskId"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        earlier = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert row.attempts == 1
+        assert row.status == earlier.status == "QUEUED"
+        earlier.status = "FAILED"
+        earlier.error_code = "TEMPORARY"
+        earlier.completed_at = now
+        if earlier_receipt == "HELD_NO_RECEIPT":
+            earlier.reconciliation_state = "HELD"
+        elif earlier_receipt == "UPSTREAM_ACCEPTED_NO_RECEIPT":
+            earlier.reconciliation_state = "UPSTREAM_ACCEPTED"
+        elif earlier_receipt == "SUBMISSION_STARTED":
+            earlier.submission_started_at = now
+        elif earlier_receipt == "UPSTREAM_ID":
+            earlier.upstream_job_id = "fake-earlier-accepted"
+        else:
+            assert earlier_receipt == "CLEAN_NOT_SUBMITTED"
+            assert earlier.reconciliation_state == "NOT_SUBMITTED"
+        # Emulate a legacy retry that cleared task-level submission markers.
+        # The CURRENT second attempt subsequently fails before any submission.
+        row.attempts = 2
+        row.max_attempts = 4
+        row.status = "FAILED"
+        row.error_code = "TEMPORARY"
+        row.completed_at = now
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="FAILED", reconciliation_state="NOT_SUBMITTED",
+            error_code="TEMPORARY", created_at=now, completed_at=now,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(db.execute(select(DBGenerationUsageEntry.kind).where(
+                DBGenerationUsageEntry.task_id == task_id,
+            ).order_by(DBGenerationUsageEntry.kind)).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (row.status, row.attempts, row.error_code, attempts, usage, events)
+
+    before = snapshot()
+    assert before[-2] == ("RESERVED",)
+    url = f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
+    if earlier_receipt == "CLEAN_NOT_SUBMITTED":
+        allowed = client.post(url)
+        assert allowed.status_code == 202, allowed.text
+        after = snapshot()
+        assert after[0] == "QUEUED" and after[1] == 3
+        assert len(after[3]) == 3
+        assert after[-2] == ("RESERVED",)
+    else:
+        for _ in range(2):
+            denied = client.post(url)
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
+            assert snapshot() == before, "rejected retry changed attempt, quota or audit"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
