@@ -6451,3 +6451,72 @@ def test_g70g71_postgres_earlier_submission_history_blocks_retry_without_mutatio
                 "Rejected PostgreSQL retry changed attempt, usage or audit state"
             )
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("lease_marker", ["owner_only", "expiry_only", "both_expired"])
+def test_g70g71_postgres_orphan_worker_lease_rejects_retry(
+    postgres_context, lease_marker,
+):
+    """Native disposable PostgreSQL: stale Worker lease is not a STOP ACK.
+
+    A migrated FAILED task may have NOT_SUBMITTED current Attempt yet still
+    retain a lease marker. Do not create an additional potentially billable
+    attempt or change its reservation/audit until trusted reconciliation.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "QUEUED"
+        project_id = task.project_id
+        prior = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        task.status = "FAILED"
+        task.error_code = "TEMPORARY"
+        task.completed_at = now
+        prior.status = "FAILED"
+        prior.error_code = "TEMPORARY"
+        prior.completed_at = now
+        assert prior.submission_started_at is None
+        assert prior.reconciliation_state == "NOT_SUBMITTED"
+        if lease_marker in {"owner_only", "both_expired"}:
+            task.lease_owner = "fake-pg-orphan-worker"
+        if lease_marker in {"expiry_only", "both_expired"}:
+            task.lease_expires_at = now - datetime.timedelta(hours=2)
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )).scalar_one()
+            return (
+                task.status, task.attempts, task.error_code, task.lease_owner,
+                task.lease_expires_at, task.upstream_job_id, attempts, usage, events,
+            )
+
+    before = snapshot()
+    assert len(before[6]) == 1
+    assert [item[0] for item in before[7]] == ["RESERVED"]
+    endpoint = f"/projects/{project_id}/generation-tasks/{task_id}/retry"
+    for _ in range(2):
+        refused = client.post(endpoint)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
+        assert snapshot() == before
+    app.state.moneyprinter.assert_not_called()
