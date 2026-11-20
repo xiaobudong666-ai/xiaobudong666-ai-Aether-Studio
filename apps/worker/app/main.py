@@ -197,8 +197,30 @@ def process_render_task(components: WorkerComponents, task: dict, poll_interval:
     upstream_job_id = task.get("upstreamJobId")
     try:
         if not upstream_job_id:
-            submitted = components.video_use.submit_render(task["renderPayload"])
-            upstream_job_id = submitted["jobId"]
+            # The API binds each render requestId to this task's immutable id.
+            # Never send an unbound request or trust a Sidecar ACK for a
+            # different task/project: it could attach another tenant's output.
+            render_payload = task.get("renderPayload")
+            if not isinstance(render_payload, dict):
+                raise TaskQueueError("Render handoff has no bound payload")
+            expected_job_id = render_payload.get("requestId")
+            expected_project_id = render_payload.get("projectId")
+            if (
+                not isinstance(expected_job_id, str) or not expected_job_id
+                or expected_job_id != task_id
+                or not isinstance(expected_project_id, str) or not expected_project_id
+            ):
+                raise TaskQueueError("Render handoff identity is not bound to task/project")
+            submitted = components.video_use.submit_render(render_payload)
+            if (
+                not isinstance(submitted, dict)
+                or submitted.get("jobId") != expected_job_id
+                or submitted.get("projectId") != expected_project_id
+            ):
+                # A Sidecar ACK is not a trusted receipt. Do not poll or
+                # persist an unverified job id. Keep the attempt UNKNOWN.
+                raise TaskQueueError("Sidecar ACK identity mismatch; manual reconciliation required")
+            upstream_job_id = expected_job_id
             components.queue.update(
                 task_id,
                 status="processing",
