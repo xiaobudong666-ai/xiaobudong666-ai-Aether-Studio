@@ -712,8 +712,8 @@ def test_g72_postgres_editor_cannot_cancel_claimed_owner_fake_and_release_quota(
         )).scalar_one() == 0
     assert app.state.video_use.media_objects == {}
     app.state.moneyprinter.assert_not_called()
-    # Positive control: original Owner retains the ordinary cancellation path
-    # before any upstream acceptance. This does not authorize paid refunds.
+    # Original Owner has authority, but Worker already claimed submission:
+    # unlike preclaim cancellation, no trusted STOP ACK exists to release usage.
     assert client.post("/auth/logout").status_code == 204
     assert client.post("/auth/login", json={
         "email": "g76-postgres-owner@example.com", "password": OWNER_PASSWORD,
@@ -721,18 +721,25 @@ def test_g72_postgres_editor_cannot_cancel_claimed_owner_fake_and_release_quota(
     owner_cancel = client.post(
         f"/projects/{project_id}/generation-tasks/{task_id}/cancel"
     )
-    assert owner_cancel.status_code == 200, owner_cancel.text
-    assert owner_cancel.json()["status"] == "CANCELED"
+    assert owner_cancel.status_code == 409, owner_cancel.text
+    assert owner_cancel.json()["detail"]["code"] == "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
-        assert task.status == "CANCELED"
+        assert (
+            task.status, task.lease_owner, task.lease_epoch,
+            task.cancel_requested_at, task.completed_at,
+        ) == before_state
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "RELEASED",
+            DBGenerationUsageEntry.kind == "RESERVED",
         )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
-            DBGenerationUsageEntry.kind == "SETTLED",
+            DBGenerationUsageEntry.kind.in_(["RELEASED", "SETTLED"]),
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CANCELED",
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
@@ -2098,8 +2105,8 @@ def test_g70_g71_postgres_duplicate_release_db_commit_failure_before_commit_retr
     )
 
 
-def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(postgres_context, monkeypatch):
-    """Owner cancel commits while sidecar upload is blocked; late intake must not overwrite CANCELED."""
+def test_g76_postgres_owner_cancel_during_artifact_upload_rejected_without_stop_ack(postgres_context, monkeypatch):
+    """Post-claim cancel cannot release RESERVED; an already accepted artifact may finish."""
     owner_client, sessions, app = postgres_context
     task_id = _create_task(owner_client)
     with sessions() as db:
@@ -2182,46 +2189,42 @@ def test_g76_postgres_owner_cancel_during_artifact_upload_keeps_terminal_state(p
             canceled = owner_client.post(
                 f"/projects/{project_id}/generation-tasks/{task_id}/cancel"
             )
-            assert canceled.status_code == 200, canceled.text
-            assert canceled.json()["status"] == "CANCELED"
+            assert canceled.status_code == 409, canceled.text
+            assert canceled.json()["detail"]["code"] == "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
         finally:
             release_upload.set()
         response = future.result(timeout=15)
 
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "TASK_CANCELED"
+    assert response.status_code == 201, response.text
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
         tenant = db.get(DBTenant, tenant_id)
-        assert stored.status == "CANCELED"
-        assert stored.cancel_requested_at is not None
+        assert stored.status == "RIGHTS_BLOCKED"
+        assert stored.cancel_requested_at is None
         assert stored.lease_owner is None
         assert stored.lease_expires_at is None
         assert stored.media_id == _expected_media_id(project_id, f"generation:{task_id}")
-        assert stored.asset_version_id is None
-        assert tenant.used_storage_bytes == 0
-        orphan_event = db.execute(select(DBGenerationEvent).where(
+        assert stored.asset_version_id is not None
+        assert tenant.used_storage_bytes == len(payload)
+        asset = db.get(DBAssetVersion, stored.asset_version_id)
+        assert asset is not None
+        assert asset.sha256 == hashlib.sha256(payload).hexdigest()
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
-            DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one()
-        assert orphan_event.metadata_json["reasonCode"] == "TASK_CANCELED"
-        assert orphan_event.metadata_json["orphanedMediaId"] == _expected_media_id(project_id, f"generation:{task_id}")
-        assert orphan_event.metadata_json["orphanedMediaSha256"] is not None
-        assert orphan_event.metadata_json["orphanedMediaSizeBytes"] == len(payload)
-        assert orphan_event.metadata_json["originalProviderArtifactId"] == artifact_id
-        assert orphan_event.metadata_json["originalUpstreamJobId"] == upstream_id
-        assert db.execute(select(func.count(DBAssetVersion.id)).where(
-            DBAssetVersion.project_id == project_id,
-            DBAssetVersion.media_id == _expected_media_id(project_id, f"generation:{task_id}"),
+            DBGenerationEvent.event_type == "ARTIFACT_INGESTED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "TASK_CANCELED",
         )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
-        )).scalar_one() == 0
+        )).scalar_one() == 1
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RELEASED",
-        )).scalar_one() == 1
+        )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
 def test_g76_postgres_provider_artifact_id_cannot_change_during_upload(postgres_context, monkeypatch):
