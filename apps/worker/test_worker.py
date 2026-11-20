@@ -199,14 +199,15 @@ def test_worker_unknown_poll_keeps_durable_upstream_id_for_manual_reconcile():
     result = process_render_task(
         components,
         {"taskId": "fake-poll-lost-ack", "progress": 50,
-         "renderPayload": {"projectId": "synthetic"}, "upstreamJobId": "upstream-already-accepted"},
+         "renderPayload": {"projectId": "synthetic", "requestId": "fake-poll-lost-ack"},
+         "upstreamJobId": "fake-poll-lost-ack"},
         poll_interval=0,
     )
     assert result["status"] == "UNKNOWN"
     assert result["retryable"] is False
-    assert result["upstream_job_id"] == "upstream-already-accepted"
+    assert result["upstream_job_id"] == "fake-poll-lost-ack"
     video_use.submit_render.assert_not_called()
-    video_use.get_job_status.assert_called_once_with("upstream-already-accepted")
+    video_use.get_job_status.assert_called_once_with("fake-poll-lost-ack")
 
 
 
@@ -269,6 +270,30 @@ def test_render_unbound_request_never_reaches_sidecar(payload):
     sidecar.submit_render.assert_not_called()
     sidecar.get_job_status.assert_not_called()
     queue.update.assert_called_once()
+
+
+
+@pytest.mark.parametrize("upstream_job_id", ["unrelated-sidecar-job", 123])
+def test_render_resume_rejects_mismatched_persisted_sidecar_identity(upstream_job_id):
+    """FAKE-only: a previous bad ACK must never authorize polling another job."""
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    sidecar = MagicMock()
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
+    )
+    result = process_render_task(
+        components, {
+            "taskId": "task-bound", "progress": 0,
+            "renderPayload": {"projectId": "project-1", "requestId": "task-bound"},
+            "upstreamJobId": upstream_job_id,
+        }, poll_interval=0,
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    sidecar.get_job_status.assert_not_called()
+    sidecar.submit_render.assert_not_called()
 
 
 from app.video_use_adapter import VideoUseAdapter, VideoUseError
