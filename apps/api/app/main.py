@@ -2425,8 +2425,14 @@ def create_app(
             prior_attempt is None
             or prior_attempt.status != task.status
             or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
+            # Worker claim durably writes this BEFORE any upstream POST. The
+            # missing receipt is ambiguous after a crash/timeout, not proof
+            # that no billable request was accepted; never replay blindly.
+            or prior_attempt.submission_started_at is not None
             or task.upstream_job_id is not None
             or task.provider_artifact_id is not None
+            or task.media_id is not None
+            or task.asset_version_id is not None
             or prior_attempt.upstream_job_id is not None
         ):
             raise HTTPException(
