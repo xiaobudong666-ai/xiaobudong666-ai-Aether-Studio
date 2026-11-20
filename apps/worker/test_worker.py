@@ -498,3 +498,53 @@ def test_g70_g71_worker_sidecar_read_only_status_get_can_retry(monkeypatch):
     assert adapter.get_job_status("fake-job")["status"] == "processing"
     assert calls == [("GET", "http://fake-sidecar/jobs/fake-job")] * 2
 
+
+
+def test_g70_g71_sidecar_corrupt_completed_bytes_409_fails_closed_without_resubmission(monkeypatch):
+    """FAKE-only transport regression for Sidecar integrity HTTP 409 boundary."""
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            request = httpx.Request(method, url)
+            return httpx.Response(
+                409,
+                json={"detail": "Completed render byte proof unavailable; manual reconciliation required"},
+                request=request,
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    sidecar = VideoUseAdapter(api_url="http://fake-sidecar", max_retries=1, backoff_factor=0)
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
+    )
+    result = process_render_task(
+        components,
+        {
+            "taskId": "byte-proof-job",
+            "progress": 50,
+            "upstreamJobId": "byte-proof-job",
+            "renderPayload": {"projectId": "byte-proof-project", "requestId": "byte-proof-job"},
+        },
+        poll_interval=0,
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    assert result["upstream_job_id"] == "byte-proof-job"
+    assert all(method == "GET" for method, _url in calls)
+    assert calls == [("GET", "http://fake-sidecar/jobs/byte-proof-job")] * 2
+    queue.update.assert_called_once()
+    assert queue.update.call_args.kwargs["status"] == "UNKNOWN"

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
@@ -1006,3 +1007,103 @@ def test_jobstore_unacknowledged_legacy_retry_flag_never_requeues(tmp_path):
     assert durable_path.read_bytes() == before, (
         "A read/replay mutated the durable failed outcome without Owner ACK"
     )
+
+
+def test_g70g71_completed_render_byte_proof_blocks_missing_corrupt_and_aliased_output(tmp_path):
+    """Native Sidecar + FFmpeg regression, disposable media only (no Provider)."""
+    upstream = tmp_path / "upstream"
+    make_fake_upstream(upstream)
+    source = tmp_path / "source.mp4"
+    make_source(source)
+    media_root = tmp_path / "media"
+    project_id = "byte-proof-project"
+    request_id = "byte-proof-job"
+
+    with TestClient(create_app(media_root=media_root, upstream_root=upstream)) as client:
+        with source.open("rb") as stream:
+            upload = client.post(
+                "/media",
+                data={"projectId": project_id},
+                files={"file": ("source.mp4", stream, "video/mp4")},
+            )
+        assert upload.status_code == 201, upload.text
+        response = client.post(
+            "/renders",
+            json={
+                "projectId": project_id,
+                "requestId": request_id,
+                "ranges": [{"mediaId": upload.json()["mediaId"], "start": 0, "end": 0.8}],
+                "mode": "preview",
+            },
+        )
+        assert response.status_code == 202, response.text
+        job = wait_for_job(client, request_id)
+        assert job["status"] == "completed", job
+        assert job["jobId"] == request_id
+        assert job["projectId"] == project_id
+        path = media_root / job["artifact"]
+        original = path.read_bytes()
+        assert job["artifactSizeBytes"] == len(original) > 0
+        assert job["artifactSha256"] == hashlib.sha256(original).hexdigest()
+        assert client.get(f"/jobs/{request_id}/artifact").status_code == 200
+
+        def assert_fenced():
+            status = client.get(f"/jobs/{request_id}")
+            assert status.status_code == 409, status.text
+            assert "manual reconciliation" in status.json()["detail"]
+            artifact = client.get(f"/jobs/{request_id}/artifact")
+            assert artifact.status_code == 409, artifact.text
+
+        # A same-length substitution must fail even if file size still matches.
+        path.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        assert path.stat().st_size == len(original)
+        assert_fenced()
+        path.write_bytes(original)
+        assert client.get(f"/jobs/{request_id}").status_code == 200
+
+        # Missing bytes must not leave a status-only completed path.
+        path.unlink()
+        assert_fenced()
+        path.write_bytes(original)
+        assert client.get(f"/jobs/{request_id}").status_code == 200
+
+        # A symlink into another project remains unsafe even with identical bytes.
+        foreign = (
+            media_root / "projects" / "foreign-project"
+            / "renders" / request_id / "final.mp4"
+        )
+        foreign.parent.mkdir(parents=True, exist_ok=True)
+        foreign.write_bytes(original)
+        path.unlink()
+        path.symlink_to(foreign)
+        assert_fenced()
+        path.unlink()
+        # A cyclic symlink is likewise a proof failure, not an unhandled 500.
+        path.symlink_to(path)
+        assert_fenced()
+        path.unlink()
+        path.write_bytes(original)
+
+        # Persisted terminal receipt metadata is not optional. Legacy or
+        # tampered records are quarantined rather than assumed reconciled.
+        record = media_root / "jobs" / f"{request_id}.json"
+        original_record = record.read_text(encoding="utf-8")
+        for edit in (
+            {"artifactSha256": None},
+            {"artifactSizeBytes": len(original) + 1},
+            {"artifact": f"projects/foreign-project/renders/{request_id}/final.mp4"},
+        ):
+            payload = json.loads(original_record)
+            payload.update(edit)
+            record.write_text(json.dumps(payload), encoding="utf-8")
+            assert_fenced()
+        record.write_text(original_record, encoding="utf-8")
+        assert client.get(f"/jobs/{request_id}").status_code == 200
+        assert client.get(f"/jobs/{request_id}/artifact").status_code == 200
+
+    # Durable completion proof is checked again after an ASGI application
+    # restart. This does not prove independent Sidecar issuer authenticity.
+    with TestClient(create_app(media_root=media_root, upstream_root=upstream)) as client:
+        response = client.get(f"/jobs/{request_id}")
+        assert response.status_code == 200, response.text
+        assert response.json()["artifactSha256"] == hashlib.sha256(original).hexdigest()

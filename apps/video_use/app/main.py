@@ -838,12 +838,19 @@ def create_app(
                 jobs.update(job_id, progress=25, message="正在使用固定版本的 video-use 渲染")
                 run_checked(command)
             metadata = probe(output)
+            # Freeze a digest and byte count into the durable terminal record.
+            # These are Sidecar-local integrity observations, not a signed
+            # independent acceptance receipt or a billing settlement.
+            artifact_size = output.stat().st_size
+            artifact_sha256 = sha256_file(output)
             jobs.update(
                 job_id,
                 status="completed",
                 progress=100,
                 message="成片渲染完成",
                 artifact=str(output.relative_to(store.root)),
+                artifactSizeBytes=artifact_size,
+                artifactSha256=artifact_sha256,
                 metadata=metadata,
             )
         except Exception as exc:  # pragma: no cover - assertion via public API
@@ -1264,6 +1271,48 @@ def create_app(
         submit_auxiliary_or_fail_closed(job, execute_timeline_view, request)
         return job
 
+    def require_completed_render_bytes(job: dict[str, Any]) -> None:
+        """Fail closed when a completed render no longer has its frozen bytes.
+
+        This guard runs at read time (including restart) before any Worker may
+        convert Sidecar 'completed' into API READY. It is not a signed receipt:
+        the Sidecar itself remains the observer, and a later mutation is still
+        possible. Older terminal records without proof require reconciliation.
+        """
+        if job.get("kind") != "render" or job.get("status") != "completed":
+            return
+        message = "Completed render byte proof unavailable; manual reconciliation required"
+        project_id, job_id = job.get("projectId"), job.get("jobId")
+        digest, size = job.get("artifactSha256"), job.get("artifactSizeBytes")
+        if not isinstance(project_id, str) or not isinstance(job_id, str):
+            raise HTTPException(status_code=409, detail=message)
+        try:
+            validate_identifier(project_id, "projectId")
+            validate_identifier(job_id, "jobId")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=message) from exc
+        expected = f"projects/{project_id}/renders/{job_id}/final.mp4"
+        if (
+            job.get("artifact") != expected
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise HTTPException(status_code=409, detail=message)
+        candidate = store.root / expected
+        try:
+            # Reject symlink aliases even when they stay within media_root.
+            # An accepted string path must identify the original owned inode.
+            resolved = candidate.resolve(strict=True)
+            if resolved != candidate.absolute() or not resolved.is_file():
+                raise ValueError("render artifact path is missing or aliased")
+            if resolved.stat().st_size != size or sha256_file(resolved) != digest:
+                raise ValueError("render artifact size/hash changed")
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=message) from exc
+
     @app.get("/jobs/{job_id}")
     def get_job(job_id: str):
         try:
@@ -1273,6 +1322,7 @@ def create_app(
         job = jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="未找到该任务")
+        require_completed_render_bytes(job)
         return job
 
     @app.get("/jobs/{job_id}/artifact")
@@ -1280,6 +1330,7 @@ def create_app(
         job = jobs.get(job_id)
         if job is None or job.get("status") != "completed" or not job.get("artifact"):
             raise HTTPException(status_code=404, detail="成片文件尚不可用")
+        require_completed_render_bytes(job)
         artifact = (store.root / job["artifact"]).resolve()
         try:
             artifact.relative_to(store.root)
