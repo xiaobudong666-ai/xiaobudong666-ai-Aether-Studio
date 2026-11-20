@@ -2409,6 +2409,33 @@ def create_app(
                 status_code=409,
                 detail={"code": "GENERATION_NOT_RETRYABLE", "message": "当前任务状态不可重试"},
             )
+        # G70/G71 FAKE-only safety prerequisite: a retryable task status is not
+        # evidence that the prior submission was never accepted or charged.
+        # Until an independently trusted human ACK/HELD reconciliation is
+        # approved, only attempts durably marked NOT_SUBMITTED with no upstream
+        # receipt on either the task or attempt may enter the existing retry.
+        # Refuse malformed legacy/divergent history without changing usage.
+        prior_attempt = db.execute(
+            select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no == task.attempts,
+            )
+        ).scalar_one_or_none()
+        if (
+            prior_attempt is None
+            or prior_attempt.status != task.status
+            or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
+            or task.upstream_job_id is not None
+            or task.provider_artifact_id is not None
+            or prior_attempt.upstream_job_id is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_RECONCILIATION_REQUIRED",
+                    "message": "原尝试存在已提交或状态不明的持久证据，禁止自动重试，须人工对账",
+                },
+            )
         if task.attempts >= task.max_attempts:
             raise HTTPException(
                 status_code=409,
