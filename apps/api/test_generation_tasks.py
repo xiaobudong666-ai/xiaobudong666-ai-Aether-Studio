@@ -7299,3 +7299,86 @@ def test_g70g71_m11_queued_ambiguous_evidence_cannot_cancel_and_release(
         assert persisted_snapshot() == before, "rejected cancel mutated receipt, lease, quota or audit"
     app.state.moneyprinter.assert_not_called()
     assert media_store.uploads == 0
+
+
+@pytest.mark.parametrize("ledger_anomaly", [
+    "MISSING_RESERVED",
+    "ZERO_UNIT_RESERVED",
+    "ORPHAN_RELEASED",
+    "MISSING_CURRENT_ATTEMPT",
+])
+def test_g70g71_m11_queued_cancel_requires_consistent_reserved_ledger(
+    generation_context, ledger_anomaly
+):
+    """FAKE-only: corrupt/missing durable accounting cannot mint a quota credit."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key=f"queued-ledger-anomaly-{ledger_anomaly.lower()}")
+    task_id = task["taskId"]
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        reservation = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        if ledger_anomaly == "MISSING_RESERVED":
+            db.delete(reservation)
+        elif ledger_anomaly == "ZERO_UNIT_RESERVED":
+            reservation.request_units = 0
+        elif ledger_anomaly == "ORPHAN_RELEASED":
+            db.add(DBGenerationUsageEntry(
+                id=str(uuid.uuid4()),
+                tenant_id=reservation.tenant_id,
+                project_id=reservation.project_id,
+                task_id=reservation.task_id,
+                attempt_id=reservation.attempt_id,
+                kind="RELEASED",
+                request_units=1,
+                generated_seconds=0,
+                reservation_key=reservation.reservation_key,
+                config_version_id=reservation.config_version_id,
+                created_at=datetime.datetime.now(datetime.timezone.utc),
+            ))
+        else:
+            row.attempts += 1  # Simulate a broken history without deleting the original attempt.
+        db.commit()
+
+    def persisted_snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            usage = tuple(sorted((
+                entry.kind, entry.request_units, entry.generated_seconds,
+                entry.reservation_key, entry.tenant_id, entry.project_id,
+                entry.task_id, entry.attempt_id,
+            ) for entry in db.execute(select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id,
+            )).scalars()))
+            attempts = tuple((
+                entry.id, entry.attempt_no, entry.status, entry.reconciliation_state,
+            ) for entry in db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            ).order_by(DBGenerationAttempt.attempt_no)).scalars())
+            event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (
+                row.status, row.attempts, row.cancel_requested_at, row.completed_at,
+                row.lease_owner, row.lease_expires_at,
+                usage, attempts, event_count,
+            )
+
+    before = persisted_snapshot()
+    assert before[0] == "QUEUED"
+    expected = (
+        "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+        if ledger_anomaly == "MISSING_CURRENT_ATTEMPT"
+        else "GENERATION_CANCEL_USAGE_EVIDENCE_INVALID"
+    )
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}/cancel"
+    for _ in range(2):
+        response = client.post(path)
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == expected
+        assert persisted_snapshot() == before, "rejected cancel mutated ledger, task or audit"
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
