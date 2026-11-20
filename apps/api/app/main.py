@@ -2461,6 +2461,22 @@ def create_app(
         # approved, only attempts durably marked NOT_SUBMITTED with no upstream
         # receipt on either the task or attempt may enter the existing retry.
         # Refuse malformed legacy/divergent history without changing usage.
+        # A clean CURRENT attempt cannot prove that earlier attempts were
+        # never accepted. Legacy retries may have cleared task-level upstream
+        # IDs even while an older attempt retains a durable HELD, submission
+        # start or upstream job marker. Do not create a third billable attempt
+        # without independent reconciliation of the entire attempt history.
+        unresolved_earlier_attempt = db.execute(
+            select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no < task.attempts,
+                or_(
+                    DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
+                    DBGenerationAttempt.submission_started_at.is_not(None),
+                    DBGenerationAttempt.upstream_job_id.is_not(None),
+                ),
+            ).limit(1)
+        ).scalar_one_or_none()
         prior_attempt = db.execute(
             select(DBGenerationAttempt).where(
                 DBGenerationAttempt.generation_task_id == task.id,
@@ -2469,6 +2485,7 @@ def create_app(
         ).scalar_one_or_none()
         if (
             prior_attempt is None
+            or unresolved_earlier_attempt is not None
             or prior_attempt.status != task.status
             or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
             # Worker claim durably writes this BEFORE any upstream POST. The
