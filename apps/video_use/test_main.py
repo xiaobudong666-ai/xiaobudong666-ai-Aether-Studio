@@ -1063,6 +1063,14 @@ def test_g70g71_artifact_download_streams_verified_snapshot_not_swapped_path(tmp
         assert downloaded.content == original, "download read a swapped mutable path"
         assert downloaded.headers["content-length"] == str(len(original))
         assert client.get(f"/jobs/{request_id}").status_code == 409
+        # Download clients also need byte ranges: preserve FileResponse 206.
+        path.write_bytes(original)
+        part = client.get(
+            f"/jobs/{request_id}/artifact",
+            headers={"Range": "bytes=0-31"},
+        )
+        assert part.status_code == 206, part.text
+        assert part.content == original[:32]
 
 
 def test_g70g71_completed_render_byte_proof_blocks_missing_corrupt_and_aliased_output(tmp_path):
