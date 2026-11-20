@@ -792,21 +792,80 @@ def test_19_cancel_is_idempotent_and_late_success_isolated(generation_context):
     assert transition(client, task["taskId"], "RUNNING", upstreamJobId="late").status_code == 409
 
 
-def test_20_retry_appends_attempt_and_preserves_history(generation_context):
-    client, sessions, _, _ = generation_context
+def test_20_claimed_failure_must_not_retry_without_independent_no_submit_evidence(generation_context):
+    """FAKE-only: a claimed task may have submitted even when no job ID survived."""
+    client, sessions, app, media_store = generation_context
     project = create_project(client)
     task = create_task(client, project)
-    claim(client)
+    assert claim(client).status_code == 200
     failed = transition(
         client, task["taskId"], "FAILED", errorCode="TEMPORARY", errorMessage="retry", retryable=True,
     )
     assert failed.status_code == 200
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == row.id,
+        )).scalar_one()
+        assert attempt.submission_started_at is not None
+        assert attempt.reconciliation_state == "NOT_SUBMITTED"
+        assert row.upstream_job_id is None and attempt.upstream_job_id is None
+        before = (row.status, row.attempts, row.error_code, attempt.status,
+                  attempt.submission_started_at, attempt.reconciliation_state)
+        events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+        )).scalar_one()
+        usage = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == row.id,
+        )).scalar_one()
     retried = client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry")
-    assert retried.status_code == 202
+    assert retried.status_code == 409, retried.text
+    assert retried.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == row.id,
+        )).scalar_one()
+        assert (row.status, row.attempts, row.error_code, attempt.status,
+                attempt.submission_started_at, attempt.reconciliation_state) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+        )).scalar_one() == events
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == row.id,
+        )).scalar_one() == usage
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
+
+
+def test_g70g71_synthetic_preclaim_failure_can_retry_with_persisted_no_submit(generation_context):
+    """Only a task never claimed/submitted can take the existing retry path."""
+    client, sessions, _, _ = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key="synthetic-preclaim-failure")
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == row.id,
+        )).scalar_one()
+        assert attempt.submission_started_at is None
+        assert attempt.reconciliation_state == "NOT_SUBMITTED"
+        row.status = "FAILED"
+        row.error_code = "TEMPORARY"
+        row.completed_at = datetime.datetime.now(datetime.timezone.utc)
+        attempt.status = "FAILED"
+        attempt.error_code = "TEMPORARY"
+        attempt.completed_at = row.completed_at
+        db.commit()
+    retried = client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry")
+    assert retried.status_code == 202, retried.text
     assert retried.json()["attempt"] == 2
     with sessions() as db:
-        attempts = list(db.execute(select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task["taskId"])).scalars())
+        attempts = list(db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task["taskId"]
+        ).order_by(DBGenerationAttempt.attempt_no)).scalars())
         assert [attempt.attempt_no for attempt in attempts] == [1, 2]
+        assert attempts[0].submission_started_at is None
 
 
 def test_21_unknown_submission_cannot_blindly_retry(generation_context):
@@ -2498,16 +2557,19 @@ def test_im17_38_success_settles_probe_seconds_once(generation_context):
     assert len(settled) == 1 and settled[0].generated_seconds == 1
 
 
-def test_im17_39_retry_reuses_reservation_and_appends_attempt(generation_context):
+def test_im17_39_claimed_failure_holds_reservation_and_does_not_append_attempt(generation_context):
     client, sessions, _, _ = generation_context
     project = create_project(client)
     task = create_task(client, project)
-    claim(client)
-    transition(client, task["taskId"], "FAILED", errorCode="TEMPORARY", retryable=True)
-    assert client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry").status_code == 202
+    assert claim(client).status_code == 200
+    assert transition(client, task["taskId"], "FAILED",
+                      errorCode="TEMPORARY", retryable=True).status_code == 200
+    rejected = client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry")
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
     with sessions() as db:
         assert db.execute(select(func.count(DBGenerationUsageEntry.id))).scalar_one() == 1
-        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == 2
+        assert db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one() == 1
 
 
 def test_im17_40_multiple_worker_failures_open_circuit_once(generation_context, monkeypatch):
@@ -3822,27 +3884,16 @@ def test_g76_stale_lease_epoch_cannot_mutate_reclaimed_half_open_probe(generatio
     assert first["taskId"] == task["taskId"]
     stale_epoch = first["leaseEpoch"]
 
-    failed = transition(
-        client, task["taskId"], "FAILED", worker_id=worker_id,
-        errorCode="PROVIDER_TEST_FAILURE", errorMessage="synthetic failure",
-        retryable=True,
-    )
-    assert failed.status_code == 200, failed.text
-    with sessions() as db:
-        circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
-        circuit.state = "CLOSED"
-        circuit.failure_timestamps_json = []
-        circuit.opened_at = None
-        circuit.cooldown_until = None
-        circuit.half_open_task_id = None
-        circuit.half_open_lease_epoch = None
-        circuit.half_open_issuer = None
-        db.commit()
-    retried = client.post(f"/projects/{project['id']}/generation-tasks/{task['taskId']}/retry")
-    assert retried.status_code == 202, retried.text
-
+    # Recover the SAME already-submitted FAKE job after its lease expires.
+    # Do not fabricate a second generation attempt after submission began.
+    assert transition(
+        client, task["taskId"], "RUNNING", worker_id=worker_id,
+        upstreamJobId="g76-upstream-current-epoch",
+    ).status_code == 200
     now = datetime.datetime.now(datetime.timezone.utc)
     with sessions() as db:
+        existing_task = db.get(DBGenerationTask, task["taskId"])
+        existing_task.lease_expires_at = now - datetime.timedelta(seconds=1)
         circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
         circuit.state = "HALF_OPEN"
         circuit.failure_timestamps_json = [now.isoformat()]
@@ -3887,7 +3938,7 @@ def test_g76_stale_lease_epoch_cannot_mutate_reclaimed_half_open_probe(generatio
             select(DBGenerationTask).where(DBGenerationTask.id == task["taskId"])
         ).scalar_one()
         circuit = db.execute(select(DBGenerationCircuitState)).scalar_one()
-        assert current_task.status == "SUBMITTING"
+        assert current_task.status == "RUNNING"
         assert circuit.state == "HALF_OPEN"
         assert circuit.probe_epoch == current_probe_epoch
         assert circuit.half_open_lease_epoch == current_epoch
