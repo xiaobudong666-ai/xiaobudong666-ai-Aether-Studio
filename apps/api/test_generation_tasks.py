@@ -2542,6 +2542,89 @@ def test_im17_37_cancel_releases_once_without_negative_usage(generation_context)
     assert sum(entry.request_units if entry.kind == "RESERVED" else -entry.request_units for entry in entries) == 0
 
 
+@pytest.mark.parametrize("phase", ["CLAIMED", "RUNNING"])
+def test_g70g71_m11_cancel_after_claim_requires_reconciliation_without_release(
+    generation_context, phase
+):
+    """FAKE-only: local cancellation cannot assert upstream STOP or release funds."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key=f"cancel-after-submit-{phase.lower()}")
+    claimed = claim(client)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task["taskId"]
+    if phase == "RUNNING":
+        running = transition(
+            client, task["taskId"], "RUNNING",
+            upstreamJobId="fake-upstream-already-accepted",
+        )
+        assert running.status_code == 200, running.text
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task["taskId"])
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == row.id,
+                DBGenerationAttempt.attempt_no == row.attempts,
+            )).scalar_one()
+            usage = tuple(db.execute(select(DBGenerationUsageEntry.kind).where(
+                DBGenerationUsageEntry.task_id == row.id,
+            )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == row.id,
+            )).scalar_one()
+            return (
+                row.status, row.cancel_requested_at, row.completed_at,
+                row.upstream_job_id, row.lease_owner, row.lease_epoch,
+                attempt.status, attempt.submission_started_at,
+                attempt.upstream_job_id, usage, events,
+            )
+
+    before = snapshot()
+    assert before[7] is not None, "Worker claim must durably mark submission start"
+    assert before[9] == ("RESERVED",)
+    path = f"/projects/{project['id']}/generation-tasks/{task['taskId']}/cancel"
+    for _ in range(2):
+        rejected = client.post(path)
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"]["code"] == "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+        assert snapshot() == before, "rejected cancellation must not mutate task, lease, usage or audit"
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
+
+
+def test_g70g71_m11_queued_with_orphan_submission_marker_must_not_release(
+    generation_context,
+):
+    """Legacy/inconsistent QUEUED evidence must fail closed, not be relabeled canceled."""
+    client, sessions, app, _ = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key="cancel-queued-orphan-submit-marker")
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == row.id,
+        )).scalar_one()
+        assert row.status == attempt.status == "QUEUED"
+        attempt.submission_started_at = datetime.datetime.now(datetime.timezone.utc)
+        db.commit()
+    path = f"/projects/{project['id']}/generation-tasks/{task['taskId']}/cancel"
+    rejected = client.post(path)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        assert row.status == "QUEUED" and row.cancel_requested_at is None
+        assert list(db.execute(select(DBGenerationUsageEntry.kind).where(
+            DBGenerationUsageEntry.task_id == row.id,
+        )).scalars()) == ["RESERVED"]
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+            DBGenerationEvent.event_type == "TASK_CANCELED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_im17_38_success_settles_probe_seconds_once(generation_context):
     client, sessions, _, _ = generation_context
     project = create_project(client)
