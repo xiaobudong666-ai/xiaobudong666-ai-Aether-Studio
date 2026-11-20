@@ -261,6 +261,19 @@ def process_render_task(components: WorkerComponents, task: dict, poll_interval:
             progress = int(upstream.get("progress", 0))
             message = str(upstream.get("message", upstream_status))
             if upstream_status == "completed":
+                # A matching job/project status alone is insufficient to
+                # attest that this render's final output exists.  The Sidecar
+                # render contract stores only this exact project/job final path.
+                # This is a binding guard, NOT an independent signed receipt
+                # or proof that durable bytes are present.
+                expected_artifact = (
+                    f"projects/{render_payload['projectId']}/renders/"
+                    f"{upstream_job_id}/final.mp4"
+                )
+                if upstream.get("artifact") != expected_artifact:
+                    raise TaskQueueError(
+                        "Sidecar completed artifact binding mismatch; manual reconciliation required"
+                    )
                 return components.queue.update(
                     task_id, status="completed", progress=100, message=message,
                     upstream_job_id=upstream_job_id,
