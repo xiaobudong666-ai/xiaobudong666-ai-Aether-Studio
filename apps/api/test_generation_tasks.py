@@ -7474,3 +7474,72 @@ def test_g70g71_m11_earlier_attempt_receipt_must_block_new_retry(
             assert snapshot() == before, "rejected retry changed attempt, quota or audit"
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("orphan_lease", ["owner_only", "expiry_only", "both_expired"])
+def test_g70g71_retry_rejects_orphan_worker_lease_without_mutation(
+    generation_context, orphan_lease,
+):
+    """FAKE-only: a failed preclaim-looking task with an orphan lease is unsafe.
+
+    Lease markers are durable evidence of possible Worker ownership even when
+    an old/partial row says FAILED and NOT_SUBMITTED. Expiry is not a STOP ACK.
+    Reject retry without creating an attempt, releasing usage or altering audit.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, f"g70-retry-orphan-lease-{orphan_lease}")
+    task = create_task(client, project, key=f"g70-retry-orphan-lease-{orphan_lease}")
+    task_id = task["taskId"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == row.attempts,
+        )).scalar_one()
+        row.status = "FAILED"
+        row.error_code = "TEMPORARY"
+        row.completed_at = now
+        attempt.status = "FAILED"
+        attempt.error_code = "TEMPORARY"
+        attempt.completed_at = now
+        assert attempt.reconciliation_state == "NOT_SUBMITTED"
+        assert attempt.submission_started_at is None
+        if orphan_lease in {"owner_only", "both_expired"}:
+            row.lease_owner = "synthetic-orphan-worker"
+        if orphan_lease in {"expiry_only", "both_expired"}:
+            row.lease_expires_at = now - datetime.timedelta(hours=1)
+        db.commit()
+
+    def durable_snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )).scalar_one()
+            return (
+                row.status, row.attempts, row.error_code, row.lease_owner,
+                row.lease_expires_at, row.upstream_job_id,
+                attempt.status, attempt.reconciliation_state,
+                db.execute(select(func.count(DBGenerationAttempt.id)).where(
+                    DBGenerationAttempt.generation_task_id == task_id
+                )).scalar_one(),
+                tuple((u.kind, u.request_units, u.generated_seconds) for u in
+                    db.execute(select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id
+                    ).order_by(DBGenerationUsageEntry.kind)).scalars()),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id
+                )).scalar_one(),
+            )
+
+    before = durable_snapshot()
+    assert before[8] == 1 and [u[0] for u in before[9]] == ["RESERVED"]
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}/retry"
+    for _ in range(2):
+        response = client.post(path)
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
+        assert durable_snapshot() == before
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
