@@ -7299,3 +7299,89 @@ def test_g70g71_m11_queued_ambiguous_evidence_cannot_cancel_and_release(
         assert persisted_snapshot() == before, "rejected cancel mutated receipt, lease, quota or audit"
     app.state.moneyprinter.assert_not_called()
     assert media_store.uploads == 0
+
+@pytest.mark.parametrize("prior_evidence", [
+    "HELD_NO_RECEIPT", "UPSTREAM_ACCEPTED_NO_RECEIPT",
+    "SUBMISSION_STARTED", "UPSTREAM_ID", "CLEAN_NOT_SUBMITTED",
+])
+def test_g70g71_m11_prior_attempt_submission_evidence_blocks_cancel(
+    generation_context, prior_evidence,
+):
+    """FAKE-only: a clean current attempt cannot erase prior billable evidence.
+
+    Historical/inconsistent multi-attempt records are injected without calling
+    any Provider. Only an entirely unsubmitted prior attempt is safe to cancel.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client)
+    task = create_task(client, project, key="multi-attempt-cancel-" + prior_evidence.lower())
+    task_id = task["taskId"]
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        old = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert row.attempts == 1 and row.status == old.status == "QUEUED"
+        now = datetime.datetime.now(datetime.timezone.utc)
+        old.status = "FAILED"
+        old.completed_at = now
+        if prior_evidence == "HELD_NO_RECEIPT":
+            old.reconciliation_state = "HELD"
+        elif prior_evidence == "UPSTREAM_ACCEPTED_NO_RECEIPT":
+            old.reconciliation_state = "UPSTREAM_ACCEPTED"
+        elif prior_evidence == "SUBMISSION_STARTED":
+            old.submission_started_at = now
+        elif prior_evidence == "UPSTREAM_ID":
+            old.upstream_job_id = "older-accepted-fake-job"
+        else:
+            assert prior_evidence == "CLEAN_NOT_SUBMITTED"
+            assert old.reconciliation_state == "NOT_SUBMITTED"
+        row.attempts = 2
+        # Emulate an old retry that cleared task-level upstream IDs.
+        row.status = "QUEUED"
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(db.execute(select(DBGenerationUsageEntry.kind).where(
+                DBGenerationUsageEntry.task_id == task_id,
+            ).order_by(DBGenerationUsageEntry.kind)).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (
+                row.status, row.attempts, row.cancel_requested_at,
+                row.lease_owner, row.lease_expires_at, attempts, usage, events,
+            )
+
+    before = snapshot()
+    assert before[-2] == ("RESERVED",)
+    endpoint = f"/projects/{project['id']}/generation-tasks/{task_id}/cancel"
+    if prior_evidence == "CLEAN_NOT_SUBMITTED":
+        accepted = client.post(endpoint)
+        assert accepted.status_code == 200, accepted.text
+        after = snapshot()
+        assert after[0] == "CANCELED" and after[1] == 2
+        assert after[-2] == ("RELEASED", "RESERVED")
+    else:
+        for _ in range(2):
+            denied = client.post(endpoint)
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"]["code"] == "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+            assert snapshot() == before, "rejected cancel mutated prior attempt or usage"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
