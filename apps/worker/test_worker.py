@@ -143,7 +143,7 @@ def test_worker_claimed_render_is_submitted_polled_and_persisted():
     queue.update.side_effect = lambda _task_id, **values: values
     video_use = MagicMock()
     video_use.submit_render.return_value = {
-        "jobId": "upstream-1", "status": "queued", "progress": 0, "message": "Queued"
+        "jobId": "task-1", "projectId": "project-1", "status": "queued", "progress": 0, "message": "Queued"
     }
     video_use.get_job_status.side_effect = [
         {"status": "processing", "progress": 50, "message": "Rendering"},
@@ -162,7 +162,7 @@ def test_worker_claimed_render_is_submitted_polled_and_persisted():
     assert result["status"] == "completed"
     video_use.submit_render.assert_called_once_with(task["renderPayload"])
     assert queue.update.call_count == 3
-    assert queue.update.call_args.kwargs["upstream_job_id"] == "upstream-1"
+    assert queue.update.call_args.kwargs["upstream_job_id"] == "task-1"
 
 
 def test_worker_unknown_video_use_handoff_never_retries_without_ack():
@@ -176,7 +176,8 @@ def test_worker_unknown_video_use_handoff_never_retries_without_ack():
     )
     result = process_render_task(
         components,
-        {"taskId": "task-retry", "progress": 0, "renderPayload": {"projectId": "p"}},
+        {"taskId": "task-retry", "progress": 0,
+         "renderPayload": {"projectId": "p", "requestId": "task-retry"}},
         poll_interval=0,
     )
     assert result["status"] == "UNKNOWN"
@@ -206,6 +207,72 @@ def test_worker_unknown_poll_keeps_durable_upstream_id_for_manual_reconcile():
     assert result["upstream_job_id"] == "upstream-already-accepted"
     video_use.submit_render.assert_not_called()
     video_use.get_job_status.assert_called_once_with("upstream-already-accepted")
+
+
+
+@pytest.mark.parametrize(
+    "sidecar_ack",
+    [
+        {"jobId": "other-task", "projectId": "project-1"},
+        {"jobId": "task-bound", "projectId": "project-other"},
+        {"jobId": None, "projectId": "project-1"},
+        {"jobId": "task-bound"},
+    ],
+)
+def test_render_sidecar_ack_must_match_immutable_task_and_project(sidecar_ack):
+    """FAKE-only negative receipt: no unrelated job is ever polled or bound."""
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    sidecar = MagicMock()
+    sidecar.submit_render.return_value = sidecar_ack
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
+    )
+    payload = {"projectId": "project-1", "requestId": "task-bound"}
+    result = process_render_task(
+        components, {"taskId": "task-bound", "progress": 0,
+                     "renderPayload": payload}, poll_interval=0,
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    assert result["upstream_job_id"] is None
+    sidecar.submit_render.assert_called_once_with(payload)
+    sidecar.get_job_status.assert_not_called()
+    queue.update.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"projectId": "project-1"},
+        {"projectId": "project-1", "requestId": "wrong-task"},
+        {"projectId": "project-1", "requestId": "task-bound", "project": None},
+        {"requestId": "task-bound"},
+    ],
+)
+def test_render_unbound_request_never_reaches_sidecar(payload):
+    """FAKE-only: reject bad request identity before any mutating POST."""
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    sidecar = MagicMock()
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
+    )
+    # The extra 'project' metadata is not a problem by itself; the
+    # third case explicitly invalidates the mandatory projectId binding.
+    if "project" in payload:
+        payload = dict(payload, projectId="")
+    result = process_render_task(
+        components, {"taskId": "task-bound", "progress": 0,
+                     "renderPayload": payload}, poll_interval=0,
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    sidecar.submit_render.assert_not_called()
+    sidecar.get_job_status.assert_not_called()
+    queue.update.assert_called_once()
 
 
 from app.video_use_adapter import VideoUseAdapter, VideoUseError
