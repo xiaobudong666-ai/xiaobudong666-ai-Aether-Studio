@@ -1078,6 +1078,10 @@ def test_g70g71_completed_render_byte_proof_blocks_missing_corrupt_and_aliased_o
         path.symlink_to(foreign)
         assert_fenced()
         path.unlink()
+        # A cyclic symlink is likewise a proof failure, not an unhandled 500.
+        path.symlink_to(path)
+        assert_fenced()
+        path.unlink()
         path.write_bytes(original)
 
         # Persisted terminal receipt metadata is not optional. Legacy or
