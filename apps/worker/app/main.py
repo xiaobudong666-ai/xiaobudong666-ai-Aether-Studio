@@ -228,6 +228,20 @@ def process_render_task(components: WorkerComponents, task: dict, poll_interval:
                 message="任务已提交至视频渲染服务",
                 upstream_job_id=upstream_job_id,
             )
+        else:
+            # An older queued record may carry an upstream id persisted before
+            # the ACK fence. Never resume polling a job bound to another task.
+            render_payload = task.get("renderPayload")
+            if (
+                not isinstance(render_payload, dict)
+                or render_payload.get("requestId") != task_id
+                or upstream_job_id != task_id
+                or not isinstance(render_payload.get("projectId"), str)
+                or not render_payload.get("projectId")
+            ):
+                raise TaskQueueError(
+                    "Persisted Sidecar job identity mismatch; manual reconciliation required"
+                )
 
         deadline = time.monotonic() + float(os.environ.get("AETHER_RENDER_TIMEOUT_SECONDS", "3600"))
         while time.monotonic() < deadline:
