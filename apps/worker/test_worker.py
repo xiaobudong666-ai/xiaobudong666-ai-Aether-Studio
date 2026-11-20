@@ -146,8 +146,8 @@ def test_worker_claimed_render_is_submitted_polled_and_persisted():
         "jobId": "task-1", "projectId": "project-1", "status": "queued", "progress": 0, "message": "Queued"
     }
     video_use.get_job_status.side_effect = [
-        {"status": "processing", "progress": 50, "message": "Rendering"},
-        {"status": "completed", "progress": 100, "message": "Done"},
+        {"jobId": "task-1", "projectId": "project-1", "status": "processing", "progress": 50, "message": "Rendering"},
+        {"jobId": "task-1", "projectId": "project-1", "status": "completed", "progress": 100, "message": "Done"},
     ]
     components = WorkerComponents(
         ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
@@ -294,6 +294,54 @@ def test_render_resume_rejects_mismatched_persisted_sidecar_identity(upstream_jo
     assert result["retryable"] is False
     sidecar.get_job_status.assert_not_called()
     sidecar.submit_render.assert_not_called()
+
+
+
+@pytest.mark.parametrize(
+    "sidecar_status",
+    [
+        {"jobId": "unrelated-job", "projectId": "project-1", "status": "completed"},
+        {"jobId": "task-bound", "projectId": "different-project", "status": "completed"},
+        {"projectId": "project-1", "status": "completed"},
+        {"jobId": "task-bound", "status": "completed"},
+        {"jobId": "unrelated-job", "projectId": "project-1", "status": "processing"},
+        [],
+    ],
+)
+@pytest.mark.parametrize("resume", [False, True])
+def test_render_sidecar_poll_identity_must_match_job_and_project(sidecar_status, resume):
+    """FAKE-only: a forged/missing GET status never authorizes a terminal write."""
+    queue = MagicMock()
+    queue.update.side_effect = lambda _task_id, **values: values
+    sidecar = MagicMock()
+    sidecar.submit_render.return_value = {
+        "jobId": "task-bound", "projectId": "project-1", "status": "queued"
+    }
+    sidecar.get_job_status.return_value = sidecar_status
+    components = WorkerComponents(
+        ffmpeg=MagicMock(), ai=MagicMock(), recovery=MagicMock(),
+        moneyprinter=MagicMock(), video_use=sidecar, queue=queue,
+    )
+    task = {
+        "taskId": "task-bound", "progress": 15,
+        "renderPayload": {"projectId": "project-1", "requestId": "task-bound"},
+    }
+    if resume:
+        task["upstreamJobId"] = "task-bound"
+    result = process_render_task(components, task, poll_interval=0)
+    assert result["status"] == "UNKNOWN"
+    assert result["retryable"] is False
+    assert result["upstream_job_id"] == "task-bound"
+    sidecar.get_job_status.assert_called_once_with("task-bound")
+    if resume:
+        sidecar.submit_render.assert_not_called()
+    else:
+        sidecar.submit_render.assert_called_once()
+    assert not any(
+        call.kwargs.get("status") == "completed"
+        for call in queue.update.call_args_list
+    )
+
 
 
 from app.video_use_adapter import VideoUseAdapter, VideoUseError
