@@ -2336,6 +2336,29 @@ def create_app(
             now = utc_now()
             previous = task.status
             attempt = current_generation_attempt(db, task)
+            # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
+            # submission can still be executing or billable upstream even
+            # when the API has no upstream job ID. Without an independently
+            # trusted STOP ACK, neither record CANCELED nor RELEASE quota.
+            # This candidate intentionally does not invent settlement or
+            # stop/ACK policy; it keeps the original task for reconciliation.
+            if (
+                task.status != "QUEUED"
+                or attempt.status != "QUEUED"
+                or attempt.submission_started_at is not None
+                or task.upstream_job_id is not None
+                or attempt.upstream_job_id is not None
+                or task.provider_artifact_id is not None
+                or task.media_id is not None
+                or task.asset_version_id is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "GENERATION_CANCEL_RECONCILIATION_REQUIRED",
+                        "message": "任务可能已被上游受理，缺少可信停止回执，禁止释放预留用量；须人工对账",
+                    },
+                )
             task.cancel_requested_at = now
             task.status = "CANCELED"
             task.message = "生成任务已取消"
