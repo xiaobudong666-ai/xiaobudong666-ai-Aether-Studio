@@ -8169,3 +8169,99 @@ def test_g73_worker_heartbeat_rechecks_prior_receipt_after_claim(
             assert snapshot() == before, "heartbeat refusal must not mutate ledger/lease/audit"
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("history_case", ["HELD_AFTER_CLAIM", "SUBMISSION_STARTED_AFTER_CLAIM"])
+def test_g73_artifact_intake_rechecks_prior_receipt_after_claim(
+    generation_context, history_case,
+):
+    """FAKE-only SQLite: a disputed old receipt must block new artifact storage.
+
+    The Worker first performs legal state transitions. Only then does older
+    durable attempt evidence drift; an existing lease is not a Sidecar ACK.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 artifact prior history")
+    task_id = create_task(
+        client, project, key="g73-intake-prior-" + history_case,
+    )["taskId"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        first.status = "FAILED"
+        first.completed_at = now
+        task.attempts = 2
+        task.max_attempts = max(task.max_attempts, 2)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+    worker = "g73-artifact-intake-worker"
+    claimed = claim(client, worker_id=worker)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", worker_id=worker,
+        upstreamJobId="g73-synthetic-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", worker_id=worker,
+        upstreamJobId="g73-synthetic-upstream",
+        providerArtifactId="g73-synthetic-artifact",
+    ).status_code == 200
+    with sessions() as db:
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        if history_case == "HELD_AFTER_CLAIM":
+            first.reconciliation_state = "HELD"
+        else:
+            first.submission_started_at = now
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            used_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.asset_version_id, attempts,
+                    usage, events, used_bytes)
+
+    before = snapshot()
+    for _ in range(2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+            data={"providerArtifactId": "g73-synthetic-artifact"},
+            files={"file": ("synthetic.mp4", b"FAKE-only-artifact", "video/mp4")},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == (
+            "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before, "intake refusal must not mutate storage, usage, lease or audit"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
