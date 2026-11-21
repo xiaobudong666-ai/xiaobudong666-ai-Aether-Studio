@@ -8457,3 +8457,92 @@ def test_g73_artifact_intake_rechecks_attempt_after_sidecar_dispatch(
     assert snapshot() == first, "replay cannot debit or mutate settled ledger"
     assert media.uploads == 1, "replay must not reach Sidecar again"
     app.state.moneyprinter.assert_not_called()
+
+
+
+@pytest.mark.parametrize("corruption", [
+    "MISSING_CURRENT", "STATUS_DRIFT", "HELD", "UPSTREAM_CONFLICT", "CLEAN",
+])
+def test_g73_worker_heartbeat_rechecks_current_attempt_after_claim(
+    generation_context, corruption,
+):
+    """FAKE-only SQLite: an invalid CURRENT attempt must not gain fresh lease time.
+
+    The corruption is committed after Worker claim. A legitimate active attempt
+    still renews; refusal must leave lease, usage, storage and audit unchanged.
+    No Provider or protected ledger is used.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 current heartbeat fence")
+    task_id = create_task(
+        client, project, key="g73-current-heartbeat-" + corruption,
+    )["taskId"]
+    worker = "g73-current-heartbeat-worker"
+    claimed = claim(client, worker_id=worker)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        if corruption == "MISSING_CURRENT":
+            # Keep the linked row and original usage FK; only corrupt its
+            # durable generation ordinal to simulate a missing CURRENT record.
+            attempt.attempt_no = task.attempts + 1
+        elif corruption == "STATUS_DRIFT":
+            attempt.status = "RUNNING"
+        elif corruption == "HELD":
+            attempt.reconciliation_state = "HELD"
+        elif corruption == "UPSTREAM_CONFLICT":
+            attempt.upstream_job_id = "unrecognized-upstream-job"
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            storage = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.upstream_job_id,
+                    attempts, usage, events, storage)
+
+    before = snapshot()
+    for _ in range(1 if corruption == "CLEAN" else 2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/heartbeat",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+                     "X-Worker-Lease-Epoch": str(epoch)},
+            json={},
+        )
+        if corruption == "CLEAN":
+            assert response.status_code == 200, response.text
+            assert snapshot()[0] == "SUBMITTING"
+            assert snapshot()[2] == epoch
+        else:
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["code"] == (
+                "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+            )
+            assert snapshot() == before, (
+                "Current-attempt heartbeat rejection must preserve durable evidence"
+            )
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
