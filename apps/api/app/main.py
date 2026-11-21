@@ -3662,6 +3662,36 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
             raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
+        # G73 FAKE-only: a lease heartbeat must not renew a task whose
+        # CURRENT durable Attempt vanished, drifted from task.status, or gained
+        # a disputed upstream receipt after claim. Prior-history checks alone
+        # do not cover this Attempt. This is read-only and fail-closed; it does
+        # not infer a human APPLY/STOP ACK or release reserved usage.
+        current_heartbeat_attempt_query = select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )
+        if app_engine.dialect.name == "postgresql":
+            current_heartbeat_attempt_query = current_heartbeat_attempt_query.with_for_update()
+        current_heartbeat_attempt = db.execute(
+            current_heartbeat_attempt_query
+        ).scalar_one_or_none()
+        if (
+            current_heartbeat_attempt is None
+            or current_heartbeat_attempt.status != task.status
+            or current_heartbeat_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+            or (
+                current_heartbeat_attempt.upstream_job_id is not None
+                and current_heartbeat_attempt.upstream_job_id != task.upstream_job_id
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "当前生成尝试的持久状态或上游回执异常，拒绝续租并保持账本",
+                },
+            )
         # G70/G71/G73: a lease heartbeat is not a fresh STOP/APPLY ACK.
         # Older attempt receipts may change after claim.  Do not prolong a
         # lease with unresolved upstream evidence: refuse before any mutation,
