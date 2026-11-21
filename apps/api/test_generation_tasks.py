@@ -7910,3 +7910,82 @@ def test_g70g71_unexpected_future_attempt_fails_closed(
         assert snapshot() == before, "Rejected operation mutated durable state"
     app.state.moneyprinter.assert_not_called()
     assert media.uploads == 0
+
+
+@pytest.mark.parametrize("historical_evidence", [
+    "HELD", "SUBMISSION_STARTED", "CLEAN_NOT_SUBMITTED",
+])
+def test_g73_worker_claim_reconciles_prior_attempt_history_before_new_submit(
+    generation_context, historical_evidence,
+):
+    """Legacy retry cannot bypass the earlier paid receipt by clearing task IDs.
+
+    FAKE-only SQLite API. A clean FAILED/NOT_SUBMITTED prefix remains claimable.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 Worker historical receipt fence")
+    damaged = create_task(client, project, key="worker-history-" + historical_evidence)
+    healthy = create_task(client, project, key="worker-next-" + historical_evidence)
+    task_id = damaged["taskId"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        older = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        older.status = "FAILED"
+        older.error_code = "TEMPORARY"
+        older.completed_at = now
+        if historical_evidence == "HELD":
+            older.reconciliation_state = "HELD"
+            older.upstream_job_id = "legacy-paid-job"
+        elif historical_evidence == "SUBMISSION_STARTED":
+            older.submission_started_at = now
+        row.attempts = 2
+        row.max_attempts = 4
+        row.status = "QUEUED"
+        row.upstream_job_id = None
+        row.created_at = now - datetime.timedelta(minutes=2)
+        next_healthy = db.get(DBGenerationTask, healthy["taskId"])
+        next_healthy.created_at = now - datetime.timedelta(minutes=1)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED", reconciliation_state="NOT_SUBMITTED",
+            created_at=now,
+        ))
+        db.commit()
+
+    with sessions() as db:
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        before_usage = tuple(db.execute(select(
+            DBGenerationUsageEntry.kind, DBGenerationUsageEntry.request_units,
+            DBGenerationUsageEntry.generated_seconds,
+        ).where(DBGenerationUsageEntry.task_id == task_id)).all())
+        assert [row[0] for row in before_usage] == ["RESERVED"]
+
+    response = claim(client, worker_id="g73-worker-prior-receipt")
+    assert response.status_code == 200, response.text
+    expected_id = (
+        damaged["taskId"] if historical_evidence == "CLEAN_NOT_SUBMITTED"
+        else healthy["taskId"]
+    )
+    assert response.json()["taskId"] == expected_id
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row.status == ("SUBMITTING" if expected_id == task_id else "QUEUED")
+        assert row.lease_epoch == (1 if expected_id == task_id else 0)
+        assert row.lease_owner == (
+            "g73-worker-prior-receipt" if expected_id == task_id else None
+        )
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == before_events + (1 if expected_id == task_id else 0)
+        assert tuple(db.execute(select(
+            DBGenerationUsageEntry.kind, DBGenerationUsageEntry.request_units,
+            DBGenerationUsageEntry.generated_seconds,
+        ).where(DBGenerationUsageEntry.task_id == task_id)).all()) == before_usage
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
