@@ -8079,3 +8079,93 @@ def test_g73_worker_transition_rechecks_prior_receipt_after_claim(
             assert snapshot() == before, "postclaim refusal must not mutate ledger/lease/audit"
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("history_case", ["HELD_AFTER_CLAIM", "SUBMISSION_STARTED_AFTER_CLAIM", "CLEAN_PREFIX"])
+def test_g73_worker_heartbeat_rechecks_prior_receipt_after_claim(
+    generation_context, history_case,
+):
+    """FAKE-only: Worker heartbeat cannot renew a lease after old receipt drift.
+
+    Durable older evidence may change between claim and transition. A clean
+    FAILED/NOT_SUBMITTED prefix still follows the established Worker lifecycle.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G73 heartbeat prior history")
+    task_id = create_task(
+        client, project, key="g73-heartbeat-prior-" + history_case,
+    )["taskId"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        first.status = "FAILED"
+        first.completed_at = now
+        row.attempts = 2
+        row.max_attempts = max(row.max_attempts, 2)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+    worker = "g73-heartbeat-worker"
+    claimed = claim(client, worker_id=worker)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+    with sessions() as db:
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        if history_case == "HELD_AFTER_CLAIM":
+            first.reconciliation_state = "HELD"
+        elif history_case == "SUBMISSION_STARTED_AFTER_CLAIM":
+            first.submission_started_at = now
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (row.status, row.lease_owner, row.lease_epoch,
+                    row.lease_expires_at, row.upstream_job_id, history, usage, events)
+
+    before = snapshot()
+    for _ in range(2 if history_case != "CLEAN_PREFIX" else 1):
+        result = client.post(
+            f"/internal/generation-tasks/{task_id}/heartbeat",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+                     "X-Worker-Lease-Epoch": str(epoch)},
+            json={},
+        )
+        if history_case == "CLEAN_PREFIX":
+            assert result.status_code == 200, result.text
+            assert snapshot()[0] == "SUBMITTING"
+        else:
+            assert result.status_code == 409, result.text
+            assert result.json()["detail"]["code"] == (
+                "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+            )
+            assert snapshot() == before, "heartbeat refusal must not mutate ledger/lease/audit"
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
