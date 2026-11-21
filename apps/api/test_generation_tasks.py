@@ -2075,6 +2075,73 @@ def test_g70_g71_recovery_existing_material_mime_mismatch_stays_held(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("prior_storage_counted", [False, True])
+def test_g70_g71_single_existing_material_cannot_prove_storage_not_already_charged(
+    generation_context, prior_storage_counted,
+):
+    """FAKE-only: matching legacy material is not a trusted storage debit receipt.
+
+    Even identical ID, URL, type, MIME, and bytes do not establish whether an
+    earlier import already incremented tenant storage. Refuse a second debit
+    pending independent Owner/M11 reconciliation; never speculate or refund.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-preexisting-material-accounting")
+    task = create_task(client, project, key="g70-preexisting-material-accounting")
+    task_id = task["taskId"]
+    media_id, payload = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    legacy = {
+        "id": media_id,
+        "name": "preexisting-original",
+        "url": f"/api/video-use/media/{project['id']}/{media_id}",
+        "type": "video",
+        "contentType": "video/mp4",
+        "sizeBytes": len(payload),
+    }
+    with sessions() as db:
+        db.get(DBProject, project["id"]).materials = [legacy]
+        tenant = db.execute(select(DBTenant)).scalar_one()
+        tenant.used_storage_bytes = len(payload) if prior_storage_counted else 0
+        db.commit()
+    original_storage = len(payload) if prior_storage_counted else 0
+    endpoint = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        rejected = client.post(
+            endpoint, json={"reason": "Owner holds ambiguous legacy storage accounting"}
+        )
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert db.get(DBProject, project["id"]).materials == [legacy]
+        assert db.get(DBTenant, stored.tenant_id).used_storage_bytes == original_storage
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one() == 0
+        assert sum(row.kind == "RESERVED" for row in usage) == 1
+        assert not any(row.kind in {"RELEASED", "SETTLED"} for row in usage)
+    assert media_store.uploads == 0
+    assert media_store.inspections == 2
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("second_row_conflicts", [False, True])
 def test_g70_g71_recovery_duplicate_orphan_media_rows_remain_held(
     generation_context, second_row_conflicts,
