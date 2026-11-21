@@ -3309,6 +3309,41 @@ def create_app(
             # Quarantine read-only; do not change leases, receipts or quota.
             if candidate_attempt.status != candidate.status:
                 continue
+            # G70/G71 + G73: the current QUEUED attempt alone is not proof
+            # that a prior paid submission was never accepted. A migrated or
+            # legacy retry can clear task-level upstream IDs while an older
+            # attempt retains HELD/started/accepted evidence. The Owner
+            # cancel/retry paths already fence this, but the Worker claim
+            # must independently enforce the same invariant before leasing.
+            # Fail closed on gaps, zero/renumbered attempts and future rows;
+            # never repair usage or call Provider while reconciling history.
+            if candidate.attempts < 1:
+                continue
+            older_and_future_attempts = list(db.execute(
+                select(
+                    DBGenerationAttempt.attempt_no,
+                    DBGenerationAttempt.status,
+                    DBGenerationAttempt.reconciliation_state,
+                    DBGenerationAttempt.submission_started_at,
+                    DBGenerationAttempt.upstream_job_id,
+                ).where(
+                    DBGenerationAttempt.generation_task_id == candidate.id,
+                    DBGenerationAttempt.attempt_no != candidate.attempts,
+                ).order_by(DBGenerationAttempt.attempt_no)
+            ).all())
+            if (
+                len(older_and_future_attempts) != candidate.attempts - 1
+                or any(
+                    number != expected
+                    or status != "FAILED"
+                    or reconciliation != "NOT_SUBMITTED"
+                    or started_at is not None
+                    or upstream_id is not None
+                    for expected, (number, status, reconciliation, started_at, upstream_id)
+                    in enumerate(older_and_future_attempts, start=1)
+                )
+            ):
+                continue
             # G73: QUEUED is safe to submit only for an attempt that has
             # *never* entered upstream submission.  A historical/crashed
             # QUEUED row can retain durable submission evidence even when
