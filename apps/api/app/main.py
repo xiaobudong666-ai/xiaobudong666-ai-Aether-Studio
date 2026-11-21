@@ -2349,9 +2349,19 @@ def create_app(
                         DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
                         DBGenerationAttempt.submission_started_at.is_not(None),
                         DBGenerationAttempt.upstream_job_id.is_not(None),
+                        DBGenerationAttempt.status != "FAILED",
                     ),
                 ).limit(1)
             ).scalar_one_or_none()
+            # A missing or renumbered older attempt is not a trusted STOP ACK.
+            # Preserve RESERVED usage until the full FAILED/NOT_SUBMITTED
+            # attempt history is present and independently reconcilable.
+            earlier_attempt_count = db.execute(
+                select(func.count(DBGenerationAttempt.id)).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no < task.attempts,
+                )
+            ).scalar_one()
             # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
             # submission can still be executing or billable upstream even
             # when the API has no upstream job ID. Without an independently
@@ -2365,6 +2375,8 @@ def create_app(
                 # Durable HELD/accepted evidence is not a preclaim cancellation.
                 or attempt.reconciliation_state != "NOT_SUBMITTED"
                 or unresolved_prior is not None
+                or task.attempts < 1
+                or earlier_attempt_count != task.attempts - 1
                 # Orphaned lease markers imply possible Worker ownership even
                 # when historical status fields still read QUEUED.
                 or task.lease_owner is not None
@@ -2474,9 +2486,18 @@ def create_app(
                     DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
                     DBGenerationAttempt.submission_started_at.is_not(None),
                     DBGenerationAttempt.upstream_job_id.is_not(None),
+                    DBGenerationAttempt.status != "FAILED",
                 ),
             ).limit(1)
         ).scalar_one_or_none()
+        # Earlier attempt rows must form a complete, terminal FAILED prefix.
+        # A missing/corrupted row cannot prove that a billable POST never ran.
+        earlier_attempt_count = db.execute(
+            select(func.count(DBGenerationAttempt.id)).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no < task.attempts,
+            )
+        ).scalar_one()
         prior_attempt = db.execute(
             select(DBGenerationAttempt).where(
                 DBGenerationAttempt.generation_task_id == task.id,
@@ -2486,6 +2507,8 @@ def create_app(
         if (
             prior_attempt is None
             or unresolved_earlier_attempt is not None
+            or task.attempts < 1
+            or earlier_attempt_count != task.attempts - 1
             or prior_attempt.status != task.status
             or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
             # Worker claim durably writes this BEFORE any upstream POST. The
