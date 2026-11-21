@@ -193,6 +193,41 @@ def generation_failure_policy_valid(snapshot: dict) -> bool:
     return True
 
 
+def generation_prior_history_safe(db: Session, task: DBGenerationTask) -> bool:
+    """Fail closed on damaged/paid earlier attempts, including post-claim drift.
+
+    The same read-only durable invariant binds both Worker lease admission and
+    subsequent Worker transitions. A clean FAILED/NOT_SUBMITTED prefix is
+    allowed; missing, renumbered, future or billable history is not a STOP ACK.
+    """
+    if type(task.attempts) is not int or task.attempts < 1:
+        return False
+    history = list(db.execute(
+        select(
+            DBGenerationAttempt.attempt_no,
+            DBGenerationAttempt.status,
+            DBGenerationAttempt.reconciliation_state,
+            DBGenerationAttempt.submission_started_at,
+            DBGenerationAttempt.upstream_job_id,
+        ).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no != task.attempts,
+        ).order_by(DBGenerationAttempt.attempt_no)
+    ).all())
+    return (
+        len(history) == task.attempts - 1
+        and all(
+            number == expected
+            and status == "FAILED"
+            and reconciliation == "NOT_SUBMITTED"
+            and started_at is None
+            and upstream_id is None
+            for expected, (number, status, reconciliation, started_at, upstream_id)
+            in enumerate(history, start=1)
+        )
+    )
+
+
 def generation_failure_history_valid(history: object) -> bool:
     """Treat damaged durable circuit history as untrusted, without rewriting it.
 
@@ -2349,7 +2384,35 @@ def create_app(
                         DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
                         DBGenerationAttempt.submission_started_at.is_not(None),
                         DBGenerationAttempt.upstream_job_id.is_not(None),
+                        DBGenerationAttempt.status != "FAILED",
                     ),
+                ).limit(1)
+            ).scalar_one_or_none()
+            # A missing or renumbered older attempt is not a trusted STOP ACK.
+            # Preserve RESERVED usage until the full FAILED/NOT_SUBMITTED
+            # attempt history is present and independently reconcilable.
+            # A count alone can hide migrated attempt 0 while attempt 1 is missing.
+            # Require exact positive prior numbering before quota release or retry.
+            earlier_attempt_numbers = db.execute(
+                select(DBGenerationAttempt.attempt_no).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no < task.attempts,
+                ).order_by(DBGenerationAttempt.attempt_no)
+            ).scalars().all()
+            earlier_attempt_sequence_valid = (
+                len(earlier_attempt_numbers) == task.attempts - 1
+                and all(
+                    number == expected
+                    for expected, number in enumerate(earlier_attempt_numbers, start=1)
+                )
+            )
+            # A legacy attempt numbered beyond task.attempts may still contain
+            # an accepted/billable upstream result. The current row being clean
+            # does not authorize quota release when history extends into future.
+            unexpected_future_attempt = db.execute(
+                select(DBGenerationAttempt.id).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no > task.attempts,
                 ).limit(1)
             ).scalar_one_or_none()
             # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
@@ -2365,6 +2428,9 @@ def create_app(
                 # Durable HELD/accepted evidence is not a preclaim cancellation.
                 or attempt.reconciliation_state != "NOT_SUBMITTED"
                 or unresolved_prior is not None
+                or task.attempts < 1
+                or not earlier_attempt_sequence_valid
+                or unexpected_future_attempt is not None
                 # Orphaned lease markers imply possible Worker ownership even
                 # when historical status fields still read QUEUED.
                 or task.lease_owner is not None
@@ -2474,7 +2540,34 @@ def create_app(
                     DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
                     DBGenerationAttempt.submission_started_at.is_not(None),
                     DBGenerationAttempt.upstream_job_id.is_not(None),
+                    DBGenerationAttempt.status != "FAILED",
                 ),
+            ).limit(1)
+        ).scalar_one_or_none()
+        # Earlier attempt rows must form a complete, terminal FAILED prefix.
+        # A missing/corrupted row cannot prove that a billable POST never ran.
+        # A count alone can hide migrated attempt 0 while attempt 1 is missing.
+        # Require exact positive prior numbering before quota release or retry.
+        earlier_attempt_numbers = db.execute(
+            select(DBGenerationAttempt.attempt_no).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no < task.attempts,
+            ).order_by(DBGenerationAttempt.attempt_no)
+        ).scalars().all()
+        earlier_attempt_sequence_valid = (
+            len(earlier_attempt_numbers) == task.attempts - 1
+            and all(
+                number == expected
+                for expected, number in enumerate(earlier_attempt_numbers, start=1)
+            )
+        )
+        # A migrated future attempt can retain a submitted/billable result
+        # even when the task's current attempt says NOT_SUBMITTED.
+        # Reject before mutating attempts, use, lease, or audit.
+        unexpected_future_attempt = db.execute(
+            select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no > task.attempts,
             ).limit(1)
         ).scalar_one_or_none()
         prior_attempt = db.execute(
@@ -2486,12 +2579,22 @@ def create_app(
         if (
             prior_attempt is None
             or unresolved_earlier_attempt is not None
+            or task.attempts < 1
+            or not earlier_attempt_sequence_valid
+            or unexpected_future_attempt is not None
             or prior_attempt.status != task.status
             or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
             # Worker claim durably writes this BEFORE any upstream POST. The
             # missing receipt is ambiguous after a crash/timeout, not proof
             # that no billable request was accepted; never replay blindly.
             or prior_attempt.submission_started_at is not None
+            # G70/G71: a legacy FAILED status does not revoke an orphaned
+            # Worker lease. Even an expired/missing counterpart lease marker
+            # means the previous dispatch might still be executing upstream.
+            # Do not erase the lease or create a new potentially billable attempt
+            # without independently trusted stop/reconciliation evidence.
+            or task.lease_owner is not None
+            or task.lease_expires_at is not None
             or task.upstream_job_id is not None
             or task.provider_artifact_id is not None
             or task.media_id is not None
@@ -2978,6 +3081,37 @@ def create_app(
                 },
             )
 
+        # G70/G71 FAKE-only: a legacy project can contain two material rows
+        # for the same orphan media ID. A single matching first row cannot
+        # certify that the second row is safe: downstream consumers may pick
+        # a different row and the recovery may double-account storage.
+        # Preserve HELD and require manual reconciliation of ambiguous history.
+        matching_materials = [
+            item for item in (project.materials or [])
+            if item.get("id") == orphan_media_id
+        ]
+        if len(matching_materials) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
+                    "message": "项目存在重复原始媒资记录，保持 HELD，需人工对账",
+                },
+            )
+
+        # A single same-ID legacy material may already have debited tenant
+        # storage. ID/MIME/size equality is not a trusted prior-debit receipt.
+        # Never unconditionally reserve a second storage charge; keep HELD
+        # and let Owner/M11 reconcile the original accounting evidence.
+        if len(matching_materials) == 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
+                    "message": "原始媒资已存在但历史存储占用未核实，保持 HELD，需人工对账",
+                },
+            )
+
         storage_reservation = db.execute(
             update(DBTenant)
             .where(
@@ -3000,13 +3134,6 @@ def create_app(
             )
 
         materials = list(project.materials or [])
-        existing_material = next(
-            (
-                item for item in materials
-                if isinstance(item, dict) and item.get("id") == orphan_media_id
-            ),
-            None,
-        )
         material = {
             "id": orphan_media_id,
             "name": f"generation-{task.id}.mp4",
@@ -3019,29 +3146,9 @@ def create_app(
             },
             "sizeBytes": actual_size,
         }
-        if existing_material is not None:
-            # Materials are untrusted project JSON. Malformed legacy sizes must
-            # fail closed as a conflict instead of raising an unhandled 500.
-            raw_material_size = existing_material.get("sizeBytes")
-            existing_material_size = raw_material_size if type(raw_material_size) is int else -1
-            if (
-                existing_material.get("url") != material["url"]
-                or existing_material.get("type") != "video"
-                or existing_material_size != actual_size
-            ):
-                # Undo the provisional quota increment before refusing recovery.
-                db.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
-                        "message": "项目中已存在同 ID 但元数据不一致的素材",
-                    },
-                )
-        else:
-            project.materials = [*materials, material]
-            project.revision += 1
-            project.updated_at = utc_now()
+        project.materials = [*materials, material]
+        project.revision += 1
+        project.updated_at = utc_now()
 
         next_version = (
             db.execute(
@@ -3236,6 +3343,16 @@ def create_app(
             # is not authority to recover or submit upstream work again.
             # Quarantine read-only; do not change leases, receipts or quota.
             if candidate_attempt.status != candidate.status:
+                continue
+            # G70/G71 + G73: the current QUEUED attempt alone is not proof
+            # that a prior paid submission was never accepted. A migrated or
+            # legacy retry can clear task-level upstream IDs while an older
+            # attempt retains HELD/started/accepted evidence. The Owner
+            # cancel/retry paths already fence this, but the Worker claim
+            # must independently enforce the same invariant before leasing.
+            # Fail closed on gaps, zero/renumbered attempts and future rows;
+            # never repair usage or call Provider while reconciling history.
+            if not generation_prior_history_safe(db, candidate):
                 continue
             # G73: QUEUED is safe to submit only for an attempt that has
             # *never* entered upstream submission.  A historical/crashed
@@ -3545,6 +3662,18 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
             raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
+        # G70/G71/G73: a lease heartbeat is not a fresh STOP/APPLY ACK.
+        # Older attempt receipts may change after claim.  Do not prolong a
+        # lease with unresolved upstream evidence: refuse before any mutation,
+        # preserving HELD/RESERVED and the prior lease for trusted review.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，拒绝续租并保持账本",
+                },
+            )
         task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         task.updated_at = now
         db.commit()
@@ -3592,6 +3721,17 @@ def create_app(
                 detail={
                     "code": "GENERATION_ATTEMPT_STATUS_CONFLICT",
                     "message": "任务与当前尝试的持久状态不一致，须先人工核验",
+                },
+            )
+        # G70/G71/G73: history may change after the Worker claim was issued.
+        # A valid lease is not an independent receipt for an older paid attempt.
+        # Recheck under the task-row lock before status/usage/audit mutations.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，停止Worker状态迁移并保持账本",
                 },
             )
         # G73: A persisted Attempt-level upstream receipt is independent
@@ -3962,6 +4102,40 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
         if task.status not in {"RUNNING", "INGESTING"}:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_INTAKE_NOT_ALLOWED", "message": "当前状态不允许接收产物"})
+        # G73 FAKE-only: a still-valid Worker lease is not an ACK for a
+        # damaged CURRENT attempt.  Status divergence, a HELD/UNKNOWN
+        # reconciliation or a contradictory upstream identity can appear after
+        # transition. Refuse before storage reservation, Sidecar I/O or audit
+        # mutation; do not infer an APPLY/STOP ACK from the task status.
+        current_attempt = current_generation_attempt(db, task)
+        if (
+            current_attempt.status != task.status
+            or current_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+            or (
+                current_attempt.upstream_job_id is not None
+                and current_attempt.upstream_job_id != task.upstream_job_id
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "当前生成尝试的持久状态或上游回执异常，禁止产物入库并保持账本",
+                },
+            )
+        # G70/G71/G73 FAKE-only: history can become HELD or acquire durable
+        # upstream submission evidence after Worker claim and transition.
+        # Neither a live lease nor an artifact ID authorizes a new storage
+        # debit or Sidecar upload while an earlier attempt is disputed.
+        # Fail before byte processing, reservation, upload or audit mutation.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，拒绝产物入库并保持账本",
+                },
+            )
         if task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ID_MISMATCH", "message": "产物编号与当前任务回执不一致"})
         if file.content_type != "video/mp4":
@@ -4550,6 +4724,29 @@ def create_app(
                     invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
                     invalid_message = "上传期间任务状态已改变"
     
+                # G73 FAKE-only: the Sidecar call occurs after a committed
+                # quota reservation and outside the original task transaction.
+                # Historical or CURRENT Attempt evidence can change during
+                # upload. Re-check both under the final serialized task lock
+                # before publishing an asset or writing SETTLED usage.
+                # An orphan is audited by the existing rejected-intake path;
+                # neither this guard nor a Sidecar response is a human ACK.
+                if invalid_code is None:
+                    final_attempt = current_generation_attempt(db, task)
+                    if (
+                        final_attempt.status != task.status
+                        or final_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+                        or (
+                            final_attempt.upstream_job_id is not None
+                            and final_attempt.upstream_job_id != task.upstream_job_id
+                        )
+                    ):
+                        invalid_code = "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+                        invalid_message = "上传期间当前尝试回执异常，禁止入库结算，保持原生成额度待核验"
+                    elif not generation_prior_history_safe(db, task):
+                        invalid_code = "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+                        invalid_message = "上传期间历史尝试回执异常，禁止入库结算，保持原生成额度待核验"
+
                 # G72: a pre-upload Owner check is not authorization for the
                 # final asset/SETTLED commit. The storage-reservation commit
                 # releases that earlier transaction while FAKE Sidecar runs.

@@ -4387,6 +4387,13 @@ def test_g72_postgres_remix_expires_during_fake_upload_releases_storage_without_
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         task.lease_expires_at = before_expiry + datetime.timedelta(hours=2)
         db.commit()
         initial_storage = db.get(DBTenant, tenant_id).used_storage_bytes
@@ -4544,6 +4551,13 @@ def test_g72_postgres_revoke_after_final_rights_read_is_serialized(postgres_cont
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         db.commit()
         base_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
@@ -4676,6 +4690,13 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         db.commit()
         initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
@@ -4861,6 +4882,13 @@ def test_g72_postgres_originator_disable_after_final_lock_waits_for_commit(
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         db.commit()
         initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
@@ -6450,4 +6478,963 @@ def test_g70g71_postgres_earlier_submission_history_blocks_retry_without_mutatio
             assert durable_snapshot() == before, (
                 "Rejected PostgreSQL retry changed attempt, usage or audit state"
             )
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("lease_marker", ["owner_only", "expiry_only", "both_expired"])
+def test_g70g71_postgres_orphan_worker_lease_rejects_retry(
+    postgres_context, lease_marker,
+):
+    """Native disposable PostgreSQL: stale Worker lease is not a STOP ACK.
+
+    A migrated FAILED task may have NOT_SUBMITTED current Attempt yet still
+    retain a lease marker. Do not create an additional potentially billable
+    attempt or change its reservation/audit until trusted reconciliation.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "QUEUED"
+        project_id = task.project_id
+        prior = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        task.status = "FAILED"
+        task.error_code = "TEMPORARY"
+        task.completed_at = now
+        prior.status = "FAILED"
+        prior.error_code = "TEMPORARY"
+        prior.completed_at = now
+        assert prior.submission_started_at is None
+        assert prior.reconciliation_state == "NOT_SUBMITTED"
+        if lease_marker in {"owner_only", "both_expired"}:
+            task.lease_owner = "fake-pg-orphan-worker"
+        if lease_marker in {"expiry_only", "both_expired"}:
+            task.lease_expires_at = now - datetime.timedelta(hours=2)
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )).scalar_one()
+            return (
+                task.status, task.attempts, task.error_code, task.lease_owner,
+                task.lease_expires_at, task.upstream_job_id, attempts, usage, events,
+            )
+
+    before = snapshot()
+    assert len(before[6]) == 1
+    assert [item[0] for item in before[7]] == ["RESERVED"]
+    endpoint = f"/projects/{project_id}/generation-tasks/{task_id}/retry"
+    for _ in range(2):
+        refused = client.post(endpoint)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
+        assert snapshot() == before
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy_case", [
+    "matching_unbilled", "matching_already_billed",
+    "duplicate_matching", "duplicate_conflicting",
+    "wrong_mime", "missing_mime",
+])
+def test_g70_g71_postgres_existing_legacy_media_must_remain_held(
+    postgres_context, monkeypatch, legacy_case,
+):
+    """Native disposable PostgreSQL: an existing same-ID project material
+    cannot authorize a second storage debit or an orphan-artifact recovery.
+
+    This carries the SQLite-only G70/G71 legacy reconciliation fence across
+    the real JSONB, ORM transaction and ledger boundary. The Sidecar is FAKE;
+    this does not issue an independent receipt or approve human APPLY/STOP.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"fake-only-postgres-original-orphan-video"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-pg-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    metadata = {
+        "durationSeconds": 1.0,
+        "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    media = app.state.video_use
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id = task.project_id
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        media.media_objects[(project_id, media_id)] = payload
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "FAKE transfer interrupted"
+        task.upstream_job_id = "fake-original-upstream"
+        task.provider_artifact_id = "fake-original-artifact"
+        task.media_id = media_id
+        task.completed_at = now
+        task.updated_at = now
+        task.lease_owner = None
+        task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = "fake-original-upstream"
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": "fake-original-upstream",
+                "originalProviderArtifactId": "fake-original-artifact",
+                "reconciliationState": "HELD",
+                "usageReservation": "HELD",
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata,
+            },
+            created_at=now,
+        ))
+        material = {
+            "id": media_id, "name": "legacy-original",
+            "url": f"/api/video-use/media/{project_id}/{media_id}",
+            "type": "video", "contentType": "video/mp4",
+            "sizeBytes": len(payload),
+        }
+        project_materials = [dict(material)]
+        if legacy_case == "duplicate_matching":
+            project_materials.append(dict(material))
+        elif legacy_case == "duplicate_conflicting":
+            project_materials.append({**material, "contentType": "application/octet-stream"})
+        elif legacy_case == "wrong_mime":
+            project_materials[0]["contentType"] = "application/octet-stream"
+        elif legacy_case == "missing_mime":
+            project_materials[0].pop("contentType")
+        project = db.get(DBProject, project_id)
+        project.materials = project_materials
+        tenant = db.get(DBTenant, task.tenant_id)
+        old_bytes = len(payload) if legacy_case == "matching_already_billed" else 0
+        tenant.used_storage_bytes = old_bytes
+        db.commit()
+
+    upload = MagicMock(wraps=media.upload_media)
+    original_inspect = media.inspect_media
+
+    def inspect_with_fake_mp4_classification(project_id, selected_media_id):
+        # Match the real Sidecar's typed inspection contract: the shared
+        # PG FakeMediaStore omits contentType in its general-purpose probe.
+        return {**original_inspect(project_id, selected_media_id),
+                "contentType": "video/mp4", "metadata": metadata}
+
+    inspection = MagicMock(side_effect=inspect_with_fake_mp4_classification)
+    monkeypatch.setattr(media, "upload_media", upload)
+    monkeypatch.setattr(media, "inspect_media", inspection)
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            project = db.get(DBProject, project_id)
+            reserved = tuple(
+                row.kind for row in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            return (
+                task.status, task.attempts, task.asset_version_id, task.error_code,
+                attempt.reconciliation_state, project.revision, project.materials,
+                db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                reserved,
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBGenerationAttempt.id)).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                )).scalar_one(),
+            )
+
+    baseline = durable_snapshot()
+    assert baseline[0] == "FAILED" and baseline[4] == "HELD"
+    assert baseline[7] == old_bytes and baseline[8] == ("RESERVED",)
+    route = f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        denied = client.post(route, json={
+            "reason": "Owner holds uncertain historical storage evidence (FAKE only)"
+        })
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT"
+        assert durable_snapshot() == baseline
+    assert inspection.call_count == 2
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["retry", "cancel"])
+@pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap", "number_zero"])
+def test_g70g71_postgres_legacy_prior_attempt_cancel_retry_is_fail_closed(
+    postgres_context, action, corrupt_prior,
+):
+    """Native PostgreSQL: a damaged prior attempt is not a trusted STOP ACK.
+
+    This deliberately mutates only synthetic, disposable test rows. It checks
+    both the no-double-spend retry and the no-premature-refund cancel path.
+    No real Provider, independent ACK issuance, or protected ledger access.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "QUEUED" and task.attempts == 1
+        project_id = task.project_id
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert first.status == "QUEUED" and first.reconciliation_state == "NOT_SUBMITTED"
+        assert first.submission_started_at is None and first.upstream_job_id is None
+
+        task.attempts = 2
+        task.max_attempts = 4
+        task.status = "FAILED" if action == "retry" else "QUEUED"
+        task.error_code = "TEMPORARY" if action == "retry" else None
+        task.completed_at = now if action == "retry" else None
+        first.status = "RUNNING" if corrupt_prior == "stale_running" else "FAILED"
+        first.error_code = "TEMPORARY"
+        first.completed_at = now
+        if corrupt_prior == "number_gap":
+            # Preserve the row but move its sequence number past the current
+            # attempt, simulating a migrated gap without a foreign-key delete.
+            first.attempt_no = 3
+        elif corrupt_prior == "number_zero":
+            # 0,2 passes the old count-only predicate, but not a 1,2 prefix.
+            first.attempt_no = 0
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_no=2,
+            status=task.status,
+            error_code=task.error_code,
+            reconciliation_state="NOT_SUBMITTED",
+            created_at=now,
+            completed_at=task.completed_at,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            tenant_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (
+                task.status, task.attempts, task.cancel_requested_at,
+                task.error_code, task.lease_owner, task.lease_expires_at,
+                task.upstream_job_id, task.provider_artifact_id,
+                history, usage, event_count, tenant_bytes,
+            )
+
+    before = snapshot()
+    assert len(before[8]) == 2
+    assert [u[0] for u in before[9]] == ["RESERVED"]
+    code = (
+        "GENERATION_RECONCILIATION_REQUIRED"
+        if action == "retry" else "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+    )
+    endpoint = f"/projects/{project_id}/generation-tasks/{task_id}/{action}"
+    for _ in range(2):
+        denied = client.post(endpoint)
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == code
+        assert snapshot() == before, (
+            "Rejected PostgreSQL reconciliation changed attempt, usage, "
+            "storage or audit state"
+        )
+    app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize("action", ["cancel", "retry"])
+def test_g70g71_postgres_unexpected_future_attempt_fails_closed(
+    postgres_context, action,
+):
+    """Disposable native PostgreSQL: an out-of-counter Attempt must fail closed.
+
+    A clean current attempt alone is insufficient when an unexpected later
+    attempt has durable upstream markers. Never release RESERVED or start a
+    potentially billable duplicate. This is FAKE-only; no trusted STOP ACK.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row is not None and row.attempts == 1 and row.status == "QUEUED"
+        project_id = row.project_id
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert current.status == "QUEUED"
+        assert current.reconciliation_state == "NOT_SUBMITTED"
+        row.max_attempts = 4
+        if action == "retry":
+            row.status = current.status = "FAILED"
+            row.error_code = current.error_code = "TEMPORARY"
+            row.completed_at = current.completed_at = now
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="RUNNING", reconciliation_state="HELD",
+            upstream_job_id="synthetic-future-postgres-receipt",
+            created_at=now,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            storage_bytes = db.get(DBTenant, row.tenant_id).used_storage_bytes
+            return (
+                row.status, row.attempts, row.cancel_requested_at,
+                row.error_code, row.lease_owner, row.lease_expires_at,
+                row.upstream_job_id, history, usage, event_count, storage_bytes,
+            )
+
+    before = snapshot()
+    assert len(before[7]) == 2
+    assert [u[0] for u in before[8]] == ["RESERVED"]
+    code = ("GENERATION_RECONCILIATION_REQUIRED" if action == "retry"
+            else "GENERATION_CANCEL_RECONCILIATION_REQUIRED")
+    path = f"/projects/{project_id}/generation-tasks/{task_id}/{action}"
+    for _ in range(2):
+        denied = client.post(path)
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == code
+        assert snapshot() == before, "Rejected PostgreSQL operation changed evidence"
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("historical_evidence", [
+    "HELD", "SUBMISSION_STARTED", "CLEAN_NOT_SUBMITTED",
+])
+def test_g73_postgres_worker_claim_fences_older_paid_attempt(
+    postgres_context, historical_evidence,
+):
+    """Native disposable PostgreSQL: never lease another paid submission
+    when a legacy previous attempt is HELD or has a durable submit marker.
+    """
+    client, sessions, app = postgres_context
+    damaged_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, damaged_id)
+        older = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        older.status = "FAILED"
+        older.error_code = "TEMPORARY"
+        older.completed_at = now
+        if historical_evidence == "HELD":
+            older.reconciliation_state = "HELD"
+            older.upstream_job_id = "legacy-accepted-upstream"
+        elif historical_evidence == "SUBMISSION_STARTED":
+            older.submission_started_at = now
+        row.attempts = 2
+        row.max_attempts = 4
+        row.status = "QUEUED"
+        row.upstream_job_id = None
+        row.created_at = now - datetime.timedelta(minutes=2)
+        db.get(DBGenerationTask, healthy_id).created_at = now - datetime.timedelta(minutes=1)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=damaged_id,
+            attempt_no=2, status="QUEUED", reconciliation_state="NOT_SUBMITTED",
+            created_at=now,
+        ))
+        db.commit()
+
+    with sessions() as db:
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+        )).scalar_one()
+        before_usage = tuple(db.execute(select(
+            DBGenerationUsageEntry.kind, DBGenerationUsageEntry.request_units,
+            DBGenerationUsageEntry.generated_seconds,
+        ).where(DBGenerationUsageEntry.task_id == damaged_id)).all())
+        assert [entry[0] for entry in before_usage] == ["RESERVED"]
+
+    response = client.post(
+        "/internal/generation-tasks/claim",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": "g73-pg-prior-receipt-worker",
+        },
+    )
+    assert response.status_code == 200, response.text
+    expected_id = (
+        damaged_id if historical_evidence == "CLEAN_NOT_SUBMITTED"
+        else healthy_id
+    )
+    assert response.json()["taskId"] == expected_id
+    with sessions() as db:
+        row = db.get(DBGenerationTask, damaged_id)
+        assert row.status == ("SUBMITTING" if expected_id == damaged_id else "QUEUED")
+        assert row.lease_epoch == (1 if expected_id == damaged_id else 0)
+        assert row.lease_owner == (
+            "g73-pg-prior-receipt-worker" if expected_id == damaged_id else None
+        )
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+        )).scalar_one() == before_events + (1 if expected_id == damaged_id else 0)
+        assert tuple(db.execute(select(
+            DBGenerationUsageEntry.kind, DBGenerationUsageEntry.request_units,
+            DBGenerationUsageEntry.generated_seconds,
+        ).where(DBGenerationUsageEntry.task_id == damaged_id)).all()) == before_usage
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("history_case", ["HELD_AFTER_CLAIM", "SUBMISSION_STARTED_AFTER_CLAIM", "CLEAN_PREFIX"])
+def test_g73_postgres_worker_transition_rechecks_prior_receipt_after_claim(
+    postgres_context, history_case,
+):
+    """Disposable native PostgreSQL: a Worker lease cannot supersede old ACK evidence.
+
+    Uses synthetic task history only; no real Provider, funds or protected ledger.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        first.status = "FAILED"
+        first.completed_at = now
+        task.attempts = 2
+        task.max_attempts = max(task.max_attempts, 2)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+    worker = "g73-pg-after-claim-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+    with sessions() as db:
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        if history_case == "HELD_AFTER_CLAIM":
+            first.reconciliation_state = "HELD"
+        elif history_case == "SUBMISSION_STARTED_AFTER_CLAIM":
+            first.submission_started_at = now
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            bytes_used = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.upstream_job_id, history, usage, events, bytes_used)
+
+    before = snapshot()
+    for _ in range(2 if history_case != "CLEAN_PREFIX" else 1):
+        result = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+                     "X-Worker-Lease-Epoch": str(epoch)},
+            json={"status": "RUNNING", "progress": 20, "message": "FAKE-only"},
+        )
+        if history_case == "CLEAN_PREFIX":
+            assert result.status_code == 200, result.text
+            assert snapshot()[0] == "RUNNING"
+        else:
+            assert result.status_code == 409, result.text
+            assert result.json()["detail"]["code"] == (
+                "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+            )
+            assert snapshot() == before, (
+                "PostgreSQL transition refusal must preserve lease, usage, storage and audit"
+            )
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("history_case", ["HELD_AFTER_CLAIM", "SUBMISSION_STARTED_AFTER_CLAIM", "CLEAN_PREFIX"])
+def test_g73_postgres_worker_heartbeat_rechecks_prior_receipt_after_claim(
+    postgres_context, history_case,
+):
+    """Disposable native PostgreSQL: a Worker heartbeat must not renew disputed old receipts.
+
+    Uses synthetic task history only; no real Provider, funds or protected ledger.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        first.status = "FAILED"
+        first.completed_at = now
+        task.attempts = 2
+        task.max_attempts = max(task.max_attempts, 2)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+    worker = "g73-pg-heartbeat-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+    with sessions() as db:
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        if history_case == "HELD_AFTER_CLAIM":
+            first.reconciliation_state = "HELD"
+        elif history_case == "SUBMISSION_STARTED_AFTER_CLAIM":
+            first.submission_started_at = now
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            bytes_used = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.upstream_job_id, history, usage, events, bytes_used)
+
+    before = snapshot()
+    for _ in range(2 if history_case != "CLEAN_PREFIX" else 1):
+        result = client.post(
+            f"/internal/generation-tasks/{task_id}/heartbeat",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+                     "X-Worker-Lease-Epoch": str(epoch)},
+            json={},
+        )
+        if history_case == "CLEAN_PREFIX":
+            assert result.status_code == 200, result.text
+            assert snapshot()[0] == "SUBMITTING"
+        else:
+            assert result.status_code == 409, result.text
+            assert result.json()["detail"]["code"] == (
+                "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+            )
+            assert snapshot() == before, (
+                "PostgreSQL heartbeat refusal must preserve lease, usage, storage and audit"
+            )
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("history_case", ["HELD_AFTER_CLAIM", "SUBMISSION_STARTED_AFTER_CLAIM"])
+def test_g73_postgres_artifact_intake_rechecks_prior_receipt_after_claim(
+    postgres_context, history_case,
+):
+    """Disposable PostgreSQL: reject postclaim old receipt drift before Sidecar upload.
+
+    No Provider call, protected usage reconciliation, or production storage.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        first.status = "FAILED"
+        first.completed_at = now
+        task.attempts = 2
+        task.max_attempts = max(task.max_attempts, 2)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+    worker = "g73-pg-artifact-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    for status in ("RUNNING", "INGESTING"):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=headers,
+            json={
+                "status": status, "progress": 20 if status == "RUNNING" else 95,
+                "message": "FAKE-only",
+                "upstreamJobId": "g73-pg-synthetic-upstream",
+                "providerArtifactId": "g73-pg-synthetic-artifact",
+            },
+        )
+        assert response.status_code == 200, response.text
+    with sessions() as db:
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        if history_case == "HELD_AFTER_CLAIM":
+            first.reconciliation_state = "HELD"
+        else:
+            first.submission_started_at = now
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            used_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.asset_version_id, attempts,
+                    usage, events, used_bytes)
+
+    before = snapshot()
+    for _ in range(2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers=headers,
+            data={"providerArtifactId": "g73-pg-synthetic-artifact"},
+            files={"file": ("synthetic.mp4", b"FAKE-only-artifact", "video/mp4")},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == (
+            "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before, "PG intake refusal must preserve storage, usage, lease and audit"
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "drift", ["STATUS_CONFLICT", "HELD_AFTER_TRANSITION", "UPSTREAM_ID_CONFLICT"],
+)
+def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
+    postgres_context, drift,
+):
+    """Native disposable PostgreSQL: current Attempt drift cannot reserve or upload."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    worker = "g73-pg-current-intake"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    for status in ("RUNNING", "INGESTING"):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=headers,
+            json={
+                "status": status, "progress": 20 if status == "RUNNING" else 95,
+                "message": "FAKE-only",
+                "upstreamJobId": "g73-pg-current-upstream",
+                "providerArtifactId": "g73-pg-current-artifact",
+            },
+        )
+        assert response.status_code == 200, response.text
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        if drift == "STATUS_CONFLICT":
+            current.status = "RUNNING"
+        elif drift == "HELD_AFTER_TRANSITION":
+            current.reconciliation_state = "HELD"
+        else:
+            current.upstream_job_id = "contradictory-upstream-id"
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            current = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == task.attempts,
+            )).scalar_one()
+            usage = tuple((u.kind, u.request_units, u.generated_seconds)
+                          for u in db.execute(select(DBGenerationUsageEntry).where(
+                              DBGenerationUsageEntry.task_id == task_id,
+                          )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            tenant_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (
+                task.status, task.lease_owner, task.lease_epoch,
+                task.lease_expires_at, task.asset_version_id,
+                current.status, current.reconciliation_state,
+                current.upstream_job_id, usage, events, tenant_bytes,
+            )
+
+    before = snapshot()
+    for _ in range(2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers=headers,
+            data={"providerArtifactId": "g73-pg-current-artifact"},
+            files={"file": ("synthetic.mp4", b"FAKE-only-current-attempt", "video/mp4")},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == (
+            "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before, "PG refusal must preserve task, quota, storage and audit"
+    app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["CURRENT_STATUS", "CURRENT_HELD", "CURRENT_UPSTREAM_ID", "PRIOR_HELD"],
+)
+def test_g73_postgres_artifact_intake_rechecks_attempt_after_sidecar_dispatch(
+    postgres_context, monkeypatch, drift,
+):
+    """Native disposable PG: final task lock must see mid-upload Attempt drift."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    if drift == "PRIOR_HELD":
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            first = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )).scalar_one()
+            first.status = "FAILED"
+            first.completed_at = now
+            task.attempts = 2
+            task.max_attempts = max(task.max_attempts, 2)
+            db.add(DBGenerationAttempt(
+                id=str(uuid.uuid4()), generation_task_id=task_id,
+                attempt_no=2, status="QUEUED",
+                reconciliation_state="NOT_SUBMITTED", created_at=now,
+            ))
+            db.commit()
+
+    worker = "g73-pg-midupload-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    for status in ("RUNNING", "INGESTING"):
+        transitioned = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=headers,
+            json={
+                "status": status,
+                "progress": 20 if status == "RUNNING" else 95,
+                "message": "FAKE-only",
+                "upstreamJobId": "g73-pg-midupload-upstream",
+                "providerArtifactId": "g73-pg-midupload-artifact",
+            },
+        )
+        assert transitioned.status_code == 200, transitioned.text
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        initial_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+
+    original_upload = app.state.video_use.upload_media
+    uploads = []
+
+    def persist_drift_during_upload(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        uploads.append(result["mediaId"])
+        # The committed reservation predates this independent PG transaction.
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt_no = 1 if drift == "PRIOR_HELD" else task.attempts
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == attempt_no,
+            )).scalar_one()
+            if drift == "CURRENT_STATUS":
+                attempt.status = "RUNNING"
+            elif drift in {"CURRENT_HELD", "PRIOR_HELD"}:
+                attempt.reconciliation_state = "HELD"
+            else:
+                attempt.upstream_job_id = "conflicting-pg-midupload-upstream"
+            db.commit()
+        return result
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", persist_drift_during_upload)
+    endpoint = f"/internal/generation-tasks/{task_id}/artifact-intake"
+    kwargs = {
+        "headers": headers,
+        "data": {"providerArtifactId": "g73-pg-midupload-artifact"},
+        "files": {"file": ("synthetic.mp4", b"g73-pg-midupload-fake", "video/mp4")},
+    }
+    rejected = client.post(endpoint, **kwargs)
+    assert uploads and len(uploads) == 1, "must actually reach FAKE Sidecar"
+    assert rejected.status_code == 409, rejected.text
+    expected_code = (
+        "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+        if drift == "PRIOR_HELD"
+        else "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+    )
+    assert rejected.json()["detail"]["code"] == expected_code
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            used_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one()
+            failed = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+            )).scalar_one()
+            return task.asset_version_id, used_bytes, settled, failed
+
+    before_replay = snapshot()
+    assert before_replay == (None, initial_bytes, 0, 1), before_replay
+    replay = client.post(endpoint, **kwargs)
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == expected_code
+    assert snapshot() == before_replay
+    assert len(uploads) == 1, "replay must not dispatch Sidecar again"
     app.state.moneyprinter.assert_not_called()
