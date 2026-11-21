@@ -2009,7 +2009,6 @@ def test_g70_g71_recovery_conflicting_material_invalid_size_is_409_not_500(
     app.state.moneyprinter.assert_not_called()
 
 
-@pytest.mark.parametrize("second_row_conflicts", [False, True])
 @pytest.mark.parametrize("stored_content_type", ["image/png", None, True])
 def test_g70_g71_recovery_existing_material_mime_mismatch_stays_held(
     generation_context, stored_content_type,
@@ -2076,6 +2075,7 @@ def test_g70_g71_recovery_existing_material_mime_mismatch_stays_held(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("second_row_conflicts", [False, True])
 def test_g70_g71_recovery_duplicate_orphan_media_rows_remain_held(
     generation_context, second_row_conflicts,
 ):
