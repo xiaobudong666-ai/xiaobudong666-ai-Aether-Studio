@@ -4724,6 +4724,29 @@ def create_app(
                     invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
                     invalid_message = "上传期间任务状态已改变"
     
+                # G73 FAKE-only: the Sidecar call occurs after a committed
+                # quota reservation and outside the original task transaction.
+                # Historical or CURRENT Attempt evidence can change during
+                # upload. Re-check both under the final serialized task lock
+                # before publishing an asset or writing SETTLED usage.
+                # An orphan is audited by the existing rejected-intake path;
+                # neither this guard nor a Sidecar response is a human ACK.
+                if invalid_code is None:
+                    final_attempt = current_generation_attempt(db, task)
+                    if (
+                        final_attempt.status != task.status
+                        or final_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+                        or (
+                            final_attempt.upstream_job_id is not None
+                            and final_attempt.upstream_job_id != task.upstream_job_id
+                        )
+                    ):
+                        invalid_code = "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+                        invalid_message = "上传期间当前尝试回执异常，禁止入库结算，保持原生成额度待核验"
+                    elif not generation_prior_history_safe(db, task):
+                        invalid_code = "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+                        invalid_message = "上传期间历史尝试回执异常，禁止入库结算，保持原生成额度待核验"
+
                 # G72: a pre-upload Owner check is not authorization for the
                 # final asset/SETTLED commit. The storage-reservation commit
                 # releases that earlier transaction while FAKE Sidecar runs.
