@@ -4102,6 +4102,27 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
         if task.status not in {"RUNNING", "INGESTING"}:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_INTAKE_NOT_ALLOWED", "message": "当前状态不允许接收产物"})
+        # G73 FAKE-only: a still-valid Worker lease is not an ACK for a
+        # damaged CURRENT attempt.  Status divergence, a HELD/UNKNOWN
+        # reconciliation or a contradictory upstream identity can appear after
+        # transition. Refuse before storage reservation, Sidecar I/O or audit
+        # mutation; do not infer an APPLY/STOP ACK from the task status.
+        current_attempt = current_generation_attempt(db, task)
+        if (
+            current_attempt.status != task.status
+            or current_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+            or (
+                current_attempt.upstream_job_id is not None
+                and current_attempt.upstream_job_id != task.upstream_job_id
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "当前生成尝试的持久状态或上游回执异常，禁止产物入库并保持账本",
+                },
+            )
         # G70/G71/G73 FAKE-only: history can become HELD or acquire durable
         # upstream submission evidence after Worker claim and transition.
         # Neither a live lease nor an artifact ID authorizes a new storage
