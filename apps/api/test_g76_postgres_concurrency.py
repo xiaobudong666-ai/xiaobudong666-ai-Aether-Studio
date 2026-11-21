@@ -6670,7 +6670,7 @@ def test_g70_g71_postgres_existing_legacy_media_must_remain_held(
 
 
 @pytest.mark.parametrize("action", ["retry", "cancel"])
-@pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap"])
+@pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap", "number_zero"])
 def test_g70g71_postgres_legacy_prior_attempt_cancel_retry_is_fail_closed(
     postgres_context, action, corrupt_prior,
 ):
@@ -6706,6 +6706,9 @@ def test_g70g71_postgres_legacy_prior_attempt_cancel_retry_is_fail_closed(
             # Preserve the row but move its sequence number past the current
             # attempt, simulating a migrated gap without a foreign-key delete.
             first.attempt_no = 3
+        elif corrupt_prior == "number_zero":
+            # 0,2 passes the old count-only predicate, but not a 1,2 prefix.
+            first.attempt_no = 0
         db.add(DBGenerationAttempt(
             id=str(uuid.uuid4()),
             generation_task_id=task_id,
