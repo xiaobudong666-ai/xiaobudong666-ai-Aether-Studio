@@ -7102,3 +7102,104 @@ def test_g73_postgres_worker_heartbeat_rechecks_prior_receipt_after_claim(
                 "PostgreSQL heartbeat refusal must preserve lease, usage, storage and audit"
             )
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("history_case", ["HELD_AFTER_CLAIM", "SUBMISSION_STARTED_AFTER_CLAIM"])
+def test_g73_postgres_artifact_intake_rechecks_prior_receipt_after_claim(
+    postgres_context, history_case,
+):
+    """Disposable PostgreSQL: reject postclaim old receipt drift before Sidecar upload.
+
+    No Provider call, protected usage reconciliation, or production storage.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        first.status = "FAILED"
+        first.completed_at = now
+        task.attempts = 2
+        task.max_attempts = max(task.max_attempts, 2)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+    worker = "g73-pg-artifact-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    for status in ("RUNNING", "INGESTING"):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=headers,
+            json={
+                "status": status, "progress": 20 if status == "RUNNING" else 95,
+                "message": "FAKE-only",
+                "upstreamJobId": "g73-pg-synthetic-upstream",
+                "providerArtifactId": "g73-pg-synthetic-artifact",
+            },
+        )
+        assert response.status_code == 200, response.text
+    with sessions() as db:
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        if history_case == "HELD_AFTER_CLAIM":
+            first.reconciliation_state = "HELD"
+        else:
+            first.submission_started_at = now
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            used_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.asset_version_id, attempts,
+                    usage, events, used_bytes)
+
+    before = snapshot()
+    for _ in range(2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers=headers,
+            data={"providerArtifactId": "g73-pg-synthetic-artifact"},
+            files={"file": ("synthetic.mp4", b"FAKE-only-artifact", "video/mp4")},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == (
+            "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before, "PG intake refusal must preserve storage, usage, lease and audit"
+    app.state.moneyprinter.assert_not_called()
