@@ -6765,3 +6765,78 @@ def test_g70g71_postgres_legacy_prior_attempt_cancel_retry_is_fail_closed(
             "storage or audit state"
         )
     app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize("action", ["cancel", "retry"])
+def test_g70g71_postgres_unexpected_future_attempt_fails_closed(
+    postgres_context, action,
+):
+    """Disposable native PostgreSQL: an out-of-counter Attempt must fail closed.
+
+    A clean current attempt alone is insufficient when an unexpected later
+    attempt has durable upstream markers. Never release RESERVED or start a
+    potentially billable duplicate. This is FAKE-only; no trusted STOP ACK.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        assert row is not None and row.attempts == 1 and row.status == "QUEUED"
+        project_id = row.project_id
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert current.status == "QUEUED"
+        assert current.reconciliation_state == "NOT_SUBMITTED"
+        row.max_attempts = 4
+        if action == "retry":
+            row.status = current.status = "FAILED"
+            row.error_code = current.error_code = "TEMPORARY"
+            row.completed_at = current.completed_at = now
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="RUNNING", reconciliation_state="HELD",
+            upstream_job_id="synthetic-future-postgres-receipt",
+            created_at=now,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            storage_bytes = db.get(DBTenant, row.tenant_id).used_storage_bytes
+            return (
+                row.status, row.attempts, row.cancel_requested_at,
+                row.error_code, row.lease_owner, row.lease_expires_at,
+                row.upstream_job_id, history, usage, event_count, storage_bytes,
+            )
+
+    before = snapshot()
+    assert len(before[7]) == 2
+    assert [u[0] for u in before[8]] == ["RESERVED"]
+    code = ("GENERATION_RECONCILIATION_REQUIRED" if action == "retry"
+            else "GENERATION_CANCEL_RECONCILIATION_REQUIRED")
+    path = f"/projects/{project_id}/generation-tasks/{task_id}/{action}"
+    for _ in range(2):
+        denied = client.post(path)
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == code
+        assert snapshot() == before, "Rejected PostgreSQL operation changed evidence"
+    app.state.moneyprinter.assert_not_called()
