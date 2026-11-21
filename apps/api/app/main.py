@@ -193,6 +193,41 @@ def generation_failure_policy_valid(snapshot: dict) -> bool:
     return True
 
 
+def generation_prior_history_safe(db: Session, task: DBGenerationTask) -> bool:
+    """Fail closed on damaged/paid earlier attempts, including post-claim drift.
+
+    The same read-only durable invariant binds both Worker lease admission and
+    subsequent Worker transitions. A clean FAILED/NOT_SUBMITTED prefix is
+    allowed; missing, renumbered, future or billable history is not a STOP ACK.
+    """
+    if type(task.attempts) is not int or task.attempts < 1:
+        return False
+    history = list(db.execute(
+        select(
+            DBGenerationAttempt.attempt_no,
+            DBGenerationAttempt.status,
+            DBGenerationAttempt.reconciliation_state,
+            DBGenerationAttempt.submission_started_at,
+            DBGenerationAttempt.upstream_job_id,
+        ).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no != task.attempts,
+        ).order_by(DBGenerationAttempt.attempt_no)
+    ).all())
+    return (
+        len(history) == task.attempts - 1
+        and all(
+            number == expected
+            and status == "FAILED"
+            and reconciliation == "NOT_SUBMITTED"
+            and started_at is None
+            and upstream_id is None
+            for expected, (number, status, reconciliation, started_at, upstream_id)
+            in enumerate(history, start=1)
+        )
+    )
+
+
 def generation_failure_history_valid(history: object) -> bool:
     """Treat damaged durable circuit history as untrusted, without rewriting it.
 
@@ -3317,32 +3352,7 @@ def create_app(
             # must independently enforce the same invariant before leasing.
             # Fail closed on gaps, zero/renumbered attempts and future rows;
             # never repair usage or call Provider while reconciling history.
-            if candidate.attempts < 1:
-                continue
-            older_and_future_attempts = list(db.execute(
-                select(
-                    DBGenerationAttempt.attempt_no,
-                    DBGenerationAttempt.status,
-                    DBGenerationAttempt.reconciliation_state,
-                    DBGenerationAttempt.submission_started_at,
-                    DBGenerationAttempt.upstream_job_id,
-                ).where(
-                    DBGenerationAttempt.generation_task_id == candidate.id,
-                    DBGenerationAttempt.attempt_no != candidate.attempts,
-                ).order_by(DBGenerationAttempt.attempt_no)
-            ).all())
-            if (
-                len(older_and_future_attempts) != candidate.attempts - 1
-                or any(
-                    number != expected
-                    or status != "FAILED"
-                    or reconciliation != "NOT_SUBMITTED"
-                    or started_at is not None
-                    or upstream_id is not None
-                    for expected, (number, status, reconciliation, started_at, upstream_id)
-                    in enumerate(older_and_future_attempts, start=1)
-                )
-            ):
+            if not generation_prior_history_safe(db, candidate):
                 continue
             # G73: QUEUED is safe to submit only for an attempt that has
             # *never* entered upstream submission.  A historical/crashed
@@ -3699,6 +3709,17 @@ def create_app(
                 detail={
                     "code": "GENERATION_ATTEMPT_STATUS_CONFLICT",
                     "message": "任务与当前尝试的持久状态不一致，须先人工核验",
+                },
+            )
+        # G70/G71/G73: history may change after the Worker claim was issued.
+        # A valid lease is not an independent receipt for an older paid attempt.
+        # Recheck under the task-row lock before status/usage/audit mutations.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，停止Worker状态迁移并保持账本",
                 },
             )
         # G73: A persisted Attempt-level upstream receipt is independent
