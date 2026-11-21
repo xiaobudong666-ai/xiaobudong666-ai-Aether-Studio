@@ -4107,9 +4107,15 @@ def create_app(
         # reconciliation or a contradictory upstream identity can appear after
         # transition. Refuse before storage reservation, Sidecar I/O or audit
         # mutation; do not infer an APPLY/STOP ACK from the task status.
-        current_attempt = current_generation_attempt(db, task)
+        # A missing/renumbered current Attempt is corrupted durable state, not
+        # permission to debit storage or dispatch a Sidecar upload.
+        current_attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one_or_none()
         if (
-            current_attempt.status != task.status
+            current_attempt is None
+            or current_attempt.status != task.status
             or current_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
             or (
                 current_attempt.upstream_job_id is not None
@@ -4732,9 +4738,19 @@ def create_app(
                 # An orphan is audited by the existing rejected-intake path;
                 # neither this guard nor a Sidecar response is a human ACK.
                 if invalid_code is None:
-                    final_attempt = current_generation_attempt(db, task)
+                    # Recheck under the final transaction and lock the Attempt
+                    # on PostgreSQL so a concurrent writer cannot invalidate
+                    # this evidence between the check and SETTLED commit.
+                    final_attempt_query = select(DBGenerationAttempt).where(
+                        DBGenerationAttempt.generation_task_id == task.id,
+                        DBGenerationAttempt.attempt_no == task.attempts,
+                    )
+                    if app_engine.dialect.name == "postgresql":
+                        final_attempt_query = final_attempt_query.with_for_update()
+                    final_attempt = db.execute(final_attempt_query).scalar_one_or_none()
                     if (
-                        final_attempt.status != task.status
+                        final_attempt is None
+                        or final_attempt.status != task.status
                         or final_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
                         or (
                             final_attempt.upstream_job_id is not None
@@ -4836,7 +4852,13 @@ def create_app(
                                 invalid_message = "上传期间口播素材授权或版本失效，模拟产物隔离"
     
                 if invalid_code:
-                    attempt = current_generation_attempt(db, task)
+                    # Audit the orphan against its task even when the current
+                    # Attempt row was renumbered/deleted during Sidecar I/O.
+                    # generation_events.attempt_id is nullable by contract.
+                    attempt = db.execute(select(DBGenerationAttempt).where(
+                        DBGenerationAttempt.generation_task_id == task.id,
+                        DBGenerationAttempt.attempt_no == task.attempts,
+                    )).scalar_one_or_none()
                     orphan_size = int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size
                     orphan_evidence = {
                         "reasonCode": invalid_code,
