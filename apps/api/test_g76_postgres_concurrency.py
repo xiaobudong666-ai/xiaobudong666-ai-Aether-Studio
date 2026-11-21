@@ -6619,7 +6619,7 @@ def test_g70_g71_postgres_existing_legacy_media_must_remain_held(
         # Match the real Sidecar's typed inspection contract: the shared
         # PG FakeMediaStore omits contentType in its general-purpose probe.
         return {**original_inspect(project_id, selected_media_id),
-                "contentType": "video/mp4"}
+                "contentType": "video/mp4", "metadata": metadata}
 
     inspection = MagicMock(side_effect=inspect_with_fake_mp4_classification)
     monkeypatch.setattr(media, "upload_media", upload)
