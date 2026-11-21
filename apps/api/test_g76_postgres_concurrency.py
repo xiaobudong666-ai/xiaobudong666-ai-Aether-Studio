@@ -6520,3 +6520,143 @@ def test_g70g71_postgres_orphan_worker_lease_rejects_retry(
         assert refused.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
         assert snapshot() == before
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy_case", [
+    "matching_unbilled", "matching_already_billed",
+    "duplicate_matching", "duplicate_conflicting",
+    "wrong_mime", "missing_mime",
+])
+def test_g70_g71_postgres_existing_legacy_media_must_remain_held(
+    postgres_context, monkeypatch, legacy_case,
+):
+    """Native disposable PostgreSQL: an existing same-ID project material
+    cannot authorize a second storage debit or an orphan-artifact recovery.
+
+    This carries the SQLite-only G70/G71 legacy reconciliation fence across
+    the real JSONB, ORM transaction and ledger boundary. The Sidecar is FAKE;
+    this does not issue an independent receipt or approve human APPLY/STOP.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"fake-only-postgres-original-orphan-video"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-pg-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    metadata = {
+        "durationSeconds": 1.0,
+        "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    media = app.state.video_use
+    media.media_objects[(None, "unused")] = b"not-an-issuer"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None
+        project_id = task.project_id
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        media.media_objects[(project_id, media_id)] = payload
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "FAKE transfer interrupted"
+        task.upstream_job_id = "fake-original-upstream"
+        task.provider_artifact_id = "fake-original-artifact"
+        task.media_id = media_id
+        task.completed_at = now
+        task.updated_at = now
+        task.lease_owner = None
+        task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = "fake-original-upstream"
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": "fake-original-upstream",
+                "originalProviderArtifactId": "fake-original-artifact",
+                "reconciliationState": "HELD",
+                "usageReservation": "HELD",
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata,
+            },
+            created_at=now,
+        ))
+        material = {
+            "id": media_id, "name": "legacy-original",
+            "url": f"/api/video-use/media/{project_id}/{media_id}",
+            "type": "video", "contentType": "video/mp4",
+            "sizeBytes": len(payload),
+        }
+        project_materials = [dict(material)]
+        if legacy_case == "duplicate_matching":
+            project_materials.append(dict(material))
+        elif legacy_case == "duplicate_conflicting":
+            project_materials.append({**material, "contentType": "application/octet-stream"})
+        elif legacy_case == "wrong_mime":
+            project_materials[0]["contentType"] = "application/octet-stream"
+        elif legacy_case == "missing_mime":
+            project_materials[0].pop("contentType")
+        project = db.get(DBProject, project_id)
+        project.materials = project_materials
+        tenant = db.get(DBTenant, task.tenant_id)
+        old_bytes = len(payload) if legacy_case == "matching_already_billed" else 0
+        tenant.used_storage_bytes = old_bytes
+        db.commit()
+
+    upload = MagicMock(wraps=media.upload_media)
+    inspection = MagicMock(wraps=media.inspect_media)
+    monkeypatch.setattr(media, "upload_media", upload)
+    monkeypatch.setattr(media, "inspect_media", inspection)
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            project = db.get(DBProject, project_id)
+            reserved = tuple(
+                row.kind for row in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            return (
+                task.status, task.attempts, task.asset_version_id, task.error_code,
+                attempt.reconciliation_state, project.revision, project.materials,
+                db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                reserved,
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBGenerationAttempt.id)).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                )).scalar_one(),
+            )
+
+    baseline = durable_snapshot()
+    assert baseline[0] == "FAILED" and baseline[4] == "HELD"
+    assert baseline[7] == old_bytes and baseline[8] == ("RESERVED",)
+    route = f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        denied = client.post(route, json={
+            "reason": "Owner holds uncertain historical storage evidence (FAKE only)"
+        })
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT"
+        assert durable_snapshot() == baseline
+    assert inspection.call_count == 2
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
