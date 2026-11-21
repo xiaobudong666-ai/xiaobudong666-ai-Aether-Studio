@@ -3052,6 +3052,10 @@ def create_app(
             if (
                 existing_material.get("url") != material["url"]
                 or existing_material.get("type") != "video"
+                # A same-ID legacy row with a different/missing MIME type is
+                # not independent evidence of a recoverable MP4 artifact.
+                # Keep the orphan HELD instead of binding mismatched material.
+                or existing_material.get("contentType") != "video/mp4"
                 or existing_material_size != actual_size
             ):
                 # Undo the provisional quota increment before refusing recovery.
