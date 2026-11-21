@@ -2010,6 +2010,72 @@ def test_g70_g71_recovery_conflicting_material_invalid_size_is_409_not_500(
 
 
 @pytest.mark.parametrize("second_row_conflicts", [False, True])
+@pytest.mark.parametrize("stored_content_type", ["image/png", None, True])
+def test_g70_g71_recovery_existing_material_mime_mismatch_stays_held(
+    generation_context, stored_content_type,
+):
+    """FAKE-only: a single same-ID legacy row cannot contradict MP4 proof.
+
+    A matching ID, URL, type and byte count is insufficient if contentType is
+    absent, malformed or names a different format. Recovery must not create an
+    asset or mutate the RESERVED/HELD ledger on repeated Owner requests.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-orphan-existing-material-mime")
+    task = create_task(client, project, key="g70-orphan-existing-material-mime")
+    task_id = task["taskId"]
+    media_id, payload = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    legacy = {
+        "id": media_id,
+        "name": "legacy-orphan-row",
+        "url": f"/api/video-use/media/{project['id']}/{media_id}",
+        "type": "video",
+        "sizeBytes": len(payload),
+    }
+    if stored_content_type is not None:
+        legacy["contentType"] = stored_content_type
+    with sessions() as db:
+        project_row = db.get(DBProject, project["id"])
+        project_row.materials = [legacy]
+        db.commit()
+
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        rejected = client.post(
+            path, json={"reason": "Owner reconciles legacy material MIME mismatch"}
+        )
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"]["code"] == "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT"
+
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        tenant = db.get(DBTenant, stored.tenant_id)
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assert stored.status == "FAILED" and stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.asset_version_id is None
+        assert attempt.reconciliation_state == "HELD"
+        assert db.get(DBProject, project["id"]).materials == [legacy]
+        assert tenant.used_storage_bytes == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one() == 0
+        assert sum(entry.kind == "RESERVED" for entry in usage) == 1
+        assert not any(entry.kind in {"RELEASED", "SETTLED"} for entry in usage)
+    assert media_store.uploads == 0 and media_store.inspections == 2
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_g71_recovery_duplicate_orphan_media_rows_remain_held(
     generation_context, second_row_conflicts,
 ):
