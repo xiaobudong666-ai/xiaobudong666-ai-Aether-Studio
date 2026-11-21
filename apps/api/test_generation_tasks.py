@@ -8339,3 +8339,113 @@ def test_g73_artifact_intake_rechecks_current_attempt_after_claim(
         assert snapshot() == before, "refusal must preserve task, quota, storage and audit"
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["CURRENT_STATUS", "CURRENT_HELD", "CURRENT_UPSTREAM_ID", "PRIOR_HELD"],
+)
+def test_g73_artifact_intake_rechecks_attempt_after_sidecar_dispatch(
+    generation_context, monkeypatch, drift,
+):
+    """FAKE-only: a Sidecar ACK must not settle a newly disputed Attempt."""
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G73 midupload Attempt integrity " + drift)
+    task_id = create_task(client, project, key="g73-midupload-" + drift)["taskId"]
+    if drift == "PRIOR_HELD":
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            first = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )).scalar_one()
+            first.status = "FAILED"
+            first.completed_at = now
+            task.attempts = 2
+            task.max_attempts = max(task.max_attempts, 2)
+            db.add(DBGenerationAttempt(
+                id=str(uuid.uuid4()), generation_task_id=task_id,
+                attempt_no=2, status="QUEUED",
+                reconciliation_state="NOT_SUBMITTED", created_at=now,
+            ))
+            db.commit()
+
+    worker = "g73-midupload-worker"
+    claimed = claim(client, worker_id=worker)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    for status in ("RUNNING", "INGESTING"):
+        response = transition(
+            client, task_id, status, worker_id=worker,
+            upstreamJobId="g73-midupload-upstream",
+            providerArtifactId="g73-midupload-artifact",
+        )
+        assert response.status_code == 200, response.text
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        original_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+
+    original_upload = media.upload_media
+    remote_returns = []
+
+    def drift_during_sidecar(*args, **kwargs):
+        uploaded = original_upload(*args, **kwargs)
+        remote_returns.append(uploaded["mediaId"])
+        # Independent committed writer runs while the API has released its
+        # original task transaction for FAKE Sidecar I/O.
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt_no = 1 if drift == "PRIOR_HELD" else task.attempts
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == attempt_no,
+            )).scalar_one()
+            if drift == "CURRENT_STATUS":
+                attempt.status = "RUNNING"
+            elif drift in {"CURRENT_HELD", "PRIOR_HELD"}:
+                attempt.reconciliation_state = "HELD"
+            else:
+                attempt.upstream_job_id = "conflicting-midupload-upstream"
+            db.commit()
+        return uploaded
+
+    monkeypatch.setattr(media, "upload_media", drift_during_sidecar)
+    endpoint = f"/internal/generation-tasks/{task_id}/artifact-intake"
+    kwargs = {
+        "headers": {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+        "data": {"providerArtifactId": "g73-midupload-artifact"},
+        "files": {"file": ("synthetic.mp4", b"g73-midupload-fake-bytes", "video/mp4")},
+    }
+    rejected = client.post(endpoint, **kwargs)
+    assert remote_returns and media.uploads == 1, "must reach Sidecar before drift"
+    assert rejected.status_code == 409, rejected.text
+    expected_code = (
+        "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+        if drift == "PRIOR_HELD"
+        else "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+    )
+    assert rejected.json()["detail"]["code"] == expected_code
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, task.tenant_id)
+            settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one()
+            failed = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+            )).scalar_one()
+            return task.asset_version_id, tenant.used_storage_bytes, settled, failed
+
+    first = snapshot()
+    assert first == (None, original_bytes, 0, 1), first
+    replay = client.post(endpoint, **kwargs)
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == expected_code
+    assert snapshot() == first, "replay cannot debit or mutate settled ledger"
+    assert media.uploads == 1, "replay must not reach Sidecar again"
+    app.state.moneyprinter.assert_not_called()
