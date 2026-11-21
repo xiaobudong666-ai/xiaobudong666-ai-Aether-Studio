@@ -7316,3 +7316,125 @@ def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
         )
         assert snapshot() == before, "PG refusal must preserve task, quota, storage and audit"
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["CURRENT_STATUS", "CURRENT_HELD", "CURRENT_UPSTREAM_ID", "PRIOR_HELD"],
+)
+def test_g73_postgres_artifact_intake_rechecks_attempt_after_sidecar_dispatch(
+    postgres_context, monkeypatch, drift,
+):
+    """Native disposable PG: final task lock must see mid-upload Attempt drift."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    if drift == "PRIOR_HELD":
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            first = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )).scalar_one()
+            first.status = "FAILED"
+            first.completed_at = now
+            task.attempts = 2
+            task.max_attempts = max(task.max_attempts, 2)
+            db.add(DBGenerationAttempt(
+                id=str(uuid.uuid4()), generation_task_id=task_id,
+                attempt_no=2, status="QUEUED",
+                reconciliation_state="NOT_SUBMITTED", created_at=now,
+            ))
+            db.commit()
+
+    worker = "g73-pg-midupload-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    for status in ("RUNNING", "INGESTING"):
+        transitioned = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=headers,
+            json={
+                "status": status,
+                "progress": 20 if status == "RUNNING" else 95,
+                "message": "FAKE-only",
+                "upstreamJobId": "g73-pg-midupload-upstream",
+                "providerArtifactId": "g73-pg-midupload-artifact",
+            },
+        )
+        assert transitioned.status_code == 200, transitioned.text
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        initial_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+
+    original_upload = app.state.video_use.upload_media
+    uploads = []
+
+    def persist_drift_during_upload(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        uploads.append(result["mediaId"])
+        # The committed reservation predates this independent PG transaction.
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt_no = 1 if drift == "PRIOR_HELD" else task.attempts
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == attempt_no,
+            )).scalar_one()
+            if drift == "CURRENT_STATUS":
+                attempt.status = "RUNNING"
+            elif drift in {"CURRENT_HELD", "PRIOR_HELD"}:
+                attempt.reconciliation_state = "HELD"
+            else:
+                attempt.upstream_job_id = "conflicting-pg-midupload-upstream"
+            db.commit()
+        return result
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", persist_drift_during_upload)
+    endpoint = f"/internal/generation-tasks/{task_id}/artifact-intake"
+    kwargs = {
+        "headers": headers,
+        "data": {"providerArtifactId": "g73-pg-midupload-artifact"},
+        "files": {"file": ("synthetic.mp4", b"g73-pg-midupload-fake", "video/mp4")},
+    }
+    rejected = client.post(endpoint, **kwargs)
+    assert uploads and len(uploads) == 1, "must actually reach FAKE Sidecar"
+    assert rejected.status_code == 409, rejected.text
+    expected_code = (
+        "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+        if drift == "PRIOR_HELD"
+        else "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+    )
+    assert rejected.json()["detail"]["code"] == expected_code
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            used_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one()
+            failed = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+                DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
+            )).scalar_one()
+            return task.asset_version_id, used_bytes, settled, failed
+
+    before_replay = snapshot()
+    assert before_replay == (None, initial_bytes, 0, 1), before_replay
+    replay = client.post(endpoint, **kwargs)
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == expected_code
+    assert snapshot() == before_replay
+    assert len(uploads) == 1, "replay must not dispatch Sidecar again"
+    app.state.moneyprinter.assert_not_called()
