@@ -6667,3 +6667,98 @@ def test_g70_g71_postgres_existing_legacy_media_must_remain_held(
     assert inspection.call_count == 2
     upload.assert_not_called()
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["retry", "cancel"])
+@pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap"])
+def test_g70g71_postgres_legacy_prior_attempt_cancel_retry_is_fail_closed(
+    postgres_context, action, corrupt_prior,
+):
+    """Native PostgreSQL: a damaged prior attempt is not a trusted STOP ACK.
+
+    This deliberately mutates only synthetic, disposable test rows. It checks
+    both the no-double-spend retry and the no-premature-refund cancel path.
+    No real Provider, independent ACK issuance, or protected ledger access.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.status == "QUEUED" and task.attempts == 1
+        project_id = task.project_id
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert first.status == "QUEUED" and first.reconciliation_state == "NOT_SUBMITTED"
+        assert first.submission_started_at is None and first.upstream_job_id is None
+
+        task.attempts = 2
+        task.max_attempts = 4
+        task.status = "FAILED" if action == "retry" else "QUEUED"
+        task.error_code = "TEMPORARY" if action == "retry" else None
+        task.completed_at = now if action == "retry" else None
+        first.status = "RUNNING" if corrupt_prior == "stale_running" else "FAILED"
+        first.error_code = "TEMPORARY"
+        first.completed_at = now
+        if corrupt_prior == "number_gap":
+            # Preserve the row but move its sequence number past the current
+            # attempt, simulating a migrated gap without a foreign-key delete.
+            first.attempt_no = 3
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_no=2,
+            status=task.status,
+            error_code=task.error_code,
+            reconciliation_state="NOT_SUBMITTED",
+            created_at=now,
+            completed_at=task.completed_at,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            tenant_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (
+                task.status, task.attempts, task.cancel_requested_at,
+                task.error_code, task.lease_owner, task.lease_expires_at,
+                task.upstream_job_id, task.provider_artifact_id,
+                history, usage, event_count, tenant_bytes,
+            )
+
+    before = snapshot()
+    assert len(before[8]) == 2
+    assert [u[0] for u in before[9]] == ["RESERVED"]
+    code = (
+        "GENERATION_RECONCILIATION_REQUIRED"
+        if action == "retry" else "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+    )
+    endpoint = f"/projects/{project_id}/generation-tasks/{task_id}/{action}"
+    for _ in range(2):
+        denied = client.post(endpoint)
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == code
+        assert snapshot() == before, (
+            "Rejected PostgreSQL reconciliation changed attempt, usage, "
+            "storage or audit state"
+        )
+    app.state.moneyprinter.assert_not_called()
