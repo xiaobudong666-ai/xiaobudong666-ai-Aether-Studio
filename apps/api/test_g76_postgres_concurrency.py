@@ -7011,3 +7011,94 @@ def test_g73_postgres_worker_transition_rechecks_prior_receipt_after_claim(
                 "PostgreSQL transition refusal must preserve lease, usage, storage and audit"
             )
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("history_case", ["HELD_AFTER_CLAIM", "SUBMISSION_STARTED_AFTER_CLAIM", "CLEAN_PREFIX"])
+def test_g73_postgres_worker_heartbeat_rechecks_prior_receipt_after_claim(
+    postgres_context, history_case,
+):
+    """Disposable native PostgreSQL: a Worker heartbeat must not renew disputed old receipts.
+
+    Uses synthetic task history only; no real Provider, funds or protected ledger.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        first.status = "FAILED"
+        first.completed_at = now
+        task.attempts = 2
+        task.max_attempts = max(task.max_attempts, 2)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="QUEUED",
+            reconciliation_state="NOT_SUBMITTED", created_at=now,
+        ))
+        db.commit()
+    worker = "g73-pg-heartbeat-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+    with sessions() as db:
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        if history_case == "HELD_AFTER_CLAIM":
+            first.reconciliation_state = "HELD"
+        elif history_case == "SUBMISSION_STARTED_AFTER_CLAIM":
+            first.submission_started_at = now
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            bytes_used = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.upstream_job_id, history, usage, events, bytes_used)
+
+    before = snapshot()
+    for _ in range(2 if history_case != "CLEAN_PREFIX" else 1):
+        result = client.post(
+            f"/internal/generation-tasks/{task_id}/heartbeat",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+                     "X-Worker-Lease-Epoch": str(epoch)},
+            json={},
+        )
+        if history_case == "CLEAN_PREFIX":
+            assert result.status_code == 200, result.text
+            assert snapshot()[0] == "SUBMITTING"
+        else:
+            assert result.status_code == 409, result.text
+            assert result.json()["detail"]["code"] == (
+                "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+            )
+            assert snapshot() == before, (
+                "PostgreSQL heartbeat refusal must preserve lease, usage, storage and audit"
+            )
+    app.state.moneyprinter.assert_not_called()
