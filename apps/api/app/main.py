@@ -2371,6 +2371,15 @@ def create_app(
                     for expected, number in enumerate(earlier_attempt_numbers, start=1)
                 )
             )
+            # A legacy attempt numbered beyond task.attempts may still contain
+            # an accepted/billable upstream result. The current row being clean
+            # does not authorize quota release when history extends into future.
+            unexpected_future_attempt = db.execute(
+                select(DBGenerationAttempt.id).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no > task.attempts,
+                ).limit(1)
+            ).scalar_one_or_none()
             # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
             # submission can still be executing or billable upstream even
             # when the API has no upstream job ID. Without an independently
@@ -2386,6 +2395,7 @@ def create_app(
                 or unresolved_prior is not None
                 or task.attempts < 1
                 or not earlier_attempt_sequence_valid
+                or unexpected_future_attempt is not None
                 # Orphaned lease markers imply possible Worker ownership even
                 # when historical status fields still read QUEUED.
                 or task.lease_owner is not None
@@ -2516,6 +2526,15 @@ def create_app(
                 for expected, number in enumerate(earlier_attempt_numbers, start=1)
             )
         )
+        # A migrated future attempt can retain a submitted/billable result
+        # even when the task's current attempt says NOT_SUBMITTED.
+        # Reject before mutating attempts, use, lease, or audit.
+        unexpected_future_attempt = db.execute(
+            select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no > task.attempts,
+            ).limit(1)
+        ).scalar_one_or_none()
         prior_attempt = db.execute(
             select(DBGenerationAttempt).where(
                 DBGenerationAttempt.generation_task_id == task.id,
@@ -2527,6 +2546,7 @@ def create_app(
             or unresolved_earlier_attempt is not None
             or task.attempts < 1
             or not earlier_attempt_sequence_valid
+            or unexpected_future_attempt is not None
             or prior_attempt.status != task.status
             or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
             # Worker claim durably writes this BEFORE any upstream POST. The
