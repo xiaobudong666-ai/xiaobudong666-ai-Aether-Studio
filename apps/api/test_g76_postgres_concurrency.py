@@ -7203,3 +7203,88 @@ def test_g73_postgres_artifact_intake_rechecks_prior_receipt_after_claim(
         )
         assert snapshot() == before, "PG intake refusal must preserve storage, usage, lease and audit"
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "drift", ["STATUS_CONFLICT", "HELD_AFTER_TRANSITION", "UPSTREAM_ID_CONFLICT"],
+)
+def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
+    postgres_context, drift,
+):
+    """Native disposable PostgreSQL: current Attempt drift cannot reserve or upload."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    worker = "g73-pg-current-intake"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    for status in ("RUNNING", "INGESTING"):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=headers,
+            json={
+                "status": status, "progress": 20 if status == "RUNNING" else 95,
+                "message": "FAKE-only",
+                "upstreamJobId": "g73-pg-current-upstream",
+                "providerArtifactId": "g73-pg-current-artifact",
+            },
+        )
+        assert response.status_code == 200, response.text
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        if drift == "STATUS_CONFLICT":
+            current.status = "RUNNING"
+        elif drift == "HELD_AFTER_TRANSITION":
+            current.reconciliation_state = "HELD"
+        else:
+            current.upstream_job_id = "contradictory-upstream-id"
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            current = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == task.attempts,
+            )).scalar_one()
+            usage = tuple((u.kind, u.request_units, u.generated_seconds)
+                          for u in db.execute(select(DBGenerationUsageEntry).where(
+                              DBGenerationUsageEntry.task_id == task_id,
+                          )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            tenant_bytes = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (
+                task.status, task.lease_owner, task.lease_epoch,
+                task.lease_expires_at, task.asset_version_id,
+                current.status, current.reconciliation_state,
+                current.upstream_job_id, usage, events, tenant_bytes,
+            )
+
+    before = snapshot()
+    for _ in range(2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers=headers,
+            data={"providerArtifactId": "g73-pg-current-artifact"},
+            files={"file": ("synthetic.mp4", b"FAKE-only-current-attempt", "video/mp4")},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == (
+            "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before, "PG refusal must preserve task, quota, storage and audit"
+    app.state.moneyprinter.assert_not_called()
