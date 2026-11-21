@@ -3662,6 +3662,18 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
             raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
+        # G70/G71/G73: a lease heartbeat is not a fresh STOP/APPLY ACK.
+        # Older attempt receipts may change after claim.  Do not prolong a
+        # lease with unresolved upstream evidence: refuse before any mutation,
+        # preserving HELD/RESERVED and the prior lease for trusted review.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，拒绝续租并保持账本",
+                },
+            )
         task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         task.updated_at = now
         db.commit()
