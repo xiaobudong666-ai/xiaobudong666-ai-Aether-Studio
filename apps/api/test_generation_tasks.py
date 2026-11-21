@@ -7744,7 +7744,7 @@ def test_g70g71_retry_rejects_orphan_worker_lease_without_mutation(
 
 
 @pytest.mark.parametrize("action", ["retry", "cancel"])
-@pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap"])
+@pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap", "number_zero"])
 def test_g70g71_legacy_prior_attempt_history_fails_closed_without_trusted_ack(
     generation_context, action, corrupt_prior,
 ):
@@ -7789,9 +7789,13 @@ def test_g70g71_legacy_prior_attempt_history_fails_closed_without_trusted_ack(
         )).scalar_one()
         if corrupt_prior == "stale_running":
             first.status = "RUNNING"
-        else:
+        elif corrupt_prior == "number_gap":
             # Preserve audit foreign keys, but simulate a migrated history gap.
             first.attempt_no = 3
+        else:
+            assert corrupt_prior == "number_zero"
+            # Same count as a valid prefix, but historical attempt 1 is absent.
+            first.attempt_no = 0
         if action == "retry":
             row.status = "FAILED"
             second.status = "FAILED"
