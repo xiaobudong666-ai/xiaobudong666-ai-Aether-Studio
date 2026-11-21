@@ -7446,3 +7446,88 @@ def test_g73_postgres_artifact_intake_rechecks_attempt_after_sidecar_dispatch(
     assert snapshot() == before_replay
     assert len(uploads) == 1, "replay must not dispatch Sidecar again"
     app.state.moneyprinter.assert_not_called()
+
+
+
+@pytest.mark.parametrize("corruption", [
+    "MISSING_CURRENT", "STATUS_DRIFT", "HELD", "UPSTREAM_CONFLICT", "CLEAN",
+])
+def test_g73_postgres_worker_heartbeat_rechecks_current_attempt_after_claim(
+    postgres_context, corruption,
+):
+    """Disposable PostgreSQL: current Attempt drift must never prolong a lease.
+
+    Uses only synthetic tasks and no Provider, real settlement or protected
+    history. Repeated HTTP409 rejection preserves task/attempt/usage/audit.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    worker = "g73-pg-current-heartbeat-worker"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        if corruption == "MISSING_CURRENT":
+            attempt.attempt_no = task.attempts + 1
+        elif corruption == "STATUS_DRIFT":
+            attempt.status = "RUNNING"
+        elif corruption == "HELD":
+            attempt.reconciliation_state = "HELD"
+        elif corruption == "UPSTREAM_CONFLICT":
+            attempt.upstream_job_id = "unrecognized-upstream-job"
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            storage = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.upstream_job_id,
+                    attempts, usage, events, storage)
+
+    before = snapshot()
+    for _ in range(1 if corruption == "CLEAN" else 2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/heartbeat",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+                     "X-Worker-Lease-Epoch": str(epoch)},
+            json={},
+        )
+        if corruption == "CLEAN":
+            assert response.status_code == 200, response.text
+            assert snapshot()[0] == "SUBMITTING"
+            assert snapshot()[2] == epoch
+        else:
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["code"] == (
+                "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+            )
+            assert snapshot() == before, (
+                "PostgreSQL heartbeat refusal must preserve lease, usage, storage and audit"
+            )
+    app.state.moneyprinter.assert_not_called()
