@@ -2985,6 +2985,24 @@ def create_app(
                 },
             )
 
+        # G70/G71 FAKE-only: a legacy project can contain two material rows
+        # for the same orphan media ID. A single matching first row cannot
+        # certify that the second row is safe: downstream consumers may pick
+        # a different row and the recovery may double-account storage.
+        # Preserve HELD and require manual reconciliation of ambiguous history.
+        matching_materials = [
+            item for item in (project.materials or [])
+            if item.get("id") == orphan_media_id
+        ]
+        if len(matching_materials) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
+                    "message": "项目存在重复原始媒资记录，保持 HELD，需人工对账",
+                },
+            )
+
         storage_reservation = db.execute(
             update(DBTenant)
             .where(
