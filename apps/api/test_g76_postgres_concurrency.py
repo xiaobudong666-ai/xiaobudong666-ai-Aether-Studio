@@ -4387,6 +4387,13 @@ def test_g72_postgres_remix_expires_during_fake_upload_releases_storage_without_
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         task.lease_expires_at = before_expiry + datetime.timedelta(hours=2)
         db.commit()
         initial_storage = db.get(DBTenant, tenant_id).used_storage_bytes
@@ -4544,6 +4551,13 @@ def test_g72_postgres_revoke_after_final_rights_read_is_serialized(postgres_cont
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         db.commit()
         base_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
@@ -4676,6 +4690,13 @@ def test_g72_postgres_owner_revoked_during_fake_upload_is_fenced_before_commit(
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         db.commit()
         initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
@@ -4861,6 +4882,13 @@ def test_g72_postgres_originator_disable_after_final_lock_waits_for_commit(
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         task.status = "RUNNING"
+        # Simulate a normal Worker transition: task and current Attempt are
+        # updated together.  A task-only test shortcut is corrupt history.
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        current.status = "RUNNING"
         db.commit()
         initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
