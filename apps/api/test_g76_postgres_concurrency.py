@@ -6550,7 +6550,6 @@ def test_g70_g71_postgres_existing_legacy_media_must_remain_held(
         "audio": None,
     }
     media = app.state.video_use
-    media.media_objects[(None, "unused")] = b"not-an-issuer"
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
