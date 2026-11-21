@@ -7741,3 +7741,96 @@ def test_g70g71_retry_rejects_orphan_worker_lease_without_mutation(
         assert durable_snapshot() == before
     app.state.moneyprinter.assert_not_called()
     assert media_store.uploads == 0
+
+
+@pytest.mark.parametrize("action", ["retry", "cancel"])
+@pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap"])
+def test_g70g71_legacy_prior_attempt_history_fails_closed_without_trusted_ack(
+    generation_context, action, corrupt_prior,
+):
+    """FAKE-only: incomplete/active earlier attempts cannot trigger new spend or release.
+
+    No true Provider/Sidecar ACK, policy change, or protected ledger mutation.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "G70/G71 legacy attempt history guard")
+    task = create_task(client, project, key=f"legacy-history-{action}-{corrupt_prior}")
+    task_id = task["taskId"]
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}"
+
+    # First create a legitimately NOT_SUBMITTED, preclaim FAILED attempt.
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert row.status == first.status == "QUEUED"
+        assert first.reconciliation_state == "NOT_SUBMITTED"
+        assert first.submission_started_at is None
+        row.status = "FAILED"
+        first.status = "FAILED"
+        row.error_code = "TEMPORARY"
+        first.error_code = "TEMPORARY"
+        db.commit()
+    response = client.post(path + "/retry")
+    assert response.status_code == 202, response.text
+    assert response.json()["attempt"] == 2
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        first = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        second = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 2,
+        )).scalar_one()
+        if corrupt_prior == "stale_running":
+            first.status = "RUNNING"
+        else:
+            # Preserve audit foreign keys, but simulate a migrated history gap.
+            first.attempt_no = 3
+        if action == "retry":
+            row.status = "FAILED"
+            second.status = "FAILED"
+            row.error_code = "TEMPORARY"
+            second.error_code = "TEMPORARY"
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            history = tuple(db.execute(
+                select(DBGenerationAttempt.attempt_no, DBGenerationAttempt.status)
+                .where(DBGenerationAttempt.generation_task_id == task_id)
+                .order_by(DBGenerationAttempt.attempt_no)
+            ).all())
+            usage = tuple(db.execute(
+                select(DBGenerationUsageEntry.kind, DBGenerationUsageEntry.request_units)
+                .where(DBGenerationUsageEntry.task_id == task_id)
+            ).all())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )).scalar_one()
+            tenant = db.get(DBTenant, row.tenant_id)
+            return (
+                row.status, row.attempts, row.cancel_requested_at,
+                row.error_code, row.lease_owner, row.upstream_job_id,
+                history, usage, events, tenant.used_storage_bytes,
+            )
+
+    before = snapshot()
+    assert len(before[7]) == 1 and before[7][0][0] == "RESERVED"
+    error = (
+        "GENERATION_RECONCILIATION_REQUIRED"
+        if action == "retry" else "GENERATION_CANCEL_RECONCILIATION_REQUIRED"
+    )
+    for _ in range(2):
+        denied = client.post(path + "/" + action)
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == error
+        assert snapshot() == before
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
