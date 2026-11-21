@@ -6840,3 +6840,83 @@ def test_g70g71_postgres_unexpected_future_attempt_fails_closed(
         assert denied.json()["detail"]["code"] == code
         assert snapshot() == before, "Rejected PostgreSQL operation changed evidence"
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("historical_evidence", [
+    "HELD", "SUBMISSION_STARTED", "CLEAN_NOT_SUBMITTED",
+])
+def test_g73_postgres_worker_claim_fences_older_paid_attempt(
+    postgres_context, historical_evidence,
+):
+    """Native disposable PostgreSQL: never lease another paid submission
+    when a legacy previous attempt is HELD or has a durable submit marker.
+    """
+    client, sessions, app = postgres_context
+    damaged_id = _create_task(client)
+    healthy_id = _create_task(client)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, damaged_id)
+        older = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == damaged_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        older.status = "FAILED"
+        older.error_code = "TEMPORARY"
+        older.completed_at = now
+        if historical_evidence == "HELD":
+            older.reconciliation_state = "HELD"
+            older.upstream_job_id = "legacy-accepted-upstream"
+        elif historical_evidence == "SUBMISSION_STARTED":
+            older.submission_started_at = now
+        row.attempts = 2
+        row.max_attempts = 4
+        row.status = "QUEUED"
+        row.upstream_job_id = None
+        row.created_at = now - datetime.timedelta(minutes=2)
+        db.get(DBGenerationTask, healthy_id).created_at = now - datetime.timedelta(minutes=1)
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=damaged_id,
+            attempt_no=2, status="QUEUED", reconciliation_state="NOT_SUBMITTED",
+            created_at=now,
+        ))
+        db.commit()
+
+    with sessions() as db:
+        before_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+        )).scalar_one()
+        before_usage = tuple(db.execute(select(
+            DBGenerationUsageEntry.kind, DBGenerationUsageEntry.request_units,
+            DBGenerationUsageEntry.generated_seconds,
+        ).where(DBGenerationUsageEntry.task_id == damaged_id)).all())
+        assert [entry[0] for entry in before_usage] == ["RESERVED"]
+
+    response = client.post(
+        "/internal/generation-tasks/claim",
+        headers={
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": "g73-pg-prior-receipt-worker",
+        },
+    )
+    assert response.status_code == 200, response.text
+    expected_id = (
+        damaged_id if historical_evidence == "CLEAN_NOT_SUBMITTED"
+        else healthy_id
+    )
+    assert response.json()["taskId"] == expected_id
+    with sessions() as db:
+        row = db.get(DBGenerationTask, damaged_id)
+        assert row.status == ("SUBMITTING" if expected_id == damaged_id else "QUEUED")
+        assert row.lease_epoch == (1 if expected_id == damaged_id else 0)
+        assert row.lease_owner == (
+            "g73-pg-prior-receipt-worker" if expected_id == damaged_id else None
+        )
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == damaged_id,
+        )).scalar_one() == before_events + (1 if expected_id == damaged_id else 0)
+        assert tuple(db.execute(select(
+            DBGenerationUsageEntry.kind, DBGenerationUsageEntry.request_units,
+            DBGenerationUsageEntry.generated_seconds,
+        ).where(DBGenerationUsageEntry.task_id == damaged_id)).all()) == before_usage
+    app.state.moneyprinter.assert_not_called()
