@@ -4102,6 +4102,19 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
         if task.status not in {"RUNNING", "INGESTING"}:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_INTAKE_NOT_ALLOWED", "message": "当前状态不允许接收产物"})
+        # G70/G71/G73 FAKE-only: history can become HELD or acquire durable
+        # upstream submission evidence after Worker claim and transition.
+        # Neither a live lease nor an artifact ID authorizes a new storage
+        # debit or Sidecar upload while an earlier attempt is disputed.
+        # Fail before byte processing, reservation, upload or audit mutation.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，拒绝产物入库并保持账本",
+                },
+            )
         if task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ID_MISMATCH", "message": "产物编号与当前任务回执不一致"})
         if file.content_type != "video/mp4":
