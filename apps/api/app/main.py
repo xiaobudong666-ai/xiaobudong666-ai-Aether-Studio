@@ -2356,12 +2356,21 @@ def create_app(
             # A missing or renumbered older attempt is not a trusted STOP ACK.
             # Preserve RESERVED usage until the full FAILED/NOT_SUBMITTED
             # attempt history is present and independently reconcilable.
-            earlier_attempt_count = db.execute(
-                select(func.count(DBGenerationAttempt.id)).where(
+            # A count alone can hide migrated attempt 0 while attempt 1 is missing.
+            # Require exact positive prior numbering before quota release or retry.
+            earlier_attempt_numbers = db.execute(
+                select(DBGenerationAttempt.attempt_no).where(
                     DBGenerationAttempt.generation_task_id == task.id,
                     DBGenerationAttempt.attempt_no < task.attempts,
+                ).order_by(DBGenerationAttempt.attempt_no)
+            ).scalars().all()
+            earlier_attempt_sequence_valid = (
+                len(earlier_attempt_numbers) == task.attempts - 1
+                and all(
+                    number == expected
+                    for expected, number in enumerate(earlier_attempt_numbers, start=1)
                 )
-            ).scalar_one()
+            )
             # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
             # submission can still be executing or billable upstream even
             # when the API has no upstream job ID. Without an independently
@@ -2376,7 +2385,7 @@ def create_app(
                 or attempt.reconciliation_state != "NOT_SUBMITTED"
                 or unresolved_prior is not None
                 or task.attempts < 1
-                or earlier_attempt_count != task.attempts - 1
+                or not earlier_attempt_sequence_valid
                 # Orphaned lease markers imply possible Worker ownership even
                 # when historical status fields still read QUEUED.
                 or task.lease_owner is not None
@@ -2492,12 +2501,21 @@ def create_app(
         ).scalar_one_or_none()
         # Earlier attempt rows must form a complete, terminal FAILED prefix.
         # A missing/corrupted row cannot prove that a billable POST never ran.
-        earlier_attempt_count = db.execute(
-            select(func.count(DBGenerationAttempt.id)).where(
+        # A count alone can hide migrated attempt 0 while attempt 1 is missing.
+        # Require exact positive prior numbering before quota release or retry.
+        earlier_attempt_numbers = db.execute(
+            select(DBGenerationAttempt.attempt_no).where(
                 DBGenerationAttempt.generation_task_id == task.id,
                 DBGenerationAttempt.attempt_no < task.attempts,
+            ).order_by(DBGenerationAttempt.attempt_no)
+        ).scalars().all()
+        earlier_attempt_sequence_valid = (
+            len(earlier_attempt_numbers) == task.attempts - 1
+            and all(
+                number == expected
+                for expected, number in enumerate(earlier_attempt_numbers, start=1)
             )
-        ).scalar_one()
+        )
         prior_attempt = db.execute(
             select(DBGenerationAttempt).where(
                 DBGenerationAttempt.generation_task_id == task.id,
@@ -2508,7 +2526,7 @@ def create_app(
             prior_attempt is None
             or unresolved_earlier_attempt is not None
             or task.attempts < 1
-            or earlier_attempt_count != task.attempts - 1
+            or not earlier_attempt_sequence_valid
             or prior_attempt.status != task.status
             or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
             # Worker claim durably writes this BEFORE any upstream POST. The
