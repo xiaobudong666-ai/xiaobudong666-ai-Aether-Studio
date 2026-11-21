@@ -7234,7 +7234,7 @@ def test_g73_postgres_artifact_intake_rechecks_prior_receipt_after_claim(
 
 
 @pytest.mark.parametrize(
-    "drift", ["STATUS_CONFLICT", "HELD_AFTER_TRANSITION", "UPSTREAM_ID_CONFLICT"],
+    "drift", ["STATUS_CONFLICT", "HELD_AFTER_TRANSITION", "UPSTREAM_ID_CONFLICT", "MISSING_CURRENT"],
 )
 def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
     postgres_context, drift,
@@ -7276,6 +7276,10 @@ def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
             current.status = "RUNNING"
         elif drift == "HELD_AFTER_TRANSITION":
             current.reconciliation_state = "HELD"
+        elif drift == "MISSING_CURRENT":
+            # Preserve FK-linked audit/usage while removing the CURRENT
+            # generation_task.attempts match from the durable table.
+            current.attempt_no = task.attempts + 1
         else:
             current.upstream_job_id = "contradictory-upstream-id"
         db.commit()
@@ -7286,7 +7290,7 @@ def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
             current = db.execute(select(DBGenerationAttempt).where(
                 DBGenerationAttempt.generation_task_id == task_id,
                 DBGenerationAttempt.attempt_no == task.attempts,
-            )).scalar_one()
+            )).scalar_one_or_none()
             usage = tuple((u.kind, u.request_units, u.generated_seconds)
                           for u in db.execute(select(DBGenerationUsageEntry).where(
                               DBGenerationUsageEntry.task_id == task_id,
@@ -7298,8 +7302,10 @@ def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
             return (
                 task.status, task.lease_owner, task.lease_epoch,
                 task.lease_expires_at, task.asset_version_id,
-                current.status, current.reconciliation_state,
-                current.upstream_job_id, usage, events, tenant_bytes,
+                current.status if current else None,
+                current.reconciliation_state if current else None,
+                current.upstream_job_id if current else None,
+                usage, events, tenant_bytes,
             )
 
     before = snapshot()
@@ -7320,7 +7326,7 @@ def test_g73_postgres_artifact_intake_rechecks_current_attempt_after_claim(
 
 @pytest.mark.parametrize(
     "drift",
-    ["CURRENT_STATUS", "CURRENT_HELD", "CURRENT_UPSTREAM_ID", "PRIOR_HELD"],
+    ["CURRENT_STATUS", "CURRENT_HELD", "CURRENT_UPSTREAM_ID", "PRIOR_HELD", "CURRENT_MISSING"],
 )
 def test_g73_postgres_artifact_intake_rechecks_attempt_after_sidecar_dispatch(
     postgres_context, monkeypatch, drift,
@@ -7394,6 +7400,8 @@ def test_g73_postgres_artifact_intake_rechecks_attempt_after_sidecar_dispatch(
                 attempt.status = "RUNNING"
             elif drift in {"CURRENT_HELD", "PRIOR_HELD"}:
                 attempt.reconciliation_state = "HELD"
+            elif drift == "CURRENT_MISSING":
+                attempt.attempt_no = task.attempts + 1
             else:
                 attempt.upstream_job_id = "conflicting-pg-midupload-upstream"
             db.commit()
