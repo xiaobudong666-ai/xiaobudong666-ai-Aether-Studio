@@ -3003,6 +3003,19 @@ def create_app(
                 },
             )
 
+        # A single same-ID legacy material may already have debited tenant
+        # storage. ID/MIME/size equality is not a trusted prior-debit receipt.
+        # Never unconditionally reserve a second storage charge; keep HELD
+        # and let Owner/M11 reconcile the original accounting evidence.
+        if len(matching_materials) == 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
+                    "message": "原始媒资已存在但历史存储占用未核实，保持 HELD，需人工对账",
+                },
+            )
+
         storage_reservation = db.execute(
             update(DBTenant)
             .where(
@@ -3025,13 +3038,6 @@ def create_app(
             )
 
         materials = list(project.materials or [])
-        existing_material = next(
-            (
-                item for item in materials
-                if isinstance(item, dict) and item.get("id") == orphan_media_id
-            ),
-            None,
-        )
         material = {
             "id": orphan_media_id,
             "name": f"generation-{task.id}.mp4",
@@ -3044,33 +3050,9 @@ def create_app(
             },
             "sizeBytes": actual_size,
         }
-        if existing_material is not None:
-            # Materials are untrusted project JSON. Malformed legacy sizes must
-            # fail closed as a conflict instead of raising an unhandled 500.
-            raw_material_size = existing_material.get("sizeBytes")
-            existing_material_size = raw_material_size if type(raw_material_size) is int else -1
-            if (
-                existing_material.get("url") != material["url"]
-                or existing_material.get("type") != "video"
-                # A same-ID legacy row with a different/missing MIME type is
-                # not independent evidence of a recoverable MP4 artifact.
-                # Keep the orphan HELD instead of binding mismatched material.
-                or existing_material.get("contentType") != "video/mp4"
-                or existing_material_size != actual_size
-            ):
-                # Undo the provisional quota increment before refusing recovery.
-                db.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
-                        "message": "项目中已存在同 ID 但元数据不一致的素材",
-                    },
-                )
-        else:
-            project.materials = [*materials, material]
-            project.revision += 1
-            project.updated_at = utc_now()
+        project.materials = [*materials, material]
+        project.revision += 1
+        project.updated_at = utc_now()
 
         next_version = (
             db.execute(
