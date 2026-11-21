@@ -7838,3 +7838,75 @@ def test_g70g71_legacy_prior_attempt_history_fails_closed_without_trusted_ack(
         assert snapshot() == before
     app.state.moneyprinter.assert_not_called()
     assert media_store.uploads == 0
+
+@pytest.mark.parametrize("action", ["cancel", "retry"])
+def test_g70g71_unexpected_future_attempt_fails_closed(
+    generation_context, action,
+):
+    """FAKE-only: stale future Attempt cannot authorize refund or new POST.
+
+    A migrated Attempt 2 may retain upstream evidence while the task counter
+    still reads 1 and Attempt 1 is clean. No live Provider or protected data.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G70/G71 future attempt reconciliation")
+    task_id = create_task(client, project, key="g70g71-future-attempt-" + action)["taskId"]
+    path = f"/projects/{project['id']}/generation-tasks/{task_id}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        assert row.attempts == 1 and row.status == current.status == "QUEUED"
+        assert current.reconciliation_state == "NOT_SUBMITTED"
+        row.max_attempts = 4
+        if action == "retry":
+            row.status = current.status = "FAILED"
+            row.error_code = current.error_code = "TEMPORARY"
+            row.completed_at = current.completed_at = now
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="RUNNING", reconciliation_state="HELD",
+            upstream_job_id="synthetic-future-receipt-not-trusted",
+            created_at=now,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            row = db.get(DBGenerationTask, task_id)
+            history = tuple(db.execute(
+                select(DBGenerationAttempt.attempt_no, DBGenerationAttempt.status,
+                       DBGenerationAttempt.reconciliation_state,
+                       DBGenerationAttempt.upstream_job_id)
+                .where(DBGenerationAttempt.generation_task_id == task_id)
+                .order_by(DBGenerationAttempt.attempt_no)
+            ).all())
+            usage = tuple(db.execute(
+                select(DBGenerationUsageEntry.kind,
+                       DBGenerationUsageEntry.request_units)
+                .where(DBGenerationUsageEntry.task_id == task_id)
+            ).all())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id
+            )).scalar_one()
+            bytes_used = db.get(DBTenant, row.tenant_id).used_storage_bytes
+            return (
+                row.status, row.attempts, row.cancel_requested_at, row.error_code,
+                row.lease_owner, row.lease_expires_at, row.upstream_job_id,
+                history, usage, events, bytes_used,
+            )
+
+    before = snapshot()
+    assert [u[0] for u in before[8]] == ["RESERVED"]
+    error = ("GENERATION_RECONCILIATION_REQUIRED" if action == "retry"
+             else "GENERATION_CANCEL_RECONCILIATION_REQUIRED")
+    for _ in range(2):
+        denied = client.post(path + "/" + action)
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == error
+        assert snapshot() == before, "Rejected operation mutated durable state"
+    app.state.moneyprinter.assert_not_called()
+    assert media.uploads == 0
