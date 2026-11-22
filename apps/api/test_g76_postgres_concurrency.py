@@ -8330,6 +8330,125 @@ def test_g70g71_postgres_orphan_recovery_fences_untrusted_reserved_ledger(
 
 
 @pytest.mark.parametrize("exception_type", [VideoUseError, RuntimeError])
+
+@pytest.mark.parametrize("storage_event_type", [
+    "STORAGE_RESERVATION_OPENED", "STORAGE_RESERVATION_RELEASED",
+])
+def test_g70g71_postgres_orphan_recovery_fences_prior_storage_accounting(
+    postgres_context, monkeypatch, storage_event_type,
+):
+    """Native disposable PostgreSQL / FAKE-only, no trusted M13 ACK.
+
+    Prior storage events are not proof of a refund or no prior debit.
+    An Owner orphan recovery must not debit the tenant twice, publish an
+    asset or convert HELD usage into a presumed settlement.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"synthetic-postgres-g70g71-storage-event"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-storage-pg-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        project_id = task.project_id
+        tenant = db.get(DBTenant, task.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic orphan after Sidecar uncertainty"
+        task.upstream_job_id = "synthetic-original-upstream"
+        task.provider_artifact_id = "synthetic-original-artifact"
+        task.media_id = media_id
+        task.completed_at = task.updated_at = now
+        task.lease_owner = task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = "synthetic-original-upstream"
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        if storage_event_type == "STORAGE_RESERVATION_OPENED":
+            tenant.used_storage_bytes = len(payload)
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": "synthetic-original-upstream",
+                "originalProviderArtifactId": "synthetic-original-artifact",
+                "reconciliationState": "HELD", "usageReservation": "HELD",
+                "orphanedMediaId": media_id, "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": {
+                    "durationSeconds": 1.0, "sizeBytes": len(payload),
+                    "video": {"codec": "h264", "width": 320, "height": 240},
+                    "audio": None,
+                },
+            }, created_at=now,
+        ))
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type=storage_event_type,
+            from_status="INGESTING", to_status="INGESTING",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={"reservedStorageBytes": len(payload)},
+            created_at=now,
+        ))
+        db.commit()
+
+    media = app.state.video_use
+    media.media_objects[(project_id, media_id)] = payload
+    inspection = MagicMock(wraps=media.inspect_media)
+    upload = MagicMock(wraps=media.upload_media)
+    monkeypatch.setattr(media, "inspect_media", inspection)
+    monkeypatch.setattr(media, "upload_media", upload)
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, task.tenant_id)
+            project = db.get(DBProject, project_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )).scalar_one()
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                attempt.reconciliation_state, tenant.used_storage_bytes,
+                project.revision, project.materials,
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id
+                )).scalar_one(),
+                tuple(sorted((entry.kind, entry.reservation_key) for entry in
+                    db.execute(select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id
+                    )).scalars())),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+            )
+    before = snapshot()
+    assert before[0] == "FAILED" and before[3] == "HELD"
+    assert before[4] == (
+        len(payload) if storage_event_type == "STORAGE_RESERVATION_OPENED" else 0
+    )
+    for _ in range(2):
+        denied = client.post(
+            f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
+            json={"reason": "FAKE-only unresolved storage prior audit"},
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == (
+            "ARTIFACT_RECOVERY_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before
+    inspection.assert_not_called()
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
+
 def test_g70_g71_postgres_sidecar_exception_after_write_keeps_original_storage_hold(
     postgres_context, monkeypatch, exception_type,
 ):
