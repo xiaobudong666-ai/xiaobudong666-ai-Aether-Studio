@@ -424,6 +424,124 @@ def test_g72_postgres_historical_reserved_owner_transfer_is_quarantined_without_
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("phase", ["after_claim", "during_upload"])
+def test_g72_postgres_postclaim_reserved_config_drift_blocks_fake_settlement(
+    postgres_context, monkeypatch, phase,
+):
+    """Native disposable PG: synthetic RESERVED may drift after a valid lease.
+
+    The app must refuse before Sidecar or at final commit, compensating a
+    temporary storage hold without creating asset/SETTLED usage. No Provider
+    calls, credentials, protected data or actual financial settlement.
+    """
+    client, sessions, app = postgres_context
+    worker = "g72-pg-reserved-postclaim-" + phase
+    task_id, _source, _project, tenant_id, owner, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, worker, source_sha="e" * 64,
+        )
+    )
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(epoch),
+    }
+    for status in ("RUNNING", "INGESTING"):
+        transitioned = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=headers,
+            json={
+                "status": status,
+                "progress": 20 if status == "RUNNING" else 95,
+                "message": "synthetic-only",
+                "upstreamJobId": "g72-pg-reserved-upstream",
+                "providerArtifactId": "g72-pg-reserved-artifact",
+            },
+        )
+        assert transitioned.status_code == 200, transitioned.text
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        original = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        usage_id = original.id
+        assert task is not None and original.tenant_id == tenant_id
+        original_version = original.config_version_id
+        initial_storage = db.get(DBTenant, tenant_id).used_storage_bytes
+        alternate_config_id = str(uuid.uuid4())
+        db.add(DBGenerationProviderConfigVersion(
+            id=alternate_config_id, tenant_id=tenant_id,
+            provider="synthetic-drift-test-only", version=1, status="DRAFT",
+            policy_json={}, policy_hash="synthetic-drift-only",
+            created_by=owner, created_at=datetime.datetime.now(datetime.timezone.utc),
+        ))
+        db.commit()
+    assert alternate_config_id != original_version
+
+    def poison_reserved():
+        with sessions() as db:
+            db.execute(
+                DBGenerationUsageEntry.__table__.update()
+                .where(DBGenerationUsageEntry.__table__.c.id == usage_id)
+                .values(config_version_id=alternate_config_id)
+            )
+            db.commit()
+
+    uploads = []
+    if phase == "after_claim":
+        poison_reserved()
+    else:
+        original_upload = app.state.video_use.upload_media
+
+        def persist_after_sidecar(*args, **kwargs):
+            result = original_upload(*args, **kwargs)
+            uploads.append(result["mediaId"])
+            poison_reserved()
+            return result
+
+        monkeypatch.setattr(app.state.video_use, "upload_media", persist_after_sidecar)
+
+    endpoint = f"/internal/generation-tasks/{task_id}/artifact-intake"
+    kwargs = {
+        "headers": headers,
+        "data": {"providerArtifactId": "g72-pg-reserved-artifact"},
+        "files": {"file": ("synthetic.mp4", b"g72-pg-reserved-byte-test", "video/mp4")},
+    }
+    rejected = client.post(endpoint, **kwargs)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_RESERVED_RECONCILIATION_REQUIRED"
+    )
+    assert len(uploads) == (1 if phase == "during_upload" else 0)
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            ledger = db.get(DBGenerationUsageEntry, usage_id)
+            settled = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+                DBGenerationUsageEntry.task_id == task_id,
+                DBGenerationUsageEntry.kind == "SETTLED",
+            )).scalar_one()
+            return (
+                task.asset_version_id, ledger.kind, ledger.config_version_id,
+                ledger.request_units, settled,
+                db.get(DBTenant, tenant_id).used_storage_bytes,
+            )
+
+    before_replay = snapshot()
+    assert before_replay == (None, "RESERVED", alternate_config_id, 1, 0, initial_storage)
+    replay = client.post(endpoint, **kwargs)
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_RESERVED_RECONCILIATION_REQUIRED"
+    )
+    assert snapshot() == before_replay
+    assert len(uploads) == (1 if phase == "during_upload" else 0)
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "damage",
     ["missing", "released", "wrong_project", "wrong_attempt", "wrong_key", "zero_units", "wrong_config"],
