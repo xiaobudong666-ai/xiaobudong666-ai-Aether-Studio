@@ -9400,21 +9400,37 @@ def test_g70_g71_lost_sidecar_ack_does_not_clobber_successor_worker_lease(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("corrupt_timing", ["before_probe", "during_probe"])
 @pytest.mark.parametrize("negative_storage_bytes", [-1, -17])
 def test_g70g71_orphan_recovery_negative_storage_counter_keeps_held(
-    generation_context, negative_storage_bytes,
+    generation_context, monkeypatch, negative_storage_bytes, corrupt_timing,
 ):
-    """FAKE-only: a negative storage balance is corrupt evidence, not quota."""
+    """FAKE-only: corrupted quota must block recovery even after Sidecar inspection."""
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-orphan-negative-counter")
     task_id = create_task(
         client, project, key=f"g70-orphan-negative-{abs(negative_storage_bytes)}"
     )["taskId"]
     seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
-    with sessions() as db:
-        task = db.get(DBGenerationTask, task_id)
-        db.get(DBTenant, task.tenant_id).used_storage_bytes = negative_storage_bytes
-        db.commit()
+    if corrupt_timing == "before_probe":
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            db.get(DBTenant, task.tenant_id).used_storage_bytes = negative_storage_bytes
+            db.commit()
+    else:
+        # A separate transaction changes quota while read-only Sidecar inspection
+        # is in flight. The final atomic UPDATE must recheck the persisted value.
+        original_inspect = media_store.inspect_media
+
+        def inspect_then_corrupt(project_id, media_id):
+            inspected = original_inspect(project_id, media_id)
+            with sessions() as other_db:
+                task = other_db.get(DBGenerationTask, task_id)
+                other_db.get(DBTenant, task.tenant_id).used_storage_bytes = negative_storage_bytes
+                other_db.commit()
+            return inspected
+
+        monkeypatch.setattr(media_store, "inspect_media", inspect_then_corrupt)
 
     def snapshot():
         with sessions() as db:
@@ -9442,7 +9458,8 @@ def test_g70g71_orphan_recovery_negative_storage_counter_keeps_held(
 
     before = snapshot()
     assert before[0] == "FAILED" and before[3] == "HELD"
-    assert before[4] == negative_storage_bytes
+    assert before[4] == (negative_storage_bytes if corrupt_timing == "before_probe" else 0)
+    expected = (*before[:4], negative_storage_bytes, *before[5:])
     for _ in range(2):
         response = client.post(
             f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
@@ -9452,6 +9469,7 @@ def test_g70g71_orphan_recovery_negative_storage_counter_keeps_held(
         assert response.json()["detail"]["code"] == (
             "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         )
-        assert snapshot() == before
+        assert snapshot() == expected
+    assert media_store.inspections == 2
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
