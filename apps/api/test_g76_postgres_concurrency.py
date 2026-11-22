@@ -7901,3 +7901,165 @@ def test_g70g71_postgres_orphan_recovery_current_attempt_drift_fenced(
     )
     upload_spy.assert_not_called()
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("corruption", [
+    "foreign_reservation_key",
+    "foreign_project",
+    "wrong_request_units",
+    "wrong_generated_seconds",
+    "foreign_attempt",
+    "duplicate_reserved_rows",
+])
+def test_g70g71_postgres_orphan_recovery_fences_untrusted_reserved_ledger(
+    postgres_context, monkeypatch, corruption,
+):
+    """Disposable native PostgreSQL/FAKE-only: malformed M11 RESERVED is not an ACK.
+
+    No protected history, live Provider, settlement or release is exercised.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"synthetic-postgres-g70g71-orphan-ledger"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-ledger-pg-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        project_id = task.project_id
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic original transfer failure"
+        task.upstream_job_id = "synthetic-original-upstream"
+        task.provider_artifact_id = "synthetic-original-artifact"
+        task.media_id = media_id
+        task.completed_at = task.updated_at = now
+        task.lease_owner = task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = "synthetic-original-upstream"
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": "synthetic-original-upstream",
+                "originalProviderArtifactId": "synthetic-original-artifact",
+                "reconciliationState": "HELD", "usageReservation": "HELD",
+                "orphanedMediaId": media_id, "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": {
+                    "durationSeconds": 1.0, "sizeBytes": len(payload),
+                    "video": {"codec": "h264", "width": 320, "height": 240},
+                    "audio": None,
+                },
+            },
+            created_at=now,
+        ))
+        db.commit()
+
+    other_task_id = (
+        _create_task(client) if corruption in {"foreign_project", "foreign_attempt"} else None
+    )
+    with sessions() as db:
+        reservation = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        if corruption == "foreign_reservation_key":
+            reservation.reservation_key = f"generation:foreign-{task_id}"
+        elif corruption == "foreign_project":
+            reservation.project_id = db.get(DBGenerationTask, other_task_id).project_id
+        elif corruption == "wrong_request_units":
+            reservation.request_units = 0
+        elif corruption == "wrong_generated_seconds":
+            reservation.generated_seconds = 1
+        elif corruption == "foreign_attempt":
+            reservation.attempt_id = db.execute(select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.generation_task_id == other_task_id,
+            )).scalar_one()
+        else:
+            db.add(DBGenerationUsageEntry(
+                id=str(uuid.uuid4()),
+                tenant_id=reservation.tenant_id,
+                project_id=reservation.project_id,
+                task_id=task_id,
+                attempt_id=reservation.attempt_id,
+                kind="RESERVED",
+                request_units=1,
+                generated_seconds=0,
+                reservation_key=f"generation:extra-{task_id}",
+                config_version_id=reservation.config_version_id,
+                created_at=reservation.created_at,
+            ))
+        db.commit()
+
+    media = app.state.video_use
+    media.media_objects[(project_id, media_id)] = payload
+    original_inspect = media.inspect_media
+
+    def inspect_valid_video(project, media_ref):
+        result = original_inspect(project, media_ref)
+        return {
+            **result, "contentType": "video/mp4",
+            "metadata": {
+                "durationSeconds": 1.0, "sizeBytes": len(payload),
+                "video": {"codec": "h264", "width": 320, "height": 240},
+                "audio": None,
+            },
+        }
+
+    inspection = MagicMock(side_effect=inspect_valid_video)
+    upload = MagicMock(wraps=media.upload_media)
+    monkeypatch.setattr(media, "inspect_media", inspection)
+    monkeypatch.setattr(media, "upload_media", upload)
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            project = db.get(DBProject, project_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            entries = tuple(sorted(
+                (row.kind, row.reservation_key, row.request_units,
+                 row.generated_seconds, row.project_id, row.attempt_id)
+                for row in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            ))
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                attempt.reconciliation_state, entries,
+                db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                project.revision, project.materials,
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+            )
+
+    before = durable_snapshot()
+    assert before[0] == "FAILED" and before[3] == "HELD"
+    route = f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        denied = client.post(route, json={
+            "reason": "FAKE-only orphan ledger integrity check",
+        })
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == (
+            "GENERATION_USAGE_RESERVATION_NOT_RECOVERABLE"
+        )
+        assert durable_snapshot() == before, "Denied PG recovery changed durable evidence"
+    assert inspection.call_count == 2
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
