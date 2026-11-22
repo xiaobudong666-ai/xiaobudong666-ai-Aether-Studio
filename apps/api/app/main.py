@@ -4748,23 +4748,15 @@ def create_app(
                         content_sha256=digest.hexdigest(),
                     )
                 except BaseException as abrupt_exit:
-                    # G70/G71/M13 (FAKE-only verification): once the Sidecar
-                    # upload has been dispatched, neither an ordinary transport
-                    # exception nor an abrupt BaseException proves that no
-                    # remote bytes were written. In both cases the OPENED hold
-                    # and tenant debit were already committed. Do not make a
-                    # speculative STORAGE_RESERVATION_RELEASED receipt, alter
-                    # RESERVED usage or resend the upload. The durable orphan
-                    # fence requires independent reconciliation before retry.
-                    db.rollback()
                     if isinstance(abrupt_exit, Exception):
-                        raise HTTPException(
-                            status_code=409,
-                            detail={
-                                "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
-                                "message": "Sidecar上传结果不确定，保留原始存储预留，须可信对账后处理",
-                            },
-                        ) from abrupt_exit
+                        # Ordinary exceptions enter the serialized post-upload
+                        # handler. It first checks a concurrently committed
+                        # identical asset before deciding whether this storage
+                        # reservation is an unresolved Sidecar write.
+                        raise
+                    # G70/G71: abrupt exits do not certify remote deletion.
+                    # Keep the original committed OPENED hold for reconciliation.
+                    db.rollback()
                     raise
                 # G70/G71/G72: a Sidecar ACK is untrusted media evidence, not
                 # permission to coerce its values into an asset/usage ledger.
@@ -5248,6 +5240,25 @@ def create_app(
                             db, failed_task, rights=generation_rights(db, failed_task), include_history=True
                         )
     
+                # G70/G71/M13 FAKE-only: no Sidecar response is not proof of
+                # a remote non-write. We already checked above for a durable,
+                # identical asset committed by a concurrent intake (which may
+                # safely release THIS duplicate hold). Otherwise keep the
+                # original OPENED reservation and tenant storage debit, even
+                # for ordinary VideoUseError/RuntimeError after dispatch. No
+                # speculative release, SETTLED, asset or second Sidecar write.
+                # A trusted issuer receipt and Owner-authorized reconciliation
+                # are separate, still-blocked gates.
+                if uploaded is None:
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "message": "Sidecar上传结果不确定，保留原始存储预留，须可信对账后处理",
+                        },
+                    ) from exc
+
                 now = utc_now()
                 invalid_code = None
                 invalid_message = None
