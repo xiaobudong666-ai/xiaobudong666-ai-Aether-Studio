@@ -5252,12 +5252,45 @@ def create_app(
                 if uploaded is None:
                     # An uncertain Sidecar response does not prove a remote
                     # deletion, STOP ACK, or refund. Preserve the original
-                    # committed OPENED storage debit and generation RESERVED,
-                    # while ending this Worker lease in a durable FAILED/HELD
-                    # state. The distinct error code prevents the legacy
-                    # Owner recover-artifact route from double-debiting storage.
+                    # committed OPENED storage debit and generation RESERVED.
+                    # A newer Worker may have obtained a lease while Sidecar
+                    # I/O was in flight. Do not overwrite its status, epoch,
+                    # attempt or owner with this stale request's FAILED/HELD.
+                    # The original OPENED hold remains for trusted review.
                     now = utc_now()
                     failed_attempt = current_generation_attempt(db, failed_task)
+                    if (
+                        failed_task.tenant_id != task_tenant_id
+                        or failed_task.project_id != task_project_id
+                        or failed_task.asset_version_id is not None
+                        or failed_task.lease_owner != x_worker_id
+                        or failed_task.lease_epoch != x_worker_lease_epoch
+                        or failed_task.lease_expires_at is None
+                        or _as_utc(failed_task.lease_expires_at) < now
+                        or failed_task.cancel_requested_at is not None
+                        or failed_task.status not in {"RUNNING", "INGESTING"}
+                        or (
+                            failed_attempt is not None
+                            and (
+                                failed_attempt.status != failed_task.status
+                                or failed_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+                                or (
+                                    failed_attempt.upstream_job_id is not None
+                                    and failed_attempt.upstream_job_id != failed_task.upstream_job_id
+                                )
+                            )
+                        )
+                    ):
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                                "message": "上传回执不明且任务租约或尝试已变化，保持原存储预留待可信对账",
+                            },
+                        ) from exc
+                    # Only this still-current Worker may safely transition its
+                    # matching Attempt to FAILED/HELD; no quota is refunded.
                     if failed_attempt is None:
                         db.rollback()
                         raise HTTPException(
