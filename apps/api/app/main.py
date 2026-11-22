@@ -2836,6 +2836,36 @@ def create_app(
                 },
             )
 
+        # G70/G71/M13 FAKE-only: an earlier storage OPENED/RELEASED audit
+        # trail is not an independently reconciled storage debit. In particular,
+        # an OPENED hold with a missing Sidecar ACK may already have charged the
+        # tenant while no project material or asset exists. The Owner recovery
+        # route would otherwise charge storage a SECOND time for the same bytes.
+        # Even a RELEASED row is not sufficient by itself to prove a refund.
+        # Do not infer M13 APPLY/STOP ACK from audit rows; require separate
+        # trusted reconciliation before this route can safely register it.
+        def require_no_prior_storage_accounting() -> None:
+            prior_storage_event = db.execute(
+                select(DBGenerationEvent.id).where(
+                    DBGenerationEvent.generation_task_id == task.id,
+                    DBGenerationEvent.event_type.in_(
+                        ("STORAGE_RESERVATION_OPENED", "STORAGE_RESERVATION_RELEASED")
+                    ),
+                ).limit(1)
+            ).first()
+            if prior_storage_event is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_RECOVERY_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "原产物已有存储预留或释放记录，未经可信对账禁止二次占额与恢复",
+                    },
+                )
+
+        # Read-only Sidecar inspection is not an authorization to inspect a
+        # paid orphan with unresolved storage accounting.
+        require_no_prior_storage_accounting()
+
         try:
             inspected = created_app.state.video_use.inspect_media(
                 project_id, orphan_media_id
@@ -3083,6 +3113,10 @@ def create_app(
                     "message": "恢复期间历史尝试证据不可信，保留HELD待人工对账",
                 },
             )
+
+        # Recheck after the read-only Sidecar inspection under the serialized
+        # task lock, so a new durable storage hold cannot be ignored at commit.
+        require_no_prior_storage_accounting()
 
         # G70/G71/M11: task_id+kind alone is not a trusted reservation receipt.
         # A damaged ledger may retain a RESERVED row from another project,
