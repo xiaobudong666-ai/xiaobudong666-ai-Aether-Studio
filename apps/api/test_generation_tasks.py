@@ -1673,6 +1673,81 @@ def seed_g71_orphan_artifact(
     return media_id, payload
 
 
+@pytest.mark.parametrize("extra_attempt_no,extra_state", [
+    (0, "HELD"),  # Migrated pre-prefix row
+    (2, "UNKNOWN"),  # Future row may contain a second upstream submission
+])
+def test_g70g71_orphan_recovery_rejects_untrusted_extra_attempt_history_without_mutation(
+    generation_context, extra_attempt_no, extra_state,
+):
+    """FAKE-only: a current HELD orphan is not a clearance for other Attempts.
+
+    The Owner-only route may not publish an asset or reserve storage on
+    corrupted historical or future Attempt evidence. No Provider is called.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70g71-orphan-history-fence")
+    task_id = create_task(
+        client, project, key=f"orphan-history-{extra_attempt_no}"
+    )["taskId"]
+    media_id, payload = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task_row = db.get(DBGenerationTask, task_id)
+        assert task_row.attempts == 1
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()),
+            generation_task_id=task_id,
+            attempt_no=extra_attempt_no,
+            status="RUNNING" if extra_state == "UNKNOWN" else "FAILED",
+            reconciliation_state=extra_state,
+            upstream_job_id="another-upstream-submission",
+            submission_started_at=now,
+            created_at=now,
+        ))
+        db.commit()
+
+    def durable_state():
+        with sessions() as db:
+            task_row = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, task_row.tenant_id)
+            project_row = db.get(DBProject, project["id"])
+            return (
+                task_row.status,
+                task_row.error_code,
+                task_row.asset_version_id,
+                task_row.media_id,
+                task_row.attempts,
+                tenant.used_storage_bytes,
+                project_row.revision,
+                tuple((e.kind, e.request_units) for e in db.execute(
+                    select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id
+                    )).scalars()),
+                db.execute(select(func.count(DBAssetVersion.id))).scalar_one(),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id
+                )).scalar_one(),
+            )
+
+    before = durable_state()
+    assert before[0] == "FAILED" and before[3] == media_id
+    assert len(payload) > 0
+    route = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        blocked = client.post(
+            route, json={"reason": "Inspect original orphan, preserve HELD"},
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_RECONCILIATION_REQUIRED"
+        assert durable_state() == before
+    assert media_store.inspections == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_attempt(generation_context):
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-owner-orphan-recovery")
