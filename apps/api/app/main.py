@@ -4752,15 +4752,14 @@ def create_app(
                         # Ordinary transport errors use the established FAILED/HELD
                         # recovery path; do not change paid-usage semantics.
                         raise
-                    # G70/G71: the reservation was committed before the sidecar
-                    # call. An in-process abrupt request exit bypasses the normal
-                    # Exception compensation path, so release this request's hold
-                    # with an atomic DB receipt before propagating the interruption.
-                    # This cannot protect against process kill or host crash.
+                    # G70/G71/M13: a Sidecar write can complete immediately
+                    # before an in-process abrupt exit loses its response. Neither
+                    # BaseException nor a released session lock proves remote
+                    # deletion. Never manufacture a storage RELEASED receipt or
+                    # a quota refund here: keep the committed OPENED hold and
+                    # original storage debit for independent reconciliation.
+                    # Subsequent attempts fail closed on that durable orphan.
                     db.rollback()
-                    begin_serialized_write(db)
-                    storage_release_reason = "UPLOAD_INTERRUPTED"
-                    persist_duplicate_storage_reservation_release()
                     raise
                 # G70/G71/G72: a Sidecar ACK is untrusted media evidence, not
                 # permission to coerce its values into an asset/usage ledger.
