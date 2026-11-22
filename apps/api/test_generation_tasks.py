@@ -1425,6 +1425,62 @@ def test_39_non_retryable_provider_4xx_cannot_be_retried(generation_context):
     assert response.status_code == 409
 
 
+@pytest.mark.parametrize(
+    ("final_status", "upstream_job_id", "error_code"),
+    [
+        ("FAILED", None, "PROVIDER_400"),
+        ("FAILED", "synthetic-accepted-job", "PROVIDER_400"),
+        ("FAILED", "synthetic-accepted-job", "PROVIDER_5XX"),
+        ("CANCELED", None, None),
+    ],
+)
+def test_g70_g71_m11_worker_terminal_without_trusted_stop_ack_keeps_reserved(
+    generation_context, final_status, upstream_job_id, error_code,
+):
+    """FAKE-only: a Worker callback cannot certify a Provider refund or STOP.
+
+    The claim persisted submission_started_at before any possible Provider POST.
+    No independent STOP/credit receipt exists even if the callback reports 4XX,
+    CANCELED or lacks an upstream job ID. Keep one original RESERVED ledger.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "worker-termination-no-trusted-ack")
+    task = create_task(
+        client, project, key=f"worker-terminal-{final_status}-{upstream_job_id}-{error_code}",
+    )
+    claimed = claim(client)
+    assert claimed.status_code == 200 and claimed.json()["taskId"] == task["taskId"]
+    if upstream_job_id:
+        running = transition(
+            client, task["taskId"], "RUNNING", upstreamJobId=upstream_job_id,
+        )
+        assert running.status_code == 200, running.text
+    kwargs = {"errorCode": error_code, "retryable": False} if error_code else {}
+    terminal = transition(client, task["taskId"], final_status, **kwargs)
+    assert terminal.status_code == 200, terminal.text
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task["taskId"])
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == row.id,
+        )).scalar_one()
+        entries = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == row.id,
+        )).scalars())
+        release_events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == row.id,
+            DBGenerationEvent.event_type == "GENERATION_USAGE_RELEASED",
+        )).scalar_one()
+        assert row.status == final_status and attempt.status == final_status
+        assert row.attempts == 1 and attempt.submission_started_at is not None
+        assert attempt.reconciliation_state in {"HELD", "SUBMITTED"}
+        assert row.upstream_job_id == upstream_job_id
+        assert [entry.kind for entry in entries] == ["RESERVED"]
+        assert release_events == 0
+    app.state.moneyprinter.assert_not_called()
+    assert media_store.uploads == 0
+
+
 def test_40_stream_interruption_compensates_quota_and_records_failure(generation_context):
     client, sessions, _, media_store = generation_context
     project = create_project(client)
