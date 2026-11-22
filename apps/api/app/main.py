@@ -745,6 +745,40 @@ def create_app(
             }
         return decision
 
+    def fake_talking_head_reserved_ledger_valid(
+        db: Session, task: DBGenerationTask, attempt: DBGenerationAttempt,
+        *, lock: bool = False,
+    ) -> bool:
+        """Recheck the original FAKE-only reservation across claim and intake.
+
+        A synthetic Worker lease or Sidecar upload cannot authorize SETTLED
+        usage when the original RESERVED ledger changed after claim. Lock
+        the existing ledger row at the final PostgreSQL transaction boundary.
+        This is validation only, never a refund/reconciliation operation.
+        """
+        snapshot = task.capability_snapshot_json
+        if not isinstance(snapshot, dict):
+            return False
+        query = select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task.id,
+        )
+        if lock and app_engine.dialect.name == "postgresql":
+            query = query.with_for_update()
+        rows = list(db.execute(query).scalars())
+        if len(rows) != 1:
+            return False
+        usage = rows[0]
+        return (
+            usage.kind == "RESERVED"
+            and usage.tenant_id == task.tenant_id
+            and usage.project_id == task.project_id
+            and usage.attempt_id == attempt.id
+            and usage.reservation_key == f"generation:{task.id}"
+            and usage.request_units == 1
+            and usage.generated_seconds == 0
+            and usage.config_version_id == snapshot.get("configVersionId")
+        )
+
     def fake_talking_head_creation_evidence_matches(
         db: Session, task: DBGenerationTask, request: dict
     ) -> bool:
@@ -3448,27 +3482,8 @@ def create_app(
                 # tenant/project/attempt, or a missing/changed reservation key.
                 # This is only a read-only claim fence, not an M11 refund,
                 # Owner disposition policy or protected-history repair.
-                usage_rows = list(db.execute(
-                    select(DBGenerationUsageEntry).where(
-                        DBGenerationUsageEntry.task_id == candidate.id,
-                    )
-                ).scalars())
-                if (
-                    len(usage_rows) != 1
-                    or any(
-                        usage.kind != "RESERVED"
-                        or usage.tenant_id != candidate.tenant_id
-                        or usage.project_id != candidate.project_id
-                        or usage.attempt_id != candidate_attempt.id
-                        or usage.reservation_key != f"generation:{candidate.id}"
-                        or usage.request_units != 1
-                        or usage.generated_seconds != 0
-                        # G72: a RESERVED row with the right task/Attempt but
-                        # another config version does not authorize a new FAKE
-                        # Worker lease. Keep disputed legacy usage read-only.
-                        or usage.config_version_id != candidate_snapshot.get("configVersionId")
-                        for usage in usage_rows
-                    )
+                if not fake_talking_head_reserved_ledger_valid(
+                    db, candidate, candidate_attempt,
                 ):
                     continue
                 # G72: a queued FAKE task is not a standing authority to act
@@ -4239,6 +4254,19 @@ def create_app(
                     "message": "历史生成尝试证据在领取后异常，拒绝产物入库并保持账本",
                 },
             )
+        # G72 FAKE-only: a valid lease is not a settlement authorization.
+        # The RESERVED row can drift after Worker claim. Reject before quota
+        # reservation or Sidecar I/O without altering the disputed ledger.
+        if task.provider == "deterministic-fake-talking-head" and not (
+            fake_talking_head_reserved_ledger_valid(db, task, current_attempt)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "FAKE_TALKING_HEAD_RESERVED_RECONCILIATION_REQUIRED",
+                    "message": "口播任务原始预留凭据已变化，禁止模拟产物入库结算，保持账本待核验",
+                },
+            )
         if task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ID_MISMATCH", "message": "产物编号与当前任务回执不一致"})
         if file.content_type != "video/mp4":
@@ -4859,6 +4887,20 @@ def create_app(
                     elif not generation_prior_history_safe(db, task):
                         invalid_code = "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
                         invalid_message = "上传期间历史尝试回执异常，禁止入库结算，保持原生成额度待核验"
+
+                # G72 FAKE-only: the quota reservation commit releases the
+                # earlier transaction, so re-lock and validate the canonical
+                # RESERVED row before asset creation or SETTLED usage. A
+                # Sidecar response is not a trusted reconciliation receipt.
+                if (
+                    invalid_code is None
+                    and task.provider == "deterministic-fake-talking-head"
+                    and not fake_talking_head_reserved_ledger_valid(
+                        db, task, final_attempt, lock=True,
+                    )
+                ):
+                    invalid_code = "FAKE_TALKING_HEAD_RESERVED_RECONCILIATION_REQUIRED"
+                    invalid_message = "上传期间口播原始预留凭据变化，模拟产物隔离并保持账本待核验"
 
                 # G72: a pre-upload Owner check is not authorization for the
                 # final asset/SETTLED commit. The storage-reservation commit
