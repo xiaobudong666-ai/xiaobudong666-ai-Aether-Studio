@@ -5250,12 +5250,71 @@ def create_app(
                 # A trusted issuer receipt and Owner-authorized reconciliation
                 # are separate, still-blocked gates.
                 if uploaded is None:
-                    db.rollback()
+                    # An uncertain Sidecar response does not prove a remote
+                    # deletion, STOP ACK, or refund. Preserve the original
+                    # committed OPENED storage debit and generation RESERVED,
+                    # while ending this Worker lease in a durable FAILED/HELD
+                    # state. The distinct error code prevents the legacy
+                    # Owner recover-artifact route from double-debiting storage.
+                    now = utc_now()
+                    failed_attempt = current_generation_attempt(db, failed_task)
+                    if failed_attempt is None:
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                                "message": "当前尝试缺失且远端写入不确定，须可信对账",
+                            },
+                        ) from exc
+                    previous_status = failed_task.status
+                    failed_task.status = "FAILED"
+                    failed_task.error_code = "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+                    failed_task.error_message = "Sidecar回执不确定，原存储预留和用量均保留待可信对账"
+                    failed_task.media_id = expected_media_id
+                    failed_task.completed_at = now
+                    failed_task.updated_at = now
+                    failed_task.lease_owner = None
+                    failed_task.lease_expires_at = None
+                    failed_attempt.status = "FAILED"
+                    failed_attempt.error_code = failed_task.error_code
+                    failed_attempt.error_message = failed_task.error_message
+                    failed_attempt.completed_at = now
+                    failed_attempt.reconciliation_state = "HELD"
+                    add_generation_event(
+                        db, failed_task, attempt=failed_attempt,
+                        event_type="ARTIFACT_INGEST_FAILED",
+                        actor_type="SYSTEM", actor_id="api",
+                        from_status=previous_status, to_status="FAILED",
+                        metadata={
+                            "reasonCode": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "reconciliationState": "HELD",
+                            "usageReservation": "HELD",
+                            "storageReservationState": "OPENED_HELD",
+                            "storageReservationEventId": storage_reservation_event_id,
+                            "reservedStorageBytes": upload_size,
+                            "storageReleaseAuthorized": False,
+                            "workerId": x_worker_id,
+                            "leaseEpoch": x_worker_lease_epoch,
+                            "originalProviderArtifactId": providerArtifactId,
+                            "originalUpstreamJobId": (
+                                failed_task.upstream_job_id or failed_attempt.upstream_job_id or ""
+                            ),
+                            # Locally expected media/hash/size are candidates,
+                            # NOT independently trusted Sidecar receipts.
+                            "orphanedMediaId": expected_media_id,
+                            "orphanedMediaSha256": digest.hexdigest(),
+                            "orphanedMediaSizeBytes": upload_size,
+                            "artifactIdempotencyKey": artifact_idempotency_key,
+                        },
+                        now=now,
+                    )
+                    db.commit()
                     raise HTTPException(
                         status_code=409,
                         detail={
                             "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
-                            "message": "Sidecar上传结果不确定，保留原始存储预留，须可信对账后处理",
+                            "message": "已持久标记HELD，禁止未经可信回执再次占额或恢复",
                         },
                     ) from exc
 

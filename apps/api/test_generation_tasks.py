@@ -1501,7 +1501,7 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
         tenant = db.execute(select(DBTenant)).scalar_one()
         stored = db.get(DBGenerationTask, task["taskId"])
         assert tenant.used_storage_bytes == len(b"video")
-        assert stored.status == "INGESTING"
+        assert stored.status == "FAILED" and stored.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task['taskId'],
@@ -1542,10 +1542,10 @@ def test_g70_g71_m11_artifact_failure_missing_upstream_id_keeps_reserved(generat
         attempt = db.execute(select(DBGenerationAttempt).where(
             DBGenerationAttempt.generation_task_id == task_id
         )).scalar_one()
-        assert stored.status == "INGESTING" and stored.asset_version_id is None
+        assert stored.status == "FAILED" and stored.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED" and stored.asset_version_id is None
         assert stored.upstream_job_id is None
         assert attempt.submission_started_at is not None
-        assert attempt.generation_task_id == task_id
+        assert attempt.status == "FAILED" and attempt.reconciliation_state == "HELD"
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
@@ -1599,7 +1599,7 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
     assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     with sessions() as db:
         row = db.get(DBGenerationTask, task_id)
-        assert row.status == "INGESTING" and row.asset_version_id is None
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED" and row.asset_version_id is None
         assert row.upstream_job_id == "original-paid-job"
         assert row.provider_artifact_id == "original-paid-artifact"
         attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
@@ -1608,7 +1608,7 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.generation_task_id == task_id
+        assert attempt.status == "FAILED" and attempt.reconciliation_state == "HELD"
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
@@ -1627,7 +1627,7 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
     assert blocked.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
     with sessions() as db:
         row = db.get(DBGenerationTask, task_id)
-        assert row.status == "INGESTING"
+        assert row.status == "FAILED"
         assert row.attempts == 1
         assert row.upstream_job_id == "original-paid-job"
         assert row.provider_artifact_id == "original-paid-artifact"
@@ -1645,7 +1645,7 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.generation_task_id == task_id
+        assert attempt.status == "FAILED" and attempt.reconciliation_state == "HELD"
     app.state.moneyprinter.assert_not_called()
 
 
@@ -4142,9 +4142,7 @@ def test_g70_g71_artifact_intake_strict_sidecar_probe_compensates_quota(
     assert media.uploads == 1
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
-        assert stored is not None and stored.status == (
-            "INGESTING" if corruption == "response_not_object" else "FAILED"
-        )
+        assert stored is not None and stored.status == "FAILED"
         assert stored.asset_version_id is None
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project["id"],
@@ -4160,7 +4158,7 @@ def test_g70_g71_artifact_intake_strict_sidecar_probe_compensates_quota(
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one() == (0 if corruption == "response_not_object" else 1)
+        )).scalar_one() == 1
     app.state.moneyprinter.assert_not_called()
 
 
