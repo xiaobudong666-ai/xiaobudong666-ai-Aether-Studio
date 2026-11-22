@@ -6433,6 +6433,99 @@ def test_g72_fake_reserved_config_drift_quarantines_queue_without_starvation(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("phase", ["after_claim", "during_upload"])
+def test_g72_fake_reserved_ledger_drift_fenced_at_intake(
+    generation_context, monkeypatch, phase,
+):
+    """FAKE-only SQLite: Worker lease cannot settle a changed original RESERVE.
+
+    Deliberate synthetic ledger corruption uses Core SQL in a disposable DB.
+    The app must fail closed before Sidecar I/O or at the final commit boundary,
+    without claiming a trusted ACK or changing original billable usage.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 postclaim reservation " + phase)
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    request = _g72_fake_payload(
+        client, project, image_id, key="g72-reserved-intake-" + phase,
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=request,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    leased = claim(client, worker_id="worker-a")
+    assert leased.status_code == 200, leased.text
+    assert leased.json()["taskId"] == task_id
+    assert transition(
+        client, task_id, "RUNNING", upstreamJobId="g72-ledger-upstream",
+    ).status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", progress=95,
+        upstreamJobId="g72-ledger-upstream",
+        providerArtifactId="g72-ledger-artifact",
+    ).status_code == 200
+
+    with sessions() as db:
+        original = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        original_id = original.id
+        original_version = original.config_version_id
+        before_storage = db.get(DBTenant, original.tenant_id).used_storage_bytes
+
+    changed_version = "synthetic-postclaim-foreign-config-" + task_id
+    assert changed_version != original_version
+
+    def poison_ledger():
+        with sessions() as db:
+            # The append-only ORM guard is intentionally retained in app code.
+            db.execute(
+                DBGenerationUsageEntry.__table__.update()
+                .where(DBGenerationUsageEntry.__table__.c.id == original_id)
+                .values(config_version_id=changed_version)
+            )
+            db.commit()
+
+    if phase == "after_claim":
+        poison_ledger()
+    else:
+        upload = media.upload_media
+
+        def persist_then_poison(*args, **kwargs):
+            uploaded = upload(*args, **kwargs)
+            poison_ledger()
+            return uploaded
+
+        monkeypatch.setattr(media, "upload_media", persist_then_poison)
+
+    rejected = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "g72-ledger-artifact"},
+        files={"file": ("synthetic.mp4", b"synthetic-g72-ledger-media", "video/mp4")},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_RESERVED_RECONCILIATION_REQUIRED"
+    )
+    assert media.uploads == (1 if phase == "during_upload" else 0)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        ledger = db.get(DBGenerationUsageEntry, original_id)
+        assert task.asset_version_id is None
+        assert ledger.config_version_id == changed_version
+        assert ledger.kind == "RESERVED" and ledger.request_units == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.get(DBTenant, ledger.tenant_id).used_storage_bytes == before_storage
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("field,bad_value", [
     ("fakeTaskType", "normal-generation"),
     ("simulatedOutput", False),
