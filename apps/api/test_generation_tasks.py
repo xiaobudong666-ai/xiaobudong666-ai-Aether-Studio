@@ -1093,7 +1093,7 @@ def test_g72_upload_failure_compensates_storage_with_portable_case(generation_co
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         tenant = db.get(DBTenant, task.tenant_id)
-        assert task.status == "INGESTING"
+        assert task.status == "FAILED" and task.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         assert task.asset_version_id is None
         assert tenant.used_storage_bytes == len(b"synthetic-g72-bytes")
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
@@ -1103,11 +1103,11 @@ def test_g72_upload_failure_compensates_storage_with_portable_case(generation_co
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one() == 0
+        )).scalar_one() == 1
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.generation_task_id == task_id
+        assert attempt.status == "FAILED" and attempt.reconciliation_state == "HELD"
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",

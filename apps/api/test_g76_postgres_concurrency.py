@@ -1417,11 +1417,11 @@ def test_g70_g71_m11_postgres_artifact_failure_without_upstream_id_holds_usage(
         attempt = db.execute(select(DBGenerationAttempt).where(
             DBGenerationAttempt.generation_task_id == task_id,
         )).scalar_one()
-        assert stored.status == "INGESTING"
+        assert stored.status == "FAILED" and stored.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         assert stored.asset_version_id is None
         assert stored.upstream_job_id is None
         assert attempt.submission_started_at is not None
-        assert attempt.generation_task_id == task_id
+        assert attempt.status == "FAILED" and attempt.reconciliation_state == "HELD"
         assert db.get(DBTenant, tenant_id).used_storage_bytes == len(b"fake-pg-upload-bytes")
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
@@ -1512,7 +1512,7 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
         tenant = db.get(DBTenant, tenant_id)
-        assert stored.status == "INGESTING" and stored.asset_version_id is None
+        assert stored.status == "FAILED" and stored.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED" and stored.asset_version_id is None
         assert tenant.used_storage_bytes == (0 if corrupt_quota_counter else len(failure_payload))
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
@@ -1521,11 +1521,11 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one() == 0
+        )).scalar_one() == 1
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.generation_task_id == task_id
+        assert attempt.status == "FAILED" and attempt.reconciliation_state == "HELD"
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
@@ -8366,18 +8366,18 @@ def test_g70_g71_postgres_sidecar_exception_after_write_keeps_original_storage_h
     monkeypatch.setattr(app.state.video_use, "upload_media", fail_if_dispatched_again)
     second = _post_g70_g71_duplicate_intake(app, task_id, headers, artifact_id, payload)
     assert second.status_code == 409, second.text
-    assert second.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert second.json()["detail"]["code"] == "LEASE_LOST"
 
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
-        assert task.status == "INGESTING" and task.asset_version_id is None
+        assert task.status == "FAILED" and task.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED" and task.asset_version_id is None
         assert db.get(DBTenant, tenant_id).used_storage_bytes == baseline + len(payload)
         events = db.execute(select(DBGenerationEvent).where(
             DBGenerationEvent.generation_task_id == task_id,
         )).scalars().all()
         assert sum(e.event_type == "STORAGE_RESERVATION_OPENED" for e in events) == 1
         assert sum(e.event_type == "STORAGE_RESERVATION_RELEASED" for e in events) == 0
-        assert sum(e.event_type == "ARTIFACT_INGEST_FAILED" for e in events) == 0
+        assert sum(e.event_type == "ARTIFACT_INGEST_FAILED" for e in events) == 1
         usage = db.execute(select(DBGenerationUsageEntry).where(
             DBGenerationUsageEntry.task_id == task_id,
         )).scalars().all()
