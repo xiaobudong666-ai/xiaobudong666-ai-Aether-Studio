@@ -7823,13 +7823,25 @@ def test_g70g71_postgres_orphan_recovery_current_attempt_drift_fenced(
             db.commit()
 
     original_inspect = media.inspect_media
-    inspect_spy = MagicMock(wraps=original_inspect)
+
+    def inspect_valid_video(project, media_ref):
+        result = original_inspect(project, media_ref)
+        return {
+            **result, "contentType": "video/mp4",
+            "metadata": {
+                "durationSeconds": 1.0, "sizeBytes": len(payload),
+                "video": {"codec": "h264", "width": 320, "height": 240},
+                "audio": None,
+            },
+        }
+
+    inspect_spy = MagicMock(side_effect=inspect_valid_video)
     upload_spy = MagicMock(wraps=media.upload_media)
     if drift_timing == "before_probe":
         drift()
     else:
         def inspect_then_drift(project, media_ref):
-            result = original_inspect(project, media_ref)
+            result = inspect_valid_video(project, media_ref)
             drift()
             return result
         inspect_spy = MagicMock(side_effect=inspect_then_drift)
