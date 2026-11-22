@@ -8475,3 +8475,135 @@ def test_g70_g71_postgres_lost_ack_cannot_clobber_successor_worker_lease(
         assert sum(e.event_type == "STORAGE_RESERVATION_RELEASED" for e in events) == 0
         assert sum(e.event_type == "ARTIFACT_INGEST_FAILED" for e in events) == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_postgres_orphan_recovery_rejects_prior_attempt_reservation(
+    postgres_context, monkeypatch,
+):
+    """FAKE-only native PG: prior-attempt RESERVED is not current HELD evidence.
+
+    A prior FAILED/NOT_SUBMITTED attempt can be a valid historical prefix, but
+    its surviving reservation must not be attached to the current failed
+    attempt's synthetic orphan. No Provider, protected data, refund or payout.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"synthetic-postgres-prior-attempt-reserved-current-held"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-prior-reservation-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    metadata = {
+        "durationSeconds": 1.0, "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        project_id = task.project_id
+        old = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        reservation = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        assert reservation.attempt_id == old.id
+        old.status = "FAILED"
+        old.reconciliation_state = "NOT_SUBMITTED"
+        old.submission_started_at = None
+        old.upstream_job_id = None
+        old.completed_at = now
+        current = DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=2, status="FAILED", reconciliation_state="HELD",
+            upstream_job_id="synthetic-current-upstream",
+            created_at=now, completed_at=now,
+        )
+        db.add(current)
+        task.attempts = 2
+        task.max_attempts = max(task.max_attempts, 2)
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic current attempt orphan"
+        task.upstream_job_id = "synthetic-current-upstream"
+        task.provider_artifact_id = "synthetic-current-artifact"
+        task.media_id = media_id
+        task.completed_at = task.updated_at = now
+        task.lease_owner = task.lease_expires_at = None
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=current.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": task.upstream_job_id,
+                "originalProviderArtifactId": task.provider_artifact_id,
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata,
+                "reconciliationState": "HELD",
+            },
+            created_at=now,
+        ))
+        db.commit()
+
+    media = app.state.video_use
+    media.media_objects[(project_id, media_id)] = payload
+    real_inspect = media.inspect_media
+
+    def valid_synthetic_probe(project, candidate):
+        return {
+            **real_inspect(project, candidate),
+            "contentType": "video/mp4", "metadata": metadata,
+        }
+
+    inspection = MagicMock(side_effect=valid_synthetic_probe)
+    upload = MagicMock(wraps=media.upload_media)
+    monkeypatch.setattr(media, "inspect_media", inspection)
+    monkeypatch.setattr(media, "upload_media", upload)
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, task.tenant_id)
+            project = db.get(DBProject, project_id)
+            attempts = tuple((a.attempt_no, a.status, a.reconciliation_state)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars())
+            usage = tuple((u.kind, u.attempt_id, u.request_units)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars())
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                tenant.used_storage_bytes, project.revision, project.materials,
+                attempts, usage,
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+            )
+
+    before = durable_snapshot()
+    assert before[0] == "FAILED" and before[6] == (
+        (1, "FAILED", "NOT_SUBMITTED"), (2, "FAILED", "HELD"),
+    )
+    for _ in range(2):
+        denied = client.post(
+            f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
+            json={"reason": "prior attempt RESERVED cannot recover current orphan"},
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == (
+            "GENERATION_USAGE_RESERVATION_NOT_RECOVERABLE"
+        )
+        assert durable_snapshot() == before
+    assert inspection.call_count == 2
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
