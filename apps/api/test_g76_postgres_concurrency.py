@@ -425,7 +425,7 @@ def test_g72_postgres_historical_reserved_owner_transfer_is_quarantined_without_
 
 @pytest.mark.parametrize(
     "damage",
-    ["missing", "released", "wrong_project", "wrong_attempt", "wrong_key", "zero_units"],
+    ["missing", "released", "wrong_project", "wrong_attempt", "wrong_key", "zero_units", "wrong_config"],
 )
 def test_g72_postgres_inconsistent_reserved_ledger_never_gets_fake_worker_lease(
     postgres_context, damage,
@@ -472,6 +472,7 @@ def test_g72_postgres_inconsistent_reserved_ledger_never_gets_fake_worker_lease(
                 "wrong_attempt": {"attempt_id": healthy_attempt.id},
                 "wrong_key": {"reservation_key": f"generation:unrelated-{old_id}"},
                 "zero_units": {"request_units": 0},
+                "wrong_config": {"config_version_id": f"synthetic-corrupt-config-{old_id}"},
             }[damage]
             db.execute(
                 usage_table.update()
