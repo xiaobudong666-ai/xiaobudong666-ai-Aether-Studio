@@ -9398,3 +9398,60 @@ def test_g70_g71_lost_sidecar_ack_does_not_clobber_successor_worker_lease(
         )).scalar_one() == 0
     assert media_store.uploads == 1
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("negative_storage_bytes", [-1, -17])
+def test_g70g71_orphan_recovery_negative_storage_counter_keeps_held(
+    generation_context, negative_storage_bytes,
+):
+    """FAKE-only: a negative storage balance is corrupt evidence, not quota."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-orphan-negative-counter")
+    task_id = create_task(
+        client, project, key=f"g70-orphan-negative-{abs(negative_storage_bytes)}"
+    )["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        db.get(DBTenant, task.tenant_id).used_storage_bytes = negative_storage_bytes
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            project_row = db.get(DBProject, project["id"])
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                attempt.reconciliation_state,
+                db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                project_row.revision, project_row.materials,
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project["id"],
+                )).scalar_one(),
+                tuple(sorted((row.kind, row.reservation_key)
+                    for row in db.execute(select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id,
+                    )).scalars())),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+            )
+
+    before = snapshot()
+    assert before[0] == "FAILED" and before[3] == "HELD"
+    assert before[4] == negative_storage_bytes
+    for _ in range(2):
+        response = client.post(
+            f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+            json={"reason": "FAKE-only negative storage accounting reconciliation"},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == (
+            "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
