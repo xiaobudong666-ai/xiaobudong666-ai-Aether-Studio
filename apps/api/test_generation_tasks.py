@@ -35,7 +35,7 @@ from app.models import (
     DBUser,
 )
 from fastapi.testclient import TestClient
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -8837,16 +8837,26 @@ def test_g70g71_orphan_recovery_fences_untrusted_reserved_ledger(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
         )).scalar_one()
-        if corruption == "foreign_reservation_key":
-            reservation.reservation_key = f"generation:foreign-{task_id}"
-        elif corruption == "foreign_project":
-            reservation.project_id = foreign_project_id
-        elif corruption == "wrong_request_units":
-            reservation.request_units = 0
-        elif corruption == "wrong_generated_seconds":
-            reservation.generated_seconds = 1
-        elif corruption == "foreign_attempt":
-            reservation.attempt_id = foreign_attempt_id
+        # The production ORM intentionally rejects append-only ledger edits.
+        # Use a narrowly scoped SQL mutation only in this disposable corruption
+        # fixture; never bypass the model's immutability in application logic.
+        corruption_values = {
+            "foreign_reservation_key": ("reservation_key", f"generation:foreign-{task_id}"),
+            "foreign_project": ("project_id", foreign_project_id),
+            "wrong_request_units": ("request_units", 0),
+            "wrong_generated_seconds": ("generated_seconds", 1),
+            "foreign_attempt": ("attempt_id", foreign_attempt_id),
+        }
+        if corruption in corruption_values:
+            column, value = corruption_values[corruption]
+            assert column in {
+                "reservation_key", "project_id", "request_units", "generated_seconds", "attempt_id",
+            }
+            mutated = db.execute(
+                text(f"UPDATE generation_usage_entries SET {column} = :value WHERE id = :id"),
+                {"value": value, "id": reservation.id},
+            )
+            assert mutated.rowcount == 1
         else:
             db.add(DBGenerationUsageEntry(
                 id=str(uuid.uuid4()),
