@@ -4379,9 +4379,24 @@ def test_g72_wrong_worker_cannot_ingest_claimed_artifact(generation_context):
     client, sessions, _app, media = generation_context
     project = create_project(client)
     asset_id = _g72_fake_visual_fixture(sessions, project)
-    payload = _g72_fake_payload(client, project, asset_id, key="g72-wrong-lease-owner")
     base = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
-    created = client.post(base, json=payload)
+    # The preflight capability snapshot is minute-bound. A UTC minute rollover
+    # between snapshot GET and create POST legitimately fails closed with 409;
+    # refresh once instead of treating that boundary as a lease regression.
+    for snapshot_attempt in range(2):
+        payload = _g72_fake_payload(client, project, asset_id, key="g72-wrong-lease-owner")
+        created = client.post(base, json=payload)
+        if created.status_code == 202:
+            break
+        rejection_code = (
+            created.json().get("detail", {}).get("code")
+            if created.status_code == 409 else None
+        )
+        if snapshot_attempt == 0 and rejection_code in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }:
+            continue
+        break
     assert created.status_code == 202, created.text
     task_id = created.json()["taskId"]
     assert claim(client, worker_id="worker-a").status_code == 200
