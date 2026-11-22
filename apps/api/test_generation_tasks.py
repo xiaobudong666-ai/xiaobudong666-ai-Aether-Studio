@@ -1506,6 +1506,62 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
 
 
 
+def test_g70_g71_m11_artifact_failure_missing_upstream_id_keeps_reserved(generation_context):
+    """FAKE-only: an absent upstream job ID is not an independent refund ACK."""
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g71-missing-upstream-artifact-failure")
+    task = create_task(client, project, key="g71-missing-upstream-artifact-failure")
+    task_id = task["taskId"]
+    with sessions() as db:
+        db.get(DBGenerationTask, task_id).max_attempts = 3
+        db.commit()
+
+    assert claim(client).status_code == 200
+    # Intentionally omit upstreamJobId: Worker claim already recorded possible
+    # submission before a paid Provider POST, but no receipt may have arrived.
+    assert transition(client, task_id, "RUNNING").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", providerArtifactId="ambiguous-artifact",
+    ).status_code == 200
+    media_store.interrupt = True
+    with pytest.raises(RuntimeError, match="stream interrupted"):
+        client.post(
+            f"/internal/generation-tasks/{task_id}/artifact-intake",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+            data={"providerArtifactId": "ambiguous-artifact"},
+            files={"file": ("artifact.mp4", b"synthetic-bytes", "video/mp4")},
+        )
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.upstream_job_id is None
+        assert attempt.submission_started_at is not None
+        assert attempt.reconciliation_state == "HELD"
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind.in_(["RELEASED", "SETTLED"]),
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "GENERATION_USAGE_RELEASED",
+        )).scalar_one() == 0
+    denied = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
+    assert denied.status_code == 409
+    assert denied.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(generation_context):
     """G70/G71: original upstream output must be reconciled, never regenerated blindly.
 
