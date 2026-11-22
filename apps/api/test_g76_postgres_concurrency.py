@@ -8329,8 +8329,6 @@ def test_g70g71_postgres_orphan_recovery_fences_untrusted_reserved_ledger(
     app.state.moneyprinter.assert_not_called()
 
 
-@pytest.mark.parametrize("exception_type", [VideoUseError, RuntimeError])
-
 @pytest.mark.parametrize("storage_event_type", [
     "STORAGE_RESERVATION_OPENED", "STORAGE_RESERVATION_RELEASED",
 ])
@@ -8449,6 +8447,8 @@ def test_g70g71_postgres_orphan_recovery_fences_prior_storage_accounting(
     upload.assert_not_called()
     app.state.moneyprinter.assert_not_called()
 
+
+@pytest.mark.parametrize("exception_type", [VideoUseError, RuntimeError])
 def test_g70_g71_postgres_sidecar_exception_after_write_keeps_original_storage_hold(
     postgres_context, monkeypatch, exception_type,
 ):
