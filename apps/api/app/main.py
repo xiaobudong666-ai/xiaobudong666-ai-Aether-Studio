@@ -3463,6 +3463,10 @@ def create_app(
                         or usage.reservation_key != f"generation:{candidate.id}"
                         or usage.request_units != 1
                         or usage.generated_seconds != 0
+                        # G72: a RESERVED row with the right task/Attempt but
+                        # another config version does not authorize a new FAKE
+                        # Worker lease. Keep disputed legacy usage read-only.
+                        or usage.config_version_id != candidate_snapshot.get("configVersionId")
                         for usage in usage_rows
                     )
                 ):
