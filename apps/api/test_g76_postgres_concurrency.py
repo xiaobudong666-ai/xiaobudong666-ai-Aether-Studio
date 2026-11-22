@@ -7742,3 +7742,150 @@ def test_g73_postgres_worker_transition_rechecks_current_attempt_after_claim(
             assert response.json()["detail"]["code"] == expected_code
             assert snapshot() == before, "PG refusal must preserve task/lease/usage/storage/audit"
     app.state.moneyprinter.assert_not_called()
+
+
+
+@pytest.mark.parametrize("drift_field,drift_timing", [
+    ("status", "before_probe"),
+    ("upstream_job_id", "before_probe"),
+    ("status", "during_probe"),
+    ("upstream_job_id", "during_probe"),
+])
+def test_g70g71_postgres_orphan_recovery_current_attempt_drift_fenced(
+    postgres_context, monkeypatch, drift_field, drift_timing,
+):
+    """Native disposable PostgreSQL/FAKE-only: stale current Attempt is not a
+    trusted receipt even when orphan media exists in the synthetic Sidecar.
+
+    The first read and the final write must each reject status/upstream drift.
+    No real Provider is called; this does NOT prove an independent Sidecar ACK.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"synthetic-g70g71-postgres-current-attempt-drift"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-drift-pg-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.attempts == 1
+        project_id = task.project_id
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic original transfer failure"
+        task.upstream_job_id = "synthetic-original-upstream"
+        task.provider_artifact_id = "synthetic-original-artifact"
+        task.media_id = media_id
+        task.completed_at = task.updated_at = now
+        task.lease_owner = task.lease_expires_at = None
+        current.status = "FAILED"
+        current.upstream_job_id = "synthetic-original-upstream"
+        current.reconciliation_state = "HELD"
+        current.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=current.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": "synthetic-original-upstream",
+                "originalProviderArtifactId": "synthetic-original-artifact",
+                "reconciliationState": "HELD", "usageReservation": "HELD",
+                "orphanedMediaId": media_id, "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": {
+                    "durationSeconds": 1.0, "sizeBytes": len(payload),
+                    "video": {"codec": "h264", "width": 320, "height": 240},
+                    "audio": None,
+                },
+            }, created_at=now,
+        ))
+        db.commit()
+
+    media = app.state.video_use
+    media.media_objects[(project_id, media_id)] = payload
+
+    def drift():
+        with sessions() as db:
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )).scalar_one()
+            if drift_field == "status":
+                attempt.status = "RUNNING"
+            else:
+                attempt.upstream_job_id = "unexpected-second-upstream"
+            db.commit()
+
+    original_inspect = media.inspect_media
+    inspect_spy = MagicMock(wraps=original_inspect)
+    upload_spy = MagicMock(wraps=media.upload_media)
+    if drift_timing == "before_probe":
+        drift()
+    else:
+        def inspect_then_drift(project, media_ref):
+            result = original_inspect(project, media_ref)
+            drift()
+            return result
+        inspect_spy = MagicMock(side_effect=inspect_then_drift)
+    monkeypatch.setattr(media, "inspect_media", inspect_spy)
+    monkeypatch.setattr(media, "upload_media", upload_spy)
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            current = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )).scalar_one()
+            project = db.get(DBProject, project_id)
+            usage = tuple(
+                (e.kind, e.request_units, e.generated_seconds)
+                for e in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            return (
+                task.status, task.error_code, task.media_id,
+                task.asset_version_id, task.attempts, task.upstream_job_id,
+                task.provider_artifact_id, current.status,
+                current.reconciliation_state, current.upstream_job_id,
+                usage, db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                project.revision, project.materials,
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+            )
+
+    assert [entry[0] for entry in snapshot()[10]] == ["RESERVED"]
+    if drift_timing == "before_probe":
+        baseline = snapshot()
+    route = f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact"
+    for call_no in range(2):
+        denied = client.post(route, json={
+            "reason": "FAKE-only Owner current Attempt identity drift check",
+        })
+        assert denied.status_code == 409, denied.text
+        expected = (
+            "ARTIFACT_RECOVERY_STATE_CHANGED"
+            if drift_timing == "during_probe" and call_no == 0 else
+            "ARTIFACT_RECOVERY_EVIDENCE_MISSING"
+        )
+        assert denied.json()["detail"]["code"] == expected
+        if drift_timing == "during_probe" and call_no == 0:
+            baseline = snapshot()
+        assert snapshot() == baseline, "Denied recovery changed durable PG state"
+
+    assert inspect_spy.call_count == (
+        0 if drift_timing == "before_probe" else 1
+    )
+    upload_spy.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
