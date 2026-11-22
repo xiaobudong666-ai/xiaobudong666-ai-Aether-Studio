@@ -3050,25 +3050,36 @@ def create_app(
                 },
             )
 
-        reserved_entry = db.execute(
+        # G70/G71/M11: task_id+kind alone is not a trusted reservation receipt.
+        # A damaged ledger may retain a RESERVED row from another project,
+        # attempt or key, or even two RESERVED rows with different keys (the
+        # schema only makes reservation_key+kind unique). Refuse every ambiguous
+        # ledger before charging storage or publishing a recovered asset.
+        usage_entries = list(db.execute(
             select(DBGenerationUsageEntry).where(
                 DBGenerationUsageEntry.task_id == task.id,
-                DBGenerationUsageEntry.kind == "RESERVED",
             )
-        ).scalar_one_or_none()
-        released_entry = db.execute(
-            select(DBGenerationUsageEntry.id).where(
-                DBGenerationUsageEntry.task_id == task.id,
-                DBGenerationUsageEntry.kind == "RELEASED",
-            )
-        ).scalar_one_or_none()
-        existing_settled_entry = db.execute(
-            select(DBGenerationUsageEntry.id).where(
-                DBGenerationUsageEntry.task_id == task.id,
-                DBGenerationUsageEntry.kind == "SETTLED",
-            )
-        ).scalar_one_or_none()
-        if reserved_entry is None or released_entry is not None or existing_settled_entry is not None:
+        ).scalars())
+        reserved_entries = [row for row in usage_entries if row.kind == "RESERVED"]
+        reserved_entry = reserved_entries[0] if len(reserved_entries) == 1 else None
+        reservation_attempt_owned = (
+            db.execute(select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.id == reserved_entry.attempt_id,
+                DBGenerationAttempt.generation_task_id == task.id,
+            )).scalar_one_or_none() is not None
+            if reserved_entry is not None else False
+        )
+        if (
+            reserved_entry is None
+            or len(usage_entries) != 1
+            or reserved_entry.tenant_id != task.tenant_id
+            or reserved_entry.project_id != task.project_id
+            or reserved_entry.reservation_key != f"generation:{task.id}"
+            or reserved_entry.request_units != 1
+            or reserved_entry.generated_seconds != 0
+            or reserved_entry.config_version_id != raw_snapshot.get("configVersionId")
+            or not reservation_attempt_owned
+        ):
             raise HTTPException(
                 status_code=409,
                 detail={
