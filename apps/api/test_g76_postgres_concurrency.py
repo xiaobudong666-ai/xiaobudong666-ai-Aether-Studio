@@ -8726,3 +8726,114 @@ def test_g70_g71_postgres_orphan_recovery_rejects_prior_attempt_reservation(
     assert inspection.call_count == 2
     upload.assert_not_called()
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("negative_storage_bytes", [-1, -17])
+def test_g70g71_postgres_orphan_recovery_negative_storage_counter_keeps_held(
+    postgres_context, monkeypatch, negative_storage_bytes,
+):
+    """Native disposable PostgreSQL: corrupted quota must not recover an orphan.
+
+    FAKE-only synthetic Sidecar proof. No trusted receipt, M13 ACK or Provider.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"synthetic-postgres-orphan-negative-storage-counter"
+    media_id = "orphan-negative-storage-" + task_id[:8]
+    digest = hashlib.sha256(payload).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    metadata = {
+        "durationSeconds": 1.0, "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        project_id = task.project_id
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        db.get(DBTenant, task.tenant_id).used_storage_bytes = negative_storage_bytes
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic orphan with corrupt quota"
+        task.upstream_job_id = "synthetic-original-upstream"
+        task.provider_artifact_id = "synthetic-original-artifact"
+        task.media_id = media_id
+        task.completed_at = task.updated_at = now
+        task.lease_owner = task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = task.upstream_job_id
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": task.upstream_job_id,
+                "originalProviderArtifactId": task.provider_artifact_id,
+                "orphanedMediaId": media_id, "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata, "reconciliationState": "HELD",
+            },
+            created_at=now,
+        ))
+        db.commit()
+
+    media = app.state.video_use
+    media.media_objects[(project_id, media_id)] = payload
+    original_inspect = media.inspect_media
+    def synthetic_probe(project, candidate):
+        return {
+            **original_inspect(project, candidate),
+            "contentType": "video/mp4", "metadata": metadata,
+        }
+    inspection = MagicMock(side_effect=synthetic_probe)
+    upload = MagicMock(wraps=media.upload_media)
+    monkeypatch.setattr(media, "inspect_media", inspection)
+    monkeypatch.setattr(media, "upload_media", upload)
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            project = db.get(DBProject, project_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                attempt.reconciliation_state,
+                db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                project.revision, project.materials,
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+                tuple(sorted((row.kind, row.attempt_id)
+                    for row in db.execute(select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id,
+                    )).scalars())),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+            )
+
+    before = snapshot()
+    assert before[0] == "FAILED" and before[3] == "HELD"
+    assert before[4] == negative_storage_bytes
+    for _ in range(2):
+        denied = client.post(
+            f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
+            json={"reason": "FAKE-only negative storage accounting reconciliation"},
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == (
+            "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before
+    assert inspection.call_count == 2
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
