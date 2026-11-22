@@ -8728,13 +8728,13 @@ def test_g70_g71_postgres_orphan_recovery_rejects_prior_attempt_reservation(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("corrupt_timing", ["before_probe", "during_probe"])
 @pytest.mark.parametrize("negative_storage_bytes", [-1, -17])
 def test_g70g71_postgres_orphan_recovery_negative_storage_counter_keeps_held(
-    postgres_context, monkeypatch, negative_storage_bytes,
+    postgres_context, monkeypatch, negative_storage_bytes, corrupt_timing,
 ):
-    """Native disposable PostgreSQL: corrupted quota must not recover an orphan.
-
-    FAKE-only synthetic Sidecar proof. No trusted receipt, M13 ACK or Provider.
+    """Native disposable PostgreSQL: quota corruption before or during inspection
+    cannot authorize an orphan recovery. FAKE-only; no Provider or trusted ACK.
     """
     client, sessions, app = postgres_context
     task_id = _create_task(client)
@@ -8754,7 +8754,8 @@ def test_g70g71_postgres_orphan_recovery_negative_storage_counter_keeps_held(
             DBGenerationAttempt.generation_task_id == task_id,
             DBGenerationAttempt.attempt_no == 1,
         )).scalar_one()
-        db.get(DBTenant, task.tenant_id).used_storage_bytes = negative_storage_bytes
+        if corrupt_timing == "before_probe":
+            db.get(DBTenant, task.tenant_id).used_storage_bytes = negative_storage_bytes
         task.status = "FAILED"
         task.progress = 100
         task.error_code = "ARTIFACT_INGEST_FAILED"
@@ -8788,10 +8789,15 @@ def test_g70g71_postgres_orphan_recovery_negative_storage_counter_keeps_held(
     media.media_objects[(project_id, media_id)] = payload
     original_inspect = media.inspect_media
     def synthetic_probe(project, candidate):
-        return {
-            **original_inspect(project, candidate),
-            "contentType": "video/mp4", "metadata": metadata,
-        }
+        inspected = original_inspect(project, candidate)
+        if corrupt_timing == "during_probe":
+            # A distinct PG transaction corrupts the stored balance after the
+            # initial check, but before the serialized final quota UPDATE.
+            with sessions() as other_db:
+                candidate_task = other_db.get(DBGenerationTask, task_id)
+                other_db.get(DBTenant, candidate_task.tenant_id).used_storage_bytes = negative_storage_bytes
+                other_db.commit()
+        return {**inspected, "contentType": "video/mp4", "metadata": metadata}
     inspection = MagicMock(side_effect=synthetic_probe)
     upload = MagicMock(wraps=media.upload_media)
     monkeypatch.setattr(media, "inspect_media", inspection)
@@ -8823,7 +8829,8 @@ def test_g70g71_postgres_orphan_recovery_negative_storage_counter_keeps_held(
 
     before = snapshot()
     assert before[0] == "FAILED" and before[3] == "HELD"
-    assert before[4] == negative_storage_bytes
+    assert before[4] == (negative_storage_bytes if corrupt_timing == "before_probe" else 0)
+    expected = (*before[:4], negative_storage_bytes, *before[5:])
     for _ in range(2):
         denied = client.post(
             f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
@@ -8833,7 +8840,7 @@ def test_g70g71_postgres_orphan_recovery_negative_storage_counter_keeps_held(
         assert denied.json()["detail"]["code"] == (
             "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         )
-        assert snapshot() == before
+        assert snapshot() == expected
     assert inspection.call_count == 2
     upload.assert_not_called()
     app.state.moneyprinter.assert_not_called()
