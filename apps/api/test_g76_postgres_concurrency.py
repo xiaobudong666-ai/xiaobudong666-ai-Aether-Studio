@@ -37,6 +37,7 @@ from app.models import (
     DBGenerationCircuitState,
     DBGenerationEvent,
     DBGenerationProviderEvent,
+    DBGenerationProviderConfigVersion,
     DBGenerationTask,
     DBGenerationUsageEntry,
     DBProject,
@@ -463,6 +464,21 @@ def test_g72_postgres_inconsistent_reserved_ledger_never_gets_fake_worker_lease(
         # Corrupt disposable fixture via SQLAlchemy Core so ORM's append-only
         # ledger guard remains enabled for the actual application under test.
         usage_table = DBGenerationUsageEntry.__table__
+        alternate_config_id = None
+        if damage == "wrong_config":
+            # PostgreSQL enforces the real config FK. Seed an independent,
+            # valid synthetic config row, not a nonexistent identifier;
+            # the mismatch must reach the API's read-only claim fence.
+            alternate_config_id = str(uuid.uuid4())
+            db.add(DBGenerationProviderConfigVersion(
+                id=alternate_config_id, tenant_id=tenant_id,
+                provider="synthetic-test-only-config", version=1,
+                status="DRAFT", policy_json={}, policy_hash="synthetic-test-only",
+                created_by=owner,
+                created_at=datetime.datetime.now(datetime.timezone.utc),
+            ))
+            db.flush()
+            assert usage.config_version_id != alternate_config_id
         if damage == "missing":
             db.execute(usage_table.delete().where(usage_table.c.id == usage.id))
         else:
@@ -472,7 +488,7 @@ def test_g72_postgres_inconsistent_reserved_ledger_never_gets_fake_worker_lease(
                 "wrong_attempt": {"attempt_id": healthy_attempt.id},
                 "wrong_key": {"reservation_key": f"generation:unrelated-{old_id}"},
                 "zero_units": {"request_units": 0},
-                "wrong_config": {"config_version_id": f"synthetic-corrupt-config-{old_id}"},
+                "wrong_config": {"config_version_id": alternate_config_id},
             }[damage]
             db.execute(
                 usage_table.update()
