@@ -4748,18 +4748,23 @@ def create_app(
                         content_sha256=digest.hexdigest(),
                     )
                 except BaseException as abrupt_exit:
-                    if isinstance(abrupt_exit, Exception):
-                        # Ordinary transport errors use the established FAILED/HELD
-                        # recovery path; do not change paid-usage semantics.
-                        raise
-                    # G70/G71/M13: a Sidecar write can complete immediately
-                    # before an in-process abrupt exit loses its response. Neither
-                    # BaseException nor a released session lock proves remote
-                    # deletion. Never manufacture a storage RELEASED receipt or
-                    # a quota refund here: keep the committed OPENED hold and
-                    # original storage debit for independent reconciliation.
-                    # Subsequent attempts fail closed on that durable orphan.
+                    # G70/G71/M13 (FAKE-only verification): once the Sidecar
+                    # upload has been dispatched, neither an ordinary transport
+                    # exception nor an abrupt BaseException proves that no
+                    # remote bytes were written. In both cases the OPENED hold
+                    # and tenant debit were already committed. Do not make a
+                    # speculative STORAGE_RESERVATION_RELEASED receipt, alter
+                    # RESERVED usage or resend the upload. The durable orphan
+                    # fence requires independent reconciliation before retry.
                     db.rollback()
+                    if isinstance(abrupt_exit, Exception):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                                "message": "Sidecar上传结果不确定，保留原始存储预留，须可信对账后处理",
+                            },
+                        ) from abrupt_exit
                     raise
                 # G70/G71/G72: a Sidecar ACK is untrusted media evidence, not
                 # permission to coerce its values into an asset/usage ledger.
