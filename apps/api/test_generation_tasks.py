@@ -1957,6 +1957,91 @@ def test_g70g71_orphan_recovery_current_attempt_identity_rechecked(
     app.state.moneyprinter.assert_not_called()
 
 
+
+@pytest.mark.parametrize("storage_event_type", [
+    "STORAGE_RESERVATION_OPENED",
+    "STORAGE_RESERVATION_RELEASED",
+])
+def test_g70g71_owner_orphan_recovery_rejects_prior_storage_accounting(
+    generation_context, storage_event_type,
+):
+    """FAKE-only: orphan recovery must not double-charge unresolved storage.
+
+    A real upload may have written the object and committed a storage hold
+    before its Sidecar ACK was lost. Neither OPENED nor RELEASED audit text is
+    an independently trusted M13 receipt. Preserve the existing quota,
+    RESERVED usage, HELD attempt and material list without inspecting/uploading.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-orphan-storage-accounting")
+    task_id = create_task(
+        client, project, key="g70-storage-" + storage_event_type
+    )["taskId"]
+    _, payload = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], task_id
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, task.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        if storage_event_type == "STORAGE_RESERVATION_OPENED":
+            tenant.used_storage_bytes = len(payload)
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type=storage_event_type,
+            from_status="INGESTING", to_status="INGESTING",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={"reservedStorageBytes": len(payload)},
+            created_at=now,
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, task.tenant_id)
+            project_row = db.get(DBProject, project["id"])
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )).scalar_one()
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                attempt.reconciliation_state, tenant.used_storage_bytes,
+                project_row.revision, project_row.materials,
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project["id"]
+                )).scalar_one(),
+                tuple(sorted((entry.kind, entry.reservation_key) for entry in
+                    db.execute(select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id
+                    )).scalars())),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+            )
+
+    before = snapshot()
+    assert before[0] == "FAILED" and before[3] == "HELD"
+    assert before[4] == (
+        len(payload) if storage_event_type == "STORAGE_RESERVATION_OPENED" else 0
+    )
+    for _ in range(2):
+        response = client.post(
+            f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact",
+            json={"reason": "FAKE-only unresolved Sidecar storage accounting"},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == (
+            "ARTIFACT_RECOVERY_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+        )
+        assert snapshot() == before
+    assert media_store.inspections == 0
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
 def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_attempt(generation_context):
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-owner-orphan-recovery")
