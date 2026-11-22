@@ -6697,6 +6697,133 @@ def test_g70_g71_postgres_existing_legacy_media_must_remain_held(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("extra_attempt_no,extra_state", [
+    (0, "HELD"),
+    (2, "UNKNOWN"),
+])
+def test_g70g71_postgres_orphan_recovery_fences_other_attempt_history(
+    postgres_context, monkeypatch, extra_attempt_no, extra_state,
+):
+    """Native disposable PostgreSQL/FAKE-only: a HELD current orphan does not
+    authorize recovery when another Attempt is outside the trusted prefix.
+
+    Proves that the PostgreSQL route rejects before any Sidecar inspection,
+    asset registration, storage debit, usage settlement or audit mutation.
+    It does not prove independent trusted Sidecar ACK or production recovery.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"synthetic-g70g71-postgres-orphan-history"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-history-pg-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    metadata = {
+        "durationSeconds": 1.0,
+        "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    media = app.state.video_use
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task is not None and task.attempts == 1 and task.status == "QUEUED"
+        project_id = task.project_id
+        current = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic original transfer failure"
+        task.upstream_job_id = "synthetic-original-upstream"
+        task.provider_artifact_id = "synthetic-original-artifact"
+        task.media_id = media_id
+        task.completed_at = task.updated_at = now
+        task.lease_owner = task.lease_expires_at = None
+        current.status = "FAILED"
+        current.upstream_job_id = "synthetic-original-upstream"
+        current.reconciliation_state = "HELD"
+        current.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=current.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": "synthetic-original-upstream",
+                "originalProviderArtifactId": "synthetic-original-artifact",
+                "reconciliationState": "HELD", "usageReservation": "HELD",
+                "orphanedMediaId": media_id, "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata,
+            },
+            created_at=now,
+        ))
+        db.add(DBGenerationAttempt(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_no=extra_attempt_no,
+            status="RUNNING" if extra_state == "UNKNOWN" else "FAILED",
+            reconciliation_state=extra_state,
+            upstream_job_id="synthetic-unexpected-upstream",
+            submission_started_at=now,
+            created_at=now,
+        ))
+        db.commit()
+    media.media_objects[(project_id, media_id)] = payload
+    inspection = MagicMock(wraps=media.inspect_media)
+    upload = MagicMock(wraps=media.upload_media)
+    monkeypatch.setattr(media, "inspect_media", inspection)
+    monkeypatch.setattr(media, "upload_media", upload)
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            project = db.get(DBProject, project_id)
+            history = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state,
+                 a.submission_started_at, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id
+                ).order_by(DBGenerationUsageEntry.kind)).scalars()
+            )
+            return (
+                task.status, task.error_code, task.media_id,
+                task.asset_version_id, task.attempts, task.upstream_job_id,
+                task.provider_artifact_id, history, usage,
+                db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                project.revision, project.materials,
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id
+                )).scalar_one(),
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id
+                )).scalar_one(),
+            )
+
+    before = durable_snapshot()
+    assert before[0] == "FAILED" and before[3] is None
+    assert before[7][0][0] == extra_attempt_no if extra_attempt_no == 0 else before[7][-1][0] == 2
+    assert [u[0] for u in before[8]] == ["RESERVED"]
+    endpoint = f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        rejected = client.post(
+            endpoint, json={"reason": "FAKE-only retain HELD pending trusted reconciliation"},
+        )
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"]["code"] == "ARTIFACT_RECOVERY_RECONCILIATION_REQUIRED"
+        assert durable_snapshot() == before, "Rejected recovery mutated durable evidence"
+    inspection.assert_not_called()
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("action", ["retry", "cancel"])
 @pytest.mark.parametrize("corrupt_prior", ["stale_running", "number_gap", "number_zero"])
 def test_g70g71_postgres_legacy_prior_attempt_cancel_retry_is_fail_closed(
