@@ -7973,18 +7973,35 @@ def test_g70g71_postgres_orphan_recovery_fences_untrusted_reserved_ledger(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
         )).scalar_one()
-        if corruption == "foreign_reservation_key":
-            reservation.reservation_key = f"generation:foreign-{task_id}"
-        elif corruption == "foreign_project":
-            reservation.project_id = db.get(DBGenerationTask, other_task_id).project_id
-        elif corruption == "wrong_request_units":
-            reservation.request_units = 0
-        elif corruption == "wrong_generated_seconds":
-            reservation.generated_seconds = 1
-        elif corruption == "foreign_attempt":
-            reservation.attempt_id = db.execute(select(DBGenerationAttempt.id).where(
+        # The production ORM forbids in-place ledger updates. Simulate a
+        # damaged legacy row through limited SQL in disposable PG fixture only.
+        foreign_project_id = (
+            db.get(DBGenerationTask, other_task_id).project_id
+            if corruption == "foreign_project" else None
+        )
+        foreign_attempt_id = (
+            db.execute(select(DBGenerationAttempt.id).where(
                 DBGenerationAttempt.generation_task_id == other_task_id,
             )).scalar_one()
+            if corruption == "foreign_attempt" else None
+        )
+        corruption_values = {
+            "foreign_reservation_key": ("reservation_key", f"generation:foreign-{task_id}"),
+            "foreign_project": ("project_id", foreign_project_id),
+            "wrong_request_units": ("request_units", 0),
+            "wrong_generated_seconds": ("generated_seconds", 1),
+            "foreign_attempt": ("attempt_id", foreign_attempt_id),
+        }
+        if corruption in corruption_values:
+            column, value = corruption_values[corruption]
+            assert column in {
+                "reservation_key", "project_id", "request_units", "generated_seconds", "attempt_id",
+            }
+            mutated = db.execute(
+                text(f"UPDATE generation_usage_entries SET {column} = :value WHERE id = :id"),
+                {"value": value, "id": reservation.id},
+            )
+            assert mutated.rowcount == 1
         else:
             db.add(DBGenerationUsageEntry(
                 id=str(uuid.uuid4()),
