@@ -299,11 +299,11 @@ def run_case(client: httpx.Client, mode: str) -> dict:
     # Owner recovery can issue a second storage debit or settle usage.
     retry = client.post(f"/projects/{project_id}/generation-tasks/{task_id}/retry")
     assert retry.status_code == 409, retry.text[:300]
-    assert retry.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
+    assert retry.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
     after_retry = inspect_task(project_id, task_id, storage_before)
     assert after_retry == evidence, "rejected retry mutated durable HELD state"
     evidence["genericRetry"] = {
-        "status": 409, "code": "GENERATION_NOT_RETRYABLE",
+        "status": 409, "code": "GENERATION_RECONCILIATION_REQUIRED",
         "attemptsAfter": after_retry["attempts"], "usageAfter": after_retry["usage"],
         "reconciliationAfter": after_retry["reconciliation"], "durableStateUnchanged": True,
     }

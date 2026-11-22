@@ -1563,7 +1563,7 @@ def test_g70_g71_m11_artifact_failure_missing_upstream_id_keeps_reserved(generat
         )).scalar_one() == 0
     denied = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
     assert denied.status_code == 409
-    assert denied.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
+    assert denied.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
     app.state.moneyprinter.assert_not_called()
 
 
@@ -1624,7 +1624,7 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
 
     blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
     assert blocked.status_code == 409
-    assert blocked.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
+    assert blocked.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
     with sessions() as db:
         row = db.get(DBGenerationTask, task_id)
         assert row.status == "FAILED"
