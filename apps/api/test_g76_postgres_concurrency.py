@@ -3288,130 +3288,107 @@ def test_g76_postgres_owner_stop_serializes_with_worker_claim_when_circuit_row_m
 
 
 
-def test_g70_g71_postgres_audit_abrupt_request_exit_after_sidecar_return_does_not_leak_storage_hold(
-    postgres_context, monkeypatch
+def test_g70_g71_postgres_abrupt_sidecar_exit_preserves_unreconciled_storage_hold(
+    postgres_context, monkeypatch,
 ):
-    """An in-process BaseException after Sidecar upload must not leak its quota hold.
+    """Disposable PG/FAKE Sidecar: an abrupt exit is not a storage refund ACK.
 
-    The exception bypasses the ordinary Exception failure path. This is not
-    an operating-system process kill or durable crash-recovery proof.
+    The Sidecar returns after a synthetic write, then the request aborts before
+    asset settlement. Its committed OPENED hold must survive unchanged, and a
+    subsequent same-lease retry may not dispatch Sidecar a second time.
+    This is not independent signed Sidecar reconciliation or production proof.
     """
     class SimulatedAbruptRequestExit(BaseException):
         pass
 
     owner_client, sessions, app = postgres_context
     task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(owner_client)
-    payload = b"synthetic-g70-g71-abrupt-request-exit-after-sidecar-return"
-
+    payload = b"synthetic-g70-g71-abrupt-sidecar-write-then-unknown"
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         assert task is not None
         tenant_id = task.tenant_id
-        tenant = db.get(DBTenant, tenant_id)
-        assert tenant is not None
-        initial_storage_bytes = tenant.used_storage_bytes
+        original_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
 
     original_upload = app.state.video_use.upload_media
     upload_calls = 0
+    sidecar_returned = False
 
-    def upload_then_abort_request(*args, **kwargs):
-        nonlocal upload_calls
+    def upload_then_abort(*args, **kwargs):
+        nonlocal upload_calls, sidecar_returned
         upload_calls += 1
         original_upload(*args, **kwargs)
-        raise SimulatedAbruptRequestExit("synthetic abrupt request exit after Sidecar returned")
+        sidecar_returned = True
+        raise SimulatedAbruptRequestExit("FAKE lost request after Sidecar returned")
 
-    monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_abort_request)
+    monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_abort)
     intake_route = next(
         route for route in app.routes
         if getattr(route, "path", None) == "/internal/generation-tasks/{task_id}/artifact-intake"
     )
-    interrupted = False
     with sessions() as db:
-        upload = UploadFile(
+        file = UploadFile(
             file=BytesIO(payload),
             filename="synthetic-g70-g71.mp4",
             headers=Headers({"content-type": "video/mp4"}),
         )
-        try:
+        with pytest.raises(SimulatedAbruptRequestExit):
             intake_route.endpoint(
                 task_id,
                 providerArtifactId=artifact_id,
-                file=upload,
+                file=file,
                 x_worker_token=WORKER_TOKEN,
                 x_worker_id=worker_headers["X-Worker-Id"],
                 x_worker_lease_epoch=int(worker_headers["X-Worker-Lease-Epoch"]),
                 db=db,
             )
-        except SimulatedAbruptRequestExit:
-            interrupted = True
-        else:
-            pytest.fail("synthetic abrupt request interruption did not reach the intake endpoint")
-
-    assert upload_calls == 1
-    assert interrupted is True
+    assert sidecar_returned is True and upload_calls == 1
 
     with sessions() as db:
-        interrupted_task = db.get(DBGenerationTask, task_id)
-        interrupted_tenant = db.get(DBTenant, tenant_id)
-        assert interrupted_task is not None
-        assert interrupted_tenant is not None
-        assert interrupted_task.status == "INGESTING"
-        assert interrupted_task.asset_version_id is None
-        assert interrupted_tenant.used_storage_bytes == initial_storage_bytes
-        releases = list(db.execute(select(DBGenerationEvent).where(
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "INGESTING" and task.asset_version_id is None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == original_bytes + len(payload)
+        events = list(db.execute(select(DBGenerationEvent).where(
             DBGenerationEvent.generation_task_id == task_id,
-            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
         )).scalars())
-        assert len(releases) == 1
-        assert releases[0].metadata_json["reasonCode"] == "UPLOAD_INTERRUPTED"
-        assert releases[0].metadata_json["reservedStorageBytes"] == len(payload)
+        opened = [e for e in events if e.event_type == "STORAGE_RESERVATION_OPENED"]
+        assert len(opened) == 1
+        assert opened[0].metadata_json["reservedStorageBytes"] == len(payload)
+        assert not any(e.event_type == "STORAGE_RESERVATION_RELEASED" for e in events)
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalars())
+        assert [entry.kind for entry in usage] == ["RESERVED"]
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == task.project_id, DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
 
-    monkeypatch.setattr(app.state.video_use, "upload_media", original_upload)
-    retry = _post_g70_g71_duplicate_intake(
-        app, task_id, worker_headers, artifact_id, payload
-    )
-    assert retry.status_code == 201, retry.text
+    def forbid_second_upload(*args, **kwargs):
+        pytest.fail("unreconciled original hold must reject before another Sidecar write")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", forbid_second_upload)
+    for _ in range(2):
+        retry = _post_g70_g71_duplicate_intake(
+            app, task_id, worker_headers, artifact_id, payload,
+        )
+        assert retry.status_code == 409, retry.text
+        assert retry.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
 
     with sessions() as db:
-        completed_task = db.get(DBGenerationTask, task_id)
-        completed_tenant = db.get(DBTenant, tenant_id)
-        assert completed_task is not None
-        assert completed_tenant is not None
-        assets = list(db.execute(
-            select(DBAssetVersion).where(
-                DBAssetVersion.project_id == completed_task.project_id,
-                DBAssetVersion.media_id == completed_task.media_id,
-            )
-        ).scalars())
-        events = list(db.execute(
-            select(DBGenerationEvent).where(
-                DBGenerationEvent.generation_task_id == task_id
-            )
-        ).scalars())
-        usage = list(db.execute(
-            select(DBGenerationUsageEntry).where(
-                DBGenerationUsageEntry.task_id == task_id
-            )
-        ).scalars())
-
-        assert completed_task.status == "RIGHTS_BLOCKED"
-        assert completed_task.attempts == 1
-        assert completed_task.asset_version_id is not None
-        assert len(assets) == 1
-        assert assets[0].sha256 == hashlib.sha256(payload).hexdigest()
-        assert sum(row.event_type == "ARTIFACT_INGESTED" for row in events) == 1
-        assert sum(row.event_type == "STORAGE_RESERVATION_RELEASED" for row in events) == 1
-        assert sum(row.kind == "RESERVED" for row in usage) == 1
-        assert sum(row.kind == "SETTLED" for row in usage) == 1
-        assert sum(row.kind == "RELEASED" for row in usage) == 0
-
-        expected_storage_bytes = initial_storage_bytes + len(payload)
-        assert completed_tenant.used_storage_bytes == expected_storage_bytes, (
-            "Aborted request must compensate its own hold, and retry must reserve "
-            "exactly once for the single durable media object."
-        )
-
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "INGESTING" and task.asset_version_id is None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == original_bytes + len(payload)
+        events = list(db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalars())
+        assert sum(e.event_type == "STORAGE_RESERVATION_OPENED" for e in events) == 1
+        assert sum(e.event_type == "STORAGE_RESERVATION_RELEASED" for e in events) == 0
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalars())
+        assert [entry.kind for entry in usage] == ["RESERVED"]
     app.state.moneyprinter.assert_not_called()
+
 
 @pytest.mark.parametrize("rotate_lease", [False, True])
 def test_g70_g71_postgres_sigkill_after_sidecar_write_replay_storage_accounting(
