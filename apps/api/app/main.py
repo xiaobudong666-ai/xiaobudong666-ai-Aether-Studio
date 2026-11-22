@@ -2710,7 +2710,15 @@ def create_app(
             )
 
         attempt = current_generation_attempt(db, task)
-        if attempt is None or attempt.reconciliation_state != "HELD":
+        # A HELD flag alone is insufficient if the current Attempt is still
+        # RUNNING or now names a different upstream submission. Refuse an
+        # orphan inspection before trusting inconsistent durable evidence.
+        if (
+            attempt is None
+            or attempt.status != "FAILED"
+            or attempt.reconciliation_state != "HELD"
+            or attempt.upstream_job_id != task.upstream_job_id
+        ):
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -3012,7 +3020,9 @@ def create_app(
             task.status != "FAILED"
             or task.error_code != "ARTIFACT_INGEST_FAILED"
             or attempt is None
+            or attempt.status != "FAILED"
             or attempt.reconciliation_state != "HELD"
+            or attempt.upstream_job_id != task.upstream_job_id
             or task.media_id != orphan_media_id
             or task.upstream_job_id != current_evidence.get("originalUpstreamJobId")
             or task.provider_artifact_id != current_evidence.get("originalProviderArtifactId")
