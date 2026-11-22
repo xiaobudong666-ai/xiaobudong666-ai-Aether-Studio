@@ -8797,3 +8797,101 @@ def test_g73_worker_transition_rechecks_current_attempt_after_claim(
             assert snapshot() == before, "refusal must not mutate task/lease/usage/storage/audit"
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("corruption", [
+    "foreign_reservation_key",
+    "foreign_project",
+    "wrong_request_units",
+    "wrong_generated_seconds",
+    "foreign_attempt",
+    "duplicate_reserved_rows",
+])
+def test_g70g71_orphan_recovery_fences_untrusted_reserved_ledger(
+    generation_context, corruption,
+):
+    """FAKE-only: a task/kind match is not a trusted M11 usage reservation.
+
+    Corrupt persisted rows are synthetic and must never authorize a Sidecar
+    orphan to become an asset or consume storage. No Provider is invoked.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, f"g70-ledger-{corruption}")
+    task = create_task(client, project, key=f"g70-ledger-{corruption}")
+    task_id = task["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+
+    foreign_project_id = None
+    foreign_attempt_id = None
+    if corruption == "foreign_project":
+        foreign_project_id = create_project(client, "g70-other-project")["id"]
+    if corruption == "foreign_attempt":
+        other_task = create_task(client, project, key="g70-other-ledger-attempt")
+        with sessions() as db:
+            foreign_attempt_id = db.execute(select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.generation_task_id == other_task["taskId"]
+            )).scalar_one()
+
+    with sessions() as db:
+        reservation = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        if corruption == "foreign_reservation_key":
+            reservation.reservation_key = f"generation:foreign-{task_id}"
+        elif corruption == "foreign_project":
+            reservation.project_id = foreign_project_id
+        elif corruption == "wrong_request_units":
+            reservation.request_units = 0
+        elif corruption == "wrong_generated_seconds":
+            reservation.generated_seconds = 1
+        elif corruption == "foreign_attempt":
+            reservation.attempt_id = foreign_attempt_id
+        else:
+            db.add(DBGenerationUsageEntry(
+                id=str(uuid.uuid4()),
+                tenant_id=reservation.tenant_id,
+                project_id=reservation.project_id,
+                task_id=task_id,
+                attempt_id=reservation.attempt_id,
+                kind="RESERVED",
+                request_units=1,
+                generated_seconds=0,
+                reservation_key=f"generation:extra-{task_id}",
+                config_version_id=reservation.config_version_id,
+                created_at=reservation.created_at,
+            ))
+        db.commit()
+
+    url = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    for _ in range(2):
+        response = client.post(url, json={"reason": "FAKE-only invalid reservation receipt"})
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "GENERATION_USAGE_RESERVATION_NOT_RECOVERABLE"
+
+    with sessions() as db:
+        row = db.get(DBGenerationTask, task_id)
+        tenant = db.get(DBTenant, row.tenant_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        entries = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id
+        )).scalars())
+        assert row.status == "FAILED" and row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.asset_version_id is None and attempt.reconciliation_state == "HELD"
+        assert tenant.used_storage_bytes == 0
+        assert sum(item.kind == "RESERVED" for item in entries) == (
+            2 if corruption == "duplicate_reserved_rows" else 1
+        )
+        assert all(item.kind not in {"RELEASED", "SETTLED"} for item in entries)
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
+        )).scalar_one() == 0
+    assert media_store.uploads == 0
+    assert media_store.inspections == 2
+    app.state.moneyprinter.assert_not_called()
