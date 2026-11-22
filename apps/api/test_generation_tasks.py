@@ -8546,3 +8546,87 @@ def test_g73_worker_heartbeat_rechecks_current_attempt_after_claim(
             )
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("corruption", [
+    "MISSING_CURRENT", "HELD", "UNKNOWN", "STATUS_DRIFT", "UPSTREAM_CONFLICT", "CLEAN",
+])
+def test_g73_worker_transition_rechecks_current_attempt_after_claim(
+    generation_context, corruption,
+):
+    """FAKE-only SQLite: postclaim CURRENT Attempt may not be silently rewritten.
+
+    Refusals are repeatable and must preserve lease/usage/storage/audit.
+    CLEAN exercises the real existing Worker transition path with no Provider.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G73 transition current attempt fence")
+    task_id = create_task(client, project, key="g73-current-transition-" + corruption)["taskId"]
+    worker = "g73-current-transition-worker"
+    claimed = claim(client, worker_id=worker)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == task_id
+    epoch = claimed.json()["leaseEpoch"]
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        if corruption == "MISSING_CURRENT":
+            attempt.attempt_no = task.attempts + 1
+        elif corruption in {"HELD", "UNKNOWN"}:
+            attempt.reconciliation_state = corruption
+        elif corruption == "STATUS_DRIFT":
+            attempt.status = "RUNNING"
+        elif corruption == "UPSTREAM_CONFLICT":
+            attempt.upstream_job_id = "orphan-current-upstream"
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempts = tuple(
+                (a.attempt_no, a.status, a.reconciliation_state, a.upstream_job_id)
+                for a in db.execute(select(DBGenerationAttempt).where(
+                    DBGenerationAttempt.generation_task_id == task_id,
+                ).order_by(DBGenerationAttempt.attempt_no)).scalars()
+            )
+            usage = tuple(
+                (u.kind, u.request_units, u.generated_seconds)
+                for u in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            storage = db.get(DBTenant, task.tenant_id).used_storage_bytes
+            return (task.status, task.progress, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.upstream_job_id, attempts,
+                    usage, events, storage)
+
+    before = snapshot()
+    for _ in range(1 if corruption == "CLEAN" else 2):
+        response = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+                     "X-Worker-Lease-Epoch": str(epoch)},
+            json={"status": "RUNNING", "progress": 20, "message": "FAKE-only"},
+        )
+        if corruption == "CLEAN":
+            assert response.status_code == 200, response.text
+            assert snapshot()[0] == "RUNNING"
+        else:
+            expected_code = (
+                "GENERATION_ATTEMPT_STATUS_CONFLICT"
+                if corruption == "STATUS_DRIFT" else
+                "UPSTREAM_ATTEMPT_IDENTITY_CONFLICT"
+                if corruption == "UPSTREAM_CONFLICT" else
+                "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+            )
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["code"] == expected_code
+            assert snapshot() == before, "refusal must not mutate task/lease/usage/storage/audit"
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()

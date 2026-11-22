@@ -3740,7 +3740,25 @@ def create_app(
                 detail={"code": "PROVIDER_ARTIFACT_ID_IMMUTABLE", "message": "上游产物编号不可替换"},
             )
         previous = task.status
-        attempt = current_generation_attempt(db, task)
+        # G73: serialize the CURRENT Attempt with the task for PostgreSQL,
+        # as already done by Worker heartbeat and artifact intake. A lease
+        # does not authorize rewriting a missing, HELD or UNKNOWN attempt.
+        # Refuse before any status, usage, lease or audit mutation.
+        current_transition_attempt_query = select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )
+        if app_engine.dialect.name == "postgresql":
+            current_transition_attempt_query = current_transition_attempt_query.with_for_update()
+        attempt = db.execute(current_transition_attempt_query).scalar_one_or_none()
+        if attempt is None or attempt.reconciliation_state in {"HELD", "UNKNOWN"}:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "当前生成尝试缺失或存在未核验状态，拒绝Worker迁移并保持账本",
+                },
+            )
         # G73: a Worker transition must not convert a legacy/partially
         # persisted current Attempt out of a terminal or divergent status.
         # Both statuses are written together by the normal transition path;
