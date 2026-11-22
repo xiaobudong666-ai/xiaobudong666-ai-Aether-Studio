@@ -1410,19 +1410,19 @@ def test_g70_g71_m11_postgres_artifact_failure_without_upstream_id_holds_usage(
         data={"providerArtifactId": artifact_id},
         files={"file": ("synthetic.mp4", b"fake-pg-upload-bytes", "video/mp4")},
     )
-    assert response.status_code == 502, response.text
-    assert response.json()["detail"]["code"] == "ARTIFACT_STORE_FAILED"
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
         attempt = db.execute(select(DBGenerationAttempt).where(
             DBGenerationAttempt.generation_task_id == task_id,
         )).scalar_one()
-        assert stored.status == "FAILED"
-        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.status == "INGESTING"
+        assert stored.asset_version_id is None
         assert stored.upstream_job_id is None
         assert attempt.submission_started_at is not None
-        assert attempt.reconciliation_state == "HELD"
-        assert db.get(DBTenant, tenant_id).used_storage_bytes == 0
+        assert attempt.generation_task_id == task_id
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == len(b"fake-pg-upload-bytes")
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
@@ -1445,7 +1445,7 @@ def test_g70_g71_m11_postgres_artifact_failure_without_upstream_id_holds_usage(
 def test_g72_postgres_artifact_upload_failure_compensates_storage_case(
     postgres_context, monkeypatch, corrupt_quota_counter,
 ):
-    """Native PostgreSQL: damaged quota counters must not certify a refund."""
+    """Native PostgreSQL: unknown remote write keeps hold; corruption is not refunded."""
     client, sessions, app = postgres_context
     task_id = _create_task(client)
     with sessions() as db:
@@ -1506,19 +1506,14 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(
         data={"providerArtifactId": artifact_id},
         files={"file": ("synthetic.mp4", failure_payload, "video/mp4")},
     )
-    assert response.status_code == (409 if corrupt_quota_counter else 502), response.text
-    assert response.json()["detail"]["code"] == (
-        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
-        if corrupt_quota_counter else "ARTIFACT_STORE_FAILED"
-    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
 
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
         tenant = db.get(DBTenant, tenant_id)
-        assert stored.status == ("INGESTING" if corrupt_quota_counter else "FAILED")
-        if not corrupt_quota_counter:
-            assert stored.error_code == "ARTIFACT_INGEST_FAILED"
-        assert tenant.used_storage_bytes == 0
+        assert stored.status == "INGESTING" and stored.asset_version_id is None
+        assert tenant.used_storage_bytes == (0 if corrupt_quota_counter else len(failure_payload))
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project_id,
             DBAssetVersion.media_type == "video",
@@ -1526,22 +1521,19 @@ def test_g72_postgres_artifact_upload_failure_compensates_storage_case(
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one() == (0 if corrupt_quota_counter else 1)
+        )).scalar_one() == 0
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        if not corrupt_quota_counter:
-            assert attempt.reconciliation_state == "HELD"
-        else:
-            # No release receipt or failure event may certify an underfunded refund.
-            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
-                DBGenerationEvent.generation_task_id == task_id,
-                DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
-            )).scalar_one() == 1
-            assert db.execute(select(func.count(DBGenerationEvent.id)).where(
-                DBGenerationEvent.generation_task_id == task_id,
-                DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
-            )).scalar_one() == 0
+        assert attempt.generation_task_id == task_id
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalar_one() == 0
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
@@ -8335,3 +8327,63 @@ def test_g70g71_postgres_orphan_recovery_fences_untrusted_reserved_ledger(
     assert inspection.call_count == 2
     upload.assert_not_called()
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("exception_type", [VideoUseError, RuntimeError])
+def test_g70_g71_postgres_sidecar_exception_after_write_keeps_original_storage_hold(
+    postgres_context, monkeypatch, exception_type,
+):
+    """FAKE-only PG: an ordinary error after a remote write is not a refund ACK.
+
+    No new asset or SETTLED, and a second same-lease request cannot re-upload.
+    This does not certify an independent Sidecar issuer or M13 human ACK.
+    """
+    client, sessions, app = postgres_context
+    task_id, headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(client)
+    payload = b"synthetic-g70-g71-sidecar-written-but-response-lost"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        tenant_id = task.tenant_id
+        baseline = db.get(DBTenant, tenant_id).used_storage_bytes
+
+    real_upload = app.state.video_use.upload_media
+    calls = []
+
+    def upload_then_fail(*args, **kwargs):
+        receipt = real_upload(*args, **kwargs)
+        calls.append(receipt["mediaId"])
+        raise exception_type("synthetic Sidecar ACK lost after remote write")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", upload_then_fail)
+    first = _post_g70_g71_duplicate_intake(app, task_id, headers, artifact_id, payload)
+    assert first.status_code == 409, first.text
+    assert first.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    assert len(calls) == 1
+
+    def fail_if_dispatched_again(*_args, **_kwargs):
+        pytest.fail("an unresolved Sidecar write must not be dispatched again")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", fail_if_dispatched_again)
+    second = _post_g70_g71_duplicate_intake(app, task_id, headers, artifact_id, payload)
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "INGESTING" and task.asset_version_id is None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == baseline + len(payload)
+        events = db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalars().all()
+        assert sum(e.event_type == "STORAGE_RESERVATION_OPENED" for e in events) == 1
+        assert sum(e.event_type == "STORAGE_RESERVATION_RELEASED" for e in events) == 0
+        assert sum(e.event_type == "ARTIFACT_INGEST_FAILED" for e in events) == 0
+        usage = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalars().all()
+        assert [entry.kind for entry in usage] == ["RESERVED"]
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == task.project_id, DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
