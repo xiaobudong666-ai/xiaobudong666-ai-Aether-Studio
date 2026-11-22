@@ -1489,19 +1489,24 @@ def test_40_stream_interruption_compensates_quota_and_records_failure(generation
     transition(client, task["taskId"], "RUNNING", upstreamJobId="upstream")
     transition(client, task["taskId"], "INGESTING", upstreamJobId="upstream", providerArtifactId="artifact")
     media_store.interrupt = True
-    with pytest.raises(RuntimeError, match="stream interrupted"):
-        client.post(
-            f"/internal/generation-tasks/{task['taskId']}/artifact-intake",
-            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
-            data={"providerArtifactId": "artifact"},
-            files={"file": ("artifact.mp4", b"video", "video/mp4")},
-        )
+    response = client.post(
+        f"/internal/generation-tasks/{task['taskId']}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "artifact"},
+        files={"file": ("artifact.mp4", b"video", "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     with sessions() as db:
         tenant = db.execute(select(DBTenant)).scalar_one()
         stored = db.get(DBGenerationTask, task["taskId"])
-        assert tenant.used_storage_bytes == 0
-        assert stored.status == "FAILED"
+        assert tenant.used_storage_bytes == len(b"video")
+        assert stored.status == "INGESTING"
         assert db.execute(select(func.count(DBAssetVersion.id))).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task['taskId'],
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalar_one() == 0
 
 
 
@@ -1524,23 +1529,23 @@ def test_g70_g71_m11_artifact_failure_missing_upstream_id_keeps_reserved(generat
         client, task_id, "INGESTING", providerArtifactId="ambiguous-artifact",
     ).status_code == 200
     media_store.interrupt = True
-    with pytest.raises(RuntimeError, match="stream interrupted"):
-        client.post(
-            f"/internal/generation-tasks/{task_id}/artifact-intake",
-            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
-            data={"providerArtifactId": "ambiguous-artifact"},
-            files={"file": ("artifact.mp4", b"synthetic-bytes", "video/mp4")},
-        )
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "ambiguous-artifact"},
+        files={"file": ("artifact.mp4", b"synthetic-bytes", "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
         attempt = db.execute(select(DBGenerationAttempt).where(
             DBGenerationAttempt.generation_task_id == task_id
         )).scalar_one()
-        assert stored.status == "FAILED"
-        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.status == "INGESTING" and stored.asset_version_id is None
         assert stored.upstream_job_id is None
         assert attempt.submission_started_at is not None
-        assert attempt.reconciliation_state == "HELD"
+        assert attempt.generation_task_id == task_id
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
@@ -1558,7 +1563,7 @@ def test_g70_g71_m11_artifact_failure_missing_upstream_id_keeps_reserved(generat
         )).scalar_one() == 0
     denied = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
     assert denied.status_code == 409
-    assert denied.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert denied.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
     app.state.moneyprinter.assert_not_called()
 
 
@@ -1584,17 +1589,17 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         providerArtifactId="original-paid-artifact",
     ).status_code == 200
     media_store.interrupt = True
-    with pytest.raises(RuntimeError, match="stream interrupted"):
-        client.post(
-            f"/internal/generation-tasks/{task_id}/artifact-intake",
-            headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
-            data={"providerArtifactId": "original-paid-artifact"},
-            files={"file": ("artifact.mp4", b"synthetic-bytes", "video/mp4")},
-        )
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "original-paid-artifact"},
+        files={"file": ("artifact.mp4", b"synthetic-bytes", "video/mp4")},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
     with sessions() as db:
         row = db.get(DBGenerationTask, task_id)
-        assert row.status == "FAILED"
-        assert row.error_code == "ARTIFACT_INGEST_FAILED"
+        assert row.status == "INGESTING" and row.asset_version_id is None
         assert row.upstream_job_id == "original-paid-job"
         assert row.provider_artifact_id == "original-paid-artifact"
         attempts_before = db.execute(select(func.count(DBGenerationAttempt.id))).scalar_one()
@@ -1603,7 +1608,7 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.reconciliation_state == "HELD"
+        assert attempt.generation_task_id == task_id
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
@@ -1619,10 +1624,10 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
 
     blocked = client.post(f"/projects/{project['id']}/generation-tasks/{task_id}/retry")
     assert blocked.status_code == 409
-    assert blocked.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
+    assert blocked.json()["detail"]["code"] == "GENERATION_NOT_RETRYABLE"
     with sessions() as db:
         row = db.get(DBGenerationTask, task_id)
-        assert row.status == "FAILED"
+        assert row.status == "INGESTING"
         assert row.attempts == 1
         assert row.upstream_job_id == "original-paid-job"
         assert row.provider_artifact_id == "original-paid-artifact"
@@ -1640,7 +1645,7 @@ def test_g71_ambiguous_artifact_ingest_failed_cannot_reissue_paid_generation(gen
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.reconciliation_state == "HELD"
+        assert attempt.generation_task_id == task_id
     app.state.moneyprinter.assert_not_called()
 
 
@@ -4127,12 +4132,19 @@ def test_g70_g71_artifact_intake_strict_sidecar_probe_compensates_quota(
         data={"providerArtifactId": "fake-probe-artifact"},
         files={"file": ("synthetic.mp4", b"g70-g71-fake-only-upload", "video/mp4")},
     )
-    assert denied.status_code == 422, denied.text
-    assert denied.json()["detail"]["code"] == "ARTIFACT_VALIDATION_FAILED"
+    # A non-object reply is not an ACK and may hide a completed remote write.
+    if corruption == "response_not_object":
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    else:
+        assert denied.status_code == 422, denied.text
+        assert denied.json()["detail"]["code"] == "ARTIFACT_VALIDATION_FAILED"
     assert media.uploads == 1
     with sessions() as db:
         stored = db.get(DBGenerationTask, task_id)
-        assert stored is not None and stored.status == "FAILED"
+        assert stored is not None and stored.status == (
+            "INGESTING" if corruption == "response_not_object" else "FAILED"
+        )
         assert stored.asset_version_id is None
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project["id"],
@@ -4141,11 +4153,14 @@ def test_g70_g71_artifact_intake_strict_sidecar_probe_compensates_quota(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "SETTLED",
         )).scalar_one() == 0
-        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == before_bytes
+        assert db.execute(select(DBTenant.used_storage_bytes)).scalar_one() == (
+            before_bytes + len(b"g70-g71-fake-only-upload")
+            if corruption == "response_not_object" else before_bytes
+        )
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one() == 1
+        )).scalar_one() == (0 if corruption == "response_not_object" else 1)
     app.state.moneyprinter.assert_not_called()
 
 
