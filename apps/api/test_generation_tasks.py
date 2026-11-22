@@ -6345,6 +6345,94 @@ def test_g72_poisoned_persisted_fake_labels_are_not_leased(
     app.state.moneyprinter.assert_not_called()
 
 
+def test_g72_fake_reserved_config_drift_quarantines_queue_without_starvation(
+    generation_context, monkeypatch,
+):
+    """FAKE-only SQLite: altered reservation config cannot authorize a Worker lease.
+
+    The corrupted immutable-ledger row exists solely in disposable test SQL.
+    No actual Provider, protected storage, financial settlement or policy update.
+    """
+    from app import generation_tasks as generation_domain
+
+    monkeypatch.setitem(generation_domain.DEFAULT_FAKE_POLICY, "concurrentTaskLimit", 2)
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 synthetic RESERVED config-drift fence")
+    image_id = _g72_fake_visual_fixture(sessions, project)
+    path = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    for _ in range(3):
+        payload = _g72_fake_payload(
+            client, project, image_id, key="g72-reserved-config-drift"
+        )
+        preflight = client.post(path + "/validate", json=payload)
+        assert preflight.status_code == 200, preflight.text
+        payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        created = client.post(path, json=payload)
+        if created.status_code == 202:
+            break
+        assert created.status_code == 409, created.text
+        assert created.json().get("detail", {}).get("code") in {
+            "CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED",
+        }, created.text
+    assert created is not None and created.status_code == 202
+    bad_id = created.json()["taskId"]
+    healthy = create_task(client, project, key="g72-healthy-after-config-drift")
+
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, bad_id)
+        assert bad is not None and bad.provider == "deterministic-fake-talking-head"
+        reservation = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == bad_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one()
+        expected = bad.capability_snapshot_json.get("configVersionId")
+        corrupt_version = f"synthetic-forged-config-{bad_id}"
+        assert expected != corrupt_version
+        # Test-only Core mutation: production ORM retains immutable ledger guard.
+        db.execute(
+            DBGenerationUsageEntry.__table__.update()
+            .where(DBGenerationUsageEntry.__table__.c.id == reservation.id)
+            .values(config_version_id=corrupt_version)
+        )
+        # Ensure bad candidate is encountered before the healthy one.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        bad.created_at = now - datetime.timedelta(minutes=2)
+        good = db.get(DBGenerationTask, healthy["taskId"])
+        good.created_at = now - datetime.timedelta(minutes=1)
+        db.commit()
+        before = (bad.status, bad.lease_owner, bad.lease_epoch, bad.updated_at)
+        event_count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == bad_id
+        )).scalar_one()
+        usage_count = db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == bad_id
+        )).scalar_one()
+        tenant_bytes = db.get(DBTenant, bad.tenant_id).used_storage_bytes
+
+    claimed = claim(client, worker_id="g72-config-drift-worker")
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["taskId"] == healthy["taskId"]
+    assert claim(client, worker_id="g72-config-drift-worker").status_code == 204
+    with sessions() as db:
+        bad = db.get(DBGenerationTask, bad_id)
+        assert (bad.status, bad.lease_owner, bad.lease_epoch, bad.updated_at) == before
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == bad_id
+        )).scalar_one() == event_count
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == bad_id
+        )).scalar_one() == usage_count
+        saved = db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == bad_id
+        )).scalar_one()
+        assert saved.config_version_id == corrupt_version
+        assert db.get(DBTenant, bad.tenant_id).used_storage_bytes == tenant_bytes
+        assert db.get(DBGenerationTask, healthy["taskId"]).lease_owner == "g72-config-drift-worker"
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("field,bad_value", [
     ("fakeTaskType", "normal-generation"),
     ("simulatedOutput", False),
