@@ -9226,3 +9226,90 @@ def test_g70g71_orphan_recovery_fences_untrusted_reserved_ledger(
     assert media_store.uploads == 0
     assert media_store.inspections == 2
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70_g71_lost_sidecar_ack_does_not_clobber_successor_worker_lease(
+    generation_context, monkeypatch,
+):
+    """FAKE-only: a late failed Sidecar ACK cannot overwrite a newer Worker lease.
+
+    Sidecar already stored the media; storage OPENED is a durable hold, not a
+    release/refund receipt. This is a disposable SQLite race regression, not
+    independent M13 trusted Sidecar receipt, Provider or production evidence.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-lost-ack-successor-lease")
+    task = create_task(client, project, key="g70-lost-ack-successor-lease")
+    task_id = task["taskId"]
+    claimed = claim(client)
+    assert claimed.status_code == 200 and claimed.json()["taskId"] == task_id
+    old_epoch = claimed.json()["leaseEpoch"]
+    assert transition(client, task_id, "RUNNING", upstreamJobId="job-late-ack").status_code == 200
+    assert transition(
+        client, task_id, "INGESTING", upstreamJobId="job-late-ack",
+        providerArtifactId="artifact-late-ack",
+    ).status_code == 200
+    payload = b"fake-successor-lease-media"
+    original_upload = media_store.upload_media
+
+    def wrote_media_then_lost_ack(*args, **kwargs):
+        result = original_upload(*args, **kwargs)
+        assert result["mediaId"]
+        # This separate DB transaction models a newer lease acquired while
+        # the previous Worker is blocked in Sidecar I/O.
+        with sessions() as db:
+            current = db.get(DBGenerationTask, task_id)
+            assert current.lease_owner == "worker-a"
+            assert current.lease_epoch == old_epoch
+            current.lease_epoch = old_epoch + 1
+            current.lease_owner = "worker-successor"
+            current.lease_expires_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(minutes=5)
+            db.commit()
+        raise VideoUseError("synthetic ACK dropped after Sidecar wrote media")
+
+    monkeypatch.setattr(media_store, "upload_media", wrote_media_then_lost_ack)
+    result = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
+        data={"providerArtifactId": "artifact-late-ack"},
+        files={"file": ("artifact.mp4", payload, "video/mp4")},
+    )
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == (
+        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    )
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        tenant = db.get(DBTenant, stored.tenant_id)
+        assert stored.status == "INGESTING" and attempt.status == "INGESTING"
+        assert stored.lease_owner == "worker-successor"
+        assert stored.lease_epoch == old_epoch + 1
+        assert attempt.reconciliation_state == "SUBMITTED"
+        assert stored.asset_version_id is None
+        assert tenant.used_storage_bytes == len(payload)
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project["id"]
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind.in_(["SETTLED", "RELEASED"]),
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_OPENED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "STORAGE_RESERVATION_RELEASED",
+        )).scalar_one() == 0
+    assert media_store.uploads == 1
+    app.state.moneyprinter.assert_not_called()
