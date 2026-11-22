@@ -2718,6 +2718,18 @@ def create_app(
                     "message": "缺少 HELD 对账状态，禁止人工恢复",
                 },
             )
+        # G70/G71: a valid current HELD orphan does not prove that every
+        # other Attempt belongs to the same generation history. Legacy or
+        # future billable attempts must be reconciled independently before
+        # inspecting or registering this synthetic orphan.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_RECONCILIATION_REQUIRED",
+                    "message": "其他生成尝试存在未确认或损坏的持久证据，保持HELD，禁止直接恢复",
+                },
+            )
         if not task.upstream_job_id or not task.provider_artifact_id:
             raise HTTPException(
                 status_code=409,
@@ -3013,6 +3025,18 @@ def create_app(
                 detail={
                     "code": "ARTIFACT_RECOVERY_STATE_CHANGED",
                     "message": "恢复期间任务或原始证据发生变化，请重新核对",
+                },
+            )
+
+        # The read-only Sidecar inspection happens outside the final write
+        # transaction. Re-check the complete Attempt prefix and reject
+        # migrated future rows before modifying storage, project or asset.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_RECONCILIATION_REQUIRED",
+                    "message": "恢复期间历史尝试证据不可信，保留HELD待人工对账",
                 },
             )
 
