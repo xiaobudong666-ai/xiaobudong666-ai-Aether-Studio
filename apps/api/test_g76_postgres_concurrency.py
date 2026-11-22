@@ -228,6 +228,71 @@ def _create_task(client: TestClient) -> str:
 
 
 
+@pytest.mark.parametrize(
+    ("final_status", "upstream_job_id", "error_code"),
+    [
+        ("FAILED", None, "PROVIDER_400"),
+        ("FAILED", "synthetic-accepted-job", "PROVIDER_400"),
+        ("FAILED", "synthetic-accepted-job", "PROVIDER_5XX"),
+        ("CANCELED", None, None),
+    ],
+)
+def test_g70_g71_m11_postgres_worker_terminal_without_trusted_ack_keeps_reserved(
+    postgres_context, final_status, upstream_job_id, error_code,
+):
+    """Native disposable PG: neither Worker 4XX nor CANCELED is a refund ACK.
+
+    Assert the real PostgreSQL task/Attempt/ledger transaction preserves the
+    original reservation and has no RELEASED/SETTLED or release audit event.
+    The provider adapter is a MagicMock and must not be invoked.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    worker_id = "g70g71-terminal-proof"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200 and claimed.json()["taskId"] == task_id, claimed.text
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    endpoint = f"/internal/generation-tasks/{task_id}/transition"
+    if upstream_job_id:
+        running = client.post(endpoint, headers=worker_headers, json={
+            "status": "RUNNING", "progress": 10,
+            "message": "synthetic job accepted", "upstreamJobId": upstream_job_id,
+        })
+        assert running.status_code == 200, running.text
+    body = {"status": final_status, "progress": 10, "message": "synthetic terminal"}
+    if error_code:
+        body.update({"errorCode": error_code, "retryable": False})
+    terminal = client.post(endpoint, headers=worker_headers, json=body)
+    assert terminal.status_code == 200, terminal.text
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        entries = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalars())
+        releases = db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "GENERATION_USAGE_RELEASED",
+        )).scalar_one()
+        assert task.status == attempt.status == final_status
+        assert attempt.submission_started_at is not None
+        assert attempt.reconciliation_state in {"HELD", "SUBMITTED"}
+        assert task.upstream_job_id == upstream_job_id
+        assert [entry.kind for entry in entries] == ["RESERVED"]
+        assert releases == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def _g72_create_claimed_typed_fake_source(
     client, sessions, worker_id: str, *, source_sha: str,
     valid_until: datetime.datetime | None = None,
