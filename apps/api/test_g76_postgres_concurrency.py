@@ -8387,3 +8387,91 @@ def test_g70_g71_postgres_sidecar_exception_after_write_keeps_original_storage_h
         )).scalar_one() == 0
     app.state.moneyprinter.assert_not_called()
 
+
+def test_g70_g71_postgres_lost_ack_cannot_clobber_successor_worker_lease(
+    postgres_context, monkeypatch,
+):
+    """Disposable native PostgreSQL: a late Sidecar ACK loss cannot steal a newer lease.
+
+    The original Sidecar writes bytes, then another PostgreSQL transaction
+    advances lease owner and epoch during the remote-I/O window. The old
+    request must not turn the successor's INGESTING task into FAILED/HELD,
+    erase the lease, issue a speculative storage refund, or settle usage.
+    This is FAKE-only: neither the Sidecar nor a real Provider is trusted.
+    """
+    client, sessions, app = postgres_context
+    task_id, worker_headers, artifact_id = _prepare_g70_g71_postgres_duplicate_intake(client)
+    original_owner = worker_headers["X-Worker-Id"]
+    original_epoch = int(worker_headers["X-Worker-Lease-Epoch"])
+    successor_owner = "worker-g70-g71-postgres-successor"
+    payload = b"synthetic-postgres-sidecar-ack-lost-after-successor-lease"
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "INGESTING"
+        assert task.lease_owner == original_owner
+        assert task.lease_epoch == original_epoch
+        tenant_id, project_id = task.tenant_id, task.project_id
+        baseline_bytes = db.get(DBTenant, tenant_id).used_storage_bytes
+
+    original_upload = app.state.video_use.upload_media
+    completed_remote_writes = []
+
+    def write_media_then_advance_lease(*args, **kwargs):
+        receipt = original_upload(*args, **kwargs)
+        completed_remote_writes.append(receipt["mediaId"])
+        # Independent PG connection/transaction while old HTTP request is
+        # awaiting its Sidecar acknowledgement. No production records used.
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            assert task.status == "INGESTING"
+            assert task.lease_owner == original_owner
+            assert task.lease_epoch == original_epoch
+            task.lease_owner = successor_owner
+            task.lease_epoch = original_epoch + 1
+            task.lease_expires_at = (
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(minutes=5)
+            )
+            db.commit()
+        raise VideoUseError("FAKE-only Sidecar lost ACK after successor obtained lease")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", write_media_then_advance_lease)
+    late_response = _post_g70_g71_duplicate_intake(
+        app, task_id, worker_headers, artifact_id, payload,
+    )
+    assert late_response.status_code == 409, late_response.text
+    assert late_response.json()["detail"]["code"] == (
+        "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+    )
+    assert len(completed_remote_writes) == 1
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id
+        )).scalar_one()
+        assert task.status == "INGESTING"
+        assert attempt.status == "INGESTING"
+        assert task.lease_owner == successor_owner
+        assert task.lease_epoch == original_epoch + 1
+        assert task.lease_expires_at is not None
+        assert attempt.reconciliation_state == "SUBMITTED"
+        assert task.asset_version_id is None
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == (
+            baseline_bytes + len(payload)
+        )
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == 0
+        usage = list(db.execute(select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task_id,
+        )).scalars())
+        assert [entry.kind for entry in usage] == ["RESERVED"]
+        events = list(db.execute(select(DBGenerationEvent).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalars())
+        assert sum(e.event_type == "STORAGE_RESERVATION_OPENED" for e in events) == 1
+        assert sum(e.event_type == "STORAGE_RESERVATION_RELEASED" for e in events) == 0
+        assert sum(e.event_type == "ARTIFACT_INGEST_FAILED" for e in events) == 0
+    app.state.moneyprinter.assert_not_called()
