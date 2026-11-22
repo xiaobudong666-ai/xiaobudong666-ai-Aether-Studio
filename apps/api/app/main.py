@@ -5309,18 +5309,32 @@ def create_app(
                 failed_attempt.error_message = failed_task.error_message
                 failed_attempt.completed_at = failed_task.completed_at
                 failure_metadata = {"compensatedQuotaBytes": upload_size}
-                artifact_recovery_hold = bool(failed_task.upstream_job_id and providerArtifactId)
+                # G70/G71/M11: missing upstreamJobId is NOT a trusted STOP or
+                # refund ACK. Worker claim persists submission_started_at before
+                # the upstream POST; an accepted/billable job may not return its
+                # ID after a timeout or crash. The original artifact-intake error
+                # branch must obey the same release fence as Worker terminal
+                # transitions. Preserve generation RESERVED even when the only
+                # durable submission marker belongs to the Attempt.
+                artifact_recovery_hold = bool(
+                    failed_attempt.submission_started_at is not None
+                    or failed_attempt.reconciliation_state != "NOT_SUBMITTED"
+                    or failed_attempt.upstream_job_id is not None
+                    or failed_task.upstream_job_id is not None
+                    or failed_task.provider_artifact_id is not None
+                )
                 if artifact_recovery_hold:
-                    # The remote job is already known and may be billable. Storage
-                    # compensation is separate from generation usage: preserve the
-                    # original RESERVED entry. The deterministic Sidecar ID lets the
-                    # Owner inspect/recover a committed object even when its upload
-                    # acknowledgement was lost and no response body reached the API.
+                    # Storage compensation is separate from generation usage.
+                    # Deterministic media identity is inspection context ONLY;
+                    # neither this exception handler nor a missing upstream ID
+                    # authorizes a second paid generation or a refund.
                     failed_attempt.reconciliation_state = "HELD"
                     failed_task.media_id = expected_media_id
                     failure_metadata.update({
                         "originalProviderArtifactId": providerArtifactId,
-                        "originalUpstreamJobId": failed_task.upstream_job_id,
+                        "originalUpstreamJobId": (
+                            failed_task.upstream_job_id or failed_attempt.upstream_job_id or ""
+                        ),
                         "reconciliationState": "HELD",
                         "usageReservation": "HELD",
                         "orphanedMediaId": expected_media_id,
