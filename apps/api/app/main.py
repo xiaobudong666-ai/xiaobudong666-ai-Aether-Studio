@@ -3919,7 +3919,24 @@ def create_app(
             if req.status == "CANCELED" or (
                 req.status == "FAILED" and (not req.retryable or task.attempts >= task.max_attempts)
             ):
-                if not artifact_recovery_hold:
+                # G70/G71/M11: a Worker terminal callback is not a trusted
+                # upstream STOP/refund acknowledgement. Claim writes
+                # submission_started_at *before* the external POST, so even
+                # FAILED PROVIDER_4XX without an upstream ID may have been
+                # accepted or billed. Preserve RESERVED for M11/M13 review.
+                # Only an unsubmitted attempt without any durable upstream
+                # evidence could be released here. Owner's separate preclaim
+                # cancellation path retains its existing safe release.
+                submission_evidence = (
+                    attempt.submission_started_at is not None
+                    or attempt.reconciliation_state != "NOT_SUBMITTED"
+                    or task.upstream_job_id is not None
+                    or attempt.upstream_job_id is not None
+                    or task.provider_artifact_id is not None
+                )
+                if submission_evidence and attempt.reconciliation_state == "NOT_SUBMITTED":
+                    attempt.reconciliation_state = "HELD"
+                if not artifact_recovery_hold and not submission_evidence:
                     release_generation_reservation(
                         db, task, attempt,
                         reason_code=req.errorCode or req.status, now=now,
