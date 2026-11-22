@@ -3112,6 +3112,10 @@ def create_app(
             or reserved_entry.request_units != 1
             or reserved_entry.generated_seconds != 0
             or reserved_entry.config_version_id != raw_snapshot.get("configVersionId")
+            # A RESERVED row owned by an older, NOT_SUBMITTED attempt is
+            # not a settlement receipt for the currently HELD orphan. Matching
+            # only task_id would silently attach the wrong attempt's debit.
+            or reserved_entry.attempt_id != attempt.id
             or not reservation_attempt_owned
         ):
             raise HTTPException(
