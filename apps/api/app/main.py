@@ -3229,10 +3229,14 @@ def create_app(
                 },
             )
 
+        # G70/G71 FAKE-only: corrupted negative storage accounting is not
+        # spendable quota. Match the existing intake/direct-media guard before
+        # creating a material, asset or synthetic accounting event.
         storage_reservation = db.execute(
             update(DBTenant)
             .where(
                 DBTenant.id == context.tenant_id,
+                DBTenant.used_storage_bytes >= 0,
                 DBTenant.used_storage_bytes + actual_size <= DBTenant.storage_quota_bytes,
             )
             .values(
@@ -3241,7 +3245,20 @@ def create_app(
             )
         )
         if storage_reservation.rowcount != 1:
+            stored_bytes = db.execute(
+                select(DBTenant.used_storage_bytes).where(
+                    DBTenant.id == context.tenant_id
+                )
+            ).scalar_one_or_none()
             db.rollback()
+            if stored_bytes is not None and stored_bytes < 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "租户存储计数器异常，保持HELD，须人工对账后才能恢复原始产物",
+                    },
+                )
             raise HTTPException(
                 status_code=429,
                 detail={
