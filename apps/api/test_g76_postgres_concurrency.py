@@ -1363,6 +1363,84 @@ def test_g76_postgres_additive_migration_is_idempotent_and_preserves_legacy_rows
 
         connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
 
+def test_g70_g71_m11_postgres_artifact_failure_without_upstream_id_holds_usage(
+    postgres_context, monkeypatch,
+):
+    """Native disposable PG: a lost upstream receipt never permits quota release."""
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        stored.max_attempts = 3
+        project_id = stored.project_id
+        tenant_id = stored.tenant_id
+        db.commit()
+
+    worker_id = "worker-g71-pg-unknown-upstream"
+    artifact_id = "unknown-upstream-synthetic-artifact"
+    claimed = client.post(
+        "/internal/generation-tasks/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker_id},
+    )
+    assert claimed.status_code == 200 and claimed.json()["taskId"] == task_id, claimed.text
+    worker_headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker_id,
+        "X-Worker-Lease-Epoch": str(claimed.json()["leaseEpoch"]),
+    }
+    for status, extra in [
+        ("RUNNING", {}),
+        ("INGESTING", {"providerArtifactId": artifact_id}),
+    ]:
+        transitioned = client.post(
+            f"/internal/generation-tasks/{task_id}/transition",
+            headers=worker_headers,
+            json={"status": status, "progress": 10 if status == "RUNNING" else 95,
+                  "message": "synthetic without upstream receipt", **extra},
+        )
+        assert transitioned.status_code == 200, transitioned.text
+
+    def interrupted_sidecar(*_args, **_kwargs):
+        raise VideoUseError("synthetic upload failure without upstream receipt")
+
+    monkeypatch.setattr(app.state.video_use, "upload_media", interrupted_sidecar)
+    response = client.post(
+        f"/internal/generation-tasks/{task_id}/artifact-intake",
+        headers=worker_headers,
+        data={"providerArtifactId": artifact_id},
+        files={"file": ("synthetic.mp4", b"fake-pg-upload-bytes", "video/mp4")},
+    )
+    assert response.status_code == 502, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORE_FAILED"
+    with sessions() as db:
+        stored = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+        )).scalar_one()
+        assert stored.status == "FAILED"
+        assert stored.error_code == "ARTIFACT_INGEST_FAILED"
+        assert stored.upstream_job_id is None
+        assert attempt.submission_started_at is not None
+        assert attempt.reconciliation_state == "HELD"
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind.in_(["RELEASED", "SETTLED"]),
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id, DBAssetVersion.media_type == "video",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+            DBGenerationEvent.event_type == "GENERATION_USAGE_RELEASED",
+        )).scalar_one() == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 @pytest.mark.parametrize("corrupt_quota_counter", [False, True])
 def test_g72_postgres_artifact_upload_failure_compensates_storage_case(
     postgres_context, monkeypatch, corrupt_quota_counter,
