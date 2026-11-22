@@ -1051,7 +1051,7 @@ def test_29_probe_failure_compensates_quota_and_creates_no_asset(generation_cont
 
 
 def test_g72_upload_failure_compensates_storage_with_portable_case(generation_context, monkeypatch):
-    """A sidecar upload failure releases only the committed storage reservation."""
+    """An uncertain Sidecar upload must not refund a committed storage hold."""
     client, sessions, app, media_store = generation_context
     project = create_project(client, "G72 storage compensation")
     asset_id = _g72_fake_visual_fixture(sessions, project)
@@ -1087,15 +1087,15 @@ def test_g72_upload_failure_compensates_storage_with_portable_case(generation_co
         data={"providerArtifactId": "g72-compensation-artifact"},
         files={"file": ("synthetic.mp4", b"synthetic-g72-bytes", "video/mp4")},
     )
-    assert response.status_code == 502, response.text
-    assert response.json()["detail"]["code"] == "ARTIFACT_STORE_FAILED"
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
 
     with sessions() as db:
         task = db.get(DBGenerationTask, task_id)
         tenant = db.get(DBTenant, task.tenant_id)
-        assert task.status == "FAILED"
-        assert task.error_code == "ARTIFACT_INGEST_FAILED"
-        assert tenant.used_storage_bytes == 0
+        assert task.status == "INGESTING"
+        assert task.asset_version_id is None
+        assert tenant.used_storage_bytes == len(b"synthetic-g72-bytes")
         assert db.execute(select(func.count(DBAssetVersion.id)).where(
             DBAssetVersion.project_id == project["id"],
             DBAssetVersion.media_type == "video",
@@ -1103,11 +1103,11 @@ def test_g72_upload_failure_compensates_storage_with_portable_case(generation_co
         assert db.execute(select(func.count(DBGenerationEvent.id)).where(
             DBGenerationEvent.generation_task_id == task_id,
             DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-        )).scalar_one() == 1
+        )).scalar_one() == 0
         attempt = db.execute(
             select(DBGenerationAttempt).where(DBGenerationAttempt.generation_task_id == task_id)
         ).scalar_one()
-        assert attempt.reconciliation_state == "HELD"
+        assert attempt.generation_task_id == task_id
         assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
             DBGenerationUsageEntry.task_id == task_id,
             DBGenerationUsageEntry.kind == "RESERVED",
