@@ -1748,6 +1748,98 @@ def test_g70g71_orphan_recovery_rejects_untrusted_extra_attempt_history_without_
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("drift_field,drift_timing", [
+    ("status", "before_probe"),
+    ("upstream_job_id", "before_probe"),
+    ("status", "during_probe"),
+    ("upstream_job_id", "during_probe"),
+])
+def test_g70g71_orphan_recovery_current_attempt_identity_rechecked(
+    generation_context, monkeypatch, drift_field, drift_timing,
+):
+    """FAKE-only: HELD alone cannot certify an in-flight or mismatched Attempt.
+
+    Status/upstream drift before or during read-only Sidecar inspection must
+    never publish an asset, debit storage, or settle/release RESERVED usage.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70g71-current-attempt-recheck")
+    task_id = create_task(
+        client, project, key=f"current-attempt-{drift_field}-{drift_timing}"
+    )["taskId"]
+    seed_g71_orphan_artifact(sessions, media_store, project["id"], task_id)
+
+    def alter_current_attempt():
+        with sessions() as db:
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )).scalar_one()
+            if drift_field == "status":
+                attempt.status = "RUNNING"
+            else:
+                attempt.upstream_job_id = "other-upstream-submission"
+            db.commit()
+
+    if drift_timing == "before_probe":
+        alter_current_attempt()
+    else:
+        original_inspect = media_store.inspect_media
+
+        def inspect_then_drift(project_id, media_id):
+            inspected = original_inspect(project_id, media_id)
+            alter_current_attempt()
+            return inspected
+
+        monkeypatch.setattr(media_store, "inspect_media", inspect_then_drift)
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            tenant = db.get(DBTenant, task.tenant_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == 1,
+            )).scalar_one()
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                task.media_id, task.attempts, tenant.used_storage_bytes,
+                db.get(DBProject, project["id"]).revision,
+                attempt.status, attempt.reconciliation_state, attempt.upstream_job_id,
+                tuple((entry.kind, entry.request_units) for entry in db.execute(
+                    select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == task_id,
+                    )
+                ).scalars()),
+                db.execute(select(func.count(DBAssetVersion.id))).scalar_one(),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+            )
+
+    route = f"/projects/{project['id']}/generation-tasks/{task_id}/recover-artifact"
+    if drift_timing == "before_probe":
+        before = durable_snapshot()
+    for request_no in range(2):
+        response = client.post(route, json={
+            "reason": "Owner synthetic reconciliation identity drift test",
+        })
+        assert response.status_code == 409, response.text
+        expected_code = (
+            "ARTIFACT_RECOVERY_EVIDENCE_MISSING"
+            if drift_timing == "before_probe" or request_no == 1
+            else "ARTIFACT_RECOVERY_STATE_CHANGED"
+        )
+        assert response.json()["detail"]["code"] == expected_code
+        if drift_timing == "during_probe" and request_no == 0:
+            before = durable_snapshot()
+        assert durable_snapshot() == before
+
+    assert media_store.inspections == (0 if drift_timing == "before_probe" else 1)
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
+
+
 def test_g70_g71_owner_recovers_verified_orphan_without_duplicate_upload_or_attempt(generation_context):
     client, sessions, app, media_store = generation_context
     project = create_project(client, "g70-owner-orphan-recovery")
