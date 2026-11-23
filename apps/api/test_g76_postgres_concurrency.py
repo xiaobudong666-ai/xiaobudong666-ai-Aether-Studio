@@ -9302,6 +9302,7 @@ def test_g72_postclaim_remix_revoke_locks_worker_commit_pg(postgres_context, act
                         + datetime.timedelta(seconds=1),
         ))
         rights_writer.flush()
+        writer_pid = rights_writer.execute(text("SELECT pg_backend_pid()")).scalar_one()
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(
                 client.post,
@@ -9309,11 +9310,24 @@ def test_g72_postclaim_remix_revoke_locks_worker_commit_pg(postgres_context, act
                 headers=headers, json=body,
             )
             try:
-                # Confirm a real PG lock wait instead of assuming a delayed
-                # Python Future proves database transaction serialization.
-                waited = _wait_until_postgres_reports_lock_wait(
-                    sessions, table_name="asset_versions", timeout_seconds=8.0,
-                )
+                # pg_stat_activity query text may not include asset_versions
+                # when PostgreSQL blocks at a prior FK/transaction-ID lock.
+                # Match the actual lock-holder PID to prove this Worker was
+                # blocked by THIS uncommitted rights writer, not just delayed.
+                waited = False
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline:
+                    with sessions() as observer:
+                        blocked = observer.execute(text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "AND pid <> pg_backend_pid() "
+                            "AND :writer_pid = ANY(pg_blocking_pids(pid))"
+                        ), {"writer_pid": writer_pid}).scalar_one()
+                    if blocked:
+                        waited = True
+                        break
+                    time.sleep(0.05)
             finally:
                 rights_writer.commit()
             denied = pending.result(timeout=15)
