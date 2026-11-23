@@ -9650,3 +9650,95 @@ def test_g72_fake_active_worker_owner_emergency_stop_fences_heartbeat_and_transi
             assert snapshot() == before, "Owner STOP must preserve lease, usage and audit"
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_claimed_fake_remix_revocation_blocks_worker_progress(generation_context):
+    """SQLite/HTTP: post-claim REMIX revocation stops heartbeat and transitions.
+
+    Bounded FAKE-only safety, not independent M12 issuance, M13 STOP ACK,
+    reconciliation, or protected-record access. Never release RESERVED usage.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 postclaim REMIX stop")
+    source_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, source_id, key="g72-claimed-rights-revoked",
+    )
+    endpoint = f"/projects/{project['id']}/talking-head/fake-generation-tasks"
+    created = None
+    stale = {"CAPABILITY_SNAPSHOT_UNKNOWN", "CAPABILITY_SNAPSHOT_EXPIRED"}
+    for _ in range(4):
+        preflight = client.post(endpoint + "/validate", json=payload)
+        if preflight.status_code != 200:
+            if preflight.json().get("detail", {}).get("code") in stale:
+                payload["capabilitySnapshotHash"] = client.get(
+                    "/generation/providers/moneyprinter/capabilities"
+                ).json()["snapshotHash"]
+                continue
+            break
+        payload["capabilitySnapshotHash"] = preflight.json()["capabilitySnapshotHash"]
+        created = client.post(endpoint, json=payload)
+        if created.status_code == 202 or created.json().get("detail", {}).get("code") not in stale:
+            break
+    assert created is not None and created.status_code == 202, (
+        created.text if created is not None else "create failed"
+    )
+    task_id = created.json()["taskId"]
+    worker = "g72-remix-revoked-worker"
+    leased = claim(client, worker_id=worker)
+    assert leased.status_code == 200 and leased.json()["taskId"] == task_id, leased.text
+    epoch = leased.json()["leaseEpoch"]
+
+    with sessions() as db:
+        old = db.execute(select(DBRightsSnapshot).where(
+            DBRightsSnapshot.asset_version_id == source_id,
+            DBRightsSnapshot.purpose == "REMIX",
+        )).scalar_one()
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=old.tenant_id,
+            project_id=old.project_id, asset_version_id=source_id,
+            status="REVOKED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="g72-disposable-revoked-after-claim",
+            captured_by=old.captured_by,
+            captured_at=datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id
+            )).scalar_one()
+            usage = tuple((u.kind, u.request_units, u.generated_seconds)
+                          for u in db.execute(select(DBGenerationUsageEntry).where(
+                              DBGenerationUsageEntry.task_id == task_id,
+                          )).scalars())
+            count = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, attempt.status, attempt.reconciliation_state,
+                    usage, count, db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                    task.asset_version_id)
+
+    before = snapshot()
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+               "X-Worker-Lease-Epoch": str(epoch)}
+    for _ in range(2):
+        for action, body in (
+            ("heartbeat", {}),
+            ("transition", {"status": "RUNNING", "progress": 15,
+                            "message": "revoked synthetic input"}),
+        ):
+            denied = client.post(
+                f"/internal/generation-tasks/{task_id}/{action}",
+                headers=headers, json=body,
+            )
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+            assert snapshot() == before
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
