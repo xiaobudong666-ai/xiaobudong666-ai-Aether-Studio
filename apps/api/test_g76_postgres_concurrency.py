@@ -9226,3 +9226,101 @@ def test_g72_postgres_postclaim_fake_worker_script_poison_blocks_progress(postgr
             assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
             assert snapshot() == before
     app.state.moneyprinter.assert_not_called()
+
+@pytest.mark.parametrize("action", ["heartbeat", "transition"])
+def test_g72_postclaim_remix_revoke_locks_worker_commit_pg(postgres_context, action):
+    """Real disposable PostgreSQL row-lock ordering, deterministic FAKE only.
+
+    When the rights writer has the source-version lock and an uncommitted
+    REMIX revocation, an already-claimed Worker heartbeat/transition MUST
+    wait for that writer, then observe the committed revoke and return 409.
+    A plain unlocked rights read could acknowledge a stale ALLOWED snapshot.
+    This is not an independently trusted M12 issuer, M13 STOP ACK or refund.
+    """
+    client, sessions, app = postgres_context
+    worker = "g72-pg-postclaim-revoke-lock-" + action
+    task_id, source_id, project_id, tenant_id, owner_id, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, worker, source_sha="e" * 64,
+        )
+    )
+
+    def task_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+                DBGenerationAttempt.attempt_no == task.attempts,
+            )).scalar_one()
+            usage = tuple(
+                (row.kind, row.request_units, row.generated_seconds)
+                for row in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                ).order_by(DBGenerationUsageEntry.id)).scalars()
+            )
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (
+                task.status, task.updated_at, task.lease_expires_at,
+                task.lease_epoch, task.lease_owner, task.asset_version_id,
+                attempt.status, attempt.reconciliation_state, usage, events,
+                db.get(DBTenant, tenant_id).used_storage_bytes,
+            )
+
+    baseline = task_snapshot()
+    headers = {
+        "X-Worker-Token": WORKER_TOKEN,
+        "X-Worker-Id": worker,
+        "X-Worker-Lease-Epoch": str(epoch),
+    }
+    body = (
+        {} if action == "heartbeat"
+        else {"status": "RUNNING", "progress": 12,
+              "message": "FAKE postclaim rights-lock proof"}
+    )
+
+    with sessions() as rights_writer:
+        # Mirrors the existing API rights-snapshot writer's SELECT FOR UPDATE
+        # and keeps its transaction open until the Worker reaches this lock.
+        locked_source = rights_writer.execute(
+            select(DBAssetVersion.id).where(
+                DBAssetVersion.id == source_id,
+                DBAssetVersion.project_id == project_id,
+                DBAssetVersion.tenant_id == tenant_id,
+            ).with_for_update()
+        ).scalar_one()
+        assert locked_source == source_id
+        rights_writer.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=tenant_id,
+            project_id=project_id, asset_version_id=source_id,
+            status="REVOKED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="g72-pg-postclaim-serialized-remix-revoke",
+            captured_by=owner_id,
+            captured_at=datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(seconds=1),
+        ))
+        rights_writer.flush()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(
+                client.post,
+                f"/internal/generation-tasks/{task_id}/{action}",
+                headers=headers, json=body,
+            )
+            try:
+                # Confirm a real PG lock wait instead of assuming a delayed
+                # Python Future proves database transaction serialization.
+                waited = _wait_until_postgres_reports_lock_wait(
+                    sessions, table_name="asset_versions", timeout_seconds=8.0,
+                )
+            finally:
+                rights_writer.commit()
+            denied = pending.result(timeout=15)
+
+    assert waited, "FAKE Worker bypassed the source rights writer row lock"
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    assert task_snapshot() == baseline
+    app.state.moneyprinter.assert_not_called()
+
