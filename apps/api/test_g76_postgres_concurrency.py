@@ -9459,3 +9459,164 @@ def test_g72_postgres_remix_expiry_while_final_source_lock_waits(
         )).scalar_one() == 1
         assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_storage
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g70g71_postgres_fake_orphan_recovery_waits_for_owner_deactivation(
+    postgres_context, monkeypatch,
+):
+    """Native disposable PG: Owner deactivation must serialize with FAKE orphan recovery.
+
+    A pending account deactivation is not a durable M13 STOP ACK. The final
+    recovery write must wait for the exact identity-row writer and refuse the
+    now-revoked originator, preserving HELD, RESERVED, quota and assets.
+    Neither a real Provider nor protected historical media is used.
+    """
+    client, sessions, app = postgres_context
+    task_id = _create_task(client)
+    payload = b"synthetic-fake-orphan-pg-owner-deactivation"
+    digest = hashlib.sha256(payload).hexdigest()
+    media_id = "orphan-pg-owner-revocation-" + task_id[:8]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    metadata = {
+        "durationSeconds": 1.0, "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+    }
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        project_id, tenant_id, owner_id = (
+            task.project_id, task.tenant_id, task.requested_by,
+        )
+        assert db.get(DBProject, project_id).owner_id == owner_id
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        task.provider = "deterministic-fake-talking-head"
+        task.status = attempt.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic Sidecar orphan for Owner-lock regression"
+        task.upstream_job_id = attempt.upstream_job_id = "fake-pg-owner-lock-job"
+        task.provider_artifact_id = "fake-pg-owner-lock-artifact"
+        task.media_id = media_id
+        task.lease_owner = task.lease_expires_at = None
+        task.completed_at = task.updated_at = now
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=task_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": task.upstream_job_id,
+                "originalProviderArtifactId": task.provider_artifact_id,
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "reconciliationState": "HELD",
+            },
+            created_at=now,
+        ))
+        db.commit()
+
+    def probe(_project_id, _media_id):
+        assert (_project_id, _media_id) == (project_id, media_id)
+        return {
+            "projectId": project_id,
+            "mediaId": media_id,
+            "contentType": "video/mp4",
+            "sha256": digest,
+            "sizeBytes": len(payload),
+            "metadata": metadata,
+        }
+
+    inspection = MagicMock(side_effect=probe)
+    upload = MagicMock(wraps=app.state.video_use.upload_media)
+    monkeypatch.setattr(app.state.video_use, "inspect_media", inspection)
+    monkeypatch.setattr(app.state.video_use, "upload_media", upload)
+
+    def durable_snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            project = db.get(DBProject, project_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            usage = tuple((e.kind, e.attempt_id, e.request_units, e.generated_seconds)
+                for e in db.execute(select(DBGenerationUsageEntry).where(
+                    DBGenerationUsageEntry.task_id == task_id,
+                )).scalars())
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                task.media_id, attempt.status, attempt.reconciliation_state,
+                project.revision, project.materials, usage,
+                db.get(DBTenant, tenant_id).used_storage_bytes,
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == task_id,
+                )).scalar_one(),
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+            )
+
+    before = durable_snapshot()
+    assert before[0] == "FAILED" and before[5] == "HELD"
+    assert [e[0] for e in before[8]] == ["RESERVED"]
+    with sessions() as identity_writer:
+        # An actual PG update locks the same authenticated Owner row. Its
+        # deactivation remains uncommitted during the initial read-only probe.
+        locked_owner = identity_writer.execute(
+            select(DBUser).where(
+                DBUser.id == owner_id, DBUser.tenant_id == tenant_id,
+            ).with_for_update()
+        ).scalar_one()
+        assert locked_owner.is_active is True
+        locked_owner.is_active = False
+        identity_writer.flush()
+        writer_pid = identity_writer.execute(
+            text("SELECT pg_backend_pid()")
+        ).scalar_one()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(
+                client.post,
+                f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
+                json={"reason": "synthetic FAKE Owner-revocation row-lock proof"},
+            )
+            blocked_by_writer = False
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    with sessions() as observer:
+                        blockers = observer.execute(text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "AND pid <> pg_backend_pid() "
+                            "AND :writer_pid = ANY(pg_blocking_pids(pid))"
+                        ), {"writer_pid": writer_pid}).scalar_one()
+                    if blockers:
+                        blocked_by_writer = True
+                        break
+                    if pending.done():
+                        break
+                    time.sleep(0.05)
+            finally:
+                identity_writer.commit()
+            denied = pending.result(timeout=20)
+
+    assert inspection.call_count == 1, (
+        "Owner revocation must be observed at recovery final-write boundary"
+    )
+    assert blocked_by_writer, (
+        "FAKE orphan recovery did not wait for the Owner identity-row writer: "
+        + denied.text
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER"
+    )
+    assert durable_snapshot() == before, (
+        "Denied recovery must not mutate HELD, RESERVED, project, quota or audit"
+    )
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
