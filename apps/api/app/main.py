@@ -5238,7 +5238,10 @@ def create_app(
                                 or current_source.media_type != "image"
                                 or current_source.sha256 != current_source_hash
                                 or not rights_decision(
-                                    latest_rights_snapshot(db, current_source.id, "REMIX"), now
+                                    # Read the time AFTER the PostgreSQL source-row lock:
+                                    # the source REMIX grant may expire while this
+                                    # transaction waits on a concurrent rights writer.
+                                    latest_rights_snapshot(db, current_source.id, "REMIX"), utc_now()
                                 )["allowed"]
                             ):
                                 invalid_code = "FAKE_TALKING_HEAD_SOURCE_REVOKED"
