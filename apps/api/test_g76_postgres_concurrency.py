@@ -727,6 +727,111 @@ def test_g72_postgres_inconsistent_reserved_ledger_never_gets_fake_worker_lease(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("pending_change", [
+    "remix_revoke", "owner_deactivate", "owner_demote",
+])
+def test_g72_postgres_fake_claim_skips_pending_owner_or_source_revoke(
+    postgres_context, pending_change,
+):
+    """A queued typed FAKE task cannot get a Worker lease over a revocation writer.
+
+    This is an actual disposable PostgreSQL transaction, not a mocked rights
+    answer. Claim must promptly skip the row locked by an uncommitted Owner
+    identity or source-rights writer; after commit it must remain unclaimable.
+    No real Provider, durable STOP ACK or protected historical repair is implied.
+    """
+    client, sessions, app = postgres_context
+    worker_id = "g72-pg-claim-revocation-" + pending_change
+    task_id, source_id, project_id, tenant_id, owner_id, _ = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, worker_id,
+            source_sha="c" * 64, claim_after_create=False,
+        )
+    )
+    with sessions() as snapshot:
+        original_task = snapshot.get(DBGenerationTask, task_id)
+        assert original_task.status == "QUEUED"
+        assert original_task.lease_owner is None
+        assert original_task.lease_epoch == 0
+        original_events = snapshot.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one()
+        original_ledger = [
+            (row.id, row.kind, row.attempt_id, row.reservation_key)
+            for row in snapshot.execute(select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id,
+            )).scalars()
+        ]
+        assert len(original_ledger) == 1 and original_ledger[0][1] == "RESERVED"
+        original_storage = snapshot.get(DBTenant, tenant_id).used_storage_bytes
+
+    def claim(worker_suffix):
+        with TestClient(app) as worker:
+            return worker.post(
+                "/internal/generation-tasks/claim",
+                headers={"X-Worker-Token": WORKER_TOKEN,
+                         "X-Worker-Id": worker_id + worker_suffix},
+            )
+
+    with sessions() as writer:
+        if pending_change == "remix_revoke":
+            source = writer.execute(select(DBAssetVersion).where(
+                DBAssetVersion.id == source_id,
+            ).with_for_update()).scalar_one()
+            assert source.tenant_id == tenant_id
+            writer.add(DBRightsSnapshot(
+                id=str(uuid.uuid4()), tenant_id=tenant_id,
+                project_id=project_id, asset_version_id=source_id,
+                status="REVOKED", purpose="REMIX", territory="TEST",
+                valid_from=None, valid_until=None,
+                evidence_ref="g72-pg-claim-inflight-owner-revocation",
+                captured_by=owner_id,
+                captured_at=datetime.datetime.now(datetime.timezone.utc)
+                            + datetime.timedelta(seconds=1),
+            ))
+        else:
+            originator = writer.execute(select(DBUser).where(
+                DBUser.id == owner_id, DBUser.tenant_id == tenant_id,
+            ).with_for_update()).scalar_one()
+            if pending_change == "owner_deactivate":
+                originator.is_active = False
+            else:
+                originator.role = "editor"
+        writer.flush()
+        # The writer remains open and owns its real PostgreSQL row lock.
+        # No waiting on a deadlocked claim: fail if it cannot promptly skip.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            during = pool.submit(claim, "-during").result(timeout=10)
+        assert during.status_code == 204, during.text
+        writer.commit()
+
+    after = claim("-after")
+    assert after.status_code == 204, after.text
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "QUEUED"
+        assert task.lease_owner is None and task.lease_epoch == 0
+        assert task.asset_version_id is None
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        assert attempt.status == "QUEUED"
+        assert attempt.submission_started_at is None
+        assert db.execute(select(func.count(DBGenerationEvent.id)).where(
+            DBGenerationEvent.generation_task_id == task_id,
+        )).scalar_one() == original_events
+        assert [
+            (row.id, row.kind, row.attempt_id, row.reservation_key)
+            for row in db.execute(select(DBGenerationUsageEntry).where(
+                DBGenerationUsageEntry.task_id == task_id,
+            )).scalars()
+        ] == original_ledger
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == original_storage
+    app.state.moneyprinter.assert_not_called()
+    assert app.state.video_use.media_objects == {}
+
+
 def test_g72_postgres_fake_talking_head_create_and_worker_claim(postgres_context):
     """The normal G72 FAKE entry creates its task/attempt and reaches the Worker queue on PostgreSQL."""
     client, sessions, _app = postgres_context
