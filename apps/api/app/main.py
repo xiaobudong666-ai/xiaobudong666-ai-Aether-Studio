@@ -3810,6 +3810,20 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
             raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
+        # G72/G75 FAKE-only: a previously claimed synthetic talking-head task
+        # must not outlive a committed Owner emergency stop by renewing its
+        # Worker lease or advancing its state. Serialize on the same circuit
+        # row as the Owner kill-switch. This is NOT a trusted STOP/settlement ACK.
+        if task.provider == "deterministic-fake-talking-head":
+            current_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+            if current_circuit is not None and current_circuit.state == "DISABLED":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PROVIDER_EMERGENCY_STOPPED",
+                        "message": "Owner紧急停止后，口播FAKE任务不得续租或推进状态",
+                    },
+                )
         # G73 FAKE-only: a lease heartbeat must not renew a task whose
         # CURRENT durable Attempt vanished, drifted from task.status, or gained
         # a disputed upstream receipt after claim. Prior-history checks alone
@@ -3878,6 +3892,20 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.cancel_requested_at is not None or task.status == "CANCELED":
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到响应已隔离"})
+        # G72/G75 FAKE-only: a previously claimed synthetic talking-head task
+        # must not outlive a committed Owner emergency stop by renewing its
+        # Worker lease or advancing its state. Serialize on the same circuit
+        # row as the Owner kill-switch. This is NOT a trusted STOP/settlement ACK.
+        if task.provider == "deterministic-fake-talking-head":
+            current_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+            if current_circuit is not None and current_circuit.state == "DISABLED":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PROVIDER_EMERGENCY_STOPPED",
+                        "message": "Owner紧急停止后，口播FAKE任务不得续租或推进状态",
+                    },
+                )
         if req.status != task.status and req.status not in WORKER_TRANSITIONS.get(task.status, set()):
             raise HTTPException(status_code=409, detail={"code": "ILLEGAL_GENERATION_TRANSITION", "message": "生成任务状态迁移不合法"})
         if req.upstreamJobId and task.upstream_job_id and req.upstreamJobId != task.upstream_job_id:
