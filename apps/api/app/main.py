@@ -2818,6 +2818,31 @@ def create_app(
                 },
             )
 
+        # G70/G71 FAKE-only: an orphan media ID claimed by a second task is
+        # ambiguous historical ownership, even when no project material or
+        # asset version has yet been published. Prevent double-accounting or
+        # attaching the same Sidecar object to two generation histories.
+        def require_unique_orphan_task_media_identity() -> None:
+            competing_task = db.execute(
+                select(DBGenerationTask.id).where(
+                    DBGenerationTask.tenant_id == context.tenant_id,
+                    DBGenerationTask.project_id == project_id,
+                    DBGenerationTask.media_id == orphan_media_id,
+                    DBGenerationTask.id != task.id,
+                ).limit(1)
+            ).scalar_one_or_none()
+            if competing_task is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ORPHAN_MEDIA_TASK_IDENTITY_CONFLICT",
+                        "message": "原始媒资已被其他任务关联，保持HELD，须独立核对媒资归属与存储额度",
+                    },
+                )
+
+        # Fail before inspecting a possibly shared synthetic orphan.
+        require_unique_orphan_task_media_identity()
+
         expected_sha256 = str(evidence.get("orphanedMediaSha256") or "").lower()
         # Failed-attempt audit evidence must be an exact byte count. Booleans,
         # floats and numeric strings are not an independent storage receipt.
@@ -3117,6 +3142,10 @@ def create_app(
         # Recheck after the read-only Sidecar inspection under the serialized
         # task lock, so a new durable storage hold cannot be ignored at commit.
         require_no_prior_storage_accounting()
+
+        # The read-only Sidecar probe permits an intervening task media claim.
+        # Recheck under the serialized write transaction before any debit.
+        require_unique_orphan_task_media_identity()
 
         # G70/G71/M11: task_id+kind alone is not a trusted reservation receipt.
         # A damaged ledger may retain a RESERVED row from another project,
