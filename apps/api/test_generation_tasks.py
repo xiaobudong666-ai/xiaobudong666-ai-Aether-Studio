@@ -9742,3 +9742,74 @@ def test_g72_claimed_fake_remix_revocation_blocks_worker_progress(generation_con
             assert snapshot() == before
     assert media.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+def test_g72_postclaim_fake_worker_script_poison_blocks_heartbeat_transition(generation_context):
+    """A claimed FAKE Worker must recheck immutable typed/derived request evidence.
+
+    Corrupting only Worker-facing script after claim must stop progress before
+    another lease extension or status transition. This checks two ordinary
+    persisted rows only, not the independent trusted receipt still required.
+    """
+    client, sessions, app, media = generation_context
+    project = create_project(client, "G72 postclaim FAKE script evidence fence")
+    source_id = _g72_fake_visual_fixture(sessions, project)
+    payload = _g72_fake_payload(
+        client, project, source_id, key="g72-postclaim-script-evidence-fence",
+    )
+    created = client.post(
+        f"/projects/{project['id']}/talking-head/fake-generation-tasks",
+        json=payload,
+    )
+    assert created.status_code == 202, created.text
+    task_id = created.json()["taskId"]
+    worker = "g72-postclaim-script-guard-worker"
+    leased = claim(client, worker_id=worker)
+    assert leased.status_code == 200 and leased.json()["taskId"] == task_id, leased.text
+    epoch = leased.json()["leaseEpoch"]
+
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.request_json["videoSubject"] == task.request_json["text"]
+        task.request_json = {
+            **task.request_json,
+            "videoSubject": "unauthorized synthetic script after Worker claim",
+        }
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            usage = tuple((u.kind, u.request_units, u.generated_seconds)
+                          for u in db.execute(select(DBGenerationUsageEntry).where(
+                              DBGenerationUsageEntry.task_id == task_id,
+                          )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.request_json["videoSubject"],
+                    attempt.status, attempt.reconciliation_state,
+                    usage, events, db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                    task.asset_version_id)
+
+    before = snapshot()
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+               "X-Worker-Lease-Epoch": str(epoch)}
+    for _ in range(2):
+        for action, body in (
+            ("heartbeat", {}),
+            ("transition", {"status": "RUNNING", "progress": 15,
+                            "message": "tampered Worker-facing FAKE script"}),
+        ):
+            denied = client.post(
+                f"/internal/generation-tasks/{task_id}/{action}",
+                headers=headers, json=body,
+            )
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+            assert snapshot() == before
+    assert media.uploads == 0
+    app.state.moneyprinter.assert_not_called()
