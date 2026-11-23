@@ -9461,12 +9461,13 @@ def test_g72_postgres_remix_expiry_while_final_source_lock_waits(
     app.state.moneyprinter.assert_not_called()
 
 
+@pytest.mark.parametrize("revocation", ["deactivation", "role_demotion"])
 def test_g70g71_postgres_fake_orphan_recovery_waits_for_owner_deactivation(
-    postgres_context, monkeypatch,
+    postgres_context, monkeypatch, revocation,
 ):
-    """Native disposable PG: Owner deactivation must serialize with FAKE orphan recovery.
+    """Native PG: Owner deactivation or role demotion must fence FAKE orphan recovery.
 
-    A pending account deactivation is not a durable M13 STOP ACK. The final
+    Pending deactivation/demotion is not an independent durable M13 STOP ACK. The final
     recovery write must wait for the exact identity-row writer and refuse the
     now-revoked originator, preserving HELD, RESERVED, quota and assets.
     Neither a real Provider nor protected historical media is used.
@@ -9571,8 +9572,11 @@ def test_g70g71_postgres_fake_orphan_recovery_waits_for_owner_deactivation(
                 DBUser.id == owner_id, DBUser.tenant_id == tenant_id,
             ).with_for_update()
         ).scalar_one()
-        assert locked_owner.is_active is True
-        locked_owner.is_active = False
+        assert locked_owner.is_active is True and locked_owner.role == "owner"
+        if revocation == "deactivation":
+            locked_owner.is_active = False
+        else:
+            locked_owner.role = "editor"
         identity_writer.flush()
         writer_pid = identity_writer.execute(
             text("SELECT pg_backend_pid()")
