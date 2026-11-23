@@ -9028,3 +9028,80 @@ def test_g72_postgres_owner_emergency_stop_fences_claimed_fake_worker(
             assert response.json()["detail"]["code"] == "PROVIDER_EMERGENCY_STOPPED"
             assert snapshot() == before
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("revocation", ["inactive", "downgraded", "project_reassigned"])
+def test_g72_postgres_claimed_fake_worker_originator_revocation_blocks_heartbeat_transition(
+    postgres_context, revocation,
+):
+    """Disposable PostgreSQL: a pre-revocation claim cannot renew/transition.
+
+    Mirrors the existing source Owner/project authorization required at
+    claim and artifact intake; no M13 ACK or reconciliation is manufactured.
+    """
+    client, sessions, app = postgres_context
+    worker = "g72-pg-revoked-originator-worker"
+    task_id, _, project_id, tenant_id, originator_id, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, worker, source_sha="b" * 64,
+        )
+    )
+    with sessions() as db:
+        owner = db.get(DBUser, originator_id)
+        project = db.get(DBProject, project_id)
+        assert owner is not None and owner.is_active and owner.role == "owner"
+        assert project is not None and project.owner_id == originator_id
+        if revocation == "inactive":
+            owner.is_active = False
+        elif revocation == "downgraded":
+            owner.role = "editor"
+        else:
+            substitute = DBUser(
+                id=str(uuid.uuid4()), tenant_id=tenant_id,
+                email=f"g72-pg-reassigned-{uuid.uuid4()}@example.com",
+                display_name="Synthetic Replacement Owner",
+                password_hash=owner.password_hash,
+                role="owner", is_active=True,
+                created_at=datetime.datetime.now(datetime.timezone.utc),
+                updated_at=datetime.datetime.now(datetime.timezone.utc),
+            )
+            db.add(substitute)
+            db.flush()
+            project.owner_id = substitute.id
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            entries = tuple((u.kind, u.request_units, u.generated_seconds)
+                            for u in db.execute(select(DBGenerationUsageEntry).where(
+                                DBGenerationUsageEntry.task_id == task_id,
+                            )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, attempt.status, attempt.reconciliation_state,
+                    entries, events, db.get(DBTenant, tenant_id).used_storage_bytes,
+                    task.asset_version_id)
+
+    before = snapshot()
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+               "X-Worker-Lease-Epoch": str(epoch)}
+    for _ in range(2):
+        for endpoint, body in (
+            ("heartbeat", {}),
+            ("transition", {"status": "RUNNING", "progress": 15,
+                            "message": "revoked synthetic originator"}),
+        ):
+            denied = client.post(
+                f"/internal/generation-tasks/{task_id}/{endpoint}",
+                headers=headers, json=body,
+            )
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
+            assert snapshot() == before
+    app.state.moneyprinter.assert_not_called()
