@@ -9168,3 +9168,61 @@ def test_g72_postgres_claimed_fake_remix_revocation_blocks_worker_progress(postg
             assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
             assert snapshot() == before
     app.state.moneyprinter.assert_not_called()
+
+def test_g72_postgres_postclaim_fake_worker_script_poison_blocks_progress(postgres_context):
+    """Native disposable PostgreSQL: postclaim script tamper must fence Worker.
+
+    FAKE-only, no independent M12 issuer or M13 trusted durable ACK assumed.
+    """
+    client, sessions, app = postgres_context
+    worker = "g72-pg-postclaim-script-guard-worker"
+    task_id, source_id, project_id, tenant_id, owner_id, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, worker, source_sha="d" * 64,
+        )
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.request_json["videoSubject"] == task.request_json["text"]
+        task.request_json = {
+            **task.request_json,
+            "videoSubject": "unauthorized PostgreSQL FAKE script after claim",
+        }
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            usage = tuple((u.kind, u.request_units, u.generated_seconds)
+                          for u in db.execute(select(DBGenerationUsageEntry).where(
+                              DBGenerationUsageEntry.task_id == task_id,
+                          )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, task.request_json["videoSubject"],
+                    attempt.status, attempt.reconciliation_state,
+                    usage, events, db.get(DBTenant, tenant_id).used_storage_bytes,
+                    task.asset_version_id)
+
+    before = snapshot()
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+               "X-Worker-Lease-Epoch": str(epoch)}
+    for _ in range(2):
+        for action, body in (
+            ("heartbeat", {}),
+            ("transition", {"status": "RUNNING", "progress": 15,
+                            "message": "postclaim unauthorized FAKE script"}),
+        ):
+            denied = client.post(
+                f"/internal/generation-tasks/{task_id}/{action}",
+                headers=headers, json=body,
+            )
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_REQUEST_INVALID"
+            assert snapshot() == before
+    app.state.moneyprinter.assert_not_called()
