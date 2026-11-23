@@ -3824,6 +3824,35 @@ def create_app(
                         "message": "Owner紧急停止后，口播FAKE任务不得续租或推进状态",
                     },
                 )
+            # G72 FAKE-only: a claimed lease is not permanent authority for
+            # a revoked originator. Mirror the existing claim/intake Owner and
+            # project predicates before renewing or transitioning a Worker.
+            # Lock the same Owner/project rows as final artifact settlement on PG.
+            originator_query = select(DBUser.id).where(
+                DBUser.id == task.requested_by,
+                DBUser.tenant_id == task.tenant_id,
+                DBUser.role == "owner",
+                DBUser.is_active.is_(True),
+            )
+            owned_project_query = select(DBProject.id).where(
+                DBProject.id == task.project_id,
+                DBProject.tenant_id == task.tenant_id,
+                DBProject.owner_id == task.requested_by,
+            )
+            if app_engine.dialect.name == "postgresql":
+                originator_query = originator_query.with_for_update()
+                owned_project_query = owned_project_query.with_for_update()
+            if (
+                db.execute(originator_query).scalar_one_or_none() is None
+                or db.execute(owned_project_query).scalar_one_or_none() is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                        "message": "原口播发起人或项目归属已失效，拒绝Worker续租及状态迁移",
+                    },
+                )
         # G73 FAKE-only: a lease heartbeat must not renew a task whose
         # CURRENT durable Attempt vanished, drifted from task.status, or gained
         # a disputed upstream receipt after claim. Prior-history checks alone
@@ -3904,6 +3933,35 @@ def create_app(
                     detail={
                         "code": "PROVIDER_EMERGENCY_STOPPED",
                         "message": "Owner紧急停止后，口播FAKE任务不得续租或推进状态",
+                    },
+                )
+            # G72 FAKE-only: a claimed lease is not permanent authority for
+            # a revoked originator. Mirror the existing claim/intake Owner and
+            # project predicates before renewing or transitioning a Worker.
+            # Lock the same Owner/project rows as final artifact settlement on PG.
+            originator_query = select(DBUser.id).where(
+                DBUser.id == task.requested_by,
+                DBUser.tenant_id == task.tenant_id,
+                DBUser.role == "owner",
+                DBUser.is_active.is_(True),
+            )
+            owned_project_query = select(DBProject.id).where(
+                DBProject.id == task.project_id,
+                DBProject.tenant_id == task.tenant_id,
+                DBProject.owner_id == task.requested_by,
+            )
+            if app_engine.dialect.name == "postgresql":
+                originator_query = originator_query.with_for_update()
+                owned_project_query = owned_project_query.with_for_update()
+            if (
+                db.execute(originator_query).scalar_one_or_none() is None
+                or db.execute(owned_project_query).scalar_one_or_none() is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                        "message": "原口播发起人或项目归属已失效，拒绝Worker续租及状态迁移",
                     },
                 )
         if req.status != task.status and req.status not in WORKER_TRANSITIONS.get(task.status, set()):
