@@ -9105,3 +9105,66 @@ def test_g72_postgres_claimed_fake_worker_originator_revocation_blocks_heartbeat
             assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
             assert snapshot() == before
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_postgres_claimed_fake_remix_revocation_blocks_worker_progress(postgres_context):
+    """Disposable native PG: a committed post-claim REMIX revocation fences work.
+
+    The original FAKE reservation remains HELD/RESERVED, without minting any
+    trusted M12 issuer, M13 ACK, refund, or real Provider call.
+    """
+    client, sessions, app = postgres_context
+    worker = "g72-pg-postclaim-remix-worker"
+    task_id, source_id, project_id, tenant_id, owner_id, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, worker, source_sha="c" * 64,
+        )
+    )
+    with sessions() as db:
+        db.add(DBRightsSnapshot(
+            id=str(uuid.uuid4()), tenant_id=tenant_id,
+            project_id=project_id, asset_version_id=source_id,
+            status="REVOKED", purpose="REMIX", territory="TEST",
+            valid_from=None, valid_until=None,
+            evidence_ref="g72-pg-postclaim-remix-revoked-synthetic",
+            captured_by=owner_id,
+            captured_at=datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(seconds=1),
+        ))
+        db.commit()
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            entries = tuple((u.kind, u.request_units, u.generated_seconds)
+                            for u in db.execute(select(DBGenerationUsageEntry).where(
+                                DBGenerationUsageEntry.task_id == task_id,
+                            )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, attempt.status, attempt.reconciliation_state,
+                    entries, events, db.get(DBTenant, tenant_id).used_storage_bytes,
+                    task.asset_version_id)
+
+    before = snapshot()
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+               "X-Worker-Lease-Epoch": str(epoch)}
+    for _ in range(2):
+        for action, body in (
+            ("heartbeat", {}),
+            ("transition", {"status": "RUNNING", "progress": 15,
+                            "message": "revoked synthetic source"}),
+        ):
+            denied = client.post(
+                f"/internal/generation-tasks/{task_id}/{action}",
+                headers=headers, json=body,
+            )
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+            assert snapshot() == before
+    app.state.moneyprinter.assert_not_called()
