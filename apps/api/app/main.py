@@ -3827,11 +3827,19 @@ def create_app(
                 detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
                         "message": "口播FAKE任务原始请求与持久合约不一致，拒绝Worker推进"},
             )
-        source = db.execute(select(DBAssetVersion).where(
+        # G72: the Owner rights-snapshot writer serializes REMIX changes on
+        # the source asset-version row. Hold that same PostgreSQL lock across
+        # the postclaim rights read AND the Worker heartbeat/transition commit,
+        # so a committed revoke cannot be overtaken by a stale Worker ACK.
+        # This stays FAKE-only; it is not an M12 issuer or M13 STOP ACK.
+        source_statement = select(DBAssetVersion).where(
             DBAssetVersion.id == source_id,
             DBAssetVersion.tenant_id == task.tenant_id,
             DBAssetVersion.project_id == task.project_id,
-        )).scalar_one_or_none()
+        )
+        if app_engine.dialect.name != "sqlite":
+            source_statement = source_statement.with_for_update()
+        source = db.execute(source_statement).scalar_one_or_none()
         if (
             source is None
             or source.media_type != "image"
