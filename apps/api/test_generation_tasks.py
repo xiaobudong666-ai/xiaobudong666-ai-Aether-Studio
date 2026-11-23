@@ -9473,3 +9473,81 @@ def test_g70g71_orphan_recovery_negative_storage_counter_keeps_held(
     assert media_store.inspections == 2
     assert media_store.uploads == 0
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("claim_timing", ["before_probe", "during_probe"])
+def test_g70g71_orphan_recovery_rejects_second_task_media_claim(
+    generation_context, monkeypatch, claim_timing,
+):
+    """FAKE-only: a second task's historical media claim is not an M13 receipt.
+
+    Even with no asset or material for the second task, the Owner must not
+    double-register/double-charge a Sidecar orphan whose identity is shared.
+    """
+    client, sessions, app, media_store = generation_context
+    project = create_project(client, "g70-shared-orphan-media-claim")
+    first_id = create_task(client, project, key="g70-shared-media-primary")["taskId"]
+    second_id = create_task(client, project, key="g70-shared-media-secondary")["taskId"]
+    media_id, _ = seed_g71_orphan_artifact(
+        sessions, media_store, project["id"], first_id
+    )
+
+    def add_competing_claim():
+        with sessions() as db:
+            other = db.get(DBGenerationTask, second_id)
+            assert other.media_id in (None, media_id)
+            other.media_id = media_id
+            db.commit()
+
+    if claim_timing == "before_probe":
+        add_competing_claim()
+    else:
+        original_inspect = media_store.inspect_media
+
+        def probe_then_competing_claim(project_id, candidate_media_id):
+            inspected = original_inspect(project_id, candidate_media_id)
+            add_competing_claim()
+            return inspected
+
+        monkeypatch.setattr(media_store, "inspect_media", probe_then_competing_claim)
+
+    def snapshot():
+        with sessions() as db:
+            primary = db.get(DBGenerationTask, first_id)
+            other = db.get(DBGenerationTask, second_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == first_id,
+            )).scalar_one()
+            project_row = db.get(DBProject, project["id"])
+            return (
+                primary.status, primary.error_code, primary.asset_version_id,
+                attempt.reconciliation_state, other.media_id,
+                db.get(DBTenant, primary.tenant_id).used_storage_bytes,
+                project_row.revision, project_row.materials,
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project["id"],
+                )).scalar_one(),
+                tuple(sorted((row.kind, row.attempt_id) for row in db.execute(
+                    select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == first_id,
+                    )
+                ).scalars())),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == first_id,
+                )).scalar_one(),
+            )
+
+    baseline = snapshot()
+    assert baseline[0] == "FAILED" and baseline[3] == "HELD"
+    expected = (*baseline[:4], media_id, *baseline[5:])
+    for _ in range(2):
+        denied = client.post(
+            f"/projects/{project['id']}/generation-tasks/{first_id}/recover-artifact",
+            json={"reason": "FAKE-only shared orphan media identity reconciliation"},
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == "ORPHAN_MEDIA_TASK_IDENTITY_CONFLICT"
+        assert snapshot() == expected
+    assert media_store.inspections == (0 if claim_timing == "before_probe" else 1)
+    assert media_store.uploads == 0
+    app.state.moneyprinter.assert_not_called()
