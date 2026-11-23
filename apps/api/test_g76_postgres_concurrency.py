@@ -8974,3 +8974,57 @@ def test_g70g71_postgres_orphan_recovery_rejects_second_task_media_claim(
     assert inspect.call_count == (0 if claim_timing == "before_probe" else 1)
     upload.assert_not_called()
     app.state.moneyprinter.assert_not_called()
+
+
+def test_g72_postgres_owner_emergency_stop_fences_claimed_fake_worker(
+    postgres_context,
+):
+    """Disposable PostgreSQL: Owner STOP wins over later FAKE heartbeat/transition.
+
+    No real Provider, protected storage, finance settlement or M13 STOP ACK.
+    """
+    client, sessions, app = postgres_context
+    worker = "g72-pg-owner-stop-worker"
+    task_id, _, _, tenant_id, _, epoch = _g72_create_claimed_typed_fake_source(
+        client, sessions, worker, source_sha="a" * 64,
+    )
+    stopped = client.post("/generation/providers/moneyprinter/kill-switch", json={
+        "disabled": True, "reasonCode": "OWNER_EMERGENCY",
+    })
+    assert stopped.status_code == 200 and stopped.json()["killSwitch"]["disabled"] is True
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, task_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == task_id,
+            )).scalar_one()
+            usage = tuple((u.kind, u.request_units, u.generated_seconds)
+                          for u in db.execute(select(DBGenerationUsageEntry).where(
+                              DBGenerationUsageEntry.task_id == task_id,
+                          )).scalars())
+            events = db.execute(select(func.count(DBGenerationEvent.id)).where(
+                DBGenerationEvent.generation_task_id == task_id,
+            )).scalar_one()
+            return (task.status, task.lease_owner, task.lease_epoch,
+                    task.lease_expires_at, attempt.status, attempt.reconciliation_state,
+                    usage, events, db.get(DBTenant, tenant_id).used_storage_bytes,
+                    task.asset_version_id)
+
+    before = snapshot()
+    headers = {"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": worker,
+               "X-Worker-Lease-Epoch": str(epoch)}
+    for _ in range(2):
+        for endpoint, payload in (
+            ("heartbeat", {}),
+            ("transition", {"status": "RUNNING", "progress": 15,
+                            "message": "synthetic stale worker"}),
+        ):
+            response = client.post(
+                f"/internal/generation-tasks/{task_id}/{endpoint}",
+                headers=headers, json=payload,
+            )
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["code"] == "PROVIDER_EMERGENCY_STOPPED"
+            assert snapshot() == before
+    app.state.moneyprinter.assert_not_called()
