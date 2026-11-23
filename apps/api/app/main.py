@@ -1180,6 +1180,7 @@ def create_app(
 
     def require_fake_talking_head_claim_authority(
         db: Session, project: DBProject, context: AuthContext,
+        *, lock_originator: bool = False,
     ) -> None:
         # Fail closed before any FAKE-only queue/usage write: the existing
         # Worker can claim only if the originating user is an active project
@@ -1191,12 +1192,20 @@ def create_app(
                 detail={"code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
                         "message": "当前身份无权建立可领取的模拟口播任务"},
             )
-        originator_id = db.execute(select(DBUser.id).where(
+        originator_query = select(DBUser.id).where(
             DBUser.id == context.user_id,
             DBUser.tenant_id == context.tenant_id,
             DBUser.role == "owner",
             DBUser.is_active.is_(True),
-        )).scalar_one_or_none()
+        )
+        # A human identity can be revoked while read-only Sidecar inspection
+        # runs. During the final serialized recovery write, lock this exact
+        # identity row so concurrent deactivation cannot pass a stale Owner
+        # read and then publish an orphan after its authorization is removed.
+        # Ordinary preflight/reads retain the existing nonlocking behavior.
+        if lock_originator and app_engine.dialect.name == "postgresql":
+            originator_query = originator_query.with_for_update()
+        originator_id = db.execute(originator_query).scalar_one_or_none()
         if originator_id is None:
             raise HTTPException(
                 status_code=403,
@@ -3070,8 +3079,12 @@ def create_app(
         # read-only call must not authorize a stale Owner to publish/recover the
         # historical FAKE artifact. Recheck current claim authority inside the
         # serialized final transaction, before any asset or quota changes.
+        # PG: also serialize on the Owner identity row; a concurrent uncommitted
+        # deactivation must commit or roll back before we accept recovery.
         if task.provider == "deterministic-fake-talking-head":
-            require_fake_talking_head_claim_authority(db, project, context)
+            require_fake_talking_head_claim_authority(
+                db, project, context, lock_originator=True,
+            )
         # Sidecar inspection runs outside the final write transaction. A
         # concurrent change to the saved generation capability/policy snapshot
         # invalidates the limits checked before the probe. Do not register an
