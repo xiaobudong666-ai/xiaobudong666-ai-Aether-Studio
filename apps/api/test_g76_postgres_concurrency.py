@@ -9318,9 +9318,14 @@ def test_g72_postclaim_remix_revoke_locks_worker_commit_pg(postgres_context, act
                 rights_writer.commit()
             denied = pending.result(timeout=15)
 
-    assert waited, "FAKE Worker bypassed the source rights writer row lock"
-    assert denied.status_code == 409, denied.text
-    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    assert denied.status_code == 409, (
+        "postclaim Worker returned before/after writer release: " + denied.text
+    )
+    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED", denied.text
+    assert waited, (
+        "FAKE Worker did not show a PostgreSQL source row lock wait; "
+        "response=" + denied.text
+    )
     assert task_snapshot() == baseline
     app.state.moneyprinter.assert_not_called()
 
