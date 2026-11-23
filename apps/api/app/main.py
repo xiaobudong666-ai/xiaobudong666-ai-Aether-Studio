@@ -3807,6 +3807,26 @@ def create_app(
                 detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
                         "message": "口播源素材持久标识异常，拒绝Worker继续处理"},
             )
+        # G72 FAKE-only postclaim fence: the original typed Owner request
+        # and Worker-facing simulation contract can be changed after a
+        # legitimate Worker claim. Recheck the same creation evidence required
+        # by claim and artifact intake before renewing a lease or advancing
+        # an Attempt. A local TASK_CREATED row is not an independent issuer.
+        if (
+            stored.get("fakeTaskType") != "talking-head"
+            or stored.get("simulatedOutput") is not True
+            or stored.get("publishable") is not False
+            or stored.get("confirmSyntheticTestOnly") is not True
+            or type(stored.get("outputCount")) is not int
+            or stored["outputCount"] != 1
+            or stored.get("inputAssetVersionIds") != [source_id]
+            or not fake_talking_head_creation_evidence_matches(db, task, stored)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                        "message": "口播FAKE任务原始请求与持久合约不一致，拒绝Worker推进"},
+            )
         source = db.execute(select(DBAssetVersion).where(
             DBAssetVersion.id == source_id,
             DBAssetVersion.tenant_id == task.tenant_id,
