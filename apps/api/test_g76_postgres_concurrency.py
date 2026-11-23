@@ -9343,3 +9343,119 @@ def test_g72_postclaim_remix_revoke_locks_worker_commit_pg(postgres_context, act
     assert task_snapshot() == baseline
     app.state.moneyprinter.assert_not_called()
 
+
+def test_g72_postgres_remix_expiry_while_final_source_lock_waits(
+    postgres_context, monkeypatch,
+):
+    """Native disposable PG: final FAKE intake must use time after the rights lock.
+
+    A valid-at-upload REMIX grant may expire while a concurrent rights writer
+    holds the source-version lock. Waiting itself is not a trusted M12 grant;
+    a stale timestamp captured before the wait must not settle generated usage.
+    This uses controlled test time, no real Provider, and no protected records.
+    """
+    from app import main as api_main
+
+    client, sessions, app = postgres_context
+    worker = "g72-pg-final-rights-expiry-worker"
+    before_expiry = datetime.datetime.now(datetime.timezone.utc)
+    expires_at = before_expiry + datetime.timedelta(minutes=20)
+    task_id, source_id, project_id, tenant_id, _, epoch = (
+        _g72_create_claimed_typed_fake_source(
+            client, sessions, worker, source_sha="f" * 64,
+            valid_until=expires_at,
+        )
+    )
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task_id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one()
+        task.status = attempt.status = "RUNNING"
+        task.lease_expires_at = before_expiry + datetime.timedelta(hours=2)
+        db.commit()
+        initial_storage = db.get(DBTenant, tenant_id).used_storage_bytes
+        initial_assets = db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one()
+    assert initial_assets == 1
+
+    clock = {"now": before_expiry}
+    monkeypatch.setattr(api_main, "utc_now", lambda: clock["now"])
+
+    def intake():
+        with TestClient(app) as worker_client:
+            return worker_client.post(
+                f"/internal/generation-tasks/{task_id}/artifact-intake",
+                headers={
+                    "X-Worker-Token": WORKER_TOKEN,
+                    "X-Worker-Id": worker,
+                    "X-Worker-Lease-Epoch": str(epoch),
+                },
+                data={"providerArtifactId": "g72-pg-expired-while-locked"},
+                files={"file": (
+                    "synthetic.mp4", b"synthetic-final-lock-expiry-bytes", "video/mp4",
+                )},
+            )
+
+    with sessions() as rights_writer:
+        # The real rights writer serializes on this source-version row.
+        assert rights_writer.execute(
+            select(DBAssetVersion.id).where(
+                DBAssetVersion.id == source_id,
+                DBAssetVersion.tenant_id == tenant_id,
+                DBAssetVersion.project_id == project_id,
+            ).with_for_update()
+        ).scalar_one() == source_id
+        writer_pid = rights_writer.execute(
+            text("SELECT pg_backend_pid()")
+        ).scalar_one()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(intake)
+            blocked_by_writer = False
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    with sessions() as observer:
+                        blocker = observer.execute(text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "AND pid <> pg_backend_pid() "
+                            "AND :writer_pid = ANY(pg_blocking_pids(pid))"
+                        ), {"writer_pid": writer_pid}).scalar_one()
+                    if blocker:
+                        blocked_by_writer = True
+                        break
+                    if pending.done():
+                        break
+                    time.sleep(0.05)
+                # Model expiry only AFTER the HTTP intake demonstrably waited
+                # on this actual PostgreSQL source lock.
+                assert blocked_by_writer, (
+                    "FAKE final intake never waited on the rights writer row lock"
+                )
+                clock["now"] = expires_at + datetime.timedelta(seconds=1)
+            finally:
+                rights_writer.commit()
+            denied = pending.result(timeout=20)
+
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_SOURCE_REVOKED"
+    with sessions() as db:
+        task = db.get(DBGenerationTask, task_id)
+        assert task.status == "RUNNING"
+        assert task.asset_version_id is None
+        assert db.execute(select(func.count(DBAssetVersion.id)).where(
+            DBAssetVersion.project_id == project_id,
+        )).scalar_one() == initial_assets
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "SETTLED",
+        )).scalar_one() == 0
+        assert db.execute(select(func.count(DBGenerationUsageEntry.id)).where(
+            DBGenerationUsageEntry.task_id == task_id,
+            DBGenerationUsageEntry.kind == "RESERVED",
+        )).scalar_one() == 1
+        assert db.get(DBTenant, tenant_id).used_storage_bytes == initial_storage
+    app.state.moneyprinter.assert_not_called()
