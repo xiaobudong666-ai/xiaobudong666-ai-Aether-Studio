@@ -8844,3 +8844,133 @@ def test_g70g71_postgres_orphan_recovery_negative_storage_counter_keeps_held(
     assert inspection.call_count == 2
     upload.assert_not_called()
     app.state.moneyprinter.assert_not_called()
+
+
+@pytest.mark.parametrize("claim_timing", ["before_probe", "during_probe"])
+def test_g70g71_postgres_orphan_recovery_rejects_second_task_media_claim(
+    postgres_context, monkeypatch, claim_timing,
+):
+    """Disposable native PostgreSQL FAKE-only: shared media task identity is HELD.
+
+    No protected media, genuine Provider, trusted M13 receipt or payout.
+    """
+    client, sessions, app = postgres_context
+    first_id = _create_task(client)
+    payload = b"synthetic-postgres-shared-orphan-media"
+    media_id = "orphan-shared-" + first_id[:8]
+    digest = hashlib.sha256(payload).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    metadata = {
+        "durationSeconds": 1.0, "sizeBytes": len(payload),
+        "video": {"codec": "h264", "width": 320, "height": 240},
+        "audio": None,
+    }
+    competing_id = str(uuid.uuid4())
+    with sessions() as db:
+        task = db.get(DBGenerationTask, first_id)
+        project_id = task.project_id
+        attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == first_id,
+            DBGenerationAttempt.attempt_no == 1,
+        )).scalar_one()
+        task.status = "FAILED"
+        task.progress = 100
+        task.error_code = "ARTIFACT_INGEST_FAILED"
+        task.error_message = "synthetic orphan with competing task identity"
+        task.upstream_job_id = "synthetic-upstream-shared"
+        task.provider_artifact_id = "synthetic-artifact-shared"
+        task.media_id = media_id
+        task.completed_at = task.updated_at = now
+        task.lease_owner = task.lease_expires_at = None
+        attempt.status = "FAILED"
+        attempt.upstream_job_id = task.upstream_job_id
+        attempt.reconciliation_state = "HELD"
+        attempt.completed_at = now
+        db.add(DBGenerationEvent(
+            id=str(uuid.uuid4()), generation_task_id=first_id,
+            attempt_id=attempt.id, event_type="ARTIFACT_INGEST_FAILED",
+            from_status="INGESTING", to_status="FAILED",
+            actor_type="SYSTEM", actor_id="api",
+            metadata_json={
+                "originalUpstreamJobId": task.upstream_job_id,
+                "originalProviderArtifactId": task.provider_artifact_id,
+                "orphanedMediaId": media_id,
+                "orphanedMediaSha256": digest,
+                "orphanedMediaSizeBytes": len(payload),
+                "orphanedMediaMetadata": metadata,
+                "reconciliationState": "HELD",
+            },
+            created_at=now,
+        ))
+        db.add(DBGenerationTask(
+            id=competing_id,
+            tenant_id=task.tenant_id, project_id=project_id,
+            requested_by=task.requested_by, provider=task.provider,
+            status="FAILED", progress=100,
+            message="synthetic migrated competing media claim",
+            request_json=task.request_json, request_hash=task.request_hash,
+            capability_snapshot_json=task.capability_snapshot_json,
+            capability_snapshot_hash=task.capability_snapshot_hash,
+            idempotency_key=str(uuid.uuid4()),
+            media_id=media_id if claim_timing == "before_probe" else None,
+            created_at=now, updated_at=now,
+        ))
+        db.commit()
+
+    media = app.state.video_use
+    media.media_objects[(project_id, media_id)] = payload
+    original_inspect = media.inspect_media
+
+    def probe_then_claim(project, candidate):
+        result = original_inspect(project, candidate)
+        if claim_timing == "during_probe":
+            with sessions() as other_db:
+                other_db.get(DBGenerationTask, competing_id).media_id = media_id
+                other_db.commit()
+        return {**result, "contentType": "video/mp4", "metadata": metadata}
+
+    inspect = MagicMock(side_effect=probe_then_claim)
+    upload = MagicMock(wraps=media.upload_media)
+    monkeypatch.setattr(media, "inspect_media", inspect)
+    monkeypatch.setattr(media, "upload_media", upload)
+
+    def snapshot():
+        with sessions() as db:
+            task = db.get(DBGenerationTask, first_id)
+            other = db.get(DBGenerationTask, competing_id)
+            attempt = db.execute(select(DBGenerationAttempt).where(
+                DBGenerationAttempt.generation_task_id == first_id,
+            )).scalar_one()
+            project = db.get(DBProject, project_id)
+            return (
+                task.status, task.error_code, task.asset_version_id,
+                attempt.reconciliation_state, other.media_id,
+                db.get(DBTenant, task.tenant_id).used_storage_bytes,
+                project.revision, project.materials,
+                db.execute(select(func.count(DBAssetVersion.id)).where(
+                    DBAssetVersion.project_id == project_id,
+                )).scalar_one(),
+                tuple(sorted((row.kind, row.attempt_id) for row in db.execute(
+                    select(DBGenerationUsageEntry).where(
+                        DBGenerationUsageEntry.task_id == first_id,
+                    )
+                ).scalars())),
+                db.execute(select(func.count(DBGenerationEvent.id)).where(
+                    DBGenerationEvent.generation_task_id == first_id,
+                )).scalar_one(),
+            )
+
+    baseline = snapshot()
+    assert baseline[0] == "FAILED" and baseline[3] == "HELD"
+    expected = (*baseline[:4], media_id, *baseline[5:])
+    for _ in range(2):
+        denied = client.post(
+            f"/projects/{project_id}/generation-tasks/{first_id}/recover-artifact",
+            json={"reason": "FAKE-only shared task media identity"},
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"]["code"] == "ORPHAN_MEDIA_TASK_IDENTITY_CONFLICT"
+        assert snapshot() == expected
+    assert inspect.call_count == (0 if claim_timing == "before_probe" else 1)
+    upload.assert_not_called()
+    app.state.moneyprinter.assert_not_called()
