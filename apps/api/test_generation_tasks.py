@@ -3622,6 +3622,25 @@ def test_g72_originator_revocation_fences_fake_worker_before_sidecar(
     if phase == "queued":
         assert claim(client).status_code == 204
     else:
+        # After a committed revocation, the already-claimed FAKE Worker must
+        # not renew or move state while protected usage remains untouched.
+        headers = {
+            "X-Worker-Token": WORKER_TOKEN,
+            "X-Worker-Id": before_state[1],
+            "X-Worker-Lease-Epoch": str(before_state[2]),
+        }
+        for _ in range(2):
+            for endpoint, body in (
+                ("heartbeat", {}),
+                ("transition", {"status": "RUNNING", "progress": 15,
+                                "message": "revoked synthetic originator"}),
+            ):
+                denied = client.post(
+                    f"/internal/generation-tasks/{task_id}/{endpoint}",
+                    headers=headers, json=body,
+                )
+                assert denied.status_code == 409, denied.text
+                assert denied.json()["detail"]["code"] == "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED"
         rejected = client.post(
             f"/internal/generation-tasks/{task_id}/artifact-intake",
             headers={"X-Worker-Token": WORKER_TOKEN, "X-Worker-Id": "worker-a"},
