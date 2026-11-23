@@ -3587,20 +3587,35 @@ def create_app(
                 # after the originating Owner is deactivated/downgraded or the
                 # project no longer belongs to that Owner. This is a read-only
                 # revocation fence; no grant/delegation policy is selected.
-                active_originator = db.execute(
-                    select(DBUser.id).where(
-                        DBUser.id == candidate.requested_by,
-                        DBUser.tenant_id == candidate.tenant_id,
-                        DBUser.role == "owner",
-                        DBUser.is_active.is_(True),
+                # A concurrent Owner deactivation/demotion or project
+                # transfer must not be bypassed by a Worker claim reading
+                # its pre-commit identity. Do not wait for an Owner writer
+                # while holding a queued task row: skip this candidate and
+                # leave all its lease/Attempt/RESERVED evidence unchanged.
+                # Only PG FAKE-only claim is affected; no delegation policy.
+                originator_claim_query = select(DBUser.id).where(
+                    DBUser.id == candidate.requested_by,
+                    DBUser.tenant_id == candidate.tenant_id,
+                    DBUser.role == "owner",
+                    DBUser.is_active.is_(True),
+                )
+                project_owner_claim_query = select(DBProject.id).where(
+                    DBProject.id == candidate.project_id,
+                    DBProject.tenant_id == candidate.tenant_id,
+                    DBProject.owner_id == candidate.requested_by,
+                )
+                if app_engine.dialect.name == "postgresql":
+                    originator_claim_query = originator_claim_query.with_for_update(
+                        skip_locked=True
                     )
+                    project_owner_claim_query = project_owner_claim_query.with_for_update(
+                        skip_locked=True
+                    )
+                active_originator = db.execute(
+                    originator_claim_query
                 ).scalar_one_or_none()
                 original_project_owner = db.execute(
-                    select(DBProject.id).where(
-                        DBProject.id == candidate.project_id,
-                        DBProject.tenant_id == candidate.tenant_id,
-                        DBProject.owner_id == candidate.requested_by,
-                    )
+                    project_owner_claim_query
                 ).scalar_one_or_none()
                 if active_originator is None or original_project_owner is None:
                     continue
@@ -3639,15 +3654,26 @@ def create_app(
                     continue
                 if not fake_talking_head_creation_evidence_matches(db, candidate, stored):
                     continue
-                source = db.execute(select(DBAssetVersion).where(
+                # The Owner rights-snapshot writer locks this same source
+                # version. A claim must skip an in-flight revoke rather than
+                # grant a lease using its stale committed ALLOWED snapshot.
+                # Recheck expiry against time *after* source lock acquisition.
+                source_claim_query = select(DBAssetVersion).where(
                     DBAssetVersion.id == image_asset_id,
                     DBAssetVersion.project_id == candidate.project_id,
                     DBAssetVersion.tenant_id == candidate.tenant_id,
-                )).scalar_one_or_none()
+                )
+                if app_engine.dialect.name == "postgresql":
+                    source_claim_query = source_claim_query.with_for_update(
+                        skip_locked=True
+                    )
+                source = db.execute(source_claim_query).scalar_one_or_none()
                 if (
                     source is None or source.media_type != "image"
                     or source.sha256 != source_sha256
-                    or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
+                    or not rights_decision(
+                        latest_rights_snapshot(db, source.id, "REMIX"), utc_now()
+                    )["allowed"]
                 ):
                     continue
             if candidate_mode == "moneyprinter":
