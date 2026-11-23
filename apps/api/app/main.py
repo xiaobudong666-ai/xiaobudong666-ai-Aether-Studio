@@ -3789,6 +3789,43 @@ def create_app(
             "circuitProbeEpoch": task.circuit_probe_epoch,
         }
 
+    def require_fake_talking_head_current_remix_rights(db: Session, task: DBGenerationTask) -> None:
+        """Fail closed if a claimed FAKE task's input REMIX right was revoked.
+
+        This reads only persisted synthetic task/source rights. It cannot
+        manufacture an M12 trusted issuer, M13 STOP ACK, or settle usage.
+        """
+        stored = task.request_json
+        source_id = stored.get("imageAssetId") if isinstance(stored, dict) else None
+        source_hash = stored.get("sourceAssetSha256") if isinstance(stored, dict) else None
+        if (
+            not isinstance(source_id, str) or not source_id
+            or not isinstance(source_hash, str) or not source_hash
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                        "message": "口播源素材持久标识异常，拒绝Worker继续处理"},
+            )
+        source = db.execute(select(DBAssetVersion).where(
+            DBAssetVersion.id == source_id,
+            DBAssetVersion.tenant_id == task.tenant_id,
+            DBAssetVersion.project_id == task.project_id,
+        )).scalar_one_or_none()
+        if (
+            source is None
+            or source.media_type != "image"
+            or source.sha256 != source_hash
+            or not rights_decision(
+                latest_rights_snapshot(db, source.id, "REMIX"), utc_now(),
+            )["allowed"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_TALKING_HEAD_SOURCE_REVOKED",
+                        "message": "口播输入图片授权或版本已失效，拒绝Worker续租及迁移"},
+            )
+
     @created_app.post("/internal/generation-tasks/{task_id}/heartbeat")
     def heartbeat_generation_task(
         task_id: str,
@@ -3853,6 +3890,10 @@ def create_app(
                         "message": "原口播发起人或项目归属已失效，拒绝Worker续租及状态迁移",
                     },
                 )
+        if task.provider == "deterministic-fake-talking-head":
+            # Previously claimed FAKE work loses permission to progress when
+            # the input REMIX right is revoked after claim.
+            require_fake_talking_head_current_remix_rights(db, task)
         # G73 FAKE-only: a lease heartbeat must not renew a task whose
         # CURRENT durable Attempt vanished, drifted from task.status, or gained
         # a disputed upstream receipt after claim. Prior-history checks alone
@@ -3964,6 +4005,8 @@ def create_app(
                         "message": "原口播发起人或项目归属已失效，拒绝Worker续租及状态迁移",
                     },
                 )
+        if task.provider == "deterministic-fake-talking-head":
+            require_fake_talking_head_current_remix_rights(db, task)
         if req.status != task.status and req.status not in WORKER_TRANSITIONS.get(task.status, set()):
             raise HTTPException(status_code=409, detail={"code": "ILLEGAL_GENERATION_TRANSITION", "message": "生成任务状态迁移不合法"})
         if req.upstreamJobId and task.upstream_job_id and req.upstreamJobId != task.upstream_job_id:
