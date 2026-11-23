@@ -193,6 +193,41 @@ def generation_failure_policy_valid(snapshot: dict) -> bool:
     return True
 
 
+def generation_prior_history_safe(db: Session, task: DBGenerationTask) -> bool:
+    """Fail closed on damaged/paid earlier attempts, including post-claim drift.
+
+    The same read-only durable invariant binds both Worker lease admission and
+    subsequent Worker transitions. A clean FAILED/NOT_SUBMITTED prefix is
+    allowed; missing, renumbered, future or billable history is not a STOP ACK.
+    """
+    if type(task.attempts) is not int or task.attempts < 1:
+        return False
+    history = list(db.execute(
+        select(
+            DBGenerationAttempt.attempt_no,
+            DBGenerationAttempt.status,
+            DBGenerationAttempt.reconciliation_state,
+            DBGenerationAttempt.submission_started_at,
+            DBGenerationAttempt.upstream_job_id,
+        ).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no != task.attempts,
+        ).order_by(DBGenerationAttempt.attempt_no)
+    ).all())
+    return (
+        len(history) == task.attempts - 1
+        and all(
+            number == expected
+            and status == "FAILED"
+            and reconciliation == "NOT_SUBMITTED"
+            and started_at is None
+            and upstream_id is None
+            for expected, (number, status, reconciliation, started_at, upstream_id)
+            in enumerate(history, start=1)
+        )
+    )
+
+
 def generation_failure_history_valid(history: object) -> bool:
     """Treat damaged durable circuit history as untrusted, without rewriting it.
 
@@ -710,6 +745,40 @@ def create_app(
             }
         return decision
 
+    def fake_talking_head_reserved_ledger_valid(
+        db: Session, task: DBGenerationTask, attempt: DBGenerationAttempt,
+        *, lock: bool = False,
+    ) -> bool:
+        """Recheck the original FAKE-only reservation across claim and intake.
+
+        A synthetic Worker lease or Sidecar upload cannot authorize SETTLED
+        usage when the original RESERVED ledger changed after claim. Lock
+        the existing ledger row at the final PostgreSQL transaction boundary.
+        This is validation only, never a refund/reconciliation operation.
+        """
+        snapshot = task.capability_snapshot_json
+        if not isinstance(snapshot, dict):
+            return False
+        query = select(DBGenerationUsageEntry).where(
+            DBGenerationUsageEntry.task_id == task.id,
+        )
+        if lock and app_engine.dialect.name == "postgresql":
+            query = query.with_for_update()
+        rows = list(db.execute(query).scalars())
+        if len(rows) != 1:
+            return False
+        usage = rows[0]
+        return (
+            usage.kind == "RESERVED"
+            and usage.tenant_id == task.tenant_id
+            and usage.project_id == task.project_id
+            and usage.attempt_id == attempt.id
+            and usage.reservation_key == f"generation:{task.id}"
+            and usage.request_units == 1
+            and usage.generated_seconds == 0
+            and usage.config_version_id == snapshot.get("configVersionId")
+        )
+
     def fake_talking_head_creation_evidence_matches(
         db: Session, task: DBGenerationTask, request: dict
     ) -> bool:
@@ -1111,6 +1180,7 @@ def create_app(
 
     def require_fake_talking_head_claim_authority(
         db: Session, project: DBProject, context: AuthContext,
+        *, lock_originator: bool = False,
     ) -> None:
         # Fail closed before any FAKE-only queue/usage write: the existing
         # Worker can claim only if the originating user is an active project
@@ -1122,12 +1192,20 @@ def create_app(
                 detail={"code": "FAKE_TALKING_HEAD_ORIGINATOR_NOT_PROJECT_OWNER",
                         "message": "当前身份无权建立可领取的模拟口播任务"},
             )
-        originator_id = db.execute(select(DBUser.id).where(
+        originator_query = select(DBUser.id).where(
             DBUser.id == context.user_id,
             DBUser.tenant_id == context.tenant_id,
             DBUser.role == "owner",
             DBUser.is_active.is_(True),
-        )).scalar_one_or_none()
+        )
+        # A human identity can be revoked while read-only Sidecar inspection
+        # runs. During the final serialized recovery write, lock this exact
+        # identity row so concurrent deactivation cannot pass a stale Owner
+        # read and then publish an orphan after its authorization is removed.
+        # Ordinary preflight/reads retain the existing nonlocking behavior.
+        if lock_originator and app_engine.dialect.name == "postgresql":
+            originator_query = originator_query.with_for_update()
+        originator_id = db.execute(originator_query).scalar_one_or_none()
         if originator_id is None:
             raise HTTPException(
                 status_code=403,
@@ -2349,7 +2427,35 @@ def create_app(
                         DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
                         DBGenerationAttempt.submission_started_at.is_not(None),
                         DBGenerationAttempt.upstream_job_id.is_not(None),
+                        DBGenerationAttempt.status != "FAILED",
                     ),
+                ).limit(1)
+            ).scalar_one_or_none()
+            # A missing or renumbered older attempt is not a trusted STOP ACK.
+            # Preserve RESERVED usage until the full FAILED/NOT_SUBMITTED
+            # attempt history is present and independently reconcilable.
+            # A count alone can hide migrated attempt 0 while attempt 1 is missing.
+            # Require exact positive prior numbering before quota release or retry.
+            earlier_attempt_numbers = db.execute(
+                select(DBGenerationAttempt.attempt_no).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no < task.attempts,
+                ).order_by(DBGenerationAttempt.attempt_no)
+            ).scalars().all()
+            earlier_attempt_sequence_valid = (
+                len(earlier_attempt_numbers) == task.attempts - 1
+                and all(
+                    number == expected
+                    for expected, number in enumerate(earlier_attempt_numbers, start=1)
+                )
+            )
+            # A legacy attempt numbered beyond task.attempts may still contain
+            # an accepted/billable upstream result. The current row being clean
+            # does not authorize quota release when history extends into future.
+            unexpected_future_attempt = db.execute(
+                select(DBGenerationAttempt.id).where(
+                    DBGenerationAttempt.generation_task_id == task.id,
+                    DBGenerationAttempt.attempt_no > task.attempts,
                 ).limit(1)
             ).scalar_one_or_none()
             # G70/G71 + M11 FAKE-only fail-closed prerequisite. A claimed
@@ -2365,6 +2471,9 @@ def create_app(
                 # Durable HELD/accepted evidence is not a preclaim cancellation.
                 or attempt.reconciliation_state != "NOT_SUBMITTED"
                 or unresolved_prior is not None
+                or task.attempts < 1
+                or not earlier_attempt_sequence_valid
+                or unexpected_future_attempt is not None
                 # Orphaned lease markers imply possible Worker ownership even
                 # when historical status fields still read QUEUED.
                 or task.lease_owner is not None
@@ -2474,7 +2583,34 @@ def create_app(
                     DBGenerationAttempt.reconciliation_state != "NOT_SUBMITTED",
                     DBGenerationAttempt.submission_started_at.is_not(None),
                     DBGenerationAttempt.upstream_job_id.is_not(None),
+                    DBGenerationAttempt.status != "FAILED",
                 ),
+            ).limit(1)
+        ).scalar_one_or_none()
+        # Earlier attempt rows must form a complete, terminal FAILED prefix.
+        # A missing/corrupted row cannot prove that a billable POST never ran.
+        # A count alone can hide migrated attempt 0 while attempt 1 is missing.
+        # Require exact positive prior numbering before quota release or retry.
+        earlier_attempt_numbers = db.execute(
+            select(DBGenerationAttempt.attempt_no).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no < task.attempts,
+            ).order_by(DBGenerationAttempt.attempt_no)
+        ).scalars().all()
+        earlier_attempt_sequence_valid = (
+            len(earlier_attempt_numbers) == task.attempts - 1
+            and all(
+                number == expected
+                for expected, number in enumerate(earlier_attempt_numbers, start=1)
+            )
+        )
+        # A migrated future attempt can retain a submitted/billable result
+        # even when the task's current attempt says NOT_SUBMITTED.
+        # Reject before mutating attempts, use, lease, or audit.
+        unexpected_future_attempt = db.execute(
+            select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.generation_task_id == task.id,
+                DBGenerationAttempt.attempt_no > task.attempts,
             ).limit(1)
         ).scalar_one_or_none()
         prior_attempt = db.execute(
@@ -2486,12 +2622,22 @@ def create_app(
         if (
             prior_attempt is None
             or unresolved_earlier_attempt is not None
+            or task.attempts < 1
+            or not earlier_attempt_sequence_valid
+            or unexpected_future_attempt is not None
             or prior_attempt.status != task.status
             or prior_attempt.reconciliation_state != "NOT_SUBMITTED"
             # Worker claim durably writes this BEFORE any upstream POST. The
             # missing receipt is ambiguous after a crash/timeout, not proof
             # that no billable request was accepted; never replay blindly.
             or prior_attempt.submission_started_at is not None
+            # G70/G71: a legacy FAILED status does not revoke an orphaned
+            # Worker lease. Even an expired/missing counterpart lease marker
+            # means the previous dispatch might still be executing upstream.
+            # Do not erase the lease or create a new potentially billable attempt
+            # without independently trusted stop/reconciliation evidence.
+            or task.lease_owner is not None
+            or task.lease_expires_at is not None
             or task.upstream_job_id is not None
             or task.provider_artifact_id is not None
             or task.media_id is not None
@@ -2607,12 +2753,32 @@ def create_app(
             )
 
         attempt = current_generation_attempt(db, task)
-        if attempt is None or attempt.reconciliation_state != "HELD":
+        # A HELD flag alone is insufficient if the current Attempt is still
+        # RUNNING or now names a different upstream submission. Refuse an
+        # orphan inspection before trusting inconsistent durable evidence.
+        if (
+            attempt is None
+            or attempt.status != "FAILED"
+            or attempt.reconciliation_state != "HELD"
+            or attempt.upstream_job_id != task.upstream_job_id
+        ):
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "ARTIFACT_RECOVERY_EVIDENCE_MISSING",
                     "message": "缺少 HELD 对账状态，禁止人工恢复",
+                },
+            )
+        # G70/G71: a valid current HELD orphan does not prove that every
+        # other Attempt belongs to the same generation history. Legacy or
+        # future billable attempts must be reconciled independently before
+        # inspecting or registering this synthetic orphan.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_RECONCILIATION_REQUIRED",
+                    "message": "其他生成尝试存在未确认或损坏的持久证据，保持HELD，禁止直接恢复",
                 },
             )
         if not task.upstream_job_id or not task.provider_artifact_id:
@@ -2661,6 +2827,31 @@ def create_app(
                 },
             )
 
+        # G70/G71 FAKE-only: an orphan media ID claimed by a second task is
+        # ambiguous historical ownership, even when no project material or
+        # asset version has yet been published. Prevent double-accounting or
+        # attaching the same Sidecar object to two generation histories.
+        def require_unique_orphan_task_media_identity() -> None:
+            competing_task = db.execute(
+                select(DBGenerationTask.id).where(
+                    DBGenerationTask.tenant_id == context.tenant_id,
+                    DBGenerationTask.project_id == project_id,
+                    DBGenerationTask.media_id == orphan_media_id,
+                    DBGenerationTask.id != task.id,
+                ).limit(1)
+            ).scalar_one_or_none()
+            if competing_task is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ORPHAN_MEDIA_TASK_IDENTITY_CONFLICT",
+                        "message": "原始媒资已被其他任务关联，保持HELD，须独立核对媒资归属与存储额度",
+                    },
+                )
+
+        # Fail before inspecting a possibly shared synthetic orphan.
+        require_unique_orphan_task_media_identity()
+
         expected_sha256 = str(evidence.get("orphanedMediaSha256") or "").lower()
         # Failed-attempt audit evidence must be an exact byte count. Booleans,
         # floats and numeric strings are not an independent storage receipt.
@@ -2678,6 +2869,36 @@ def create_app(
                     "message": "孤儿媒资缺少有效 SHA256 或字节数证据",
                 },
             )
+
+        # G70/G71/M13 FAKE-only: an earlier storage OPENED/RELEASED audit
+        # trail is not an independently reconciled storage debit. In particular,
+        # an OPENED hold with a missing Sidecar ACK may already have charged the
+        # tenant while no project material or asset exists. The Owner recovery
+        # route would otherwise charge storage a SECOND time for the same bytes.
+        # Even a RELEASED row is not sufficient by itself to prove a refund.
+        # Do not infer M13 APPLY/STOP ACK from audit rows; require separate
+        # trusted reconciliation before this route can safely register it.
+        def require_no_prior_storage_accounting() -> None:
+            prior_storage_event = db.execute(
+                select(DBGenerationEvent.id).where(
+                    DBGenerationEvent.generation_task_id == task.id,
+                    DBGenerationEvent.event_type.in_(
+                        ("STORAGE_RESERVATION_OPENED", "STORAGE_RESERVATION_RELEASED")
+                    ),
+                ).limit(1)
+            ).first()
+            if prior_storage_event is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_RECOVERY_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "原产物已有存储预留或释放记录，未经可信对账禁止二次占额与恢复",
+                    },
+                )
+
+        # Read-only Sidecar inspection is not an authorization to inspect a
+        # paid orphan with unresolved storage accounting.
+        require_no_prior_storage_accounting()
 
         try:
             inspected = created_app.state.video_use.inspect_media(
@@ -2858,8 +3079,12 @@ def create_app(
         # read-only call must not authorize a stale Owner to publish/recover the
         # historical FAKE artifact. Recheck current claim authority inside the
         # serialized final transaction, before any asset or quota changes.
+        # PG: also serialize on the Owner identity row; a concurrent uncommitted
+        # deactivation must commit or roll back before we accept recovery.
         if task.provider == "deterministic-fake-talking-head":
-            require_fake_talking_head_claim_authority(db, project, context)
+            require_fake_talking_head_claim_authority(
+                db, project, context, lock_originator=True,
+            )
         # Sidecar inspection runs outside the final write transaction. A
         # concurrent change to the saved generation capability/policy snapshot
         # invalidates the limits checked before the probe. Do not register an
@@ -2897,7 +3122,9 @@ def create_app(
             task.status != "FAILED"
             or task.error_code != "ARTIFACT_INGEST_FAILED"
             or attempt is None
+            or attempt.status != "FAILED"
             or attempt.reconciliation_state != "HELD"
+            or attempt.upstream_job_id != task.upstream_job_id
             or task.media_id != orphan_media_id
             or task.upstream_job_id != current_evidence.get("originalUpstreamJobId")
             or task.provider_artifact_id != current_evidence.get("originalProviderArtifactId")
@@ -2913,25 +3140,60 @@ def create_app(
                 },
             )
 
-        reserved_entry = db.execute(
+        # The read-only Sidecar inspection happens outside the final write
+        # transaction. Re-check the complete Attempt prefix and reject
+        # migrated future rows before modifying storage, project or asset.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_RECOVERY_RECONCILIATION_REQUIRED",
+                    "message": "恢复期间历史尝试证据不可信，保留HELD待人工对账",
+                },
+            )
+
+        # Recheck after the read-only Sidecar inspection under the serialized
+        # task lock, so a new durable storage hold cannot be ignored at commit.
+        require_no_prior_storage_accounting()
+
+        # The read-only Sidecar probe permits an intervening task media claim.
+        # Recheck under the serialized write transaction before any debit.
+        require_unique_orphan_task_media_identity()
+
+        # G70/G71/M11: task_id+kind alone is not a trusted reservation receipt.
+        # A damaged ledger may retain a RESERVED row from another project,
+        # attempt or key, or even two RESERVED rows with different keys (the
+        # schema only makes reservation_key+kind unique). Refuse every ambiguous
+        # ledger before charging storage or publishing a recovered asset.
+        usage_entries = list(db.execute(
             select(DBGenerationUsageEntry).where(
                 DBGenerationUsageEntry.task_id == task.id,
-                DBGenerationUsageEntry.kind == "RESERVED",
             )
-        ).scalar_one_or_none()
-        released_entry = db.execute(
-            select(DBGenerationUsageEntry.id).where(
-                DBGenerationUsageEntry.task_id == task.id,
-                DBGenerationUsageEntry.kind == "RELEASED",
-            )
-        ).scalar_one_or_none()
-        existing_settled_entry = db.execute(
-            select(DBGenerationUsageEntry.id).where(
-                DBGenerationUsageEntry.task_id == task.id,
-                DBGenerationUsageEntry.kind == "SETTLED",
-            )
-        ).scalar_one_or_none()
-        if reserved_entry is None or released_entry is not None or existing_settled_entry is not None:
+        ).scalars())
+        reserved_entries = [row for row in usage_entries if row.kind == "RESERVED"]
+        reserved_entry = reserved_entries[0] if len(reserved_entries) == 1 else None
+        reservation_attempt_owned = (
+            db.execute(select(DBGenerationAttempt.id).where(
+                DBGenerationAttempt.id == reserved_entry.attempt_id,
+                DBGenerationAttempt.generation_task_id == task.id,
+            )).scalar_one_or_none() is not None
+            if reserved_entry is not None else False
+        )
+        if (
+            reserved_entry is None
+            or len(usage_entries) != 1
+            or reserved_entry.tenant_id != task.tenant_id
+            or reserved_entry.project_id != task.project_id
+            or reserved_entry.reservation_key != f"generation:{task.id}"
+            or reserved_entry.request_units != 1
+            or reserved_entry.generated_seconds != 0
+            or reserved_entry.config_version_id != raw_snapshot.get("configVersionId")
+            # A RESERVED row owned by an older, NOT_SUBMITTED attempt is
+            # not a settlement receipt for the currently HELD orphan. Matching
+            # only task_id would silently attach the wrong attempt's debit.
+            or reserved_entry.attempt_id != attempt.id
+            or not reservation_attempt_owned
+        ):
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -2978,10 +3240,45 @@ def create_app(
                 },
             )
 
+        # G70/G71 FAKE-only: a legacy project can contain two material rows
+        # for the same orphan media ID. A single matching first row cannot
+        # certify that the second row is safe: downstream consumers may pick
+        # a different row and the recovery may double-account storage.
+        # Preserve HELD and require manual reconciliation of ambiguous history.
+        matching_materials = [
+            item for item in (project.materials or [])
+            if item.get("id") == orphan_media_id
+        ]
+        if len(matching_materials) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
+                    "message": "项目存在重复原始媒资记录，保持 HELD，需人工对账",
+                },
+            )
+
+        # A single same-ID legacy material may already have debited tenant
+        # storage. ID/MIME/size equality is not a trusted prior-debit receipt.
+        # Never unconditionally reserve a second storage charge; keep HELD
+        # and let Owner/M11 reconcile the original accounting evidence.
+        if len(matching_materials) == 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
+                    "message": "原始媒资已存在但历史存储占用未核实，保持 HELD，需人工对账",
+                },
+            )
+
+        # G70/G71 FAKE-only: corrupted negative storage accounting is not
+        # spendable quota. Match the existing intake/direct-media guard before
+        # creating a material, asset or synthetic accounting event.
         storage_reservation = db.execute(
             update(DBTenant)
             .where(
                 DBTenant.id == context.tenant_id,
+                DBTenant.used_storage_bytes >= 0,
                 DBTenant.used_storage_bytes + actual_size <= DBTenant.storage_quota_bytes,
             )
             .values(
@@ -2990,7 +3287,20 @@ def create_app(
             )
         )
         if storage_reservation.rowcount != 1:
+            stored_bytes = db.execute(
+                select(DBTenant.used_storage_bytes).where(
+                    DBTenant.id == context.tenant_id
+                )
+            ).scalar_one_or_none()
             db.rollback()
+            if stored_bytes is not None and stored_bytes < 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                        "message": "租户存储计数器异常，保持HELD，须人工对账后才能恢复原始产物",
+                    },
+                )
             raise HTTPException(
                 status_code=429,
                 detail={
@@ -3000,13 +3310,6 @@ def create_app(
             )
 
         materials = list(project.materials or [])
-        existing_material = next(
-            (
-                item for item in materials
-                if isinstance(item, dict) and item.get("id") == orphan_media_id
-            ),
-            None,
-        )
         material = {
             "id": orphan_media_id,
             "name": f"generation-{task.id}.mp4",
@@ -3019,29 +3322,9 @@ def create_app(
             },
             "sizeBytes": actual_size,
         }
-        if existing_material is not None:
-            # Materials are untrusted project JSON. Malformed legacy sizes must
-            # fail closed as a conflict instead of raising an unhandled 500.
-            raw_material_size = existing_material.get("sizeBytes")
-            existing_material_size = raw_material_size if type(raw_material_size) is int else -1
-            if (
-                existing_material.get("url") != material["url"]
-                or existing_material.get("type") != "video"
-                or existing_material_size != actual_size
-            ):
-                # Undo the provisional quota increment before refusing recovery.
-                db.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "ORPHAN_MEDIA_PROJECT_MATERIAL_CONFLICT",
-                        "message": "项目中已存在同 ID 但元数据不一致的素材",
-                    },
-                )
-        else:
-            project.materials = [*materials, material]
-            project.revision += 1
-            project.updated_at = utc_now()
+        project.materials = [*materials, material]
+        project.revision += 1
+        project.updated_at = utc_now()
 
         next_version = (
             db.execute(
@@ -3237,6 +3520,16 @@ def create_app(
             # Quarantine read-only; do not change leases, receipts or quota.
             if candidate_attempt.status != candidate.status:
                 continue
+            # G70/G71 + G73: the current QUEUED attempt alone is not proof
+            # that a prior paid submission was never accepted. A migrated or
+            # legacy retry can clear task-level upstream IDs while an older
+            # attempt retains HELD/started/accepted evidence. The Owner
+            # cancel/retry paths already fence this, but the Worker claim
+            # must independently enforce the same invariant before leasing.
+            # Fail closed on gaps, zero/renumbered attempts and future rows;
+            # never repair usage or call Provider while reconciling history.
+            if not generation_prior_history_safe(db, candidate):
+                continue
             # G73: QUEUED is safe to submit only for an attempt that has
             # *never* entered upstream submission.  A historical/crashed
             # QUEUED row can retain durable submission evidence even when
@@ -3286,43 +3579,43 @@ def create_app(
                 # tenant/project/attempt, or a missing/changed reservation key.
                 # This is only a read-only claim fence, not an M11 refund,
                 # Owner disposition policy or protected-history repair.
-                usage_rows = list(db.execute(
-                    select(DBGenerationUsageEntry).where(
-                        DBGenerationUsageEntry.task_id == candidate.id,
-                    )
-                ).scalars())
-                if (
-                    len(usage_rows) != 1
-                    or any(
-                        usage.kind != "RESERVED"
-                        or usage.tenant_id != candidate.tenant_id
-                        or usage.project_id != candidate.project_id
-                        or usage.attempt_id != candidate_attempt.id
-                        or usage.reservation_key != f"generation:{candidate.id}"
-                        or usage.request_units != 1
-                        or usage.generated_seconds != 0
-                        for usage in usage_rows
-                    )
+                if not fake_talking_head_reserved_ledger_valid(
+                    db, candidate, candidate_attempt,
                 ):
                     continue
                 # G72: a queued FAKE task is not a standing authority to act
                 # after the originating Owner is deactivated/downgraded or the
                 # project no longer belongs to that Owner. This is a read-only
                 # revocation fence; no grant/delegation policy is selected.
-                active_originator = db.execute(
-                    select(DBUser.id).where(
-                        DBUser.id == candidate.requested_by,
-                        DBUser.tenant_id == candidate.tenant_id,
-                        DBUser.role == "owner",
-                        DBUser.is_active.is_(True),
+                # A concurrent Owner deactivation/demotion or project
+                # transfer must not be bypassed by a Worker claim reading
+                # its pre-commit identity. Do not wait for an Owner writer
+                # while holding a queued task row: skip this candidate and
+                # leave all its lease/Attempt/RESERVED evidence unchanged.
+                # Only PG FAKE-only claim is affected; no delegation policy.
+                originator_claim_query = select(DBUser.id).where(
+                    DBUser.id == candidate.requested_by,
+                    DBUser.tenant_id == candidate.tenant_id,
+                    DBUser.role == "owner",
+                    DBUser.is_active.is_(True),
+                )
+                project_owner_claim_query = select(DBProject.id).where(
+                    DBProject.id == candidate.project_id,
+                    DBProject.tenant_id == candidate.tenant_id,
+                    DBProject.owner_id == candidate.requested_by,
+                )
+                if app_engine.dialect.name == "postgresql":
+                    originator_claim_query = originator_claim_query.with_for_update(
+                        skip_locked=True
                     )
+                    project_owner_claim_query = project_owner_claim_query.with_for_update(
+                        skip_locked=True
+                    )
+                active_originator = db.execute(
+                    originator_claim_query
                 ).scalar_one_or_none()
                 original_project_owner = db.execute(
-                    select(DBProject.id).where(
-                        DBProject.id == candidate.project_id,
-                        DBProject.tenant_id == candidate.tenant_id,
-                        DBProject.owner_id == candidate.requested_by,
-                    )
+                    project_owner_claim_query
                 ).scalar_one_or_none()
                 if active_originator is None or original_project_owner is None:
                     continue
@@ -3361,15 +3654,26 @@ def create_app(
                     continue
                 if not fake_talking_head_creation_evidence_matches(db, candidate, stored):
                     continue
-                source = db.execute(select(DBAssetVersion).where(
+                # The Owner rights-snapshot writer locks this same source
+                # version. A claim must skip an in-flight revoke rather than
+                # grant a lease using its stale committed ALLOWED snapshot.
+                # Recheck expiry against time *after* source lock acquisition.
+                source_claim_query = select(DBAssetVersion).where(
                     DBAssetVersion.id == image_asset_id,
                     DBAssetVersion.project_id == candidate.project_id,
                     DBAssetVersion.tenant_id == candidate.tenant_id,
-                )).scalar_one_or_none()
+                )
+                if app_engine.dialect.name == "postgresql":
+                    source_claim_query = source_claim_query.with_for_update(
+                        skip_locked=True
+                    )
+                source = db.execute(source_claim_query).scalar_one_or_none()
                 if (
                     source is None or source.media_type != "image"
                     or source.sha256 != source_sha256
-                    or not rights_decision(latest_rights_snapshot(db, source.id, "REMIX"), now)["allowed"]
+                    or not rights_decision(
+                        latest_rights_snapshot(db, source.id, "REMIX"), utc_now()
+                    )["allowed"]
                 ):
                     continue
             if candidate_mode == "moneyprinter":
@@ -3524,6 +3828,71 @@ def create_app(
             "circuitProbeEpoch": task.circuit_probe_epoch,
         }
 
+    def require_fake_talking_head_current_remix_rights(db: Session, task: DBGenerationTask) -> None:
+        """Fail closed if a claimed FAKE task's input REMIX right was revoked.
+
+        This reads only persisted synthetic task/source rights. It cannot
+        manufacture an M12 trusted issuer, M13 STOP ACK, or settle usage.
+        """
+        stored = task.request_json
+        source_id = stored.get("imageAssetId") if isinstance(stored, dict) else None
+        source_hash = stored.get("sourceAssetSha256") if isinstance(stored, dict) else None
+        if (
+            not isinstance(source_id, str) or not source_id
+            or not isinstance(source_hash, str) or not source_hash
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                        "message": "口播源素材持久标识异常，拒绝Worker继续处理"},
+            )
+        # G72 FAKE-only postclaim fence: the original typed Owner request
+        # and Worker-facing simulation contract can be changed after a
+        # legitimate Worker claim. Recheck the same creation evidence required
+        # by claim and artifact intake before renewing a lease or advancing
+        # an Attempt. A local TASK_CREATED row is not an independent issuer.
+        if (
+            stored.get("fakeTaskType") != "talking-head"
+            or stored.get("simulatedOutput") is not True
+            or stored.get("publishable") is not False
+            or stored.get("confirmSyntheticTestOnly") is not True
+            or type(stored.get("outputCount")) is not int
+            or stored["outputCount"] != 1
+            or stored.get("inputAssetVersionIds") != [source_id]
+            or not fake_talking_head_creation_evidence_matches(db, task, stored)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_TALKING_HEAD_REQUEST_INVALID",
+                        "message": "口播FAKE任务原始请求与持久合约不一致，拒绝Worker推进"},
+            )
+        # G72: the Owner rights-snapshot writer serializes REMIX changes on
+        # the source asset-version row. Hold that same PostgreSQL lock across
+        # the postclaim rights read AND the Worker heartbeat/transition commit,
+        # so a committed revoke cannot be overtaken by a stale Worker ACK.
+        # This stays FAKE-only; it is not an M12 issuer or M13 STOP ACK.
+        source_statement = select(DBAssetVersion).where(
+            DBAssetVersion.id == source_id,
+            DBAssetVersion.tenant_id == task.tenant_id,
+            DBAssetVersion.project_id == task.project_id,
+        )
+        if app_engine.dialect.name != "sqlite":
+            source_statement = source_statement.with_for_update()
+        source = db.execute(source_statement).scalar_one_or_none()
+        if (
+            source is None
+            or source.media_type != "image"
+            or source.sha256 != source_hash
+            or not rights_decision(
+                latest_rights_snapshot(db, source.id, "REMIX"), utc_now(),
+            )["allowed"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "FAKE_TALKING_HEAD_SOURCE_REVOKED",
+                        "message": "口播输入图片授权或版本已失效，拒绝Worker续租及迁移"},
+            )
+
     @created_app.post("/internal/generation-tasks/{task_id}/heartbeat")
     def heartbeat_generation_task(
         task_id: str,
@@ -3545,6 +3914,95 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.status not in ACTIVE_GENERATION_STATES or task.cancel_requested_at is not None:
             raise HTTPException(status_code=409, detail={"code": "TASK_NOT_ACTIVE", "message": "任务已不再处于可续租状态"})
+        # G72/G75 FAKE-only: a previously claimed synthetic talking-head task
+        # must not outlive a committed Owner emergency stop by renewing its
+        # Worker lease or advancing its state. Serialize on the same circuit
+        # row as the Owner kill-switch. This is NOT a trusted STOP/settlement ACK.
+        if task.provider == "deterministic-fake-talking-head":
+            current_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+            if current_circuit is not None and current_circuit.state == "DISABLED":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PROVIDER_EMERGENCY_STOPPED",
+                        "message": "Owner紧急停止后，口播FAKE任务不得续租或推进状态",
+                    },
+                )
+            # G72 FAKE-only: a claimed lease is not permanent authority for
+            # a revoked originator. Mirror the existing claim/intake Owner and
+            # project predicates before renewing or transitioning a Worker.
+            # Lock the same Owner/project rows as final artifact settlement on PG.
+            originator_query = select(DBUser.id).where(
+                DBUser.id == task.requested_by,
+                DBUser.tenant_id == task.tenant_id,
+                DBUser.role == "owner",
+                DBUser.is_active.is_(True),
+            )
+            owned_project_query = select(DBProject.id).where(
+                DBProject.id == task.project_id,
+                DBProject.tenant_id == task.tenant_id,
+                DBProject.owner_id == task.requested_by,
+            )
+            if app_engine.dialect.name == "postgresql":
+                originator_query = originator_query.with_for_update()
+                owned_project_query = owned_project_query.with_for_update()
+            if (
+                db.execute(originator_query).scalar_one_or_none() is None
+                or db.execute(owned_project_query).scalar_one_or_none() is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                        "message": "原口播发起人或项目归属已失效，拒绝Worker续租及状态迁移",
+                    },
+                )
+        if task.provider == "deterministic-fake-talking-head":
+            # Previously claimed FAKE work loses permission to progress when
+            # the input REMIX right is revoked after claim.
+            require_fake_talking_head_current_remix_rights(db, task)
+        # G73 FAKE-only: a lease heartbeat must not renew a task whose
+        # CURRENT durable Attempt vanished, drifted from task.status, or gained
+        # a disputed upstream receipt after claim. Prior-history checks alone
+        # do not cover this Attempt. This is read-only and fail-closed; it does
+        # not infer a human APPLY/STOP ACK or release reserved usage.
+        current_heartbeat_attempt_query = select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )
+        if app_engine.dialect.name == "postgresql":
+            current_heartbeat_attempt_query = current_heartbeat_attempt_query.with_for_update()
+        current_heartbeat_attempt = db.execute(
+            current_heartbeat_attempt_query
+        ).scalar_one_or_none()
+        if (
+            current_heartbeat_attempt is None
+            or current_heartbeat_attempt.status != task.status
+            or current_heartbeat_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+            or (
+                current_heartbeat_attempt.upstream_job_id is not None
+                and current_heartbeat_attempt.upstream_job_id != task.upstream_job_id
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "当前生成尝试的持久状态或上游回执异常，拒绝续租并保持账本",
+                },
+            )
+        # G70/G71/G73: a lease heartbeat is not a fresh STOP/APPLY ACK.
+        # Older attempt receipts may change after claim.  Do not prolong a
+        # lease with unresolved upstream evidence: refuse before any mutation,
+        # preserving HELD/RESERVED and the prior lease for trusted review.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，拒绝续租并保持账本",
+                },
+            )
         task.lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         task.updated_at = now
         db.commit()
@@ -3571,6 +4029,51 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "LEASE_EPOCH_MISMATCH", "message": "工作节点租约版本已过期"})
         if task.cancel_requested_at is not None or task.status == "CANCELED":
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到响应已隔离"})
+        # G72/G75 FAKE-only: a previously claimed synthetic talking-head task
+        # must not outlive a committed Owner emergency stop by renewing its
+        # Worker lease or advancing its state. Serialize on the same circuit
+        # row as the Owner kill-switch. This is NOT a trusted STOP/settlement ACK.
+        if task.provider == "deterministic-fake-talking-head":
+            current_circuit = generation_circuit(db, task.tenant_id, for_update=True)
+            if current_circuit is not None and current_circuit.state == "DISABLED":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PROVIDER_EMERGENCY_STOPPED",
+                        "message": "Owner紧急停止后，口播FAKE任务不得续租或推进状态",
+                    },
+                )
+            # G72 FAKE-only: a claimed lease is not permanent authority for
+            # a revoked originator. Mirror the existing claim/intake Owner and
+            # project predicates before renewing or transitioning a Worker.
+            # Lock the same Owner/project rows as final artifact settlement on PG.
+            originator_query = select(DBUser.id).where(
+                DBUser.id == task.requested_by,
+                DBUser.tenant_id == task.tenant_id,
+                DBUser.role == "owner",
+                DBUser.is_active.is_(True),
+            )
+            owned_project_query = select(DBProject.id).where(
+                DBProject.id == task.project_id,
+                DBProject.tenant_id == task.tenant_id,
+                DBProject.owner_id == task.requested_by,
+            )
+            if app_engine.dialect.name == "postgresql":
+                originator_query = originator_query.with_for_update()
+                owned_project_query = owned_project_query.with_for_update()
+            if (
+                db.execute(originator_query).scalar_one_or_none() is None
+                or db.execute(owned_project_query).scalar_one_or_none() is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "FAKE_TALKING_HEAD_OWNER_AUTH_REVOKED",
+                        "message": "原口播发起人或项目归属已失效，拒绝Worker续租及状态迁移",
+                    },
+                )
+        if task.provider == "deterministic-fake-talking-head":
+            require_fake_talking_head_current_remix_rights(db, task)
         if req.status != task.status and req.status not in WORKER_TRANSITIONS.get(task.status, set()):
             raise HTTPException(status_code=409, detail={"code": "ILLEGAL_GENERATION_TRANSITION", "message": "生成任务状态迁移不合法"})
         if req.upstreamJobId and task.upstream_job_id and req.upstreamJobId != task.upstream_job_id:
@@ -3581,7 +4084,25 @@ def create_app(
                 detail={"code": "PROVIDER_ARTIFACT_ID_IMMUTABLE", "message": "上游产物编号不可替换"},
             )
         previous = task.status
-        attempt = current_generation_attempt(db, task)
+        # G73: serialize the CURRENT Attempt with the task for PostgreSQL,
+        # as already done by Worker heartbeat and artifact intake. A lease
+        # does not authorize rewriting a missing, HELD or UNKNOWN attempt.
+        # Refuse before any status, usage, lease or audit mutation.
+        current_transition_attempt_query = select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )
+        if app_engine.dialect.name == "postgresql":
+            current_transition_attempt_query = current_transition_attempt_query.with_for_update()
+        attempt = db.execute(current_transition_attempt_query).scalar_one_or_none()
+        if attempt is None or attempt.reconciliation_state in {"HELD", "UNKNOWN"}:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "当前生成尝试缺失或存在未核验状态，拒绝Worker迁移并保持账本",
+                },
+            )
         # G73: a Worker transition must not convert a legacy/partially
         # persisted current Attempt out of a terminal or divergent status.
         # Both statuses are written together by the normal transition path;
@@ -3592,6 +4113,17 @@ def create_app(
                 detail={
                     "code": "GENERATION_ATTEMPT_STATUS_CONFLICT",
                     "message": "任务与当前尝试的持久状态不一致，须先人工核验",
+                },
+            )
+        # G70/G71/G73: history may change after the Worker claim was issued.
+        # A valid lease is not an independent receipt for an older paid attempt.
+        # Recheck under the task-row lock before status/usage/audit mutations.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，停止Worker状态迁移并保持账本",
                 },
             )
         # G73: A persisted Attempt-level upstream receipt is independent
@@ -3667,7 +4199,24 @@ def create_app(
             if req.status == "CANCELED" or (
                 req.status == "FAILED" and (not req.retryable or task.attempts >= task.max_attempts)
             ):
-                if not artifact_recovery_hold:
+                # G70/G71/M11: a Worker terminal callback is not a trusted
+                # upstream STOP/refund acknowledgement. Claim writes
+                # submission_started_at *before* the external POST, so even
+                # FAILED PROVIDER_4XX without an upstream ID may have been
+                # accepted or billed. Preserve RESERVED for M11/M13 review.
+                # Only an unsubmitted attempt without any durable upstream
+                # evidence could be released here. Owner's separate preclaim
+                # cancellation path retains its existing safe release.
+                submission_evidence = (
+                    attempt.submission_started_at is not None
+                    or attempt.reconciliation_state != "NOT_SUBMITTED"
+                    or task.upstream_job_id is not None
+                    or attempt.upstream_job_id is not None
+                    or task.provider_artifact_id is not None
+                )
+                if submission_evidence and attempt.reconciliation_state == "NOT_SUBMITTED":
+                    attempt.reconciliation_state = "HELD"
+                if not artifact_recovery_hold and not submission_evidence:
                     release_generation_reservation(
                         db, task, attempt,
                         reason_code=req.errorCode or req.status, now=now,
@@ -3962,6 +4511,59 @@ def create_app(
             raise HTTPException(status_code=409, detail={"code": "TASK_CANCELED", "message": "任务已取消，迟到产物已隔离"})
         if task.status not in {"RUNNING", "INGESTING"}:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_INTAKE_NOT_ALLOWED", "message": "当前状态不允许接收产物"})
+        # G73 FAKE-only: a still-valid Worker lease is not an ACK for a
+        # damaged CURRENT attempt.  Status divergence, a HELD/UNKNOWN
+        # reconciliation or a contradictory upstream identity can appear after
+        # transition. Refuse before storage reservation, Sidecar I/O or audit
+        # mutation; do not infer an APPLY/STOP ACK from the task status.
+        # A missing/renumbered current Attempt is corrupted durable state, not
+        # permission to debit storage or dispatch a Sidecar upload.
+        current_attempt = db.execute(select(DBGenerationAttempt).where(
+            DBGenerationAttempt.generation_task_id == task.id,
+            DBGenerationAttempt.attempt_no == task.attempts,
+        )).scalar_one_or_none()
+        if (
+            current_attempt is None
+            or current_attempt.status != task.status
+            or current_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+            or (
+                current_attempt.upstream_job_id is not None
+                and current_attempt.upstream_job_id != task.upstream_job_id
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "当前生成尝试的持久状态或上游回执异常，禁止产物入库并保持账本",
+                },
+            )
+        # G70/G71/G73 FAKE-only: history can become HELD or acquire durable
+        # upstream submission evidence after Worker claim and transition.
+        # Neither a live lease nor an artifact ID authorizes a new storage
+        # debit or Sidecar upload while an earlier attempt is disputed.
+        # Fail before byte processing, reservation, upload or audit mutation.
+        if not generation_prior_history_safe(db, task):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED",
+                    "message": "历史生成尝试证据在领取后异常，拒绝产物入库并保持账本",
+                },
+            )
+        # G72 FAKE-only: a valid lease is not a settlement authorization.
+        # The RESERVED row can drift after Worker claim. Reject before quota
+        # reservation or Sidecar I/O without altering the disputed ledger.
+        if task.provider == "deterministic-fake-talking-head" and not (
+            fake_talking_head_reserved_ledger_valid(db, task, current_attempt)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "FAKE_TALKING_HEAD_RESERVED_RECONCILIATION_REQUIRED",
+                    "message": "口播任务原始预留凭据已变化，禁止模拟产物入库结算，保持账本待核验",
+                },
+            )
         if task.provider_artifact_id and task.provider_artifact_id != providerArtifactId:
             raise HTTPException(status_code=409, detail={"code": "ARTIFACT_ID_MISMATCH", "message": "产物编号与当前任务回执不一致"})
         if file.content_type != "video/mp4":
@@ -4427,18 +5029,14 @@ def create_app(
                     )
                 except BaseException as abrupt_exit:
                     if isinstance(abrupt_exit, Exception):
-                        # Ordinary transport errors use the established FAILED/HELD
-                        # recovery path; do not change paid-usage semantics.
+                        # Ordinary exceptions enter the serialized post-upload
+                        # handler. It first checks a concurrently committed
+                        # identical asset before deciding whether this storage
+                        # reservation is an unresolved Sidecar write.
                         raise
-                    # G70/G71: the reservation was committed before the sidecar
-                    # call. An in-process abrupt request exit bypasses the normal
-                    # Exception compensation path, so release this request's hold
-                    # with an atomic DB receipt before propagating the interruption.
-                    # This cannot protect against process kill or host crash.
+                    # G70/G71: abrupt exits do not certify remote deletion.
+                    # Keep the original committed OPENED hold for reconciliation.
                     db.rollback()
-                    begin_serialized_write(db)
-                    storage_release_reason = "UPLOAD_INTERRUPTED"
-                    persist_duplicate_storage_reservation_release()
                     raise
                 # G70/G71/G72: a Sidecar ACK is untrusted media evidence, not
                 # permission to coerce its values into an asset/usage ledger.
@@ -4550,6 +5148,53 @@ def create_app(
                     invalid_code = "ARTIFACT_INTAKE_NOT_ALLOWED"
                     invalid_message = "上传期间任务状态已改变"
     
+                # G73 FAKE-only: the Sidecar call occurs after a committed
+                # quota reservation and outside the original task transaction.
+                # Historical or CURRENT Attempt evidence can change during
+                # upload. Re-check both under the final serialized task lock
+                # before publishing an asset or writing SETTLED usage.
+                # An orphan is audited by the existing rejected-intake path;
+                # neither this guard nor a Sidecar response is a human ACK.
+                if invalid_code is None:
+                    # Recheck under the final transaction and lock the Attempt
+                    # on PostgreSQL so a concurrent writer cannot invalidate
+                    # this evidence between the check and SETTLED commit.
+                    final_attempt_query = select(DBGenerationAttempt).where(
+                        DBGenerationAttempt.generation_task_id == task.id,
+                        DBGenerationAttempt.attempt_no == task.attempts,
+                    )
+                    if app_engine.dialect.name == "postgresql":
+                        final_attempt_query = final_attempt_query.with_for_update()
+                    final_attempt = db.execute(final_attempt_query).scalar_one_or_none()
+                    if (
+                        final_attempt is None
+                        or final_attempt.status != task.status
+                        or final_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+                        or (
+                            final_attempt.upstream_job_id is not None
+                            and final_attempt.upstream_job_id != task.upstream_job_id
+                        )
+                    ):
+                        invalid_code = "GENERATION_CURRENT_ATTEMPT_RECONCILIATION_REQUIRED"
+                        invalid_message = "上传期间当前尝试回执异常，禁止入库结算，保持原生成额度待核验"
+                    elif not generation_prior_history_safe(db, task):
+                        invalid_code = "GENERATION_PRIOR_ATTEMPT_RECONCILIATION_REQUIRED"
+                        invalid_message = "上传期间历史尝试回执异常，禁止入库结算，保持原生成额度待核验"
+
+                # G72 FAKE-only: the quota reservation commit releases the
+                # earlier transaction, so re-lock and validate the canonical
+                # RESERVED row before asset creation or SETTLED usage. A
+                # Sidecar response is not a trusted reconciliation receipt.
+                if (
+                    invalid_code is None
+                    and task.provider == "deterministic-fake-talking-head"
+                    and not fake_talking_head_reserved_ledger_valid(
+                        db, task, final_attempt, lock=True,
+                    )
+                ):
+                    invalid_code = "FAKE_TALKING_HEAD_RESERVED_RECONCILIATION_REQUIRED"
+                    invalid_message = "上传期间口播原始预留凭据变化，模拟产物隔离并保持账本待核验"
+
                 # G72: a pre-upload Owner check is not authorization for the
                 # final asset/SETTLED commit. The storage-reservation commit
                 # releases that earlier transaction while FAKE Sidecar runs.
@@ -4632,14 +5277,23 @@ def create_app(
                                 or current_source.media_type != "image"
                                 or current_source.sha256 != current_source_hash
                                 or not rights_decision(
-                                    latest_rights_snapshot(db, current_source.id, "REMIX"), now
+                                    # Read the time AFTER the PostgreSQL source-row lock:
+                                    # the source REMIX grant may expire while this
+                                    # transaction waits on a concurrent rights writer.
+                                    latest_rights_snapshot(db, current_source.id, "REMIX"), utc_now()
                                 )["allowed"]
                             ):
                                 invalid_code = "FAKE_TALKING_HEAD_SOURCE_REVOKED"
                                 invalid_message = "上传期间口播素材授权或版本失效，模拟产物隔离"
     
                 if invalid_code:
-                    attempt = current_generation_attempt(db, task)
+                    # Audit the orphan against its task even when the current
+                    # Attempt row was renumbered/deleted during Sidecar I/O.
+                    # generation_events.attempt_id is nullable by contract.
+                    attempt = db.execute(select(DBGenerationAttempt).where(
+                        DBGenerationAttempt.generation_task_id == task.id,
+                        DBGenerationAttempt.attempt_no == task.attempts,
+                    )).scalar_one_or_none()
                     orphan_size = int(metadata.get("sizeBytes") or upload_size) if isinstance(metadata, dict) else upload_size
                     orphan_evidence = {
                         "reasonCode": invalid_code,
@@ -4869,6 +5523,117 @@ def create_app(
                             db, failed_task, rights=generation_rights(db, failed_task), include_history=True
                         )
     
+                # G70/G71/M13 FAKE-only: no Sidecar response is not proof of
+                # a remote non-write. We already checked above for a durable,
+                # identical asset committed by a concurrent intake (which may
+                # safely release THIS duplicate hold). Otherwise keep the
+                # original OPENED reservation and tenant storage debit, even
+                # for ordinary VideoUseError/RuntimeError after dispatch. No
+                # speculative release, SETTLED, asset or second Sidecar write.
+                # A trusted issuer receipt and Owner-authorized reconciliation
+                # are separate, still-blocked gates.
+                if uploaded is None:
+                    # An uncertain Sidecar response does not prove a remote
+                    # deletion, STOP ACK, or refund. Preserve the original
+                    # committed OPENED storage debit and generation RESERVED.
+                    # A newer Worker may have obtained a lease while Sidecar
+                    # I/O was in flight. Do not overwrite its status, epoch,
+                    # attempt or owner with this stale request's FAILED/HELD.
+                    # The original OPENED hold remains for trusted review.
+                    now = utc_now()
+                    failed_attempt = current_generation_attempt(db, failed_task)
+                    if (
+                        failed_task.tenant_id != task_tenant_id
+                        or failed_task.project_id != task_project_id
+                        or failed_task.asset_version_id is not None
+                        or failed_task.lease_owner != x_worker_id
+                        or failed_task.lease_epoch != x_worker_lease_epoch
+                        or failed_task.lease_expires_at is None
+                        or _as_utc(failed_task.lease_expires_at) < now
+                        or failed_task.cancel_requested_at is not None
+                        or failed_task.status not in {"RUNNING", "INGESTING"}
+                        or (
+                            failed_attempt is not None
+                            and (
+                                failed_attempt.status != failed_task.status
+                                or failed_attempt.reconciliation_state in {"HELD", "UNKNOWN"}
+                                or (
+                                    failed_attempt.upstream_job_id is not None
+                                    and failed_attempt.upstream_job_id != failed_task.upstream_job_id
+                                )
+                            )
+                        )
+                    ):
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                                "message": "上传回执不明且任务租约或尝试已变化，保持原存储预留待可信对账",
+                            },
+                        ) from exc
+                    # Only this still-current Worker may safely transition its
+                    # matching Attempt to FAILED/HELD; no quota is refunded.
+                    if failed_attempt is None:
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                                "message": "当前尝试缺失且远端写入不确定，须可信对账",
+                            },
+                        ) from exc
+                    previous_status = failed_task.status
+                    failed_task.status = "FAILED"
+                    failed_task.error_code = "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
+                    failed_task.error_message = "Sidecar回执不确定，原存储预留和用量均保留待可信对账"
+                    failed_task.media_id = expected_media_id
+                    failed_task.completed_at = now
+                    failed_task.updated_at = now
+                    failed_task.lease_owner = None
+                    failed_task.lease_expires_at = None
+                    failed_attempt.status = "FAILED"
+                    failed_attempt.error_code = failed_task.error_code
+                    failed_attempt.error_message = failed_task.error_message
+                    failed_attempt.completed_at = now
+                    failed_attempt.reconciliation_state = "HELD"
+                    add_generation_event(
+                        db, failed_task, attempt=failed_attempt,
+                        event_type="ARTIFACT_INGEST_FAILED",
+                        actor_type="SYSTEM", actor_id="api",
+                        from_status=previous_status, to_status="FAILED",
+                        metadata={
+                            "reasonCode": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "reconciliationState": "HELD",
+                            "usageReservation": "HELD",
+                            "storageReservationState": "OPENED_HELD",
+                            "storageReservationEventId": storage_reservation_event_id,
+                            "reservedStorageBytes": upload_size,
+                            "storageReleaseAuthorized": False,
+                            "workerId": x_worker_id,
+                            "leaseEpoch": x_worker_lease_epoch,
+                            "originalProviderArtifactId": providerArtifactId,
+                            "originalUpstreamJobId": (
+                                failed_task.upstream_job_id or failed_attempt.upstream_job_id or ""
+                            ),
+                            # Locally expected media/hash/size are candidates,
+                            # NOT independently trusted Sidecar receipts.
+                            "orphanedMediaId": expected_media_id,
+                            "orphanedMediaSha256": digest.hexdigest(),
+                            "orphanedMediaSizeBytes": upload_size,
+                            "artifactIdempotencyKey": artifact_idempotency_key,
+                        },
+                        now=now,
+                    )
+                    db.commit()
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED",
+                            "message": "已持久标记HELD，禁止未经可信回执再次占额或恢复",
+                        },
+                    ) from exc
+
                 now = utc_now()
                 invalid_code = None
                 invalid_message = None
@@ -4934,18 +5699,32 @@ def create_app(
                 failed_attempt.error_message = failed_task.error_message
                 failed_attempt.completed_at = failed_task.completed_at
                 failure_metadata = {"compensatedQuotaBytes": upload_size}
-                artifact_recovery_hold = bool(failed_task.upstream_job_id and providerArtifactId)
+                # G70/G71/M11: missing upstreamJobId is NOT a trusted STOP or
+                # refund ACK. Worker claim persists submission_started_at before
+                # the upstream POST; an accepted/billable job may not return its
+                # ID after a timeout or crash. The original artifact-intake error
+                # branch must obey the same release fence as Worker terminal
+                # transitions. Preserve generation RESERVED even when the only
+                # durable submission marker belongs to the Attempt.
+                artifact_recovery_hold = bool(
+                    failed_attempt.submission_started_at is not None
+                    or failed_attempt.reconciliation_state != "NOT_SUBMITTED"
+                    or failed_attempt.upstream_job_id is not None
+                    or failed_task.upstream_job_id is not None
+                    or failed_task.provider_artifact_id is not None
+                )
                 if artifact_recovery_hold:
-                    # The remote job is already known and may be billable. Storage
-                    # compensation is separate from generation usage: preserve the
-                    # original RESERVED entry. The deterministic Sidecar ID lets the
-                    # Owner inspect/recover a committed object even when its upload
-                    # acknowledgement was lost and no response body reached the API.
+                    # Storage compensation is separate from generation usage.
+                    # Deterministic media identity is inspection context ONLY;
+                    # neither this exception handler nor a missing upstream ID
+                    # authorizes a second paid generation or a refund.
                     failed_attempt.reconciliation_state = "HELD"
                     failed_task.media_id = expected_media_id
                     failure_metadata.update({
                         "originalProviderArtifactId": providerArtifactId,
-                        "originalUpstreamJobId": failed_task.upstream_job_id,
+                        "originalUpstreamJobId": (
+                            failed_task.upstream_job_id or failed_attempt.upstream_job_id or ""
+                        ),
                         "reconciliationState": "HELD",
                         "usageReservation": "HELD",
                         "orphanedMediaId": expected_media_id,

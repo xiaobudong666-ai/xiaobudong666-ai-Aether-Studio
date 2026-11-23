@@ -244,13 +244,13 @@ def inspect_task(project_id: str, task_id: str, storage_before: int) -> dict:
         ).scalar_one()
         assert task.provider == "deterministic-fake-talking-head"
         assert task.status == "FAILED"
-        assert task.error_code == "ARTIFACT_INGEST_FAILED"
+        assert task.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         assert task.upstream_job_id
         assert task.provider_artifact_id
         assert task.media_id == media_id
         assert task.asset_version_id is None
         assert attempt.status == "FAILED"
-        assert attempt.error_code == "ARTIFACT_INGEST_FAILED"
+        assert attempt.error_code == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED"
         assert attempt.reconciliation_state == "HELD"
         assert attempt.upstream_job_id == task.upstream_job_id
         assert attempt_count == 1
@@ -262,7 +262,9 @@ def inspect_task(project_id: str, task_id: str, storage_before: int) -> dict:
         assert metadata.get("usageReservation") == "HELD"
         assert len(metadata.get("orphanedMediaSha256", "")) == 64
         assert int(metadata.get("orphanedMediaSizeBytes") or 0) > 0
-        assert int(tenant.used_storage_bytes or 0) == storage_before
+        assert int(tenant.used_storage_bytes or 0) == storage_before + int(metadata["orphanedMediaSizeBytes"])
+        assert metadata.get("storageReservationState") == "OPENED_HELD"
+        assert metadata.get("storageReleaseAuthorized") is False
         return {
             "taskId": task_id,
             "projectId": project_id,
@@ -289,37 +291,28 @@ def inspect_task(project_id: str, task_id: str, storage_before: int) -> dict:
 def run_case(client: httpx.Client, mode: str) -> dict:
     project_id, task_id, storage_before = create_fake_task(client, mode)
     failed_row = poll_failed(client, project_id, task_id, mode)
-    assert failed_row.get("errorCode") == "ARTIFACT_INGEST_FAILED", failed_row
+    assert failed_row.get("errorCode") == "ARTIFACT_STORAGE_HOLD_RECONCILIATION_REQUIRED", failed_row
     evidence = inspect_task(project_id, task_id, storage_before)
 
-    # A generic retry must never create another generation attempt or paid job.
+    # A durable FAILED/HELD task with uncertain remote storage has no
+    # independently trusted receipt. Neither generic paid retry nor legacy
+    # Owner recovery can issue a second storage debit or settle usage.
     retry = client.post(f"/projects/{project_id}/generation-tasks/{task_id}/retry")
     assert retry.status_code == 409, retry.text[:300]
-    assert retry.json()["detail"]["code"] == "ARTIFACT_RECOVERY_REQUIRED"
-
-    # Re-read all durable invariants after the rejected generic retry. A 409
-    # alone is insufficient if the request mutated task/attempt/usage state.
+    assert retry.json()["detail"]["code"] == "GENERATION_RECONCILIATION_REQUIRED"
     after_retry = inspect_task(project_id, task_id, storage_before)
-    assert after_retry == evidence, (
-        "generic retry changed durable task, attempt, usage, or storage state: "
-        f"before={evidence} after={after_retry}"
-    )
+    assert after_retry == evidence, "rejected retry mutated durable HELD state"
     evidence["genericRetry"] = {
-        "status": 409,
-        "code": "ARTIFACT_RECOVERY_REQUIRED",
-        "attemptsAfter": after_retry["attempts"],
-        "usageAfter": after_retry["usage"],
-        "reconciliationAfter": after_retry["reconciliation"],
-        "durableStateUnchanged": True,
+        "status": 409, "code": "GENERATION_RECONCILIATION_REQUIRED",
+        "attemptsAfter": after_retry["attempts"], "usageAfter": after_retry["usage"],
+        "reconciliationAfter": after_retry["reconciliation"], "durableStateUnchanged": True,
     }
 
     media_id = evidence["mediaId"]
     inspection = httpx.get(
         f"{VIDEO_USE_BASE}/media/{project_id}/{media_id}/inspect",
-        timeout=45,
-        trust_env=False,
+        timeout=45, trust_env=False,
     )
-
     if mode == "forward_then_drop_ack":
         assert inspection.status_code == 200, inspection.text[:300]
         inspected = inspection.json()
@@ -327,124 +320,42 @@ def run_case(client: httpx.Client, mode: str) -> dict:
         assert inspected["sizeBytes"] == evidence["sizeBytes"]
         media = httpx.get(
             f"{VIDEO_USE_BASE}/media/{project_id}/{media_id}",
-            timeout=45,
-            trust_env=False,
+            timeout=45, trust_env=False,
         )
         assert media.status_code == 200
         assert hashlib.sha256(media.content).hexdigest() == evidence["sha256"]
         assert len(media.content) == evidence["sizeBytes"]
-
-        recovery = client.post(
-            f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
-            json={"reason": "Owner verifies the original Sidecar object after a lost FAKE-only acknowledgement"},
-        )
-        assert recovery.status_code == 200, recovery.text[:500]
-        recovered = recovery.json()
-        assert recovered["status"] == "RIGHTS_BLOCKED"
-        asset_version_id = recovered["results"][0]["assetVersionId"]
-
-        repeated = client.post(
-            f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
-            json={"reason": "Owner repeats the same FAKE-only orphan recovery to verify idempotency"},
-        )
-        assert repeated.status_code == 200, repeated.text[:300]
-        assert repeated.json()["results"][0]["assetVersionId"] == asset_version_id
-
-        public_export = client.get(f"/video-use/media/{project_id}/{media_id}")
-        assert public_export.status_code == 403, public_export.text[:300]
-        assert public_export.json()["detail"]["code"] == "RIGHTS_MISSING"
-
-        with SessionLocal() as db:
-            task = db.get(DBGenerationTask, task_id)
-            attempt = db.execute(
-                select(DBGenerationAttempt).where(
-                    DBGenerationAttempt.generation_task_id == task_id
-                )
-            ).scalar_one()
-            tenant = db.get(DBTenant, task.tenant_id)
-            asset = db.get(DBAssetVersion, asset_version_id)
-            failure_count = db.execute(
-                select(func.count(DBGenerationEvent.id)).where(
-                    DBGenerationEvent.generation_task_id == task_id,
-                    DBGenerationEvent.event_type == "ARTIFACT_INGEST_FAILED",
-                )
-            ).scalar_one()
-            recovery_count = db.execute(
-                select(func.count(DBGenerationEvent.id)).where(
-                    DBGenerationEvent.generation_task_id == task_id,
-                    DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
-                )
-            ).scalar_one()
-            counts = {
-                kind: db.execute(
-                    select(func.count(DBGenerationUsageEntry.id)).where(
-                        DBGenerationUsageEntry.task_id == task_id,
-                        DBGenerationUsageEntry.kind == kind,
-                    )
-                ).scalar_one()
-                for kind in ("RESERVED", "RELEASED", "SETTLED")
-            }
-            assert task.status == "RIGHTS_BLOCKED"
-            assert task.error_code is None
-            assert task.media_id == media_id
-            assert task.asset_version_id == asset_version_id
-            assert task.upstream_job_id == evidence["upstreamJobId"]
-            assert task.provider_artifact_id == evidence["providerArtifactId"]
-            assert attempt.reconciliation_state == "ARTIFACT_INGESTED"
-            assert attempt.status == "RIGHTS_BLOCKED"
-            assert counts == {"RESERVED": 1, "RELEASED": 0, "SETTLED": 0}
-            assert (failure_count, recovery_count) == (1, 1)
-            assert asset is not None
-            assert asset.media_id == media_id
-            assert asset.sha256 == evidence["sha256"]
-            assert asset.size_bytes == evidence["sizeBytes"]
-            assert int(tenant.used_storage_bytes or 0) == (
-                storage_before + evidence["sizeBytes"]
-            )
-        evidence["manualRecovery"] = {
-            "result": "PASS",
-            "status": "RIGHTS_BLOCKED",
-            "assetVersionId": asset_version_id,
-            "repeatedRecovery": "IDEMPOTENT",
-            "publicExport": "403 RIGHTS_MISSING",
-            "usage": counts,
-            "reconciliation": "ARTIFACT_INGESTED",
-        }
+        evidence["sidecarOriginal"] = "PERSISTED_BUT_ACK_LOST"
     else:
-        assert inspection.status_code == 404, f"pre-forward failure unexpectedly stored media: {inspection.status_code}"
-        recovery = client.post(
-            f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
-            json={"reason": "Owner verifies that no Sidecar object exists after the FAKE-only pre-storage failure"},
+        assert inspection.status_code == 404, (
+            f"pre-forward failure unexpectedly stored media: {inspection.status_code}"
         )
-        assert recovery.status_code == 409, recovery.text[:300]
-        assert recovery.json()["detail"]["code"] == "ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED"
-        with SessionLocal() as db:
-            task = db.get(DBGenerationTask, task_id)
-            attempt = db.execute(
-                select(DBGenerationAttempt).where(
-                    DBGenerationAttempt.generation_task_id == task_id
-                )
-            ).scalar_one()
-            tenant = db.get(DBTenant, task.tenant_id)
-            recovery_count = db.execute(
-                select(func.count(DBGenerationEvent.id)).where(
-                    DBGenerationEvent.generation_task_id == task_id,
-                    DBGenerationEvent.event_type == "ARTIFACT_RECOVERY_COMPLETED",
-                )
-            ).scalar_one()
-            assert task.status == "FAILED"
-            assert task.error_code == "ARTIFACT_INGEST_FAILED"
-            assert task.asset_version_id is None
-            assert attempt.reconciliation_state == "HELD"
-            assert recovery_count == 0
-            assert int(tenant.used_storage_bytes or 0) == storage_before
-        evidence["manualRecovery"] = {
-            "result": "DENY_ONLY_PASS",
-            "status": "409 ORIGINAL_ARTIFACT_RETRIEVAL_REQUIRED",
-            "usage": evidence["usage"],
-            "reconciliation": "HELD",
-        }
+        evidence["sidecarOriginal"] = "ABSENT_IN_SYNTHETIC_FAULT_PLAN"
 
+    recovery = client.post(
+        f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Prevent storage double debit when original OPENED receipt remains unresolved"},
+    )
+    assert recovery.status_code == 409, recovery.text[:300]
+    assert recovery.json()["detail"]["code"] == "ARTIFACT_RECOVERY_NOT_REQUIRED"
+    repeated = client.post(
+        f"/projects/{project_id}/generation-tasks/{task_id}/recover-artifact",
+        json={"reason": "Repeat storage hold reconciliation rejection"},
+    )
+    assert repeated.status_code == 409, repeated.text[:300]
+    assert repeated.json()["detail"]["code"] == "ARTIFACT_RECOVERY_NOT_REQUIRED"
+    after_recovery = inspect_task(project_id, task_id, storage_before)
+    assert after_recovery == {
+        key: value for key, value in evidence.items()
+        if key not in ("genericRetry", "sidecarOriginal")
+    }, "rejected recovery mutated original storage/usage hold"
+    evidence["ownerRecovery"] = {
+        "result": "BLOCKED_PENDING_INDEPENDENT_STORAGE_ACK",
+        "status": "409 ARTIFACT_RECOVERY_NOT_REQUIRED",
+        "storageHoldPreserved": True,
+        "noDoubleStorageDebit": True,
+        "noAssetOrSettlement": True,
+    }
     evidence["proxy"] = proxy_stats()
     return evidence
 
@@ -678,8 +589,8 @@ def main() -> None:
             "proxyTopology": "one Uvicorn process in disposable Compose; multi-instance state sharing is not claimed",
         },
         "conclusion": {
-            "lostAck": "one deterministic Sidecar media ID survives three lost acknowledgements; Owner recovery succeeds without a new generation attempt",
-            "preStorageFailure": "no Sidecar object exists; task and usage remain HELD; Owner recovery fails closed pending original artifact retrieval",
+            "lostAck": "original synthetic media survives lost ACK; FAILED/HELD and OPENED storage persist pending trusted reconciliation; no second debit",
+            "preStorageFailure": "no Sidecar object exists in bounded proxy; task, usage and storage remain HELD pending trusted independent reconciliation",
             "automaticPaidRetry": "none",
             "providerCalls": 0,
         },

@@ -120,7 +120,7 @@ def prepare() -> None:
     attempt_id = str(uuid.uuid4())
     upstream_job_id = f"fake-original-job-{uuid.uuid4()}"
     provider_artifact_id = f"fake-original-artifact-{uuid.uuid4()}"
-    reservation_key = f"g70-compose-recovery-{uuid.uuid4()}"
+    reservation_key = f"generation:{task_id}"
 
     with SessionLocal() as db:
         project = db.get(DBProject, project_id)
@@ -209,6 +209,9 @@ def prepare() -> None:
             },
             created_at=now,
         )
+        # Synthetic original creation must retain the same canonical usage
+        # receipt as the API's real task-creation path; otherwise a stricter
+        # recovery gate correctly rejects the fixture instead of the code.
         reserved_usage = DBGenerationUsageEntry(
             id=str(uuid.uuid4()),
             tenant_id=project.tenant_id,
@@ -217,9 +220,9 @@ def prepare() -> None:
             attempt_id=attempt_id,
             kind="RESERVED",
             request_units=1,
-            generated_seconds=1,
+            generated_seconds=0,
             reservation_key=reservation_key,
-            config_version_id=None,
+            config_version_id=source_task.capability_snapshot_json.get("configVersionId"),
             created_at=now,
         )
         db.add_all([task, attempt, failure_event, reserved_usage])
@@ -453,7 +456,7 @@ def verify_missing_original_object() -> None:
     attempt_id = str(uuid.uuid4())
     upstream_job_id = f"fake-missing-original-job-{uuid.uuid4()}"
     provider_artifact_id = f"fake-missing-original-artifact-{uuid.uuid4()}"
-    reservation_key = f"g70-missing-original-{uuid.uuid4()}"
+    reservation_key = f"generation:{task_id}"
     now = dt.datetime.now(dt.timezone.utc)
     missing_sha256 = "b" * 64
     missing_size = int(state["bytes"])
@@ -550,9 +553,9 @@ def verify_missing_original_object() -> None:
             attempt_id=attempt_id,
             kind="RESERVED",
             request_units=1,
-            generated_seconds=1,
+            generated_seconds=0,
             reservation_key=reservation_key,
-            config_version_id=None,
+            config_version_id=source_task.capability_snapshot_json.get("configVersionId"),
             created_at=now,
         )
         db.add_all([task, attempt, failure_event, reserved_usage])
